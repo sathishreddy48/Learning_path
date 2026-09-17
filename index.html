@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard — C# Learning Path</title>
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body data-root="">
+<div class="layout">
+<main class="main">
+
+  <h1>C# Learning Path</h1>
+  <p class="lede">A self-paced study site for <strong>C# / .NET preparation</strong> — from the language core through
+  threading, Web API, security, data access, patterns, and the Azure platform. Every topic page pairs C# with the
+  equivalent <strong>Python</strong> so you can practise the same idea in both languages. Pick a topic from the sidebar;
+  pages you have opened turn <span class="badge badge-visited">✓ visited</span>.</p>
+
+  <div class="storage-banner"></div>
+
+  <div class="stats-row">
+    <div class="progress">
+      <span>Visited</span>
+      <span class="progress-bar"><span class="progress-fill" data-progress-fill></span></span>
+      <span class="progress-num" data-progress-num>0 / 0</span>
+    </div>
+    <button type="button" class="btn btn-danger btn-sm" data-reset-visited>Reset visited topics</button>
+  </div>
+
+  <div class="callout callout-note">
+    <span class="callout-title">How to use this site</span>
+    <ul>
+      <li><strong>Start with Core Concepts</strong> and go in order — later pages assume the earlier ones.</li>
+      <li>Every code sample has a <strong>C# | Python</strong> tab bar. Switch tabs to see the same concept in the other language; <strong>Copy</strong> grabs whatever tab is showing.</li>
+      <li>Each section ends with a <strong>Practice</strong> box. Do the exercise in both languages before moving on.</li>
+      <li><strong>Interview angle</strong> boxes call out what a senior-level interviewer will probe on that topic.</li>
+      <li>Visited state lives in your browser only. Use <em>Reset visited topics</em> to start a fresh pass.</li>
+    </ul>
+  </div>
+
+  <h2 id="topics">Topics</h2>
+  <div class="cards" data-topic-cards></div>
+
+  <h2 id="order">Suggested order</h2>
+  <p>The sidebar is already in study order. Roughly: <strong>language</strong> (1–2) → <strong>building services</strong> (3–7)
+  → <strong>algorithms &amp; runtime</strong> (8–9) → <strong>architecture</strong> (10–11) → <strong>platform &amp; delivery</strong> (12–13).
+  If you are short on time, the highest-yield pages for a senior C# interview are Core Concepts, Threading, Web API, Security and Performance.</p>
+
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Phase</th><th>Pages</th><th>You should be able to…</th></tr></thead>
+    <tbody>
+      <tr><td>Language</td><td>Core Concepts · Threading &amp; Async</td><td>Explain value vs reference types, generics, LINQ deferred execution, the async state machine, and the classic deadlock — and write each from memory in C# and Python.</td></tr>
+      <tr><td>Services</td><td>Web API · Security · EF Core · Patterns · Testing</td><td>Build a secured, validated, versioned API with EF Core behind it, structured with SOLID and a couple of patterns, and covered by unit + one integration test.</td></tr>
+      <tr><td>Algorithms &amp; runtime</td><td>DSA · Performance</td><td>Solve the standard pattern problems in 45 minutes and diagnose a GC / allocation problem with the right tool.</td></tr>
+      <tr><td>Architecture</td><td>Microservices · Service Fabric</td><td>Argue boundaries, pick sync vs async communication, apply resilience and outbox patterns, and explain stateful services and partitioning.</td></tr>
+      <tr><td>Platform &amp; delivery</td><td>Azure Services · Azure DevOps</td><td>Choose the right Azure service and talk to it with managed identity; take a change from PR to production through a YAML pipeline with approvals.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p class="footer-note">Personal study site · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="assets/js/curriculum.js"></script>
+<script src="assets/js/visited.js"></script>
+<script src="assets/js/nav.js"></script>
+<script src="assets/js/code-tabs.js"></script>
+<script>
+/* Dashboard: topic cards + progress, kept in sync with visited state */
+(function () {
+  'use strict';
+  var C = window.CURRICULUM, V = window.VISITED;
+  if (!C || !V) return;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
+    });
+  }
+
+  function render() {
+    var host = document.querySelector('[data-topic-cards]');
+    if (host) {
+      host.innerHTML = C.topics.map(function (t, i) {
+        var visited = V.isVisited(t.id);
+        return '<div class="card' + (visited ? ' visited' : '') + '">' +
+          '<h3><span class="card-num">' + (visited ? '✓' : (i + 1)) + '</span><a href="' + t.href + '">' + esc(t.label) + '</a></h3>' +
+          '<p>' + esc(t.blurb) + '</p>' +
+          '<div class="card-foot"><span>' + t.sections.length + ' sections</span>' +
+          (visited ? '<span class="badge badge-visited">Visited</span>' : (i === 0 ? '<span class="badge badge-start">Start here</span>' : '')) +
+          '</div></div>';
+      }).join('');
+    }
+    var n = V.count(), total = C.topics.length;
+    var fill = document.querySelector('[data-progress-fill]');
+    var num = document.querySelector('[data-progress-num]');
+    if (fill) fill.style.width = (total ? Math.round(n / total * 100) : 0) + '%';
+    if (num) num.textContent = n + ' / ' + total;
+  }
+
+  document.addEventListener('DOMContentLoaded', render);
+  document.addEventListener('visited:change', render);
+})();
+</script>
+</body>
+</html>

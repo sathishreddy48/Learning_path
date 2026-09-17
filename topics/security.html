@@ -1,0 +1,747 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="security">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 4 of 13</div>
+  <h1>Security</h1>
+  <p class="lede">What you must get right before shipping any API. The page moves from concepts (authn vs authz) to concrete ASP.NET Core configuration, and finishes with the OWASP issues that show up in code reviews. FastAPI equivalents are alongside where the concept translates.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#authn-authz">Authentication vs authorization</a></li><li><a href="#jwt">JWT bearer tokens</a></li><li><a href="#oauth-oidc">OAuth 2.0, OpenID Connect and Microsoft Entra ID</a></li><li><a href="#policies">Role-, claim- and policy-based authorization</a></li><li><a href="#passwords">Password hashing and ASP.NET Core Identity</a></li><li><a href="#secrets">Secrets and configuration</a></li><li><a href="#transport">HTTPS, HSTS and security headers</a></li><li><a href="#owasp">OWASP Top 10 in .NET: injection, XSS, CSRF, SSRF</a></li><li><a href="#data-protection">Data Protection API and encryption</a></li><li><a href="#input-validation">Input validation and safe defaults</a></li></ol>
+  </div>
+
+<section id="authn-authz"><h2 id="authn-authz">Authentication vs authorization</h2><p><strong>Authentication</strong> (authn) answers “who are you?” and produces a <code>ClaimsPrincipal</code>. <strong>Authorization</strong> (authz) answers “are you allowed?” by evaluating roles, claims or policies against that principal. In ASP.NET Core they are two middlewares — <code>UseAuthentication()</code> must run first. Schemes (Cookie, JWT Bearer, OpenIdConnect) are how identity is proven; policies are how access is decided.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// 1. Register an authentication scheme (how identity is proven)
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(/* see next section */);
+
+// 2. Register authorization (how access is decided)
+builder.Services.AddAuthorization(o =&gt;
+{
+    o.AddPolicy(&quot;AdminOnly&quot;, p =&gt; p.RequireRole(&quot;admin&quot;));
+    o.FallbackPolicy = new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build(); // secure by default
+});
+
+var app = builder.Build();
+app.UseAuthentication();     // sets HttpContext.User
+app.UseAuthorization();      // enforces [Authorize] / RequireAuthorization
+
+app.MapGet(&quot;/me&quot;, (ClaimsPrincipal user) =&gt; new
+{
+    name = user.Identity?.Name,
+    id = user.FindFirstValue(ClaimTypes.NameIdentifier),
+    roles = user.FindAll(ClaimTypes.Role).Select(c =&gt; c.Value)
+});
+app.MapGet(&quot;/public&quot;, () =&gt; &quot;anyone&quot;).AllowAnonymous();
+app.MapGet(&quot;/admin&quot;, () =&gt; &quot;admins&quot;).RequireAuthorization(&quot;AdminOnly&quot;);
+
+// The principal is a set of identities, each a set of claims
+var identity = new ClaimsIdentity(new[]
+{
+    new Claim(ClaimTypes.NameIdentifier, &quot;42&quot;),
+    new Claim(ClaimTypes.Name, &quot;ada&quot;),
+    new Claim(ClaimTypes.Role, &quot;admin&quot;),
+    new Claim(&quot;department&quot;, &quot;eng&quot;)
+}, authenticationType: &quot;Test&quot;);
+var principal = new ClaimsPrincipal(identity);</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from dataclasses import dataclass, field
+
+app = FastAPI()
+bearer = HTTPBearer(auto_error=False)
+
+@dataclass
+class Principal:                       # ≈ ClaimsPrincipal
+    id: str; name: str; roles: list[str] = field(default_factory=list); claims: dict = field(default_factory=dict)
+
+# Authentication: turn credentials into a principal (or None)
+async def current_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -&gt; Principal | None:
+    if creds is None:
+        return None
+    return decode_token(creds.credentials)      # see JWT section
+
+# Authorization: policies as dependencies
+def require_user(user: Principal | None = Depends(current_user)) -&gt; Principal:
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, headers={&quot;WWW-Authenticate&quot;: &quot;Bearer&quot;})
+    return user
+
+def require_role(role: str):
+    def check(user: Principal = Depends(require_user)) -&gt; Principal:
+        if role not in user.roles:
+            raise HTTPException(status.HTTP_403_FORBIDDEN)
+        return user
+    return check
+
+@app.get(&quot;/me&quot;)
+def me(user: Principal = Depends(require_user)):
+    return {&quot;name&quot;: user.name, &quot;id&quot;: user.id, &quot;roles&quot;: user.roles}
+
+@app.get(&quot;/public&quot;)
+def public(): return &quot;anyone&quot;
+
+@app.get(&quot;/admin&quot;, dependencies=[Depends(require_role(&quot;admin&quot;))])
+def admin(): return &quot;admins&quot;</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>401 vs 403: 401 = not authenticated (and include <code>WWW-Authenticate</code>), 403 = authenticated but not allowed. Also: what a claim is, and why roles are just claims of a particular type.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Configure a fallback policy that requires authentication everywhere, then explicitly open <code>/health</code> and <code>/login</code> with <code>AllowAnonymous</code>.</li></ul></div></section>
+<section id="jwt"><h2 id="jwt">JWT bearer tokens</h2><p>A JSON Web Token carries signed claims. The API validates the signature (symmetric key or the issuer's public keys), issuer, audience and expiry — then trusts the claims without a database round-trip. Keep tokens short-lived and use refresh tokens for longevity. Never put secrets in the payload: it is only base64-encoded, not encrypted.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Validate tokens (API side)
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(o =&gt;
+    {
+        o.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,   ValidIssuer = &quot;https://auth.example.com&quot;,
+            ValidateAudience = true, ValidAudience = &quot;orders-api&quot;,
+            ValidateLifetime = true, ClockSkew = TimeSpan.FromSeconds(30),
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(builder.Configuration[&quot;Jwt:Key&quot;]!))
+        };
+        // For an external IdP, set o.Authority = &quot;https://login.microsoftonline.com/{tenant}/v2.0&quot;
+        // and the handler downloads the signing keys (JWKS) automatically.
+    });
+
+// Issue tokens (auth server / login endpoint) — use an IdP in production
+app.MapPost(&quot;/login&quot;, (LoginDto dto, IConfiguration cfg, IUserStore users) =&gt;
+{
+    var user = users.Verify(dto.Username, dto.Password);
+    if (user is null) return Results.Unauthorized();
+
+    var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(cfg[&quot;Jwt:Key&quot;]!));
+    var token = new JwtSecurityToken(
+        issuer: &quot;https://auth.example.com&quot;,
+        audience: &quot;orders-api&quot;,
+        claims: new[]
+        {
+            new Claim(JwtRegisteredClaimNames.Sub, user.Id),
+            new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+            new Claim(ClaimTypes.Role, &quot;admin&quot;)
+        },
+        expires: DateTime.UtcNow.AddMinutes(15),
+        signingCredentials: new SigningCredentials(key, SecurityAlgorithms.HmacSha256));
+
+    return Results.Ok(new { access_token = new JwtSecurityTokenHandler().WriteToken(token), token_type = &quot;Bearer&quot;, expires_in = 900 });
+});
+
+// Call it:  curl -H &quot;Authorization: Bearer &lt;token&gt;&quot; https://localhost:5001/me</code></pre><pre data-lang="python" hidden><code># pip install pyjwt[crypto] passlib
+import jwt, uuid
+from datetime import datetime, timedelta, timezone
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+
+SECRET = settings.jwt_key
+ISSUER, AUDIENCE = &quot;https://auth.example.com&quot;, &quot;orders-api&quot;
+app = FastAPI()
+oauth2 = OAuth2PasswordBearer(tokenUrl=&quot;login&quot;)     # reads Authorization: Bearer
+
+# Validate tokens (API side)
+def decode_token(token: str) -&gt; Principal:
+    try:
+        payload = jwt.decode(token, SECRET, algorithms=[&quot;HS256&quot;],
+                             issuer=ISSUER, audience=AUDIENCE, leeway=30)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, &quot;token expired&quot;)
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, &quot;invalid token&quot;)
+    return Principal(id=payload[&quot;sub&quot;], name=payload.get(&quot;name&quot;, &quot;&quot;), roles=payload.get(&quot;roles&quot;, []))
+
+def current_user(token: str = Depends(oauth2)) -&gt; Principal:
+    return decode_token(token)
+
+# Issue tokens
+@app.post(&quot;/login&quot;)
+def login(form: OAuth2PasswordRequestForm = Depends()):
+    user = users.verify(form.username, form.password)
+    if user is None:
+        raise HTTPException(401)
+    now = datetime.now(timezone.utc)
+    token = jwt.encode({
+        &quot;sub&quot;: user.id, &quot;jti&quot;: uuid.uuid4().hex, &quot;roles&quot;: [&quot;admin&quot;],
+        &quot;iss&quot;: ISSUER, &quot;aud&quot;: AUDIENCE,
+        &quot;iat&quot;: now, &quot;exp&quot;: now + timedelta(minutes=15),
+    }, SECRET, algorithm=&quot;HS256&quot;)
+    return {&quot;access_token&quot;: token, &quot;token_type&quot;: &quot;bearer&quot;, &quot;expires_in&quot;: 900}
+
+# For an external IdP, fetch the JWKS and verify RS256:
+# jwks = jwt.PyJWKClient(f&quot;{authority}/discovery/v2.0/keys&quot;); key = jwks.get_signing_key_from_jwt(token).key</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>What is in a JWT (header.payload.signature), symmetric vs asymmetric signing, why you validate <code>aud</code>, how to revoke (you can't — use short expiry + refresh tokens or a denylist), and the <code>alg: none</code> attack.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Issue a token, decode it at jwt.io, tamper with a claim and confirm the API rejects it. Then set expiry to 10 seconds and watch the 401.</li></ul></div></section>
+<section id="oauth-oidc"><h2 id="oauth-oidc">OAuth 2.0, OpenID Connect and Microsoft Entra ID</h2><p>OAuth 2.0 is <em>delegated authorization</em>: a client gets an access token to call an API on a user's behalf. OpenID Connect adds an <em>ID token</em> and standard user info on top — that is what “login with Microsoft/Google” is. Flows: <strong>Authorization Code + PKCE</strong> (web/SPA/mobile), <strong>Client Credentials</strong> (service-to-service), <strong>On-Behalf-Of</strong> (API calling another API as the user). Entra ID is Microsoft's IdP; <code>Microsoft.Identity.Web</code> wires it into ASP.NET Core.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// API protected by Entra ID (validates tokens issued to your app registration)
+// appsettings.json: &quot;AzureAd&quot;: { &quot;Instance&quot;: &quot;https://login.microsoftonline.com/&quot;, &quot;TenantId&quot;: &quot;...&quot;, &quot;ClientId&quot;: &quot;api://orders&quot; }
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddMicrosoftIdentityWebApi(builder.Configuration.GetSection(&quot;AzureAd&quot;))
+    .EnableTokenAcquisitionToCallDownstreamApi()           // On-Behalf-Of
+    .AddDownstreamApi(&quot;Graph&quot;, builder.Configuration.GetSection(&quot;Graph&quot;))
+    .AddInMemoryTokenCaches();
+
+app.MapGet(&quot;/profile&quot;, [Authorize] async (IDownstreamApi graph) =&gt;
+    await graph.CallApiForUserAsync&lt;User&gt;(&quot;Graph&quot;, o =&gt; o.RelativePath = &quot;me&quot;));
+
+// Require a scope (delegated) or app role (client credentials)
+app.MapGet(&quot;/orders&quot;, [RequiredScope(&quot;Orders.Read&quot;)] () =&gt; ...);
+app.MapGet(&quot;/jobs&quot;, () =&gt; ...).RequireAuthorization(p =&gt; p.RequireRole(&quot;Jobs.Run&quot;));
+
+// Web app login (OIDC) with cookies
+builder.Services.AddAuthentication(OpenIdConnectDefaults.AuthenticationScheme)
+    .AddMicrosoftIdentityWebApp(builder.Configuration.GetSection(&quot;AzureAd&quot;));
+builder.Services.AddRazorPages().AddMicrosoftIdentityUI();     // /MicrosoftIdentity/Account/SignIn
+
+// Service-to-service: client credentials with MSAL
+var cca = ConfidentialClientApplicationBuilder.Create(clientId)
+    .WithClientSecret(secret)          // or .WithCertificate(cert) — preferred
+    .WithAuthority($&quot;https://login.microsoftonline.com/{tenant}&quot;)
+    .Build();
+var result = await cca.AcquireTokenForClient(new[] { &quot;api://orders/.default&quot; }).ExecuteAsync();
+http.DefaultRequestHeaders.Authorization = new(&quot;Bearer&quot;, result.AccessToken);
+
+// Managed identity (no secrets at all, inside Azure)
+var cred = new DefaultAzureCredential();
+var token = await cred.GetTokenAsync(new TokenRequestContext(new[] { &quot;api://orders/.default&quot; }));</code></pre><pre data-lang="python" hidden><code># pip install msal fastapi-azure-auth  (or validate manually with PyJWT + JWKS)
+from fastapi import FastAPI, Security
+from fastapi_azure_auth import SingleTenantAzureAuthorizationCodeBearer
+
+app = FastAPI()
+azure = SingleTenantAzureAuthorizationCodeBearer(
+    app_client_id=settings.client_id,
+    tenant_id=settings.tenant_id,
+    scopes={&quot;api://orders/Orders.Read&quot;: &quot;Read orders&quot;},
+)
+
+@app.get(&quot;/orders&quot;, dependencies=[Security(azure, scopes=[&quot;Orders.Read&quot;])])
+def orders(): ...
+
+# Manual validation against Entra&#x27;s JWKS (works for any OIDC provider)
+import jwt
+jwks = jwt.PyJWKClient(f&quot;https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys&quot;)
+def validate(token: str):
+    key = jwks.get_signing_key_from_jwt(token).key
+    return jwt.decode(token, key, algorithms=[&quot;RS256&quot;], audience=&quot;api://orders&quot;,
+                      issuer=f&quot;https://login.microsoftonline.com/{tenant}/v2.0&quot;)
+
+# Service-to-service: client credentials with MSAL
+import msal
+cca = msal.ConfidentialClientApplication(
+    client_id, authority=f&quot;https://login.microsoftonline.com/{tenant}&quot;, client_credential=secret)
+result = cca.acquire_token_for_client(scopes=[&quot;api://orders/.default&quot;])
+headers = {&quot;Authorization&quot;: f&quot;Bearer {result[&#x27;access_token&#x27;]}&quot;}
+
+# Managed identity inside Azure
+from azure.identity import DefaultAzureCredential
+token = DefaultAzureCredential().get_token(&quot;api://orders/.default&quot;).token
+
+# Web login (OIDC) — use `authlib` with FastAPI sessions:
+# oauth.register(&quot;azure&quot;, server_metadata_url=f&quot;https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration&quot;, ...)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Explain the authorization-code flow end to end (redirect, code, token exchange, PKCE), why implicit flow is deprecated, the difference between ID token and access token, and scopes vs app roles in Entra ID.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Register an app in Entra ID, protect an endpoint with a scope, and call it from Postman using the auth-code flow. Then add a second app with client credentials and an app role.</li></ul></div></section>
+<section id="policies"><h2 id="policies">Role-, claim- and policy-based authorization</h2><p>Roles are the simplest check but do not scale to business rules. Policies compose <em>requirements</em>; a <em>handler</em> evaluates each requirement against the user and (optionally) the resource. Resource-based authorization (“can this user edit <em>this</em> document?”) uses <code>IAuthorizationService</code> inside the endpoint.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>builder.Services.AddAuthorization(o =&gt;
+{
+    o.AddPolicy(&quot;Adult&quot;, p =&gt; p.RequireClaim(&quot;age_verified&quot;, &quot;true&quot;));
+    o.AddPolicy(&quot;EngOrAdmin&quot;, p =&gt; p.RequireAssertion(ctx =&gt;
+        ctx.User.IsInRole(&quot;admin&quot;) || ctx.User.HasClaim(&quot;department&quot;, &quot;eng&quot;)));
+    o.AddPolicy(&quot;MinLevel3&quot;, p =&gt; p.Requirements.Add(new MinLevelRequirement(3)));
+});
+builder.Services.AddSingleton&lt;IAuthorizationHandler, MinLevelHandler&gt;();
+builder.Services.AddSingleton&lt;IAuthorizationHandler, DocumentOwnerHandler&gt;();
+
+public record MinLevelRequirement(int Level) : IAuthorizationRequirement;
+
+public class MinLevelHandler : AuthorizationHandler&lt;MinLevelRequirement&gt;
+{
+    protected override Task HandleRequirementAsync(AuthorizationHandlerContext ctx, MinLevelRequirement req)
+    {
+        var lvl = int.TryParse(ctx.User.FindFirstValue(&quot;level&quot;), out var l) ? l : 0;
+        if (lvl &gt;= req.Level) ctx.Succeed(req);
+        return Task.CompletedTask;         // not calling Succeed = fail (unless another handler succeeds)
+    }
+}
+
+// Resource-based: the handler sees the resource
+public record OwnerRequirement : IAuthorizationRequirement;
+public class DocumentOwnerHandler : AuthorizationHandler&lt;OwnerRequirement, Document&gt;
+{
+    protected override Task HandleRequirementAsync(AuthorizationHandlerContext ctx, OwnerRequirement req, Document doc)
+    {
+        if (doc.OwnerId == ctx.User.FindFirstValue(ClaimTypes.NameIdentifier)) ctx.Succeed(req);
+        return Task.CompletedTask;
+    }
+}
+
+app.MapPut(&quot;/docs/{id}&quot;, async (int id, DocDto dto, ClaimsPrincipal user, IAuthorizationService authz, IDocRepo repo) =&gt;
+{
+    var doc = await repo.Get(id);
+    if (doc is null) return Results.NotFound();
+    var result = await authz.AuthorizeAsync(user, doc, new OwnerRequirement());
+    if (!result.Succeeded) return Results.Forbid();
+    await repo.Update(doc with { Title = dto.Title });
+    return Results.NoContent();
+});</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI, Depends, HTTPException
+
+app = FastAPI()
+
+# Policies as dependency factories
+def require_claim(name: str, value: str):
+    def check(user: Principal = Depends(require_user)):
+        if user.claims.get(name) != value:
+            raise HTTPException(403)
+        return user
+    return check
+
+def require_any(*checks):
+    def check(user: Principal = Depends(require_user)):
+        if not any(c(user) for c in checks):
+            raise HTTPException(403)
+        return user
+    return check
+
+is_admin = lambda u: &quot;admin&quot; in u.roles
+is_eng = lambda u: u.claims.get(&quot;department&quot;) == &quot;eng&quot;
+
+def min_level(level: int):
+    def check(user: Principal = Depends(require_user)):
+        if int(user.claims.get(&quot;level&quot;, 0)) &lt; level:
+            raise HTTPException(403)
+        return user
+    return check
+
+@app.get(&quot;/adult&quot;, dependencies=[Depends(require_claim(&quot;age_verified&quot;, &quot;true&quot;))])
+def adult(): ...
+
+@app.get(&quot;/eng&quot;, dependencies=[Depends(require_any(is_admin, is_eng))])
+def eng(): ...
+
+# Resource-based: check inside the handler
+@app.put(&quot;/docs/{id}&quot;, status_code=204)
+async def update_doc(id: int, dto: DocDto, user: Principal = Depends(require_user)):
+    doc = await repo.get(id)
+    if doc is None:
+        raise HTTPException(404)
+    if doc.owner_id != user.id and &quot;admin&quot; not in user.roles:
+        raise HTTPException(403)
+    await repo.update(doc.model_copy(update={&quot;title&quot;: dto.title}))</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement a “business hours only” policy with a requirement + handler that takes an <code>ISystemClock</code> so it is unit-testable.</li></ul></div></section>
+<section id="passwords"><h2 id="passwords">Password hashing and ASP.NET Core Identity</h2><p>Never store or compare plain-text passwords. Use a slow, salted hash: PBKDF2 (what Identity uses), bcrypt, or Argon2id. ASP.NET Core Identity provides users, roles, password policies, lockout, 2FA and email confirmation on top of EF Core — use it instead of rolling your own. In Python, <code>passlib</code> with bcrypt/argon2 is the standard.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Manual hashing (when you can&#x27;t use Identity)
+public static class PasswordHasher
+{
+    public static string Hash(string password)
+    {
+        byte[] salt = RandomNumberGenerator.GetBytes(16);
+        byte[] hash = Rfc2898DeriveBytes.Pbkdf2(password, salt, iterations: 600_000, HashAlgorithmName.SHA256, outputLength: 32);
+        return $&quot;{Convert.ToBase64String(salt)}.{Convert.ToBase64String(hash)}&quot;;
+    }
+    public static bool Verify(string password, string stored)
+    {
+        var parts = stored.Split(&#x27;.&#x27;);
+        byte[] salt = Convert.FromBase64String(parts[0]);
+        byte[] expected = Convert.FromBase64String(parts[1]);
+        byte[] actual = Rfc2898DeriveBytes.Pbkdf2(password, salt, 600_000, HashAlgorithmName.SHA256, 32);
+        return CryptographicOperations.FixedTimeEquals(actual, expected);   // constant-time compare
+    }
+}
+
+// ASP.NET Core Identity — the default choice
+builder.Services.AddDbContext&lt;AppDb&gt;(o =&gt; o.UseSqlServer(cs));
+builder.Services.AddIdentityApiEndpoints&lt;IdentityUser&gt;(o =&gt;
+{
+    o.Password.RequiredLength = 12;
+    o.Lockout.MaxFailedAccessAttempts = 5;
+    o.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(15);
+    o.User.RequireUniqueEmail = true;
+}).AddEntityFrameworkStores&lt;AppDb&gt;();
+
+var app = builder.Build();
+app.MapIdentityApi&lt;IdentityUser&gt;();      // /register, /login, /refresh, /manage/2fa …
+
+// Using the managers directly
+app.MapPost(&quot;/change-password&quot;, async (ChangePwDto dto, ClaimsPrincipal user, UserManager&lt;IdentityUser&gt; users) =&gt;
+{
+    var u = await users.GetUserAsync(user);
+    var result = await users.ChangePasswordAsync(u!, dto.Current, dto.New);
+    return result.Succeeded ? Results.NoContent() : Results.ValidationProblem(result.Errors.ToDictionary(e =&gt; e.Code, e =&gt; new[] { e.Description }));
+});</code></pre><pre data-lang="python" hidden><code># pip install &quot;passlib[bcrypt,argon2]&quot;
+from passlib.context import CryptContext
+import hmac, hashlib, os, base64
+
+pwd = CryptContext(schemes=[&quot;argon2&quot;, &quot;bcrypt&quot;], deprecated=&quot;auto&quot;)
+
+hashed = pwd.hash(&quot;correct horse battery staple&quot;)      # salt + params embedded in the string
+ok = pwd.verify(&quot;guess&quot;, hashed)                        # constant-time
+if pwd.needs_update(hashed):                            # rehash on login if params changed
+    hashed = pwd.hash(&quot;...&quot;)
+
+# Manual PBKDF2 with the stdlib (if you can&#x27;t add a dependency)
+def hash_password(password: str) -&gt; str:
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac(&quot;sha256&quot;, password.encode(), salt, 600_000, dklen=32)
+    return f&quot;{base64.b64encode(salt).decode()}.{base64.b64encode(dk).decode()}&quot;
+
+def verify_password(password: str, stored: str) -&gt; bool:
+    s, h = stored.split(&quot;.&quot;)
+    salt, expected = base64.b64decode(s), base64.b64decode(h)
+    actual = hashlib.pbkdf2_hmac(&quot;sha256&quot;, password.encode(), salt, 600_000, dklen=32)
+    return hmac.compare_digest(actual, expected)
+
+# There&#x27;s no &quot;Identity&quot; framework in FastAPI; `fastapi-users` is the closest
+# batteries-included option (registration, login, reset, verify, OAuth).</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why not SHA-256 for passwords (too fast → brute-forceable)? What does a salt defend against (rainbow tables)? Why constant-time comparison (timing attacks)? What is account lockout for (online brute force)?</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a login endpoint that returns the same 401 and takes the same time whether the user exists or not (no user enumeration).</li></ul></div></section>
+<section id="secrets"><h2 id="secrets">Secrets and configuration</h2><p>Secrets never go in source control. Locally: <code>dotnet user-secrets</code> (stored outside the repo). In Azure: Key Vault via Managed Identity, with <code>AddAzureKeyVault</code> mapping secrets to configuration keys. Environment variables for containers. The configuration system layers all of these, so code just reads <code>IConfiguration["ConnectionStrings:Default"]</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Local development
+//   dotnet user-secrets init
+//   dotnet user-secrets set &quot;ConnectionStrings:Default&quot; &quot;Server=...;Password=...&quot;
+//   dotnet user-secrets set &quot;Jwt:Key&quot; &quot;dev-only-long-random-string&quot;
+
+// Configuration layering (later wins): appsettings.json → appsettings.{Env}.json →
+// user secrets (Dev) → environment variables → command line
+var builder = WebApplication.CreateBuilder(args);
+
+// Azure Key Vault in non-development
+if (!builder.Environment.IsDevelopment())
+{
+    builder.Configuration.AddAzureKeyVault(
+        new Uri($&quot;https://{builder.Configuration[&quot;KeyVault:Name&quot;]}.vault.azure.net/&quot;),
+        new DefaultAzureCredential());          // Managed Identity in Azure, az login locally
+    // secret &quot;ConnectionStrings--Default&quot; in Key Vault → &quot;ConnectionStrings:Default&quot; in config
+}
+
+// Strongly-typed access
+builder.Services.AddOptions&lt;JwtOptions&gt;()
+    .Bind(builder.Configuration.GetSection(&quot;Jwt&quot;))
+    .ValidateDataAnnotations()
+    .ValidateOnStart();                       // fail fast if a secret is missing
+
+public class JwtOptions
+{
+    [Required, MinLength(32)] public string Key { get; set; } = &quot;&quot;;
+    [Required] public string Issuer { get; set; } = &quot;&quot;;
+}
+
+// Environment variables:  Jwt__Key=...  (double underscore = section separator)
+
+// Reading a single secret on demand
+var client = new SecretClient(new Uri(vaultUri), new DefaultAzureCredential());
+KeyVaultSecret s = await client.GetSecretAsync(&quot;StripeApiKey&quot;);
+
+// .gitignore must include: appsettings.*.local.json, *.pfx, .env</code></pre><pre data-lang="python" hidden><code># pip install pydantic-settings python-dotenv azure-identity azure-keyvault-secrets
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=&quot;.env&quot;, env_nested_delimiter=&quot;__&quot;)
+    database_url: str
+    jwt_key: str = Field(min_length=32)
+    jwt_issuer: str = &quot;https://auth.example.com&quot;
+
+settings = Settings()      # raises at startup if a required value is missing (fail fast)
+
+# .env (gitignored) for local dev:
+#   DATABASE_URL=postgresql://...
+#   JWT_KEY=dev-only-long-random-string
+
+# Azure Key Vault in production
+import os
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
+
+if os.getenv(&quot;ENV&quot;) != &quot;development&quot;:
+    client = SecretClient(f&quot;https://{os.environ[&#x27;KEYVAULT_NAME&#x27;]}.vault.azure.net/&quot;, DefaultAzureCredential())
+    os.environ[&quot;JWT_KEY&quot;] = client.get_secret(&quot;Jwt--Key&quot;).value
+    settings = Settings()
+
+# Never: hard-coded keys, secrets in logs, secrets in the OpenAPI examples.
+# Add to .gitignore: .env, *.pem, *.pfx</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Move a connection string from <code>appsettings.json</code> to user secrets, then to an environment variable, and prove the app reads the right one each time with a <code>/config-check</code> endpoint (Development only).</li></ul></div></section>
+<section id="transport"><h2 id="transport">HTTPS, HSTS and security headers</h2><p>Redirect HTTP to HTTPS, send <code>Strict-Transport-Security</code> so browsers never try HTTP again, and add the standard hardening headers: <code>X-Content-Type-Options</code>, <code>X-Frame-Options</code>/<code>frame-ancestors</code>, <code>Content-Security-Policy</code>, <code>Referrer-Policy</code>. Behind a reverse proxy, configure forwarded headers so the app knows the original scheme.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>var app = builder.Build();
+
+// Behind Azure App Service / nginx / Front Door
+app.UseForwardedHeaders(new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto
+});
+
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHsts();                       // Strict-Transport-Security: max-age=2592000
+}
+app.UseHttpsRedirection();
+
+// Security headers middleware
+app.Use(async (ctx, next) =&gt;
+{
+    var h = ctx.Response.Headers;
+    h[&quot;X-Content-Type-Options&quot;] = &quot;nosniff&quot;;
+    h[&quot;X-Frame-Options&quot;] = &quot;DENY&quot;;
+    h[&quot;Referrer-Policy&quot;] = &quot;strict-origin-when-cross-origin&quot;;
+    h[&quot;Permissions-Policy&quot;] = &quot;camera=(), microphone=(), geolocation=()&quot;;
+    h[&quot;Content-Security-Policy&quot;] = &quot;default-src &#x27;self&#x27;; frame-ancestors &#x27;none&#x27;; object-src &#x27;none&#x27;&quot;;
+    await next();
+});
+
+// Cookie hardening
+builder.Services.ConfigureApplicationCookie(o =&gt;
+{
+    o.Cookie.HttpOnly = true;
+    o.Cookie.SecurePolicy = CookieSecurePolicy.Always;
+    o.Cookie.SameSite = SameSiteMode.Strict;
+    o.ExpireTimeSpan = TimeSpan.FromHours(1);
+    o.SlidingExpiration = true;
+});
+
+// Kestrel TLS in appsettings.json
+// &quot;Kestrel&quot;: { &quot;Endpoints&quot;: { &quot;Https&quot;: { &quot;Url&quot;: &quot;https://*:5001&quot;, &quot;Certificate&quot;: { &quot;Path&quot;: &quot;cert.pfx&quot;, &quot;Password&quot;: &quot;...&quot; } } } }</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI, Request
+from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+
+app = FastAPI()
+
+# Usually TLS terminates at the proxy; run uvicorn with --proxy-headers --forwarded-allow-ips=&#x27;*&#x27;
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=[&quot;api.example.com&quot;])
+if not settings.debug:
+    app.add_middleware(HTTPSRedirectMiddleware)
+
+@app.middleware(&quot;http&quot;)
+async def security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers[&quot;Strict-Transport-Security&quot;] = &quot;max-age=2592000; includeSubDomains&quot;
+    resp.headers[&quot;X-Content-Type-Options&quot;] = &quot;nosniff&quot;
+    resp.headers[&quot;X-Frame-Options&quot;] = &quot;DENY&quot;
+    resp.headers[&quot;Referrer-Policy&quot;] = &quot;strict-origin-when-cross-origin&quot;
+    resp.headers[&quot;Permissions-Policy&quot;] = &quot;camera=(), microphone=(), geolocation=()&quot;
+    resp.headers[&quot;Content-Security-Policy&quot;] = &quot;default-src &#x27;self&#x27;; frame-ancestors &#x27;none&#x27;; object-src &#x27;none&#x27;&quot;
+    return resp
+
+# Cookie hardening
+from fastapi import Response
+@app.post(&quot;/login&quot;)
+def login(response: Response):
+    response.set_cookie(&quot;session&quot;, token, httponly=True, secure=True, samesite=&quot;strict&quot;, max_age=3600)
+
+# TLS directly in uvicorn (dev/test):
+#   uvicorn main:app --ssl-keyfile key.pem --ssl-certfile cert.pem</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Run your API through <a href='https://securityheaders.com' target='_blank' rel='noopener'>securityheaders.com</a> (or curl -I) and fix every missing header.</li></ul></div></section>
+<section id="owasp"><h2 id="owasp">OWASP Top 10 in .NET: injection, XSS, CSRF, SSRF</h2><p>The bugs that actually get exploited. <strong>SQL injection</strong>: use parameters — EF Core and Dapper do this; string-built SQL does not. <strong>XSS</strong>: Razor encodes by default; <code>Html.Raw</code> and manual string building do not. <strong>CSRF</strong>: antiforgery tokens for cookie-authenticated forms; bearer-token APIs are immune. <strong>SSRF</strong>: validate and allow-list any URL you fetch on behalf of a user. Plus mass assignment, path traversal and insecure deserialization.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// SQL injection
+var bad  = db.Users.FromSqlRaw($&quot;SELECT * FROM Users WHERE Name = &#x27;{name}&#x27;&quot;);          // ✗ injectable
+var good = db.Users.FromSqlInterpolated($&quot;SELECT * FROM Users WHERE Name = {name}&quot;);  // ✓ parameterised
+var ok   = db.Users.Where(u =&gt; u.Name == name);                                        // ✓ LINQ
+var dapper = conn.Query&lt;User&gt;(&quot;SELECT * FROM Users WHERE Name = @Name&quot;, new { Name = name }); // ✓
+
+// XSS
+// Razor:  &lt;p&gt;@Model.Comment&lt;/p&gt;            ✓ encoded
+//         &lt;p&gt;@Html.Raw(Model.Comment)&lt;/p&gt;  ✗ only for trusted HTML
+string safe = HtmlEncoder.Default.Encode(userInput);                 // when building strings
+// API: return JSON with correct content-type; never text/html built from input
+
+// CSRF (cookie auth + browser forms)
+builder.Services.AddAntiforgery();
+app.UseAntiforgery();
+app.MapPost(&quot;/profile&quot;, ([FromForm] ProfileDto dto) =&gt; ...);   // minimal APIs validate the token for form posts
+// Razor: &lt;form method=&quot;post&quot;&gt; gets the hidden token automatically; SPA: send X-CSRF-TOKEN header from a cookie
+
+// SSRF
+app.MapGet(&quot;/fetch&quot;, async (string url, HttpClient http) =&gt;
+{
+    if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != &quot;https&quot;) return Results.BadRequest();
+    var allowed = new[] { &quot;api.partner.com&quot;, &quot;cdn.example.com&quot; };
+    if (!allowed.Contains(uri.Host)) return Results.BadRequest(&quot;host not allowed&quot;);   // never 169.254.169.254
+    return Results.Text(await http.GetStringAsync(uri));
+});
+
+// Mass assignment: bind to a DTO, not the entity
+app.MapPut(&quot;/users/{id}&quot;, (int id, UpdateUserDto dto) =&gt; ...);   // dto has no IsAdmin property
+
+// Path traversal
+var root = Path.GetFullPath(&quot;uploads&quot;);
+var full = Path.GetFullPath(Path.Combine(root, fileName));
+if (!full.StartsWith(root + Path.DirectorySeparatorChar)) return Results.BadRequest();
+
+// Insecure deserialization: never BinaryFormatter (removed in .NET 9); System.Text.Json with known types only</code></pre><pre data-lang="python" hidden><code># SQL injection
+cur.execute(f&quot;SELECT * FROM users WHERE name = &#x27;{name}&#x27;&quot;)          # ✗ injectable
+cur.execute(&quot;SELECT * FROM users WHERE name = %s&quot;, (name,))         # ✓ parameterised (psycopg)
+session.execute(text(&quot;SELECT * FROM users WHERE name = :n&quot;), {&quot;n&quot;: name})  # ✓ SQLAlchemy
+session.query(User).filter(User.name == name)                       # ✓ ORM
+
+# XSS
+# Jinja2 templates autoescape in FastAPI/Starlette&#x27;s Jinja2Templates ✓
+# {{ comment | safe }}  ✗ only for trusted HTML
+import html
+safe = html.escape(user_input)                                      # when building strings
+
+# CSRF (cookie auth + browser forms): `starlette-csrf` or double-submit cookie
+from starlette_csrf import CSRFMiddleware
+app.add_middleware(CSRFMiddleware, secret=settings.csrf_secret)
+# Bearer-token APIs don&#x27;t need it: the browser won&#x27;t attach the token automatically.
+
+# SSRF
+from urllib.parse import urlparse
+ALLOWED = {&quot;api.partner.com&quot;, &quot;cdn.example.com&quot;}
+@app.get(&quot;/fetch&quot;)
+async def fetch(url: str):
+    u = urlparse(url)
+    if u.scheme != &quot;https&quot; or u.hostname not in ALLOWED:
+        raise HTTPException(400, &quot;host not allowed&quot;)             # never 169.254.169.254
+    return (await client.get(url)).text
+
+# Mass assignment: separate input model
+class UpdateUserDto(BaseModel):
+    name: str; email: str        # no is_admin
+
+# Path traversal
+from pathlib import Path
+root = Path(&quot;uploads&quot;).resolve()
+full = (root / file_name).resolve()
+if root not in full.parents:
+    raise HTTPException(400)
+
+# Insecure deserialization: never pickle.loads() / yaml.load() on untrusted input; use json / yaml.safe_load</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Be able to show a vulnerable line and the fixed line for each of injection, XSS and CSRF, and explain why bearer-token APIs don't need antiforgery tokens.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a deliberately vulnerable endpoint using <code>FromSqlRaw</code> with string concatenation, exploit it with <code>' OR 1=1 --</code>, then fix it.</li></ul></div></section>
+<section id="data-protection"><h2 id="data-protection">Data Protection API and encryption</h2><p>ASP.NET Core's Data Protection stack encrypts cookies, antiforgery tokens and anything you <code>Protect()</code>, with automatic key rotation. In a web farm the key ring must be shared (blob storage + Key Vault). For general encryption use <code>AesGcm</code> (authenticated) — never ECB, never a home-made scheme; hash with SHA-256 for integrity, HMAC for signatures.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Shared key ring for multiple instances (Azure)
+builder.Services.AddDataProtection()
+    .SetApplicationName(&quot;orders&quot;)                                         // same name on every instance
+    .PersistKeysToAzureBlobStorage(new Uri(blobUri), new DefaultAzureCredential())
+    .ProtectKeysWithAzureKeyVault(new Uri(keyId), new DefaultAzureCredential())
+    .SetDefaultKeyLifetime(TimeSpan.FromDays(90));
+
+// Protect arbitrary data (purpose strings isolate uses)
+public class TokenService(IDataProtectionProvider provider)
+{
+    private readonly IDataProtector _p = provider.CreateProtector(&quot;password-reset&quot;);
+    private readonly ITimeLimitedDataProtector _t = provider.CreateProtector(&quot;password-reset&quot;).ToTimeLimitedDataProtector();
+
+    public string Create(string userId) =&gt; _t.Protect(userId, TimeSpan.FromMinutes(30));
+    public string? Read(string token)
+    {
+        try { return _t.Unprotect(token); } catch (CryptographicException) { return null; }
+    }
+}
+
+// AES-GCM for data at rest you manage yourself
+public static (byte[] cipher, byte[] nonce, byte[] tag) Encrypt(byte[] key, byte[] plain)
+{
+    var nonce = RandomNumberGenerator.GetBytes(AesGcm.NonceByteSizes.MaxSize);
+    var cipher = new byte[plain.Length];
+    var tag = new byte[AesGcm.TagByteSizes.MaxSize];
+    using var aes = new AesGcm(key, tag.Length);
+    aes.Encrypt(nonce, plain, cipher, tag);
+    return (cipher, nonce, tag);
+}
+
+// Hashing and HMAC
+string sha = Convert.ToHexString(SHA256.HashData(bytes));
+byte[] mac = HMACSHA256.HashData(key, bytes);
+bool valid = CryptographicOperations.FixedTimeEquals(mac, received);</code></pre><pre data-lang="python" hidden><code># pip install cryptography itsdangerous
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+import hashlib, hmac, os
+
+# Time-limited signed tokens (≈ ITimeLimitedDataProtector)
+serializer = URLSafeTimedSerializer(settings.secret_key, salt=&quot;password-reset&quot;)
+token = serializer.dumps(user_id)
+try:
+    user_id = serializer.loads(token, max_age=1800)
+except (BadSignature, SignatureExpired):
+    user_id = None
+
+# Symmetric encryption with a simple safe API (AES-CBC + HMAC under the hood)
+f = Fernet(Fernet.generate_key())
+blob = f.encrypt(b&quot;secret&quot;); plain = f.decrypt(blob)
+
+# AES-GCM directly
+key = AESGCM.generate_key(bit_length=256)
+nonce = os.urandom(12)
+cipher = AESGCM(key).encrypt(nonce, b&quot;secret&quot;, associated_data=None)
+plain = AESGCM(key).decrypt(nonce, cipher, None)
+
+# Hashing and HMAC
+sha = hashlib.sha256(data).hexdigest()
+mac = hmac.new(key, data, hashlib.sha256).digest()
+valid = hmac.compare_digest(mac, received)
+
+# Key management: store keys in Key Vault / env, rotate, never in code.</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement a password-reset link with a 30-minute time-limited protector; verify an expired or tampered token is rejected.</li></ul></div></section>
+<section id="input-validation"><h2 id="input-validation">Input validation and safe defaults</h2><p>Validate at the boundary, allow-list rather than deny-list, limit sizes, and fail closed. Set request body limits, restrict file uploads by type and size, use strongly-typed IDs to avoid IDOR, and log security events without logging secrets. Most of this is configuration, not code.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Request size limits
+builder.WebHost.ConfigureKestrel(k =&gt; k.Limits.MaxRequestBodySize = 10 * 1024 * 1024);   // 10 MB
+app.MapPost(&quot;/upload&quot;, ...).WithMetadata(new RequestSizeLimitAttribute(2 * 1024 * 1024));
+
+// File upload validation
+app.MapPost(&quot;/avatar&quot;, async (IFormFile file) =&gt;
+{
+    var allowed = new Dictionary&lt;string, byte[]&gt; { [&quot;.png&quot;] = new byte[] { 0x89, 0x50, 0x4E, 0x47 } };
+    var ext = Path.GetExtension(file.FileName).ToLowerInvariant();
+    if (!allowed.ContainsKey(ext) || file.Length &gt; 1_000_000) return Results.BadRequest();
+    using var s = file.OpenReadStream();
+    var header = new byte[4]; await s.ReadExactlyAsync(header);
+    if (!header.SequenceEqual(allowed[ext])) return Results.BadRequest(&quot;not a png&quot;);      // check magic bytes, not just extension
+    var safeName = $&quot;{Guid.NewGuid()}{ext}&quot;;                                              // never use the client&#x27;s file name
+    await using var dst = File.Create(Path.Combine(&quot;uploads&quot;, safeName));
+    s.Position = 0; await s.CopyToAsync(dst);
+    return Results.Ok(safeName);
+});
+
+// IDOR: scope every query by the caller
+app.MapGet(&quot;/orders/{id}&quot;, async (int id, ClaimsPrincipal user, AppDb db) =&gt;
+{
+    var uid = user.FindFirstValue(ClaimTypes.NameIdentifier);
+    var order = await db.Orders.FirstOrDefaultAsync(o =&gt; o.Id == id &amp;&amp; o.OwnerId == uid);   // not just o.Id == id
+    return order is null ? Results.NotFound() : Results.Ok(order);
+});
+
+// Allow-list enums / values
+if (!Enum.TryParse&lt;SortField&gt;(sort, ignoreCase: true, out var field)) return Results.BadRequest();
+
+// Logging: structured, without secrets
+log.LogWarning(&quot;Failed login for {User} from {IP}&quot;, username, ctx.Connection.RemoteIpAddress);   // never the password
+builder.Services.AddHttpLogging(o =&gt; o.RequestHeaders.Remove(&quot;Authorization&quot;));</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI, UploadFile, HTTPException, Depends, Request
+from pathlib import Path
+import uuid, logging
+
+app = FastAPI()
+
+# Request size limit: enforce at the proxy (nginx client_max_body_size) or middleware
+@app.middleware(&quot;http&quot;)
+async def limit_body(request: Request, call_next):
+    if int(request.headers.get(&quot;content-length&quot;, 0)) &gt; 10 * 1024 * 1024:
+        raise HTTPException(413)
+    return await call_next(request)
+
+# File upload validation
+MAGIC = {&quot;.png&quot;: b&quot;\x89PNG&quot;}
+@app.post(&quot;/avatar&quot;)
+async def avatar(file: UploadFile):
+    ext = Path(file.filename or &quot;&quot;).suffix.lower()
+    header = await file.read(4)
+    if ext not in MAGIC or header != MAGIC[ext]:
+        raise HTTPException(400, &quot;not a png&quot;)
+    data = header + await file.read(1_000_000 + 1)
+    if len(data) &gt; 1_000_000:
+        raise HTTPException(400, &quot;too large&quot;)
+    safe_name = f&quot;{uuid.uuid4()}{ext}&quot;                # never the client&#x27;s name
+    (Path(&quot;uploads&quot;) / safe_name).write_bytes(data)
+    return {&quot;file&quot;: safe_name}
+
+# IDOR: scope by caller
+@app.get(&quot;/orders/{id}&quot;)
+async def order(id: int, user: Principal = Depends(require_user)):
+    order = await repo.get_for_owner(id, user.id)     # WHERE id=? AND owner_id=?
+    if order is None:
+        raise HTTPException(404)
+    return order
+
+# Allow-list with an Enum (pydantic validates automatically)
+from enum import Enum
+class SortField(str, Enum):
+    created = &quot;created&quot;; total = &quot;total&quot;
+
+@app.get(&quot;/orders&quot;)
+def list_orders(sort: SortField = SortField.created): ...
+
+# Logging without secrets
+logging.warning(&quot;Failed login for %s from %s&quot;, username, request.client.host)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Add an upload endpoint that accepts only PNG/JPEG under 1 MB by checking magic bytes, then try to upload a renamed <code>.exe</code>.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/aspnet/core/security/" target="_blank" rel="noopener">ASP.NET Core security overview</a></li><li><a href="https://learn.microsoft.com/aspnet/core/security/authentication/jwt-authn" target="_blank" rel="noopener">JWT bearer authentication</a></li><li><a href="https://learn.microsoft.com/aspnet/core/security/authorization/policies" target="_blank" rel="noopener">Policy-based authorization</a></li><li><a href="https://learn.microsoft.com/entra/identity-platform/" target="_blank" rel="noopener">Microsoft identity platform (Entra ID)</a> — OAuth2/OIDC with Microsoft.Identity.Web</li><li><a href="https://learn.microsoft.com/aspnet/core/security/app-secrets" target="_blank" rel="noopener">Safe storage of app secrets in development</a></li><li><a href="https://learn.microsoft.com/aspnet/core/security/data-protection/introduction" target="_blank" rel="noopener">Data Protection in ASP.NET Core</a></li><li><a href="https://owasp.org/www-project-top-ten/" target="_blank" rel="noopener">OWASP Top 10</a></li><li><a href="https://fastapi.tiangolo.com/tutorial/security/" target="_blank" rel="noopener">FastAPI security tutorial</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

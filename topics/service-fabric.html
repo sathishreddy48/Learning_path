@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure Service Fabric — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="service-fabric">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 11 of 13</div>
+  <h1>Azure Service Fabric</h1>
+  <p class="lede">Service Fabric is Microsoft's distributed-systems platform: it hosts, scales, heals and upgrades services, and — uniquely — lets you keep state <em>inside</em> the service with replicated Reliable Collections. This page is C#-only (the SDK is .NET); Python sits this one out. Focus on the concepts an interviewer will probe: partitions, replicas, quorum, and why stateful services are different.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#concepts">Cluster, nodes, applications and services</a></li><li><a href="#stateless-stateful">Stateless vs stateful services</a></li><li><a href="#reliable-collections">Reliable Collections</a></li><li><a href="#actors">Reliable Actors</a></li><li><a href="#partitioning">Partitioning, replicas and quorum</a></li><li><a href="#communication">Communication: remoting, reverse proxy, Kestrel</a></li><li><a href="#upgrades-health">Upgrades, health and monitoring</a></li><li><a href="#config-secrets">Configuration, secrets and containers</a></li></ol>
+  </div>
+
+<section id="concepts"><h2 id="concepts">Cluster, nodes, applications and services</h2><p>A <strong>cluster</strong> is a set of VMs (<strong>nodes</strong>). An <strong>application type</strong> (versioned package of service types + manifests) is instantiated as a named <strong>application</strong>, which contains named <strong>services</strong>. Each service has <strong>partitions</strong>; each partition has <strong>replicas</strong> (stateful) or <strong>instances</strong> (stateless) spread across nodes. The <em>Cluster Resource Manager</em> places and balances them; the <em>Failover Manager</em> handles node loss. The system services (Naming, Failover Manager, Image Store) run in the cluster itself.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><span class="code-note">No Python equivalent</span></div><pre data-lang="csharp"><code>// ApplicationManifest.xml — the application type: parameters + which services to create
+// &lt;ApplicationManifest ApplicationTypeName=&quot;ShopType&quot; ApplicationTypeVersion=&quot;1.0.0&quot;&gt;
+//   &lt;Parameters&gt;
+//     &lt;Parameter Name=&quot;Orders_PartitionCount&quot; DefaultValue=&quot;10&quot; /&gt;
+//     &lt;Parameter Name=&quot;Orders_MinReplicaSetSize&quot; DefaultValue=&quot;3&quot; /&gt;
+//     &lt;Parameter Name=&quot;Orders_TargetReplicaSetSize&quot; DefaultValue=&quot;3&quot; /&gt;
+//   &lt;/Parameters&gt;
+//   &lt;ServiceManifestImport&gt;&lt;ServiceManifestRef ServiceManifestName=&quot;OrdersPkg&quot; ServiceManifestVersion=&quot;1.0.0&quot; /&gt;&lt;/ServiceManifestImport&gt;
+//   &lt;DefaultServices&gt;
+//     &lt;Service Name=&quot;Orders&quot;&gt;
+//       &lt;StatefulService ServiceTypeName=&quot;OrdersType&quot; TargetReplicaSetSize=&quot;[Orders_TargetReplicaSetSize]&quot; MinReplicaSetSize=&quot;[Orders_MinReplicaSetSize]&quot;&gt;
+//         &lt;UniformInt64Partition PartitionCount=&quot;[Orders_PartitionCount]&quot; LowKey=&quot;0&quot; HighKey=&quot;9&quot; /&gt;
+//       &lt;/StatefulService&gt;
+//     &lt;/Service&gt;
+//     &lt;Service Name=&quot;Web&quot;&gt;&lt;StatelessService ServiceTypeName=&quot;WebType&quot; InstanceCount=&quot;-1&quot;&gt;&lt;SingletonPartition /&gt;&lt;/StatelessService&gt;&lt;/Service&gt;
+//   &lt;/DefaultServices&gt;
+// &lt;/ApplicationManifest&gt;
+
+// Program.cs — register the service type with the runtime on this node
+internal static class Program
+{
+    private static void Main()
+    {
+        ServiceRuntime.RegisterServiceAsync(&quot;OrdersType&quot;, ctx =&gt; new Orders(ctx)).GetAwaiter().GetResult();
+        ServiceEventSource.Current.ServiceTypeRegistered(Environment.ProcessId, typeof(Orders).Name);
+        Thread.Sleep(Timeout.Infinite);      // the host process stays alive; SF creates replicas inside it
+    }
+}
+
+// Names: fabric:/Shop/Orders — resolved through the Naming service
+// PowerShell/CLI:
+//   Connect-ServiceFabricCluster -ConnectionEndpoint mycluster.westus.cloudapp.azure.com:19000 -X509Credential ...
+//   Get-ServiceFabricApplication; Get-ServiceFabricService -ApplicationName fabric:/Shop
+//   sfctl cluster health; sfctl node list</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Know the vocabulary cold: application type vs application, service type vs service, partition vs replica vs instance, primary vs secondary, and what the Naming service does.</p></div></section>
+<section id="stateless-stateful"><h2 id="stateless-stateful">Stateless vs stateful services</h2><p>A <strong>stateless</strong> service keeps state in an external store (SQL, Cosmos) — like any web API; SF just runs N instances. A <strong>stateful</strong> service keeps state locally in Reliable Collections that SF replicates to secondaries; writes go to the primary and are acknowledged only after a quorum of replicas has persisted the log. That removes the database hop from the hot path and gives you a partitioned, in-memory-fast store with durability — at the cost of learning the programming model.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><span class="code-note">No Python equivalent</span></div><pre data-lang="csharp"><code>// Stateless: override CreateServiceInstanceListeners + RunAsync (optional)
+internal sealed class Web(StatelessServiceContext ctx) : StatelessService(ctx)
+{
+    protected override IEnumerable&lt;ServiceInstanceListener&gt; CreateServiceInstanceListeners() =&gt;
+        new[]
+        {
+            new ServiceInstanceListener(serviceContext =&gt;
+                new KestrelCommunicationListener(serviceContext, &quot;ServiceEndpoint&quot;, (url, listener) =&gt;
+                    WebApplication.CreateBuilder().ConfigureSfHost(serviceContext, url).Build()))
+        };
+}
+
+// Stateful: StateManager is your replicated store; RunAsync runs on the PRIMARY only
+internal sealed class Orders(StatefulServiceContext ctx) : StatefulService(ctx)
+{
+    protected override IEnumerable&lt;ServiceReplicaListener&gt; CreateServiceReplicaListeners() =&gt;
+        this.CreateServiceRemotingReplicaListeners();          // remoting listener (see Communication)
+
+    protected override async Task RunAsync(CancellationToken cancellationToken)
+    {
+        var counters = await StateManager.GetOrAddAsync&lt;IReliableDictionary&lt;string, long&gt;&gt;(&quot;counters&quot;);
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();     // primary is being demoted/moved: stop cleanly
+            using (var tx = StateManager.CreateTransaction())
+            {
+                await counters.AddOrUpdateAsync(tx, &quot;heartbeat&quot;, 1, (k, v) =&gt; v + 1);
+                await tx.CommitAsync();                          // replicated to a quorum before returning
+            }
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+        }
+    }
+}
+
+// Lifecycle to remember
+//  stateless instance: CreateServiceInstanceListeners → OpenAsync → RunAsync → CloseAsync/OnAbort
+//  stateful replica:   OpenAsync → ChangeRoleAsync(Primary/ActiveSecondary/IdleSecondary) → RunAsync (primary) → …
+//  RunAsync&#x27;s CancellationToken fires on role change; ignoring it is the #1 bug.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>When would you choose a stateful service over stateless + database? Low-latency, high-throughput state that partitions naturally (carts, game sessions, IoT device state), or when you need a durable queue without an external broker.</p></div></section>
+<section id="reliable-collections"><h2 id="reliable-collections">Reliable Collections</h2><p><code>IReliableDictionary&lt;K,V&gt;</code>, <code>IReliableQueue&lt;T&gt;</code>, <code>IReliableConcurrentQueue&lt;T&gt;</code> — replicated, transactional, persisted collections that live in the primary's memory and on disk on every replica. All operations take a transaction; commit replicates. Values must be immutable once handed to the collection (or you will mutate the in-memory copy without replication). Locks are held for the transaction's lifetime, so keep transactions short.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><span class="code-note">No Python equivalent</span></div><pre data-lang="csharp"><code>public interface IOrdersService : IService
+{
+    Task&lt;Guid&gt; Place(Order order);
+    Task&lt;Order?&gt; Get(Guid id);
+    Task&lt;int&gt; CountOpen();
+}
+
+internal sealed class Orders : StatefulService, IOrdersService
+{
+    public async Task&lt;Guid&gt; Place(Order order)
+    {
+        var orders = await StateManager.GetOrAddAsync&lt;IReliableDictionary&lt;Guid, Order&gt;&gt;(&quot;orders&quot;);
+        var queue  = await StateManager.GetOrAddAsync&lt;IReliableConcurrentQueue&lt;Guid&gt;&gt;(&quot;toInvoice&quot;);
+
+        using var tx = StateManager.CreateTransaction();
+        await orders.AddAsync(tx, order.Id, order);          // takes an exclusive lock on the key
+        await queue.EnqueueAsync(tx, order.Id);
+        await tx.CommitAsync();                              // both or neither, replicated
+        return order.Id;
+    }
+
+    public async Task&lt;Order?&gt; Get(Guid id)
+    {
+        var orders = await StateManager.GetOrAddAsync&lt;IReliableDictionary&lt;Guid, Order&gt;&gt;(&quot;orders&quot;);
+        using var tx = StateManager.CreateTransaction();
+        var result = await orders.TryGetValueAsync(tx, id);   // shared lock; no commit needed for reads
+        return result.HasValue ? result.Value : null;
+    }
+
+    public async Task&lt;int&gt; CountOpen()
+    {
+        var orders = await StateManager.GetOrAddAsync&lt;IReliableDictionary&lt;Guid, Order&gt;&gt;(&quot;orders&quot;);
+        using var tx = StateManager.CreateTransaction();
+        var e = (await orders.CreateEnumerableAsync(tx, EnumerationMode.Unordered)).GetAsyncEnumerator();
+        int n = 0;
+        while (await e.MoveNextAsync(CancellationToken.None)) if (e.Current.Value.Status == &quot;open&quot;) n++;
+        return n;                                             // full scans hold locks — prefer a maintained counter
+    }
+
+    // Consumer loop on the primary
+    protected override async Task RunAsync(CancellationToken ct)
+    {
+        var queue = await StateManager.GetOrAddAsync&lt;IReliableConcurrentQueue&lt;Guid&gt;&gt;(&quot;toInvoice&quot;);
+        while (!ct.IsCancellationRequested)
+        {
+            using var tx = StateManager.CreateTransaction();
+            var item = await queue.TryDequeueAsync(tx, ct);
+            if (!item.HasValue) { await Task.Delay(500, ct); continue; }
+            await Invoice(item.Value);                        // if this throws, tx is not committed → item stays
+            await tx.CommitAsync();
+        }
+    }
+}
+
+// Rules
+//  • Values are copied by reference in memory: treat them as immutable (records are perfect).
+//  • Keep transactions short; TimeoutException = lock contention.
+//  • Backup/restore: BackupAsync(...) to Azure Storage; restore via OnDataLossAsync.
+//  • Custom serialization for versioned types: IStateSerializer&lt;T&gt;, registered in the constructor.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>What does a Reliable Collection transaction guarantee (atomic across collections in one partition, durable after quorum)? Why not across partitions (no distributed transactions — use a saga)? What is the in-memory vs disk story (all in memory on the primary, log + checkpoint on disk)?</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Build a stateful <code>Counter</code> service on the local dev cluster, kill the primary node in Service Fabric Explorer, and observe the failover with no data loss.</li></ul></div></section>
+<section id="actors"><h2 id="actors">Reliable Actors</h2><p>The virtual-actor model (from Orleans): millions of tiny single-threaded stateful objects, each addressed by an ID, activated on demand and garbage-collected when idle. Turn-based concurrency means no locks inside an actor. State goes through the <code>StateManager</code> (persisted, volatile or none). Great for per-entity logic (a device, a user session, a game); poor for fan-out queries or long-running operations that block the actor.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><span class="code-note">No Python equivalent</span></div><pre data-lang="csharp"><code>// Interface project (shared with clients)
+public interface IThermostatActor : IActor
+{
+    Task&lt;double&gt; GetTemperature();
+    Task Report(double celsius);
+    Task SetTarget(double celsius);
+}
+
+// Actor implementation
+[StatePersistence(StatePersistence.Persisted)]
+internal class ThermostatActor(ActorService service, ActorId id) : Actor(service, id), IThermostatActor, IRemindable
+{
+    private const string TempKey = &quot;temp&quot;, TargetKey = &quot;target&quot;;
+
+    protected override async Task OnActivateAsync()
+    {
+        await StateManager.TryAddStateAsync(TargetKey, 21.0);       // default on first activation
+        await RegisterReminderAsync(&quot;check&quot;, null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+    }
+
+    public Task&lt;double&gt; GetTemperature() =&gt; StateManager.GetOrAddStateAsync(TempKey, 0.0);
+
+    public async Task Report(double celsius)
+    {
+        await StateManager.SetStateAsync(TempKey, celsius);          // saved at end of the turn
+        var target = await StateManager.GetStateAsync&lt;double&gt;(TargetKey);
+        if (Math.Abs(celsius - target) &gt; 3) ActorEventSource.Current.Message($&quot;{Id} out of range&quot;);
+    }
+
+    public Task SetTarget(double celsius) =&gt; StateManager.SetStateAsync(TargetKey, celsius);
+
+    // Reminders survive deactivation and failover (timers do not)
+    public async Task ReceiveReminderAsync(string name, byte[] state, TimeSpan due, TimeSpan period)
+    {
+        var t = await GetTemperature(); /* ... */
+    }
+}
+
+// Registration
+ActorRuntime.RegisterActorAsync&lt;ThermostatActor&gt;((ctx, info) =&gt; new ActorService(ctx, info)).GetAwaiter().GetResult();
+
+// Client — any service or external app with the interface assembly
+var actor = ActorProxy.Create&lt;IThermostatActor&gt;(new ActorId(&quot;device-42&quot;), new Uri(&quot;fabric:/Shop/ThermostatActorService&quot;));
+await actor.Report(23.5);
+
+// Anti-patterns: one &quot;manager&quot; actor everything calls (hotspot), holding an actor turn on I/O to another actor
+// (reentrancy deadlocks), enumerating all actors (use an external index or a stateful service instead).</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Explain turn-based concurrency, virtual activation, reminders vs timers, and why an actor that calls another actor synchronously can deadlock (reentrancy). Compare to Orleans and Dapr actors.</p></div></section>
+<section id="partitioning"><h2 id="partitioning">Partitioning, replicas and quorum</h2><p>A stateful service scales by <strong>partitioning</strong> state: ranged (<code>UniformInt64</code>, key ranges), named, or singleton. Each partition is an independent replica set with one <strong>primary</strong> (serves reads and writes) and N <strong>secondaries</strong>. A write commits when a write quorum (⌈N/2⌉+1) acknowledges. Partition count is <em>fixed at creation</em> — choose it for the eventual scale (e.g. 20–50 partitions on a 5-node cluster) and let SF pack many partitions per node.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><span class="code-note">No Python equivalent</span></div><pre data-lang="csharp"><code>// Choosing a partition for a key: hash it into the Int64 range
+static long PartitionKeyFor(string customerId)
+{
+    // stable hash; MD5 is fine here (not security) and stable across processes unlike string.GetHashCode()
+    var bytes = MD5.HashData(Encoding.UTF8.GetBytes(customerId));
+    return BitConverter.ToInt64(bytes, 0) &amp; long.MaxValue % 10;     // 0..9 to match LowKey/HighKey above
+}
+
+// Client resolves the partition, then talks to its primary
+var proxy = ServiceProxy.Create&lt;IOrdersService&gt;(
+    new Uri(&quot;fabric:/Shop/Orders&quot;),
+    new ServicePartitionKey(PartitionKeyFor(order.CustomerId)));
+await proxy.Place(order);
+
+// Inside the service: which partition am I?
+var info = (Int64RangePartitionInformation)Context.PartitionId /* via Partition.PartitionInfo */;
+var range = (Int64RangePartitionInformation)Partition.PartitionInfo;
+Console.WriteLine($&quot;{range.LowKey}-{range.HighKey}, replica {Context.ReplicaId}, role {/* current */ &quot;&quot;}&quot;);
+
+// Replica set sizes (in ApplicationManifest): TargetReplicaSetSize=3, MinReplicaSetSize=3 for production.
+//   3 replicas → tolerate 1 loss with write quorum 2.  5 → tolerate 2.
+//   MinReplicaSetSize &lt; Target lets writes continue while SF rebuilds a lost replica.
+
+// Placement constraints and metrics steer the Cluster Resource Manager
+//   &lt;StatefulService ...&gt;&lt;PlacementConstraints&gt;(NodeType==Backend)&lt;/PlacementConstraints&gt;
+//   &lt;ServiceLoadMetric Name=&quot;MemoryMB&quot; Weight=&quot;High&quot; PrimaryDefaultLoad=&quot;512&quot; SecondaryDefaultLoad=&quot;256&quot; /&gt;
+// Report live load from code:
+Partition.ReportLoad(new[] { new LoadMetric(&quot;MemoryMB&quot;, currentMb) });
+
+// Fan-out query across all partitions (avoid on hot paths)
+var fabric = new FabricClient();
+var partitions = await fabric.QueryManager.GetPartitionListAsync(new Uri(&quot;fabric:/Shop/Orders&quot;));
+var counts = await Task.WhenAll(partitions.Select(p =&gt;
+    ServiceProxy.Create&lt;IOrdersService&gt;(new Uri(&quot;fabric:/Shop/Orders&quot;),
+        new ServicePartitionKey(((Int64RangePartitionInformation)p.PartitionInformation).LowKey)).CountOpen()));</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why is the partition count fixed (state would have to be re-split)? How do you handle a hot partition? What happens when a primary dies (secondary promoted from the replicated log; in-flight uncommitted writes are lost — the client retries)?</p></div></section>
+<section id="communication"><h2 id="communication">Communication: remoting, reverse proxy, Kestrel</h2><p>Services expose listeners. <strong>Service Remoting</strong> is the RPC stack: define an interface, <code>ServiceProxy.Create</code> resolves the partition/primary via the Naming service and retries on failover. For HTTP, host Kestrel inside the service and let clients find the address via the <strong>reverse proxy</strong> (<code>http://localhost:19081/App/Service/...</code>) or a <code>ServicePartitionResolver</code>. External traffic comes in through a load balancer to a stateless front-end.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><span class="code-note">No Python equivalent</span></div><pre data-lang="csharp"><code>// Remoting listener (V2, interface-compatible). Interface assembly referenced by both sides.
+// [assembly: FabricTransportServiceRemotingProvider(RemotingListenerVersion = RemotingListenerVersion.V2_1, RemotingClientVersion = RemotingClientVersion.V2_1)]
+protected override IEnumerable&lt;ServiceReplicaListener&gt; CreateServiceReplicaListeners() =&gt;
+    this.CreateServiceRemotingReplicaListeners();
+
+// Client — retries transient failures and re-resolves on failover automatically
+var orders = ServiceProxy.Create&lt;IOrdersService&gt;(new Uri(&quot;fabric:/Shop/Orders&quot;), new ServicePartitionKey(3));
+var order = await orders.Get(id);
+
+// Kestrel listener inside a service (ServiceManifest: &lt;Endpoint Name=&quot;ServiceEndpoint&quot; Protocol=&quot;http&quot; Port=&quot;8080&quot; /&gt;)
+new ServiceReplicaListener(ctx =&gt; new KestrelCommunicationListener(ctx, &quot;ServiceEndpoint&quot;, (url, listener) =&gt;
+{
+    var b = WebApplication.CreateBuilder();
+    b.Services.AddSingleton&lt;StatefulServiceContext&gt;(ctx).AddSingleton(StateManager);
+    b.WebHost.UseKestrel().UseUrls(url);
+    var app = b.Build();
+    app.MapGet(&quot;/orders/{id:guid}&quot;, async (Guid id, IReliableStateManager sm) =&gt; { /* ... */ });
+    return app;
+}), listenOnSecondary: true);      // allow reads from secondaries
+
+// Reverse proxy (enable in cluster manifest; port 19081):
+//   GET http://localhost:19081/Shop/Orders/orders/{id}?PartitionKey=3&amp;PartitionKind=Int64Range
+//   GET http://localhost:19081/Shop/Web/api/health           (stateless singleton: no partition params)
+// Add ?ListenerName=... for multiple listeners; ?Timeout=20 for the resolution timeout.
+
+// Manual resolution (e.g. gRPC or custom protocol)
+var resolver = ServicePartitionResolver.GetDefault();
+var partition = await resolver.ResolveAsync(new Uri(&quot;fabric:/Shop/Orders&quot;), new ServicePartitionKey(3), CancellationToken.None);
+var endpoint = partition.GetEndpoint();      // JSON: {&quot;Endpoints&quot;:{&quot;ServiceEndpoint&quot;:&quot;http://10.0.0.5:8080&quot;}}
+// Re-resolve with (previousRsp) when a call fails — the address may have moved.
+
+// Exceptions to handle on the client: FabricNotPrimaryException, FabricTransientException,
+// FabricObjectClosedException → retry after re-resolve (ServiceProxy does this for you).</code></pre></div></section>
+<section id="upgrades-health"><h2 id="upgrades-health">Upgrades, health and monitoring</h2><p>Application upgrades are <strong>rolling</strong> by upgrade domain: SF upgrades one UD, waits for health checks to pass, then moves on — and rolls back automatically if health degrades (<em>Monitored</em> mode). Health is a hierarchy (cluster → node/application → service → partition → replica) fed by system reports and your own <code>ReportReplicaHealth</code>. Service Fabric Explorer shows all of it; ship events and health to Application Insights/Log Analytics.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button></div><pre data-lang="bash"><code># Package and upgrade (PowerShell)
+Copy-ServiceFabricApplicationPackage -ApplicationPackagePath .\pkg -ImageStoreConnectionString fabric:ImageStore -ApplicationPackagePathInImageStore Shop_1.1.0
+Register-ServiceFabricApplicationType -ApplicationPathInImageStore Shop_1.1.0
+Start-ServiceFabricApplicationUpgrade -ApplicationName fabric:/Shop -ApplicationTypeVersion 1.1.0 `
+    -Monitored -FailureAction Rollback -HealthCheckStableDurationSec 60 -UpgradeDomainTimeoutSec 1200 -UpgradeTimeoutSec 3600
+Get-ServiceFabricApplicationUpgrade -ApplicationName fabric:/Shop     # progress per upgrade domain
+
+# sfctl equivalents
+sfctl application upload --path ./pkg
+sfctl application provision --application-type-build-path pkg
+sfctl application upgrade --app-id Shop --app-version 1.1.0 --parameters &#x27;{}&#x27; --mode Monitored --failure-action Rollback
+
+# Only the changed service package versions need to bump; unchanged code packages are not restarted.
+# Config-only upgrade: bump ConfigPackage version + ServiceManifest version + ApplicationManifest version.</code></pre><pre data-lang="csharp" hidden><code>// Report custom health from inside a replica
+Partition.ReportReplicaHealth(new HealthInformation(&quot;Orders&quot;, &quot;QueueDepth&quot;,
+    queueDepth &gt; 10_000 ? HealthState.Warning : HealthState.Ok)
+{
+    Description = $&quot;queue depth {queueDepth}&quot;,
+    TimeToLive = TimeSpan.FromMinutes(2),
+    RemoveWhenExpired = true                // stale report disappears rather than sticking
+});
+
+// React to configuration package changes without restart
+Context.CodePackageActivationContext.ConfigurationPackageModifiedEvent += (s, e) =&gt;
+{
+    var settings = e.NewPackage.Settings.Sections[&quot;Orders&quot;].Parameters;
+    _maxLines = int.Parse(settings[&quot;MaxLines&quot;].Value);
+};
+
+// Health policy (ApplicationManifest / upgrade parameters)
+//   MaxPercentUnhealthyServices, MaxPercentUnhealthyPartitionsPerService, ConsiderWarningAsError
+// Upgrade rollback triggers when the aggregated health is Error.
+
+// Diagnostics: EventSource → EventFlow / Azure Diagnostics → Application Insights or Log Analytics
+[EventSource(Name = &quot;Shop-Orders&quot;)]
+internal sealed class ServiceEventSource : EventSource
+{
+    public static readonly ServiceEventSource Current = new();
+    [Event(1, Level = EventLevel.Informational, Message = &quot;{0}&quot;)]
+    public void Message(string message) =&gt; WriteEvent(1, message);
+}
+// Cluster-level: Service Fabric Explorer (https://cluster:19080/Explorer), Get-ServiceFabricClusterHealth,
+// Azure Monitor &quot;Service Fabric analytics&quot; for node/partition/replica events.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Upgrade domains vs fault domains (UD = rolling upgrade unit, FD = shared failure unit like a rack); what makes an upgrade roll back; how a stateful service survives an upgrade (secondaries take over while the primary's node is upgraded).</p></div></section>
+<section id="config-secrets"><h2 id="config-secrets">Configuration, secrets and containers</h2><p>Settings live in the service's <code>Config</code> package (<code>Settings.xml</code>) and are overridden per environment in <code>ApplicationParameters/*.xml</code>. Encrypted parameters use a cluster certificate; better, read secrets from Key Vault with a managed identity. Service Fabric can also host <strong>containers</strong> and <strong>guest executables</strong> alongside Reliable Services, and Service Fabric Managed Clusters simplify the infrastructure side.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><span class="code-note">No Python equivalent</span></div><pre data-lang="csharp"><code>// PackageRoot/Config/Settings.xml
+// &lt;Settings&gt;
+//   &lt;Section Name=&quot;Orders&quot;&gt;
+//     &lt;Parameter Name=&quot;MaxLines&quot; Value=&quot;50&quot; /&gt;
+//     &lt;Parameter Name=&quot;SqlConnection&quot; Value=&quot;&quot; IsEncrypted=&quot;true&quot; /&gt;
+//   &lt;/Section&gt;
+// &lt;/Settings&gt;
+// ApplicationParameters/Cloud.xml overrides:  &lt;Parameter Name=&quot;Orders_MaxLines&quot; Value=&quot;100&quot; /&gt;
+// wired through ApplicationManifest &lt;ConfigOverrides&gt; ... &lt;Parameter Name=&quot;MaxLines&quot; Value=&quot;[Orders_MaxLines]&quot; /&gt;
+
+// Read configuration
+var config = Context.CodePackageActivationContext.GetConfigurationPackageObject(&quot;Config&quot;);
+var section = config.Settings.Sections[&quot;Orders&quot;];
+int maxLines = int.Parse(section.Parameters[&quot;MaxLines&quot;].Value);
+string cs = section.Parameters[&quot;SqlConnection&quot;].DecryptValue().ToUnsecureString();   // encrypted with the cluster cert
+
+// Bridge into IConfiguration for ASP.NET-style options
+var builder = WebApplication.CreateBuilder();
+builder.Configuration.AddServiceFabricConfiguration(Context);     // Microsoft.ServiceFabric.AspNetCore.Configuration
+builder.Services.Configure&lt;OrdersOptions&gt;(builder.Configuration.GetSection(&quot;Config:Orders&quot;));
+
+// Preferred for secrets: Key Vault via managed identity on the VM scale set
+var kv = new SecretClient(new Uri(&quot;https://shop-kv.vault.azure.net/&quot;), new DefaultAzureCredential());
+string sql = (await kv.GetSecretAsync(&quot;SqlConnection&quot;)).Value.Value;
+
+// Encrypting a value for Settings.xml (PowerShell):
+//   Invoke-ServiceFabricEncryptText -Text &quot;Server=...&quot; -CertThumbprint &lt;thumb&gt; -CertStore -StoreLocation LocalMachine -StoreName My
+
+// Containers in ServiceManifest.xml
+// &lt;CodePackage Name=&quot;Code&quot; Version=&quot;1.0.0&quot;&gt;
+//   &lt;EntryPoint&gt;&lt;ContainerHost&gt;&lt;ImageName&gt;myacr.azurecr.io/orders:1.0.0&lt;/ImageName&gt;&lt;/ContainerHost&gt;&lt;/EntryPoint&gt;
+// &lt;/CodePackage&gt;
+// ApplicationManifest: &lt;ContainerHostPolicies CodePackageRef=&quot;Code&quot;&gt;&lt;RepositoryCredentials .../&gt;&lt;PortBinding ContainerPort=&quot;8080&quot; EndpointRef=&quot;ServiceEndpoint&quot;/&gt;&lt;/ContainerHostPolicies&gt;
+
+// When to pick SF today: existing SF estates, stateful services/actors, Windows-heavy workloads.
+// New greenfield container workloads usually go to AKS or Azure Container Apps (see Azure Services page).</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Deploy a two-service app (stateless web + stateful orders) to the local cluster, do a monitored upgrade that changes only the config package, and confirm the replicas were not restarted.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/azure/service-fabric/" target="_blank" rel="noopener">Service Fabric documentation</a></li><li><a href="https://learn.microsoft.com/azure/service-fabric/service-fabric-reliable-services-introduction" target="_blank" rel="noopener">Reliable Services overview</a></li><li><a href="https://learn.microsoft.com/azure/service-fabric/service-fabric-reliable-services-reliable-collections" target="_blank" rel="noopener">Reliable Collections</a></li><li><a href="https://learn.microsoft.com/azure/service-fabric/service-fabric-reliable-actors-introduction" target="_blank" rel="noopener">Reliable Actors</a></li><li><a href="https://learn.microsoft.com/azure/service-fabric/service-fabric-concepts-partitioning" target="_blank" rel="noopener">Partitioning Service Fabric services</a></li><li><a href="https://learn.microsoft.com/azure/service-fabric/service-fabric-application-upgrade" target="_blank" rel="noopener">Application upgrade</a></li><li><a href="https://learn.microsoft.com/azure/architecture/guide/technology-choices/compute-decision-tree" target="_blank" rel="noopener">Service Fabric vs AKS / Container Apps</a> — when to choose which</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

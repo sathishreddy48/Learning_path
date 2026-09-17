@@ -1,0 +1,672 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance, GC & Memory — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="performance">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 9 of 13</div>
+  <h1>Performance, GC & Memory</h1>
+  <p class="lede">Senior .NET interviews probe the runtime: what the GC does, what allocates, why a service's P99 spikes. This page explains the mechanisms, shows the code that avoids the cost, and names the tools to prove it. Python notes appear where the concept carries over (CPython's reference counting and cycle collector).</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#gc">GC generations, LOH and GC modes</a></li><li><a href="#dispose-finalizers">IDisposable, finalizers and unmanaged resources</a></li><li><a href="#structs-boxing">Structs vs classes, boxing and readonly</a></li><li><a href="#span">Span<T>, Memory<T> and stackalloc</a></li><li><a href="#arraypool">ArrayPool, object pooling and buffer reuse</a></li><li><a href="#strings">String handling costs</a></li><li><a href="#async-pitfalls">Async performance pitfalls</a></li><li><a href="#caching">Caching strategies</a></li><li><a href="#benchmarkdotnet">Measuring with BenchmarkDotNet</a></li><li><a href="#profiling">Profiling and diagnostics in production</a></li></ol>
+  </div>
+
+<section id="gc"><h2 id="gc">GC generations, LOH and GC modes</h2><p>The .NET GC is generational: gen 0 (new, collected often and fast), gen 1 (survivors), gen 2 (long-lived, expensive full collections). Objects ≥ 85 KB go to the Large Object Heap, which is collected with gen 2 and not compacted by default. Workstation vs Server GC and concurrent/background modes change latency vs throughput. CPython instead uses reference counting with a generational cycle collector.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Observe the GC
+Console.WriteLine($&quot;Gen0 {GC.CollectionCount(0)}  Gen1 {GC.CollectionCount(1)}  Gen2 {GC.CollectionCount(2)}&quot;);
+Console.WriteLine($&quot;Heap {GC.GetTotalMemory(false) / 1024 / 1024} MB, allocated {GC.GetTotalAllocatedBytes() / 1024 / 1024} MB total&quot;);
+Console.WriteLine($&quot;Object generation: {GC.GetGeneration(obj)}&quot;);
+var info = GC.GetGCMemoryInfo();      // pause durations, heap sizes, fragmentation
+
+// Large object: 85,000+ bytes → LOH → gen 2 collection required to free it
+var big = new byte[100_000];
+Console.WriteLine(GC.GetGeneration(big));   // 2
+
+// Compact the LOH once (after a known big drop), never in a loop
+GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+GC.Collect();
+
+// Configure in runtimeconfig.json / csproj:
+// &lt;ServerGarbageCollection&gt;true&lt;/ServerGarbageCollection&gt;      one heap per core; throughput for services
+// &lt;ConcurrentGarbageCollection&gt;true&lt;/ConcurrentGarbageCollection&gt;  background gen2 → shorter pauses
+// &lt;TieredPGO&gt;true&lt;/TieredPGO&gt;                                     profile-guided JIT (default .NET 8+)
+// DOTNET_GCHeapHardLimit=0x40000000  cap heap at 1 GB in containers (auto from cgroup limits)
+
+// Latency-sensitive window (e.g. during a request burst)
+GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+
+// Rules of thumb
+//  • Gen0 GCs are cheap; allocation *rate* is what matters.
+//  • Gen2/LOH GCs are the ones that cause P99 spikes — avoid promoting short-lived big objects.
+//  • Never call GC.Collect() in production code paths.</code></pre><pre data-lang="python" hidden><code>import gc, sys, tracemalloc
+
+# CPython: reference counting frees most objects immediately…
+a = [1, 2, 3]; b = a
+print(sys.getrefcount(a))           # 3 (a, b, and the argument)
+del b                                # refcount drops; freed when it hits 0
+
+# …plus a generational cycle collector for reference cycles
+print(gc.get_count())                # allocations since last collection per generation
+print(gc.get_threshold())            # (700, 10, 10) by default
+gc.collect()                         # force full collection (rarely needed)
+
+# Cycles keep objects alive until the collector runs
+class Node:
+    def __init__(self): self.other = None
+x, y = Node(), Node(); x.other, y.other = y, x
+del x, y                             # not freed by refcount; the cycle collector gets them
+
+# Weak references avoid cycles for caches/observers
+import weakref
+cache = weakref.WeakValueDictionary()
+
+# Track allocations
+tracemalloc.start()
+data = [str(i) for i in range(100_000)]
+current, peak = tracemalloc.get_traced_memory()
+print(f&quot;current {current/1e6:.1f} MB, peak {peak/1e6:.1f} MB&quot;)
+for stat in tracemalloc.take_snapshot().statistics(&quot;lineno&quot;)[:3]: print(stat)
+
+# Rules of thumb
+#  • Most objects die by refcount instantly; GC pauses come from cycle collection.
+#  • gc.freeze() before forking workers keeps shared pages copy-on-write friendly.
+#  • __slots__ shrinks per-instance memory significantly.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Draw the generations. Explain why a cache of large arrays is a problem (LOH fragmentation), what “mid-life crisis” means (objects that die just after promotion), and Server vs Workstation GC.</p></div></section>
+<section id="dispose-finalizers"><h2 id="dispose-finalizers">IDisposable, finalizers and unmanaged resources</h2><p>Finalizers run on a dedicated thread after the GC finds the object unreachable — non-deterministic and expensive (the object survives one extra collection). Use them only as a safety net for unmanaged handles; prefer <code>SafeHandle</code>. Implement the full Dispose pattern only when you actually own unmanaged resources; otherwise a simple <code>Dispose</code> that disposes owned <code>IDisposable</code>s is enough.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Simple: you own managed disposables only
+public sealed class ReportWriter(Stream output) : IDisposable
+{
+    private readonly StreamWriter _w = new(output);
+    public void Dispose() =&gt; _w.Dispose();
+}
+
+// Full pattern: unmanaged handle + finalizer safety net
+public class NativeBuffer : IDisposable
+{
+    private IntPtr _ptr;
+    private bool _disposed;
+
+    public NativeBuffer(int size) =&gt; _ptr = Marshal.AllocHGlobal(size);
+
+    public void Dispose()
+    {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);          // no need to finalize; we cleaned up
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (_disposed) return;
+        if (disposing) { /* dispose managed fields here */ }
+        if (_ptr != IntPtr.Zero) { Marshal.FreeHGlobal(_ptr); _ptr = IntPtr.Zero; }
+        _disposed = true;
+    }
+
+    ~NativeBuffer() =&gt; Dispose(disposing: false);   // runs only if Dispose was never called
+}
+
+// Better: SafeHandle does the finalizer work for you and is thread/abort safe
+public sealed class HGlobalHandle : SafeHandleZeroOrMinusOneIsInvalid
+{
+    public HGlobalHandle(int size) : base(ownsHandle: true) =&gt; SetHandle(Marshal.AllocHGlobal(size));
+    protected override bool ReleaseHandle() { Marshal.FreeHGlobal(handle); return true; }
+}
+
+// Leaks to look for: event subscriptions, timers, HttpResponseMessage, DbConnection without using,
+// CancellationTokenRegistration, static caches of IDisposable.</code></pre><pre data-lang="python" hidden><code># __del__ is the finalizer: non-deterministic under cycles; avoid relying on it
+class NativeBuffer:
+    def __init__(self, size): self._ptr = lib.alloc(size)
+    def __del__(self):
+        if self._ptr: lib.free(self._ptr)
+
+# Deterministic cleanup: context manager
+class NativeBuffer:
+    def __init__(self, size): self._ptr = lib.alloc(size)
+    def close(self):
+        if self._ptr: lib.free(self._ptr); self._ptr = None
+    def __enter__(self): return self
+    def __exit__(self, *exc): self.close()
+
+with NativeBuffer(1024) as buf:
+    ...
+
+# weakref.finalize is the SafeHandle analogue: robust finalizer, runs at exit too
+import weakref
+class NativeBuffer:
+    def __init__(self, size):
+        ptr = lib.alloc(size)
+        self._ptr = ptr
+        self._finalizer = weakref.finalize(self, lib.free, ptr)
+    def close(self): self._finalizer()          # idempotent
+
+# Leaks to look for: unclosed files/sockets (ResourceWarning with -X dev), global caches, cycles with __del__</code></pre></div></section>
+<section id="structs-boxing"><h2 id="structs-boxing">Structs vs classes, boxing and readonly</h2><p>Structs avoid heap allocation and GC pressure — but they are copied on every assignment and parameter pass, so keep them small (≤16 bytes rule of thumb) and immutable. Boxing (struct → <code>object</code>/interface) allocates; it happens silently with non-generic collections, <code>string.Format</code> args and interface calls on struct values. <code>readonly struct</code>, <code>in</code> parameters and <code>ref struct</code> (e.g. <code>Span</code>) give control.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Boxing: value type → object allocates a heap copy
+int n = 42;
+object o = n;                    // box
+int back = (int)o;               // unbox
+IComparable c = n;               // box (interface)
+var list = new ArrayList { n };  // box (non-generic)
+Console.WriteLine(&quot;{0}&quot;, n);     // box (object param) — string interpolation with handlers does not
+
+// Generics avoid it
+var generic = new List&lt;int&gt; { n };   // no box
+static bool Less&lt;T&gt;(T a, T b) where T : IComparable&lt;T&gt; =&gt; a.CompareTo(b) &lt; 0;   // constrained call, no box
+
+// Small immutable struct with readonly (defensive copies avoided)
+public readonly record struct Point(double X, double Y)
+{
+    public double Length =&gt; Math.Sqrt(X * X + Y * Y);
+}
+
+// Pass big structs by readonly reference
+public readonly struct Matrix4x4 { /* 64 bytes */ }
+static float Trace(in Matrix4x4 m) =&gt; ...;     // no copy, cannot mutate
+
+// Mutable struct pitfall: mutating a copy
+struct Counter { public int N; public void Inc() =&gt; N++; }
+var counters = new List&lt;Counter&gt; { new() };
+counters[0].Inc();                                // compiles?? no — CS1612; with arrays it mutates in place, with List it&#x27;s a copy
+foreach (var ct in counters) ct.Inc();            // mutates a copy — silent bug
+
+// Equality: default struct Equals uses reflection (slow) — override or use record struct
+// Stack allocation
+Span&lt;int&gt; buf = stackalloc int[16];              // no heap at all; small sizes only</code></pre><pre data-lang="python" hidden><code># Everything is a heap object in CPython; even small ints are boxed (cached for -5..256)
+import sys
+print(sys.getsizeof(42))          # 28 bytes
+print(sys.getsizeof((1.0, 2.0)))  # tuple of two boxed floats
+
+# Reduce per-object overhead with __slots__ (no __dict__ per instance)
+class Point:
+    __slots__ = (&quot;x&quot;, &quot;y&quot;)
+    def __init__(self, x, y): self.x, self.y = x, y
+print(sys.getsizeof(Point(1, 2)))  # ~48 vs ~56 + a 100+ byte __dict__ without slots
+
+from dataclasses import dataclass
+@dataclass(frozen=True, slots=True)   # 3.10+: immutable + slots
+class P: x: float; y: float
+
+# Unboxed numeric arrays: array module / NumPy store raw values contiguously
+import array, numpy as np
+a = array.array(&quot;d&quot;, [1.0, 2.0])     # 8 bytes per element
+v = np.zeros(1_000_000, dtype=np.float64)
+print(v.nbytes / 1e6, &quot;MB&quot;)           # 8 MB, vs ~32 MB for a list of floats
+
+# Struct-like packed binary data
+import struct
+packed = struct.pack(&quot;&lt;2d&quot;, 1.0, 2.0)  # 16 bytes
+x, y = struct.unpack(&quot;&lt;2d&quot;, packed)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>“When would you use a struct?” Small, immutable, value semantics, hot loops. “What is boxing and where does it sneak in?” Non-generic collections, interface casts, <code>object</code> parameters, <code>Equals(object)</code>.</p></div></section>
+<section id="span"><h2 id="span">Span<T>, Memory<T> and stackalloc</h2><p><code>Span&lt;T&gt;</code> is a ref struct that views a contiguous slice of an array, string, stack or native memory — slicing without copying and without allocation. It cannot live on the heap (no fields in classes, no async), which is what <code>Memory&lt;T&gt;</code> is for. Parsing, tokenising and buffer manipulation get dramatically cheaper. There is no Python equivalent beyond <code>memoryview</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Parse &quot;key=value;key2=value2&quot; without allocating substrings
+static Dictionary&lt;string, string&gt; Parse(ReadOnlySpan&lt;char&gt; input)
+{
+    var result = new Dictionary&lt;string, string&gt;();
+    while (!input.IsEmpty)
+    {
+        int semi = input.IndexOf(&#x27;;&#x27;);
+        var pair = semi &lt; 0 ? input : input[..semi];
+        int eq = pair.IndexOf(&#x27;=&#x27;);
+        if (eq &gt; 0) result[pair[..eq].ToString()] = pair[(eq + 1)..].ToString();   // allocate only the final strings
+        input = semi &lt; 0 ? default : input[(semi + 1)..];
+    }
+    return result;
+}
+
+// Slicing arrays and strings
+int[] data = { 1, 2, 3, 4, 5 };
+Span&lt;int&gt; middle = data.AsSpan(1, 3);       // view, not copy
+middle[0] = 99;                             // writes through to data
+ReadOnlySpan&lt;char&gt; word = &quot;hello world&quot;.AsSpan(6);
+
+// Parse numbers straight from a span
+int value = int.Parse(&quot;123&quot;.AsSpan());
+bool ok = Utf8Parser.TryParse(utf8Bytes, out int n, out int consumed);
+
+// stackalloc for small scratch buffers
+Span&lt;byte&gt; hash = stackalloc byte[32];
+SHA256.HashData(payload, hash);
+
+// Memory&lt;T&gt; when you need to store or await
+async Task ProcessAsync(Memory&lt;byte&gt; buffer, Stream s)
+{
+    int read = await s.ReadAsync(buffer);       // Memory works with async
+    Work(buffer.Span[..read]);                    // get a Span when synchronous again
+}
+
+// String building without intermediate strings
+string s = string.Create(8, 1234, (span, val) =&gt; val.TryFormat(span, out _, &quot;D8&quot;));
+
+// Rules: Span cannot be a field of a class, captured by a lambda, boxed, or used across await.</code></pre><pre data-lang="python" hidden><code># memoryview: zero-copy slices of bytes-like objects
+data = bytearray(b&quot;hello world&quot;)
+view = memoryview(data)[6:]           # no copy
+view[0:1] = b&quot;W&quot;                       # writes through
+print(data)                            # bytearray(b&#x27;hello World&#x27;)
+
+# Parsing without intermediate copies — bytes.find + slicing of memoryview
+def parse(buf: bytes) -&gt; dict[str, str]:
+    mv = memoryview(buf); result = {}
+    start = 0
+    while start &lt; len(mv):
+        semi = buf.find(b&quot;;&quot;, start); end = len(buf) if semi &lt; 0 else semi
+        eq = buf.find(b&quot;=&quot;, start, end)
+        if eq &gt; 0:
+            result[bytes(mv[start:eq]).decode()] = bytes(mv[eq+1:end]).decode()
+        start = end + 1
+    return result
+
+# For str, slicing always copies — Python strings are immutable and small copies are cheap.
+# For heavy numeric slicing use NumPy views (a[1:4] is a view, not a copy).
+import numpy as np
+a = np.arange(5); m = a[1:4]; m[0] = 99; print(a)   # [0 99 2 3 4]
+
+# struct.unpack_from / int.from_bytes parse straight from a buffer
+n = int.from_bytes(view[:4], &quot;little&quot;)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Rewrite a CSV line splitter to use <code>ReadOnlySpan&lt;char&gt;</code> and measure allocations with BenchmarkDotNet's <code>[MemoryDiagnoser]</code>.</li></ul></div></section>
+<section id="arraypool"><h2 id="arraypool">ArrayPool, object pooling and buffer reuse</h2><p>Renting buffers from <code>ArrayPool&lt;T&gt;.Shared</code> instead of allocating keeps large temporary arrays off the LOH and out of the GC. Always return in a <code>finally</code>, never use the array after returning it, and remember rented arrays may be larger than requested and contain old data. <code>ObjectPool&lt;T&gt;</code> and <code>RecyclableMemoryStream</code> follow the same idea.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Rent / return
+async Task CopyAsync(Stream src, Stream dst)
+{
+    byte[] buffer = ArrayPool&lt;byte&gt;.Shared.Rent(81920);        // may return a bigger array
+    try
+    {
+        int read;
+        while ((read = await src.ReadAsync(buffer)) &gt; 0)
+            await dst.WriteAsync(buffer.AsMemory(0, read));     // slice to what you asked for
+    }
+    finally
+    {
+        ArrayPool&lt;byte&gt;.Shared.Return(buffer, clearArray: false); // clearArray: true for sensitive data
+    }
+}
+
+// Pooled MemoryStream (Microsoft.IO.RecyclableMemoryStream)
+private static readonly RecyclableMemoryStreamManager _msm = new();
+using var ms = _msm.GetStream(&quot;serialize&quot;);
+JsonSerializer.Serialize(ms, obj);
+
+// ObjectPool for expensive-to-create, reusable objects (StringBuilder is the classic)
+builder.Services.AddSingleton&lt;ObjectPool&lt;StringBuilder&gt;&gt;(sp =&gt;
+    new DefaultObjectPoolProvider().CreateStringBuilderPool());
+
+public class Renderer(ObjectPool&lt;StringBuilder&gt; pool)
+{
+    public string Render(Report r)
+    {
+        var sb = pool.Get();
+        try { sb.Append(r.Title); /* ... */ return sb.ToString(); }
+        finally { pool.Return(sb); }        // policy resets Length = 0
+    }
+}
+
+// Pipelines/IBufferWriter for high-throughput I/O: System.IO.Pipelines</code></pre><pre data-lang="python" hidden><code># Python rarely pools explicitly — the allocator has free lists for small objects.
+# Where it matters:
+
+# 1) Reuse a bytearray buffer with readinto instead of read() allocating each time
+def copy(src, dst, size=81920):
+    buf = bytearray(size); view = memoryview(buf)
+    while (n := src.readinto(buf)) &gt; 0:
+        dst.write(view[:n])
+
+# 2) Pool expensive objects (connections, parsers) with a queue
+import queue
+class Pool:
+    def __init__(self, factory, size):
+        self._q = queue.LifoQueue()
+        for _ in range(size): self._q.put(factory())
+    def acquire(self): return self._q.get()
+    def release(self, obj): self._q.put(obj)
+
+from contextlib import contextmanager
+@contextmanager
+def pooled(pool):
+    obj = pool.acquire()
+    try: yield obj
+    finally: pool.release(obj)
+
+# 3) io.BytesIO reuse:  bio.seek(0); bio.truncate()
+# 4) NumPy: preallocate output arrays and use out= parameters
+import numpy as np
+out = np.empty(1_000_000); np.multiply(a, b, out=out)</code></pre></div></section>
+<section id="strings"><h2 id="strings">String handling costs</h2><p>Strings are immutable, so every <code>+</code>, <code>Substring</code>, <code>ToUpper</code>, <code>Replace</code> allocates. Use <code>StringBuilder</code> for loops, <code>string.Create</code>/interpolation handlers for formatting, <code>Span</code> for parsing, <code>StringComparison.Ordinal</code> for non-linguistic comparisons, and <code>string.Intern</code> almost never. Watch for hidden <code>ToString()</code> in logging — use structured logging with message templates.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// ✗ O(n²) allocations
+string csv = &quot;&quot;;
+foreach (var x in items) csv += x + &quot;,&quot;;
+
+// ✓ StringBuilder (or string.Join)
+var sb = new StringBuilder(items.Count * 8);
+foreach (var x in items) sb.Append(x).Append(&#x27;,&#x27;);
+string csv2 = string.Join(&quot;,&quot;, items);
+
+// Ordinal comparisons are much faster than culture-aware ones
+bool eq = string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+var dict = new Dictionary&lt;string, int&gt;(StringComparer.Ordinal);
+int i = s.IndexOf(&quot;x&quot;, StringComparison.Ordinal);
+
+// Interpolation is efficient in .NET 6+ (DefaultInterpolatedStringHandler): no intermediate strings
+string msg = $&quot;Order {id} total {total:C}&quot;;
+
+// Logging: message templates defer formatting until it&#x27;s actually written
+log.LogDebug(&quot;Processing {OrderId} with {Count} lines&quot;, id, lines.Count);   // ✓
+log.LogDebug($&quot;Processing {id} with {lines.Count} lines&quot;);                  // ✗ formats even if Debug is off
+
+// Avoid substrings for checks
+if (s.StartsWith(&quot;Bearer &quot;, StringComparison.Ordinal)) token = s.AsSpan(7);   // no Substring alloc
+
+// UTF-8 at the edges: work in bytes when the data is bytes (JSON, HTTP)
+ReadOnlySpan&lt;byte&gt; utf8 = &quot;hello&quot;u8;                 // UTF-8 literal, no encoding at runtime
+var json = JsonSerializer.SerializeToUtf8Bytes(obj);
+
+// string.Concat / string.Join over LINQ Aggregate for joins; Split with StringSplitOptions.TrimEntries</code></pre><pre data-lang="python" hidden><code># ✗ Quadratic in theory (CPython optimises += on a uniquely-referenced str, but don&#x27;t rely on it)
+csv = &quot;&quot;
+for x in items: csv += f&quot;{x},&quot;
+
+# ✓ Build a list and join
+csv = &quot;,&quot;.join(str(x) for x in items)
+
+# f-strings are the fastest formatting; % and .format are slower
+msg = f&quot;Order {id} total {total:.2f}&quot;
+
+# Logging: let the logger format lazily
+logging.debug(&quot;Processing %s with %d lines&quot;, id, len(lines))   # ✓
+logging.debug(f&quot;Processing {id} with {len(lines)} lines&quot;)      # ✗ formats even when disabled
+
+# Case-insensitive comparison: casefold once, compare many
+key = s.casefold()
+
+# Prefix checks without slicing
+if s.startswith(&quot;Bearer &quot;): token = s[7:]
+
+# Bytes at the edges: avoid decode/encode round-trips when the data stays bytes
+payload = orjson.dumps(obj)            # bytes, faster than json.dumps().encode()
+
+# Interning identical strings in big datasets: sys.intern()
+import sys
+names = [sys.intern(n) for n in raw_names]</code></pre></div></section>
+<section id="async-pitfalls"><h2 id="async-pitfalls">Async performance pitfalls</h2><p>Async keeps threads free but is not free itself: each <code>async</code> method allocates a state machine when it actually suspends. Avoid <code>async</code> on hot synchronous paths (return the task directly or use <code>ValueTask</code>), never block (<code>.Result</code>), batch instead of awaiting in a loop, and watch thread-pool starvation with <code>dotnet-counters</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// ✗ Sequential awaits in a loop — N round-trips
+foreach (var id in ids) results.Add(await repo.Get(id));
+
+// ✓ One query, or bounded concurrency
+var all = await repo.GetMany(ids);
+await Parallel.ForEachAsync(ids, new ParallelOptions { MaxDegreeOfParallelism = 8 }, async (id, ct) =&gt; { /* ... */ });
+
+// ✗ Blocking on async — thread-pool starvation under load
+var data = FetchAsync().Result;
+
+// ✓ ValueTask for hot paths that usually complete synchronously (cache hits)
+public ValueTask&lt;Product?&gt; Get(int id)
+{
+    if (_cache.TryGetValue(id, out var p)) return ValueTask.FromResult&lt;Product?&gt;(p);   // no allocation
+    return new ValueTask&lt;Product?&gt;(LoadAsync(id));
+}
+
+// ✓ Return the task directly when there&#x27;s nothing to do after it (no state machine)
+public Task&lt;string&gt; Load(string url) =&gt; _http.GetStringAsync(url);
+
+// ✗ Async void / fire-and-forget hides exceptions and load
+// ✓ Queue to a Channel + BackgroundService (see Threading page)
+
+// ✓ ConfigureAwait(false) in library code avoids context hops (no effect in ASP.NET Core, harmless)
+
+// Pool the timers: Task.Delay in tight loops → PeriodicTimer
+using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+while (await timer.WaitForNextTickAsync(ct)) { /* ... */ }
+
+// Diagnose starvation:
+//   dotnet-counters monitor --process-id &lt;pid&gt; System.Runtime
+//   watch &quot;ThreadPool Queue Length&quot; and &quot;ThreadPool Thread Count&quot; climbing together</code></pre><pre data-lang="python" hidden><code>import asyncio
+
+# ✗ Sequential awaits in a loop
+for id in ids: results.append(await repo.get(id))
+
+# ✓ One query, or bounded concurrency
+results = await repo.get_many(ids)
+sem = asyncio.Semaphore(8)
+async def one(id):
+    async with sem: return await repo.get(id)
+results = await asyncio.gather(*(one(i) for i in ids))
+
+# ✗ Blocking the event loop (CPU work or sync I/O inside async def)
+async def handler(): data = requests.get(url)          # freezes every other request
+# ✓ offload
+async def handler(): data = await asyncio.to_thread(requests.get, url)
+
+# ✗ Creating a coroutine per hot call when a sync path exists
+async def get(id):
+    if id in cache: return cache[id]                   # still pays coroutine overhead
+# ✓ check the cache synchronously in the caller; only await on miss
+
+# ✓ Fire-and-forget safely: keep a reference and log exceptions
+background = set()
+def spawn(coro):
+    t = asyncio.create_task(coro); background.add(t)
+    t.add_done_callback(background.discard)
+    t.add_done_callback(lambda t: t.exception() and logging.error(t.exception()))
+
+# Diagnose a blocked loop: PYTHONASYNCIODEBUG=1 logs callbacks slower than 100ms
+asyncio.get_running_loop().slow_callback_duration = 0.05
+# uvloop for a faster event loop:  uvicorn --loop uvloop</code></pre></div></section>
+<section id="caching"><h2 id="caching">Caching strategies</h2><p>The cheapest operation is the one you skip. Cache-aside with <code>IMemoryCache</code> for per-instance hot data; <code>IDistributedCache</code>/Redis for shared state across instances; <code>HybridCache</code> (.NET 9) for both with stampede protection. Set size limits and expirations, key carefully, and measure hit ratio. Invalidation is the hard part — prefer short TTLs over clever invalidation.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>builder.Services.AddMemoryCache(o =&gt; o.SizeLimit = 10_000);    // entries must declare a Size
+
+public class ProductCache(IMemoryCache cache, IProductRepo repo)
+{
+    private static readonly SemaphoreSlim _gate = new(1, 1);
+
+    public async Task&lt;Product?&gt; Get(int id, CancellationToken ct)
+    {
+        if (cache.TryGetValue($&quot;p:{id}&quot;, out Product? p)) return p;
+
+        await _gate.WaitAsync(ct);                     // stampede protection (coarse; HybridCache does per-key)
+        try
+        {
+            if (cache.TryGetValue($&quot;p:{id}&quot;, out p)) return p;
+            p = await repo.Get(id, ct);
+            cache.Set($&quot;p:{id}&quot;, p, new MemoryCacheEntryOptions
+            {
+                Size = 1,
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10),
+                SlidingExpiration = TimeSpan.FromMinutes(2),
+                Priority = CacheItemPriority.High
+            }.RegisterPostEvictionCallback((k, v, reason, _) =&gt; Console.WriteLine($&quot;{k} evicted: {reason}&quot;)));
+            return p;
+        }
+        finally { _gate.Release(); }
+    }
+
+    public void Invalidate(int id) =&gt; cache.Remove($&quot;p:{id}&quot;);
+}
+
+// HybridCache (.NET 9): L1 + L2, per-key stampede protection, tags for bulk invalidation
+builder.Services.AddHybridCache();
+builder.Services.AddStackExchangeRedisCache(o =&gt; o.Configuration = &quot;localhost&quot;);
+public class Catalog(HybridCache cache, IProductRepo repo)
+{
+    public Task&lt;Product?&gt; Get(int id, CancellationToken ct) =&gt;
+        cache.GetOrCreateAsync($&quot;p:{id}&quot;, async token =&gt; await repo.Get(id, token),
+            new HybridCacheEntryOptions { Expiration = TimeSpan.FromMinutes(10) }, tags: [&quot;products&quot;], ct);
+    public Task InvalidateAll(CancellationToken ct) =&gt; cache.RemoveByTagAsync(&quot;products&quot;, ct);
+}
+
+// Lazy&lt;T&gt; / memoization for pure, expensive computations
+private static readonly ConcurrentDictionary&lt;int, Lazy&lt;BigResult&gt;&gt; _memo = new();
+BigResult Compute(int n) =&gt; _memo.GetOrAdd(n, k =&gt; new Lazy&lt;BigResult&gt;(() =&gt; Expensive(k))).Value;</code></pre><pre data-lang="python" hidden><code>import asyncio, time
+from functools import lru_cache
+from cachetools import TTLCache, cached
+
+# Memoisation for pure functions
+@lru_cache(maxsize=10_000)
+def expensive(n): ...
+
+# TTL cache with size limit (single process)
+products = TTLCache(maxsize=10_000, ttl=600)
+locks: dict[int, asyncio.Lock] = {}
+
+async def get_product(id: int):
+    if id in products: return products[id]
+    lock = locks.setdefault(id, asyncio.Lock())      # per-key stampede protection
+    async with lock:
+        if id in products: return products[id]
+        p = await repo.get(id)
+        products[id] = p
+        return p
+
+def invalidate(id): products.pop(id, None)
+
+# Distributed: Redis with TTL; aiocache / redis-py
+import redis.asyncio as redis, orjson
+r = redis.Redis()
+async def get_cached(key, loader, ttl=600):
+    if (raw := await r.get(key)) is not None:
+        return orjson.loads(raw)
+    value = await loader()
+    await r.set(key, orjson.dumps(value), ex=ttl)
+    return value
+
+# Bulk invalidation by tag: keep a Redis set of keys per tag, delete them together
+async def invalidate_tag(tag):
+    keys = await r.smembers(f&quot;tag:{tag}&quot;)
+    if keys: await r.delete(*keys, f&quot;tag:{tag}&quot;)</code></pre></div></section>
+<section id="benchmarkdotnet"><h2 id="benchmarkdotnet">Measuring with BenchmarkDotNet</h2><p>Never optimise on a hunch. BenchmarkDotNet runs your method thousands of times in a separate process with warm-up, reports mean/error/allocations, and handles JIT tiering. Use <code>[MemoryDiagnoser]</code> for allocations and <code>[Params]</code> for input sizes. Python has <code>timeit</code> and <code>pytest-benchmark</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// dotnet add package BenchmarkDotNet — run in Release: dotnet run -c Release
+[MemoryDiagnoser]
+[SimpleJob(RuntimeMoniker.Net80), SimpleJob(RuntimeMoniker.Net90)]   // compare runtimes
+public class JoinBenchmarks
+{
+    [Params(10, 1_000)] public int N;
+    private string[] _items = null!;
+
+    [GlobalSetup] public void Setup() =&gt; _items = Enumerable.Range(0, N).Select(i =&gt; i.ToString()).ToArray();
+
+    [Benchmark(Baseline = true)]
+    public string Concat() { var s = &quot;&quot;; foreach (var x in _items) s += x + &quot;,&quot;; return s; }
+
+    [Benchmark]
+    public string Builder() { var sb = new StringBuilder(); foreach (var x in _items) sb.Append(x).Append(&#x27;,&#x27;); return sb.ToString(); }
+
+    [Benchmark]
+    public string Join() =&gt; string.Join(&quot;,&quot;, _items);
+}
+
+BenchmarkRunner.Run&lt;JoinBenchmarks&gt;();
+
+/* Output (illustrative):
+| Method  | N    | Mean        | Ratio | Allocated |
+|-------- |----- |------------:|------:|----------:|
+| Concat  | 1000 | 1,254.3 us  |  1.00 | 3.9 MB    |
+| Builder | 1000 |    12.8 us  |  0.01 | 24 KB     |
+| Join    | 1000 |     9.1 us  |  0.01 | 8 KB      |
+*/
+
+// Quick and dirty (not a substitute): Stopwatch with warm-up and many iterations
+var sw = Stopwatch.StartNew(); for (int i = 0; i &lt; 100_000; i++) Work(); Console.WriteLine(sw.Elapsed / 100_000);</code></pre><pre data-lang="python" hidden><code># timeit: the quick tool
+import timeit
+items = [str(i) for i in range(1000)]
+print(timeit.timeit(lambda: &quot;,&quot;.join(items), number=10_000))
+# CLI:  python -m timeit -s &quot;items=[str(i) for i in range(1000)]&quot; &#x27;&quot;,&quot;.join(items)&#x27;
+
+# pytest-benchmark: proper stats inside your test suite
+# pip install pytest-benchmark
+def join(items): return &quot;,&quot;.join(items)
+def concat(items):
+    s = &quot;&quot;
+    for x in items: s += x + &quot;,&quot;
+    return s
+
+def test_join(benchmark):
+    result = benchmark(join, items)
+    assert result
+
+def test_concat(benchmark):
+    benchmark(concat, items)
+# pytest --benchmark-compare  → table with mean, stddev, ops/sec
+
+# Memory: tracemalloc (above) or memory_profiler&#x27;s @profile line-by-line
+# CPU profiling: python -m cProfile -o out.prof app.py; snakeviz out.prof
+#                py-spy record -o profile.svg --pid &lt;pid&gt;   (sampling, production-safe)</code></pre></div></section>
+<section id="profiling"><h2 id="profiling">Profiling and diagnostics in production</h2><p>The <code>dotnet-*</code> global tools work against any running .NET process, including in containers: <code>dotnet-counters</code> for live metrics (GC, thread pool, exceptions), <code>dotnet-trace</code> for CPU sampling, <code>dotnet-dump</code> + <code>dotnet-gcdump</code> for memory. Wire <code>EventCounters</code>/<code>System.Diagnostics.Metrics</code> into OpenTelemetry so you can see the same numbers on a dashboard.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code>dotnet tool install -g dotnet-counters dotnet-trace dotnet-dump dotnet-gcdump
+
+# Live metrics: GC heap, gen0/1/2 counts, thread pool queue, exceptions/sec
+dotnet-counters monitor --process-id &lt;pid&gt; System.Runtime Microsoft.AspNetCore.Hosting
+
+# CPU sampling for 30s → open in PerfView / Visual Studio / speedscope
+dotnet-trace collect --process-id &lt;pid&gt; --duration 00:00:30 --format speedscope
+
+# Heap snapshot: who holds the memory?
+dotnet-gcdump collect --process-id &lt;pid&gt;          # open .gcdump in VS or PerfView
+
+# Full dump for a hang/deadlock
+dotnet-dump collect --process-id &lt;pid&gt;
+dotnet-dump analyze core_xxx
+&gt; clrstack -all          # every managed thread&#x27;s stack
+&gt; dumpheap -stat         # object counts by type
+&gt; gcroot &lt;address&gt;       # why is this object alive?
+
+# In containers: install the tools in a sidecar or use `dotnet-monitor` as a sidecar with an HTTP API</code></pre><pre data-lang="csharp" hidden><code>// Custom metrics via System.Diagnostics.Metrics → OpenTelemetry → Prometheus/App Insights
+public class OrderMetrics
+{
+    private static readonly Meter _meter = new(&quot;Shop.Orders&quot;, &quot;1.0&quot;);
+    private static readonly Counter&lt;long&gt; _placed = _meter.CreateCounter&lt;long&gt;(&quot;orders.placed&quot;);
+    private static readonly Histogram&lt;double&gt; _latency = _meter.CreateHistogram&lt;double&gt;(&quot;orders.place.duration&quot;, &quot;ms&quot;);
+
+    public void Record(double ms, string channel)
+    {
+        _placed.Add(1, new KeyValuePair&lt;string, object?&gt;(&quot;channel&quot;, channel));
+        _latency.Record(ms);
+    }
+}
+
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(m =&gt; m.AddMeter(&quot;Shop.Orders&quot;).AddRuntimeInstrumentation().AddAspNetCoreInstrumentation().AddPrometheusExporter())
+    .WithTracing(t =&gt; t.AddAspNetCoreInstrumentation().AddHttpClientInstrumentation().AddEntityFrameworkCoreInstrumentation().AddOtlpExporter());
+app.MapPrometheusScrapingEndpoint();
+
+// Activity (distributed tracing) around a unit of work
+private static readonly ActivitySource _source = new(&quot;Shop.Orders&quot;);
+using var activity = _source.StartActivity(&quot;PlaceOrder&quot;);
+activity?.SetTag(&quot;order.id&quot;, id);
+
+// Health + readiness (see Microservices page)</code></pre><pre data-lang="python" hidden><code># Sampling profiler that attaches to a running process (safe in production)
+#   pip install py-spy
+#   py-spy top --pid &lt;pid&gt;
+#   py-spy record -o profile.svg --pid &lt;pid&gt; --duration 30
+#   py-spy dump --pid &lt;pid&gt;          # stacks of every thread — great for hangs
+
+# Deterministic profiler for local runs
+#   python -m cProfile -o out.prof -m uvicorn main:app
+#   pip install snakeviz; snakeviz out.prof
+
+# Metrics / tracing with OpenTelemetry
+from opentelemetry import metrics, trace
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.exporter.prometheus import PrometheusMetricReader
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+metrics.set_meter_provider(MeterProvider(metric_readers=[PrometheusMetricReader()]))
+meter = metrics.get_meter(&quot;shop.orders&quot;)
+placed = meter.create_counter(&quot;orders.placed&quot;)
+latency = meter.create_histogram(&quot;orders.place.duration&quot;, unit=&quot;ms&quot;)
+
+def record(ms: float, channel: str):
+    placed.add(1, {&quot;channel&quot;: channel}); latency.record(ms)
+
+FastAPIInstrumentor.instrument_app(app)      # traces every request
+
+tracer = trace.get_tracer(&quot;shop.orders&quot;)
+with tracer.start_as_current_span(&quot;PlaceOrder&quot;) as span:
+    span.set_attribute(&quot;order.id&quot;, id)
+
+# Memory over time: tracemalloc snapshots diffed, or `memray` for a full flame graph</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Walk through diagnosing “P99 latency doubled after the last deploy”: counters first (GC gen2 rate? thread-pool queue? exceptions?), then a trace, then a gcdump if memory is the suspect.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Attach <code>dotnet-counters</code> to your own API under load (<code>bombardier</code> or <code>wrk</code>) and watch gen0 rate; then add a caching layer and compare.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/dotnet/standard/garbage-collection/fundamentals" target="_blank" rel="noopener">Fundamentals of garbage collection</a></li><li><a href="https://learn.microsoft.com/dotnet/standard/memory-and-spans/memory-t-usage-guidelines" target="_blank" rel="noopener">Memory&lt;T&gt; and Span&lt;T&gt; usage guidelines</a></li><li><a href="https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-9/" target="_blank" rel="noopener">Performance improvements in .NET (Stephen Toub&#x27;s annual posts)</a> — the deep dive</li><li><a href="https://benchmarkdotnet.org/" target="_blank" rel="noopener">BenchmarkDotNet</a></li><li><a href="https://learn.microsoft.com/dotnet/core/diagnostics/" target="_blank" rel="noopener">dotnet-counters / dotnet-trace / dotnet-dump</a> — diagnostic tools</li><li><a href="https://docs.python.org/3/c-api/memory.html" target="_blank" rel="noopener">Python memory management</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

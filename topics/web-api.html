@@ -1,0 +1,908 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASP.NET Core Web API — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="web-api">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 3 of 13</div>
+  <h1>ASP.NET Core Web API</h1>
+  <p class="lede">How a request flows through ASP.NET Core and every hook you have along the way. Each concept is paired with its FastAPI equivalent so you can build the same endpoint in both stacks.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#minimal-vs-controllers">Minimal APIs vs controllers</a></li><li><a href="#routing-binding">Routing and model binding</a></li><li><a href="#validation">Validation</a></li><li><a href="#di">Dependency injection and service lifetimes</a></li><li><a href="#middleware">Middleware pipeline</a></li><li><a href="#filters">Filters (MVC) and endpoint filters</a></li><li><a href="#error-handling">Error handling and ProblemDetails</a></li><li><a href="#versioning">API versioning</a></li><li><a href="#httpclient">HttpClient and IHttpClientFactory</a></li><li><a href="#openapi">OpenAPI / Swagger</a></li><li><a href="#cors">CORS</a></li><li><a href="#caching-ratelimit">Caching and rate limiting</a></li></ol>
+  </div>
+
+<section id="minimal-vs-controllers"><h2 id="minimal-vs-controllers">Minimal APIs vs controllers</h2><p>Both styles run on the same pipeline. <em>Minimal APIs</em> (.NET 6+) map lambdas straight onto routes — less ceremony, great for small services. <em>Controllers</em> give you attribute routing, filters, model-state conventions and a familiar structure for large APIs. Know both; interviewers ask when you would pick each. FastAPI is closest to minimal APIs.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Program.cs — minimal API
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSingleton&lt;ITodoRepo, InMemoryTodoRepo&gt;();
+var app = builder.Build();
+
+app.MapGet(&quot;/todos&quot;, (ITodoRepo repo) =&gt; repo.All());
+app.MapGet(&quot;/todos/{id:int}&quot;, (int id, ITodoRepo repo) =&gt;
+    repo.Get(id) is { } t ? Results.Ok(t) : Results.NotFound());
+app.MapPost(&quot;/todos&quot;, (Todo todo, ITodoRepo repo) =&gt;
+{
+    var created = repo.Add(todo);
+    return Results.Created($&quot;/todos/{created.Id}&quot;, created);
+});
+app.MapDelete(&quot;/todos/{id:int}&quot;, (int id, ITodoRepo repo) =&gt;
+    repo.Delete(id) ? Results.NoContent() : Results.NotFound());
+
+// Group + shared config
+var api = app.MapGroup(&quot;/api/v1&quot;).RequireAuthorization().WithOpenApi();
+api.MapGet(&quot;/health&quot;, () =&gt; &quot;ok&quot;);
+
+app.Run();
+
+public record Todo(int Id, string Title, bool Done);
+
+// ---- Controller equivalent ----
+[ApiController]
+[Route(&quot;api/[controller]&quot;)]
+public class TodosController(ITodoRepo repo) : ControllerBase
+{
+    [HttpGet] public IEnumerable&lt;Todo&gt; All() =&gt; repo.All();
+
+    [HttpGet(&quot;{id:int}&quot;)]
+    public ActionResult&lt;Todo&gt; Get(int id) =&gt; repo.Get(id) is { } t ? t : NotFound();
+
+    [HttpPost]
+    public ActionResult&lt;Todo&gt; Create(Todo todo)          // [ApiController] auto-400s on invalid model
+    {
+        var created = repo.Add(todo);
+        return CreatedAtAction(nameof(Get), new { id = created.Id }, created);
+    }
+}
+// builder.Services.AddControllers();  app.MapControllers();</code></pre><pre data-lang="python" hidden><code># main.py — FastAPI
+from fastapi import FastAPI, HTTPException, Depends, status
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class Todo(BaseModel):
+    id: int | None = None
+    title: str
+    done: bool = False
+
+class InMemoryTodoRepo:
+    def __init__(self): self._items: dict[int, Todo] = {}; self._next = 1
+    def all(self): return list(self._items.values())
+    def get(self, id): return self._items.get(id)
+    def add(self, t: Todo):
+        t.id = self._next; self._next += 1; self._items[t.id] = t; return t
+    def delete(self, id): return self._items.pop(id, None) is not None
+
+repo = InMemoryTodoRepo()
+def get_repo(): return repo               # dependency provider
+
+@app.get(&quot;/todos&quot;)
+def all_todos(r: InMemoryTodoRepo = Depends(get_repo)):
+    return r.all()
+
+@app.get(&quot;/todos/{id}&quot;)
+def get_todo(id: int, r=Depends(get_repo)):
+    if (t := r.get(id)) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
+    return t
+
+@app.post(&quot;/todos&quot;, status_code=status.HTTP_201_CREATED)
+def create(todo: Todo, r=Depends(get_repo)):
+    return r.add(todo)
+
+@app.delete(&quot;/todos/{id}&quot;, status_code=204)
+def delete(id: int, r=Depends(get_repo)):
+    if not r.delete(id):
+        raise HTTPException(404)
+
+# Router = MapGroup
+from fastapi import APIRouter
+api = APIRouter(prefix=&quot;/api/v1&quot;)
+@api.get(&quot;/health&quot;)
+def health(): return &quot;ok&quot;
+app.include_router(api)
+
+# run: uvicorn main:app --reload</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Minimal APIs: less overhead, faster startup, endpoint filters instead of MVC filters. Controllers: conventions, action filters, <code>[ApiController]</code> behaviours, easier for large teams. Both support the same auth, OpenAPI and DI.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Build the Todo API both ways in the same solution and hit both with <code>curl</code>. Add a <code>PUT</code> that returns 404 vs 204 correctly.</li></ul></div></section>
+<section id="routing-binding"><h2 id="routing-binding">Routing and model binding</h2><p>Route templates with constraints (<code>{id:int}</code>, <code>{slug:alpha}</code>, <code>{*path}</code>) decide which endpoint runs. Model binding then fills parameters from the route, query string, headers, body (JSON) or services. Minimal APIs infer the source; attributes (<code>[FromQuery]</code>, <code>[FromBody]</code>, <code>[FromHeader]</code>, <code>[FromServices]</code>) make it explicit. FastAPI uses parameter annotations for the same purpose.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Route constraints and catch-all
+app.MapGet(&quot;/users/{id:int:min(1)}&quot;, (int id) =&gt; $&quot;user {id}&quot;);
+app.MapGet(&quot;/posts/{year:int}/{slug}&quot;, (int year, string slug) =&gt; $&quot;{year}/{slug}&quot;);
+app.MapGet(&quot;/files/{*path}&quot;, (string path) =&gt; path);
+
+// Sources
+app.MapGet(&quot;/search&quot;, (
+    [FromQuery(Name = &quot;q&quot;)] string query,
+    [FromQuery] int page = 1,
+    [FromHeader(Name = &quot;X-Correlation-Id&quot;)] string? corr = null) =&gt;
+    new { query, page, corr });
+
+app.MapPost(&quot;/orders&quot;, ([FromBody] OrderDto dto, [FromServices] IOrderService svc) =&gt; svc.Place(dto));
+
+// Bind a whole object from the query string (AsParameters)
+app.MapGet(&quot;/products&quot;, ([AsParameters] ProductQuery q) =&gt; q);
+record ProductQuery(string? Category, int Page = 1, int Size = 20);
+
+// Custom binding: TryParse or BindAsync on your type
+public record Money(decimal Amount, string Currency)
+{
+    public static bool TryParse(string s, out Money? m)
+    {
+        var parts = s.Split(&#x27; &#x27;);
+        m = parts.Length == 2 &amp;&amp; decimal.TryParse(parts[0], out var a) ? new(a, parts[1]) : null;
+        return m is not null;
+    }
+}
+app.MapGet(&quot;/price/{money}&quot;, (Money money) =&gt; money);    // GET /price/9.99%20USD
+
+// Controller: [Route(&quot;api/[controller]/[action]&quot;)], [HttpGet(&quot;{id}&quot;)], [FromRoute], [FromForm]</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI, Query, Header, Body, Path, Depends
+from pydantic import BaseModel
+from typing import Annotated
+
+app = FastAPI()
+
+# Path params with validation (≈ route constraints)
+@app.get(&quot;/users/{id}&quot;)
+def user(id: Annotated[int, Path(ge=1)]):
+    return f&quot;user {id}&quot;
+
+@app.get(&quot;/posts/{year}/{slug}&quot;)
+def post(year: int, slug: str): return f&quot;{year}/{slug}&quot;
+
+@app.get(&quot;/files/{path:path}&quot;)            # catch-all
+def files(path: str): return path
+
+# Sources: query, header, body
+@app.get(&quot;/search&quot;)
+def search(
+    query: Annotated[str, Query(alias=&quot;q&quot;)],
+    page: int = 1,
+    corr: Annotated[str | None, Header(alias=&quot;X-Correlation-Id&quot;)] = None,
+):
+    return {&quot;query&quot;: query, &quot;page&quot;: page, &quot;corr&quot;: corr}
+
+class OrderDto(BaseModel):
+    sku: str; qty: int
+
+@app.post(&quot;/orders&quot;)
+def orders(dto: OrderDto, svc=Depends(get_order_service)):
+    return svc.place(dto)
+
+# Whole object from query string (≈ AsParameters)
+class ProductQuery(BaseModel):
+    category: str | None = None; page: int = 1; size: int = 20
+
+@app.get(&quot;/products&quot;)
+def products(q: Annotated[ProductQuery, Query()]): return q
+
+# Custom parsing with a validator
+from pydantic import field_validator
+class Money(BaseModel):
+    amount: float; currency: str
+    @classmethod
+    def parse(cls, s: str):
+        a, c = s.split(&quot; &quot;); return cls(amount=float(a), currency=c)
+
+@app.get(&quot;/price/{money}&quot;)
+def price(money: str): return Money.parse(money)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Add an endpoint <code>GET /orders?status=open&amp;from=2024-01-01</code> binding a <code>DateOnly</code> and an enum from the query string; return 400 on bad values.</li></ul></div></section>
+<section id="validation"><h2 id="validation">Validation</h2><p>Data annotations (<code>[Required]</code>, <code>[Range]</code>, <code>[StringLength]</code>) work automatically in controllers with <code>[ApiController]</code> (400 + ProblemDetails). Minimal APIs need a filter or a library — FluentValidation is the de facto standard for complex rules. Pydantic does this natively in FastAPI.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Data annotations — automatic in controllers
+public class CreateUserDto
+{
+    [Required, StringLength(50, MinimumLength = 2)] public string Name { get; set; } = &quot;&quot;;
+    [Required, EmailAddress] public string Email { get; set; } = &quot;&quot;;
+    [Range(18, 120)] public int Age { get; set; }
+}
+
+// FluentValidation — expressive, testable
+public class CreateUserValidator : AbstractValidator&lt;CreateUserDto&gt;
+{
+    public CreateUserValidator()
+    {
+        RuleFor(x =&gt; x.Name).NotEmpty().Length(2, 50);
+        RuleFor(x =&gt; x.Email).NotEmpty().EmailAddress();
+        RuleFor(x =&gt; x.Age).InclusiveBetween(18, 120);
+        RuleFor(x =&gt; x).Must(BeUniqueEmail).WithMessage(&quot;Email already used&quot;);
+    }
+}
+builder.Services.AddValidatorsFromAssemblyContaining&lt;CreateUserValidator&gt;();
+
+// Minimal API endpoint filter that validates any argument with a registered validator
+public class ValidationFilter&lt;T&gt; : IEndpointFilter
+{
+    public async ValueTask&lt;object?&gt; InvokeAsync(EndpointFilterInvocationContext ctx, EndpointFilterDelegate next)
+    {
+        var validator = ctx.HttpContext.RequestServices.GetService&lt;IValidator&lt;T&gt;&gt;();
+        var arg = ctx.Arguments.OfType&lt;T&gt;().FirstOrDefault();
+        if (validator is not null &amp;&amp; arg is not null)
+        {
+            var result = await validator.ValidateAsync(arg);
+            if (!result.IsValid)
+                return Results.ValidationProblem(result.ToDictionary());   // 400 + ProblemDetails
+        }
+        return await next(ctx);
+    }
+}
+
+app.MapPost(&quot;/users&quot;, (CreateUserDto dto) =&gt; Results.Created(&quot;/users/1&quot;, dto))
+   .AddEndpointFilter&lt;ValidationFilter&lt;CreateUserDto&gt;&gt;();</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI
+from pydantic import BaseModel, Field, EmailStr, field_validator, model_validator
+
+app = FastAPI()
+
+class CreateUserDto(BaseModel):
+    name: str = Field(min_length=2, max_length=50)
+    email: EmailStr
+    age: int = Field(ge=18, le=120)
+
+    @field_validator(&quot;name&quot;)
+    @classmethod
+    def no_whitespace(cls, v: str) -&gt; str:
+        if v.strip() != v:
+            raise ValueError(&quot;no leading/trailing whitespace&quot;)
+        return v
+
+    @model_validator(mode=&quot;after&quot;)
+    def unique_email(self):
+        if email_exists(self.email):
+            raise ValueError(&quot;Email already used&quot;)
+        return self
+
+@app.post(&quot;/users&quot;, status_code=201)
+def create_user(dto: CreateUserDto):
+    return dto
+# Invalid body → 422 with a detailed error list, automatically.
+
+# Change 422 → 400 to match ASP.NET conventions if you like:
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+@app.exception_handler(RequestValidationError)
+async def bad_request(request, exc):
+    return JSONResponse(status_code=400, content={&quot;errors&quot;: exc.errors()})</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write validation for a <code>Booking</code> DTO where <code>CheckOut &gt; CheckIn</code> and the stay is at most 30 nights. Unit test the validator without spinning up the web host.</li></ul></div></section>
+<section id="di"><h2 id="di">Dependency injection and service lifetimes</h2><p>ASP.NET Core has a built-in container. Three lifetimes: <strong>Transient</strong> (new every time), <strong>Scoped</strong> (one per HTTP request), <strong>Singleton</strong> (one for the process). The classic bug: injecting a scoped service (like <code>DbContext</code>) into a singleton — a “captive dependency”. FastAPI's <code>Depends</code> is per-request by default; singletons are module-level objects.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>builder.Services.AddTransient&lt;IEmailSender, SmtpEmailSender&gt;();   // stateless helpers
+builder.Services.AddScoped&lt;IOrderService, OrderService&gt;();        // per request (uses DbContext)
+builder.Services.AddSingleton&lt;ICache, MemoryCache&gt;();             // shared, must be thread-safe
+builder.Services.AddDbContext&lt;AppDb&gt;(o =&gt; o.UseSqlServer(cs));   // scoped by default
+
+// Options pattern
+builder.Services.Configure&lt;SmtpOptions&gt;(builder.Configuration.GetSection(&quot;Smtp&quot;));
+public class SmtpEmailSender(IOptions&lt;SmtpOptions&gt; opts, ILogger&lt;SmtpEmailSender&gt; log) : IEmailSender { }
+
+// Constructor injection (primary constructor, C# 12)
+public class OrderService(AppDb db, IEmailSender email) : IOrderService
+{
+    public async Task Place(OrderDto dto) { db.Add(dto.ToEntity()); await db.SaveChangesAsync(); await email.Send(); }
+}
+
+// Captive dependency — BUG: singleton holds a scoped DbContext forever
+builder.Services.AddSingleton&lt;ReportCache&gt;();     // ctor takes AppDb → wrong
+// Fix: inject IServiceScopeFactory and create a scope per operation
+public class ReportCache(IServiceScopeFactory scopes)
+{
+    public async Task Refresh()
+    {
+        using var scope = scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService&lt;AppDb&gt;();
+        // ...
+    }
+}
+
+// Keyed services (.NET 8)
+builder.Services.AddKeyedSingleton&lt;IPayment, StripePayment&gt;(&quot;stripe&quot;);
+app.MapPost(&quot;/pay&quot;, ([FromKeyedServices(&quot;stripe&quot;)] IPayment p) =&gt; p.Charge());
+
+// Validate lifetimes at startup in Development
+builder.Host.UseDefaultServiceProvider(o =&gt; { o.ValidateScopes = true; o.ValidateOnBuild = true; });</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI, Depends
+from functools import lru_cache
+from typing import Annotated
+
+app = FastAPI()
+
+# Singleton: module-level object or lru_cache&#x27;d factory
+@lru_cache
+def get_settings() -&gt; Settings:
+    return Settings()                    # loaded once
+
+class MemoryCache: ...
+cache = MemoryCache()                    # process-wide singleton
+def get_cache(): return cache
+
+# Scoped (per request): yield-based dependency with cleanup
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db                          # request runs here
+    finally:
+        db.close()
+
+# Transient: a plain factory that builds a new object each call
+def get_email_sender(settings: Annotated[Settings, Depends(get_settings)]):
+    return SmtpEmailSender(settings)
+
+class OrderService:
+    def __init__(self, db, email): self.db, self.email = db, email
+    async def place(self, dto): ...
+
+def get_order_service(db=Depends(get_db), email=Depends(get_email_sender)):
+    return OrderService(db, email)
+
+@app.post(&quot;/orders&quot;)
+async def place(dto: OrderDto, svc: Annotated[OrderService, Depends(get_order_service)]):
+    await svc.place(dto)
+
+# Override in tests
+app.dependency_overrides[get_db] = lambda: fake_db</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Explain the three lifetimes with an example of each, what a captive dependency is, and why <code>HttpClient</code> should come from <code>IHttpClientFactory</code> rather than a singleton or a transient.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Register the same interface with all three lifetimes in turn, inject it twice into one endpoint and log <code>GetHashCode()</code> across two requests. Predict the output before running it.</li></ul></div></section>
+<section id="middleware"><h2 id="middleware">Middleware pipeline</h2><p>A request passes through an ordered chain of middleware; each can short-circuit or call <code>next</code>. Order matters: exception handling → HSTS/HTTPS → static files → routing → CORS → authentication → authorization → endpoints. Write your own with a class or inline <code>app.Use</code>. FastAPI/Starlette middleware is the same idea.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Order matters
+app.UseExceptionHandler();          // outermost: catches everything below
+app.UseHsts();
+app.UseHttpsRedirection();
+app.UseStaticFiles();
+app.UseRouting();
+app.UseCors();
+app.UseAuthentication();
+app.UseAuthorization();
+app.MapControllers();
+
+// Inline middleware
+app.Use(async (ctx, next) =&gt;
+{
+    var sw = Stopwatch.StartNew();
+    await next(ctx);
+    ctx.Response.Headers[&quot;X-Elapsed-Ms&quot;] = sw.ElapsedMilliseconds.ToString();   // careful: headers must be set before body starts
+});
+
+// Class-based middleware
+public class CorrelationIdMiddleware(RequestDelegate next, ILogger&lt;CorrelationIdMiddleware&gt; log)
+{
+    public async Task InvokeAsync(HttpContext ctx)
+    {
+        var id = ctx.Request.Headers[&quot;X-Correlation-Id&quot;].FirstOrDefault() ?? Guid.NewGuid().ToString(&quot;N&quot;);
+        ctx.Items[&quot;CorrelationId&quot;] = id;
+        ctx.Response.OnStarting(() =&gt; { ctx.Response.Headers[&quot;X-Correlation-Id&quot;] = id; return Task.CompletedTask; });
+        using (log.BeginScope(new Dictionary&lt;string, object&gt; { [&quot;CorrelationId&quot;] = id }))
+            await next(ctx);
+    }
+}
+app.UseMiddleware&lt;CorrelationIdMiddleware&gt;();
+
+// Short-circuit / branch
+app.Map(&quot;/ping&quot;, b =&gt; b.Run(async ctx =&gt; await ctx.Response.WriteAsync(&quot;pong&quot;)));
+app.UseWhen(ctx =&gt; ctx.Request.Path.StartsWithSegments(&quot;/admin&quot;),
+            b =&gt; b.UseMiddleware&lt;AdminAuditMiddleware&gt;());</code></pre><pre data-lang="python" hidden><code>import time, uuid, logging
+from fastapi import FastAPI, Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.responses import PlainTextResponse
+
+app = FastAPI()
+
+# Inline (decorator) middleware — runs for every request
+@app.middleware(&quot;http&quot;)
+async def timing(request: Request, call_next):
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    response.headers[&quot;X-Elapsed-Ms&quot;] = f&quot;{(time.perf_counter() - t0) * 1000:.0f}&quot;
+    return response
+
+# Class-based middleware
+class CorrelationIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        cid = request.headers.get(&quot;X-Correlation-Id&quot;) or uuid.uuid4().hex
+        request.state.correlation_id = cid
+        response = await call_next(request)
+        response.headers[&quot;X-Correlation-Id&quot;] = cid
+        return response
+
+app.add_middleware(CorrelationIdMiddleware)
+# Order: the LAST add_middleware is the OUTERMOST (opposite of ASP.NET&#x27;s Use order)
+
+# Built-ins
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Short-circuit
+@app.get(&quot;/ping&quot;)
+def ping(): return PlainTextResponse(&quot;pong&quot;)
+
+# Conditional: check the path inside dispatch</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Draw the pipeline. Explain why <code>UseAuthentication</code> must come before <code>UseAuthorization</code>, why <code>UseExceptionHandler</code> is first, and the difference between <code>Use</code>, <code>Run</code> and <code>Map</code>.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a middleware that rejects requests without an <code>X-Api-Key</code> header with 401, but only for paths under <code>/api</code>. Test it with <code>WebApplicationFactory</code>.</li></ul></div></section>
+<section id="filters"><h2 id="filters">Filters (MVC) and endpoint filters</h2><p>Filters run <em>inside</em> the endpoint, after routing and model binding, so they know which action is executing and can see its arguments. MVC has authorization, resource, action, exception and result filters. Minimal APIs have a single <code>IEndpointFilter</code> pipeline. FastAPI achieves the same with dependencies and decorators.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// MVC action filter: log arguments and timing
+public class LogActionFilter(ILogger&lt;LogActionFilter&gt; log) : IAsyncActionFilter
+{
+    public async Task OnActionExecutionAsync(ActionExecutingContext ctx, ActionExecutionDelegate next)
+    {
+        log.LogInformation(&quot;→ {Action} {@Args}&quot;, ctx.ActionDescriptor.DisplayName, ctx.ActionArguments);
+        var executed = await next();                       // runs the action
+        if (executed.Exception is not null) log.LogError(executed.Exception, &quot;action failed&quot;);
+    }
+}
+builder.Services.AddControllers(o =&gt; o.Filters.Add&lt;LogActionFilter&gt;());   // global
+[ServiceFilter(typeof(LogActionFilter))] public class OrdersController : ControllerBase { }   // per controller
+
+// Exception filter → custom response
+public class DomainExceptionFilter : IExceptionFilter
+{
+    public void OnException(ExceptionContext ctx)
+    {
+        if (ctx.Exception is DomainException de)
+        {
+            ctx.Result = new BadRequestObjectResult(new { error = de.Message });
+            ctx.ExceptionHandled = true;
+        }
+    }
+}
+
+// Minimal API endpoint filter
+app.MapPost(&quot;/orders&quot;, (OrderDto dto) =&gt; Results.Ok(dto))
+   .AddEndpointFilter(async (ctx, next) =&gt;
+   {
+       var dto = ctx.GetArgument&lt;OrderDto&gt;(0);
+       if (dto.Qty &lt;= 0) return Results.BadRequest(&quot;qty must be positive&quot;);
+       return await next(ctx);
+   });
+
+// Reusable filter class applied to a group
+app.MapGroup(&quot;/admin&quot;).AddEndpointFilter&lt;AuditFilter&gt;();</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
+import logging, functools
+
+app = FastAPI()
+
+# &quot;Action filter&quot; via a dependency that runs before the handler
+async def log_request(request: Request):
+    logging.info(&quot;→ %s %s&quot;, request.method, request.url.path)
+
+@app.get(&quot;/orders&quot;, dependencies=[Depends(log_request)])
+def orders(): return []
+
+# Per-router filter
+from fastapi import APIRouter
+admin = APIRouter(prefix=&quot;/admin&quot;, dependencies=[Depends(audit)])
+
+# &quot;Exception filter&quot; → custom response for a domain error
+class DomainException(Exception): ...
+
+@app.exception_handler(DomainException)
+async def domain_error(request, exc: DomainException):
+    return JSONResponse(status_code=400, content={&quot;error&quot;: str(exc)})
+
+# Argument check before the handler (≈ endpoint filter)
+def positive_qty(dto: OrderDto) -&gt; OrderDto:
+    if dto.qty &lt;= 0:
+        raise HTTPException(400, &quot;qty must be positive&quot;)
+    return dto
+
+@app.post(&quot;/orders&quot;)
+def create(dto: OrderDto = Depends(positive_qty)):
+    return dto
+
+# Or a plain decorator around the handler function
+def timed(fn):
+    @functools.wraps(fn)
+    async def wrapper(*a, **kw):
+        import time; t0 = time.perf_counter()
+        try: return await fn(*a, **kw)
+        finally: logging.info(&quot;%s took %.1fms&quot;, fn.__name__, (time.perf_counter()-t0)*1000)
+    return wrapper</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write an endpoint filter that caches GET responses in <code>IMemoryCache</code> keyed by path+query for 30 seconds.</li></ul></div></section>
+<section id="error-handling"><h2 id="error-handling">Error handling and ProblemDetails</h2><p>Return RFC 7807 <code>ProblemDetails</code> for every error so clients get a consistent shape. .NET 8 adds <code>IExceptionHandler</code> plus <code>AddProblemDetails()</code>, replacing hand-rolled exception middleware. Map domain exceptions to status codes in one place; never leak stack traces in production. FastAPI's exception handlers do the same job.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>builder.Services.AddProblemDetails(o =&gt; o.CustomizeProblemDetails = ctx =&gt;
+{
+    ctx.ProblemDetails.Extensions[&quot;traceId&quot;] = ctx.HttpContext.TraceIdentifier;
+});
+builder.Services.AddExceptionHandler&lt;GlobalExceptionHandler&gt;();
+var app = builder.Build();
+app.UseExceptionHandler();          // uses the handlers above
+app.UseStatusCodePages();           // ProblemDetails for bare 404/405 etc.
+
+public class GlobalExceptionHandler(ILogger&lt;GlobalExceptionHandler&gt; log) : IExceptionHandler
+{
+    public async ValueTask&lt;bool&gt; TryHandleAsync(HttpContext ctx, Exception ex, CancellationToken ct)
+    {
+        var (status, title) = ex switch
+        {
+            NotFoundException   =&gt; (StatusCodes.Status404NotFound, &quot;Not found&quot;),
+            ValidationException =&gt; (StatusCodes.Status400BadRequest, &quot;Validation failed&quot;),
+            UnauthorizedAccessException =&gt; (StatusCodes.Status403Forbidden, &quot;Forbidden&quot;),
+            _                   =&gt; (StatusCodes.Status500InternalServerError, &quot;Unexpected error&quot;)
+        };
+        if (status == 500) log.LogError(ex, &quot;Unhandled exception&quot;);
+
+        await Results.Problem(title: title, statusCode: status,
+                              detail: status == 500 ? null : ex.Message,
+                              extensions: new Dictionary&lt;string, object?&gt; { [&quot;traceId&quot;] = ctx.TraceIdentifier })
+                     .ExecuteAsync(ctx);
+        return true;                  // handled
+    }
+}
+
+// Explicit results in endpoints
+app.MapGet(&quot;/orders/{id}&quot;, (int id) =&gt;
+    id &gt; 0 ? Results.Ok() : Results.Problem(&quot;id must be positive&quot;, statusCode: 400));
+
+// Typed results make OpenAPI accurate
+app.MapGet(&quot;/x/{id}&quot;, Results&lt;Ok&lt;Todo&gt;, NotFound&gt; (int id) =&gt; id == 1 ? TypedResults.Ok(new Todo(1, &quot;a&quot;, false)) : TypedResults.NotFound());</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+import logging, uuid
+
+app = FastAPI()
+
+def problem(status: int, title: str, detail: str | None = None, **ext):
+    body = {&quot;type&quot;: &quot;about:blank&quot;, &quot;title&quot;: title, &quot;status&quot;: status}
+    if detail: body[&quot;detail&quot;] = detail
+    body.update(ext)
+    return JSONResponse(status_code=status, content=body,
+                        media_type=&quot;application/problem+json&quot;)
+
+class NotFoundError(Exception): ...
+class ValidationError(Exception): ...
+
+@app.exception_handler(NotFoundError)
+async def not_found(req: Request, exc): return problem(404, &quot;Not found&quot;, str(exc))
+
+@app.exception_handler(ValidationError)
+async def invalid(req: Request, exc): return problem(400, &quot;Validation failed&quot;, str(exc))
+
+@app.exception_handler(Exception)             # catch-all
+async def unhandled(req: Request, exc):
+    trace = uuid.uuid4().hex
+    logging.exception(&quot;Unhandled exception trace=%s&quot;, trace)
+    return problem(500, &quot;Unexpected error&quot;, traceId=trace)   # no details leaked
+
+# HTTPException still works for quick cases
+@app.get(&quot;/orders/{id}&quot;)
+def order(id: int):
+    if id &lt;= 0:
+        raise HTTPException(400, &quot;id must be positive&quot;)
+    return {&quot;id&quot;: id}
+
+# Document responses for OpenAPI
+@app.get(&quot;/x/{id}&quot;, responses={404: {&quot;description&quot;: &quot;Not found&quot;}})
+def x(id: int):
+    if id != 1: raise NotFoundError(f&quot;todo {id}&quot;)
+    return {&quot;id&quot;: 1}</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Throw three different domain exceptions from endpoints and confirm each maps to the right status code and a ProblemDetails body with a <code>traceId</code>.</li></ul></div></section>
+<section id="versioning"><h2 id="versioning">API versioning</h2><p>Once clients depend on you, breaking changes need a new version. Strategies: URL segment (<code>/v2/orders</code>, most visible), query string (<code>?api-version=2</code>), or header. The <code>Asp.Versioning</code> package handles all three and integrates with OpenAPI. Prefer additive, non-breaking changes so you version rarely.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// dotnet add package Asp.Versioning.Http
+builder.Services.AddApiVersioning(o =&gt;
+{
+    o.DefaultApiVersion = new ApiVersion(1, 0);
+    o.AssumeDefaultVersionWhenUnspecified = true;
+    o.ReportApiVersions = true;                               // api-supported-versions header
+    o.ApiVersionReader = ApiVersionReader.Combine(
+        new UrlSegmentApiVersionReader(),
+        new HeaderApiVersionReader(&quot;X-Api-Version&quot;));
+});
+
+var versioned = app.NewVersionedApi(&quot;Orders&quot;);
+
+var v1 = versioned.MapGroup(&quot;/api/v{version:apiVersion}/orders&quot;).HasApiVersion(1, 0);
+v1.MapGet(&quot;/&quot;, () =&gt; new[] { new { id = 1, total = 10m } });
+
+var v2 = versioned.MapGroup(&quot;/api/v{version:apiVersion}/orders&quot;).HasApiVersion(2, 0);
+v2.MapGet(&quot;/&quot;, () =&gt; new[] { new { id = 1, total = 10m, currency = &quot;USD&quot; } });   // additive change
+
+// Deprecate
+v1.HasDeprecatedApiVersion(1, 0);
+
+// Controllers
+[ApiVersion(1.0)] [ApiVersion(2.0)]
+[Route(&quot;api/v{version:apiVersion}/[controller]&quot;)]
+public class OrdersController : ControllerBase
+{
+    [HttpGet, MapToApiVersion(1.0)] public IActionResult GetV1() =&gt; Ok();
+    [HttpGet, MapToApiVersion(2.0)] public IActionResult GetV2() =&gt; Ok();
+}</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI, APIRouter, Header
+
+app = FastAPI()
+
+# URL-segment versioning with routers (the common approach)
+v1 = APIRouter(prefix=&quot;/api/v1/orders&quot;, tags=[&quot;orders v1&quot;], deprecated=True)
+v2 = APIRouter(prefix=&quot;/api/v2/orders&quot;, tags=[&quot;orders v2&quot;])
+
+@v1.get(&quot;/&quot;)
+def orders_v1(): return [{&quot;id&quot;: 1, &quot;total&quot;: 10.0}]
+
+@v2.get(&quot;/&quot;)
+def orders_v2(): return [{&quot;id&quot;: 1, &quot;total&quot;: 10.0, &quot;currency&quot;: &quot;USD&quot;}]
+
+app.include_router(v1); app.include_router(v2)
+
+# Header-based: branch on a header inside one handler
+@app.get(&quot;/orders&quot;)
+def orders(x_api_version: str = Header(default=&quot;1&quot;)):
+    return orders_v2() if x_api_version == &quot;2&quot; else orders_v1()
+
+# Separate sub-apps give independent OpenAPI docs per version
+app_v1 = FastAPI(title=&quot;Orders v1&quot;); app.mount(&quot;/v1&quot;, app_v1)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Version an endpoint twice, generate OpenAPI docs per version, and write a test asserting <code>api-supported-versions</code> is present.</li></ul></div></section>
+<section id="httpclient"><h2 id="httpclient">HttpClient and IHttpClientFactory</h2><p>Do not <code>new HttpClient()</code> per request (socket exhaustion) and do not keep one forever (stale DNS). <code>IHttpClientFactory</code> pools handlers and rotates them. Use named or typed clients, configure base address and headers once, and add resilience (retry, circuit breaker, timeout) with <code>Microsoft.Extensions.Http.Resilience</code> / Polly. Python's <code>httpx.AsyncClient</code> should likewise be created once and reused.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Typed client
+public class GitHubClient(HttpClient http)
+{
+    public async Task&lt;Repo?&gt; GetRepo(string owner, string name, CancellationToken ct = default)
+        =&gt; await http.GetFromJsonAsync&lt;Repo&gt;($&quot;repos/{owner}/{name}&quot;, ct);
+}
+
+builder.Services.AddHttpClient&lt;GitHubClient&gt;(c =&gt;
+{
+    c.BaseAddress = new Uri(&quot;https://api.github.com/&quot;);
+    c.DefaultRequestHeaders.UserAgent.ParseAdd(&quot;learning-path/1.0&quot;);
+    c.Timeout = TimeSpan.FromSeconds(10);
+})
+.AddStandardResilienceHandler();          // retry + circuit breaker + timeout (Microsoft.Extensions.Http.Resilience)
+
+// Named client
+builder.Services.AddHttpClient(&quot;weather&quot;, c =&gt; c.BaseAddress = new Uri(&quot;https://api.weather.example/&quot;));
+public class WeatherService(IHttpClientFactory factory)
+{
+    public async Task&lt;string&gt; Today()
+    {
+        var client = factory.CreateClient(&quot;weather&quot;);
+        using var resp = await client.GetAsync(&quot;today&quot;);
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadAsStringAsync();
+    }
+}
+
+// POST JSON, read JSON, handle non-success without exceptions
+using var response = await http.PostAsJsonAsync(&quot;orders&quot;, new { sku = &quot;A1&quot;, qty = 2 });
+if (!response.IsSuccessStatusCode)
+{
+    var problem = await response.Content.ReadFromJsonAsync&lt;ProblemDetails&gt;();
+    return Results.Problem(problem?.Detail, statusCode: (int)response.StatusCode);
+}
+var created = await response.Content.ReadFromJsonAsync&lt;Order&gt;();
+
+// Delegating handler: add auth header to every call
+public class AuthHandler(ITokenProvider tokens) : DelegatingHandler
+{
+    protected override async Task&lt;HttpResponseMessage&gt; SendAsync(HttpRequestMessage req, CancellationToken ct)
+    {
+        req.Headers.Authorization = new(&quot;Bearer&quot;, await tokens.GetAsync(ct));
+        return await base.SendAsync(req, ct);
+    }
+}
+builder.Services.AddTransient&lt;AuthHandler&gt;();
+builder.Services.AddHttpClient&lt;GitHubClient&gt;().AddHttpMessageHandler&lt;AuthHandler&gt;();</code></pre><pre data-lang="python" hidden><code>import httpx
+from fastapi import FastAPI, Request
+from contextlib import asynccontextmanager
+
+# Create ONE client for the app lifetime (connection pooling)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.github = httpx.AsyncClient(
+        base_url=&quot;https://api.github.com/&quot;,
+        headers={&quot;User-Agent&quot;: &quot;learning-path/1.0&quot;},
+        timeout=10.0,
+        transport=httpx.AsyncHTTPTransport(retries=3),   # connection-level retries
+    )
+    yield
+    await app.state.github.aclose()
+
+app = FastAPI(lifespan=lifespan)
+
+class GitHubClient:
+    def __init__(self, http: httpx.AsyncClient): self.http = http
+    async def get_repo(self, owner: str, name: str):
+        r = await self.http.get(f&quot;repos/{owner}/{name}&quot;)
+        r.raise_for_status()
+        return r.json()
+
+@app.get(&quot;/repo/{owner}/{name}&quot;)
+async def repo(owner: str, name: str, request: Request):
+    return await GitHubClient(request.app.state.github).get_repo(owner, name)
+
+# POST JSON and handle non-success without exceptions
+async def create_order(http: httpx.AsyncClient):
+    r = await http.post(&quot;orders&quot;, json={&quot;sku&quot;: &quot;A1&quot;, &quot;qty&quot;: 2})
+    if r.is_error:
+        return {&quot;error&quot;: r.json().get(&quot;detail&quot;), &quot;status&quot;: r.status_code}
+    return r.json()
+
+# Auth on every request via event hooks (≈ DelegatingHandler)
+async def add_auth(request: httpx.Request):
+    request.headers[&quot;Authorization&quot;] = f&quot;Bearer {await get_token()}&quot;
+client = httpx.AsyncClient(event_hooks={&quot;request&quot;: [add_auth]})
+
+# Retry with backoff: `tenacity` package
+from tenacity import retry, stop_after_attempt, wait_exponential
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=0.2, max=2))
+async def fetch(url): ...</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why is <code>new HttpClient()</code> per call bad (TIME_WAIT sockets)? Why is a static one bad (DNS changes)? What does the factory do (handler pool with 2-minute lifetime)?</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Build a typed client for a public API with a retry policy, then write a test that uses a fake <code>HttpMessageHandler</code> to return 500 twice and 200 on the third try.</li></ul></div></section>
+<section id="openapi"><h2 id="openapi">OpenAPI / Swagger</h2><p>OpenAPI documents your API and drives Swagger UI, client generators and contract tests. .NET 9 has built-in <code>Microsoft.AspNetCore.OpenApi</code>; earlier versions use Swashbuckle. Typed results and XML comments make the spec accurate. FastAPI generates OpenAPI automatically from type hints.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// .NET 9 built-in
+builder.Services.AddOpenApi();
+var app = builder.Build();
+app.MapOpenApi();                         // /openapi/v1.json
+// Add Swashbuckle or Scalar for a UI:  app.MapScalarApiReference();
+
+// Swashbuckle (.NET 6–8)
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(o =&gt;
+{
+    o.SwaggerDoc(&quot;v1&quot;, new OpenApiInfo { Title = &quot;Orders API&quot;, Version = &quot;v1&quot; });
+    o.IncludeXmlComments(Path.Combine(AppContext.BaseDirectory, &quot;Api.xml&quot;));   // &lt;GenerateDocumentationFile&gt;true&lt;/GenerateDocumentationFile&gt;
+    o.AddSecurityDefinition(&quot;Bearer&quot;, new OpenApiSecurityScheme
+    {
+        Type = SecuritySchemeType.Http, Scheme = &quot;bearer&quot;, BearerFormat = &quot;JWT&quot;
+    });
+});
+if (app.Environment.IsDevelopment()) { app.UseSwagger(); app.UseSwaggerUI(); }
+
+// Describe endpoints
+app.MapGet(&quot;/orders/{id}&quot;, Results&lt;Ok&lt;Order&gt;, NotFound&gt; (int id) =&gt; ...)
+   .WithName(&quot;GetOrder&quot;)
+   .WithSummary(&quot;Get an order by id&quot;)
+   .WithTags(&quot;Orders&quot;)
+   .Produces&lt;Order&gt;(200)
+   .Produces(404);
+
+/// &lt;summary&gt;Creates an order.&lt;/summary&gt;
+/// &lt;response code=&quot;201&quot;&gt;Created&lt;/response&gt;
+[HttpPost, ProducesResponseType&lt;Order&gt;(201), ProducesResponseType(400)]
+public IActionResult Create(OrderDto dto) =&gt; ...;</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI, status
+from pydantic import BaseModel, Field
+
+app = FastAPI(
+    title=&quot;Orders API&quot;, version=&quot;1.0&quot;,
+    docs_url=&quot;/swagger&quot;, redoc_url=&quot;/redoc&quot;,   # /openapi.json is automatic
+)
+
+class Order(BaseModel):
+    id: int = Field(examples=[1])
+    total: float = Field(description=&quot;Total in USD&quot;, examples=[9.99])
+
+@app.get(
+    &quot;/orders/{id}&quot;,
+    response_model=Order,
+    summary=&quot;Get an order by id&quot;,
+    tags=[&quot;Orders&quot;],
+    responses={404: {&quot;description&quot;: &quot;Not found&quot;}},
+    operation_id=&quot;GetOrder&quot;,
+)
+def get_order(id: int):
+    &quot;&quot;&quot;Docstrings become the description.&quot;&quot;&quot;
+    ...
+
+@app.post(&quot;/orders&quot;, status_code=status.HTTP_201_CREATED, response_model=Order)
+def create(dto: Order): ...
+
+# Security scheme shows up automatically when you use OAuth2PasswordBearer / HTTPBearer
+from fastapi.security import HTTPBearer
+bearer = HTTPBearer()</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Generate a typed client from your OpenAPI JSON (<code>dotnet tool install -g NSwag.ConsoleCore</code> or <code>openapi-generator</code>) and call your own API with it.</li></ul></div></section>
+<section id="cors"><h2 id="cors">CORS</h2><p>Browsers block cross-origin <code>fetch</code> unless the server opts in with <code>Access-Control-Allow-*</code> headers. Configure named policies, allow only known origins in production, and remember preflight (<code>OPTIONS</code>) requests. CORS is a browser rule — it does nothing for server-to-server calls.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>builder.Services.AddCors(o =&gt;
+{
+    o.AddPolicy(&quot;spa&quot;, p =&gt; p
+        .WithOrigins(&quot;https://app.example.com&quot;, &quot;http://localhost:5173&quot;)
+        .AllowAnyHeader()
+        .WithMethods(&quot;GET&quot;, &quot;POST&quot;, &quot;PUT&quot;, &quot;DELETE&quot;)
+        .AllowCredentials()                       // cookies; cannot combine with AllowAnyOrigin
+        .SetPreflightMaxAge(TimeSpan.FromHours(1)));
+});
+
+var app = builder.Build();
+app.UseRouting();
+app.UseCors(&quot;spa&quot;);             // after routing, before auth
+app.UseAuthorization();
+
+// Per-endpoint
+app.MapGet(&quot;/public&quot;, () =&gt; &quot;hi&quot;).RequireCors(p =&gt; p.AllowAnyOrigin());
+[EnableCors(&quot;spa&quot;)] public class OrdersController : ControllerBase { }
+[DisableCors] public IActionResult Internal() =&gt; Ok();</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[&quot;https://app.example.com&quot;, &quot;http://localhost:5173&quot;],
+    allow_credentials=True,                    # cannot combine with [&quot;*&quot;]
+    allow_methods=[&quot;GET&quot;, &quot;POST&quot;, &quot;PUT&quot;, &quot;DELETE&quot;],
+    allow_headers=[&quot;*&quot;],
+    max_age=3600,
+)
+
+# Per-route CORS is not built in; use a sub-app with its own middleware
+public_app = FastAPI()
+public_app.add_middleware(CORSMiddleware, allow_origins=[&quot;*&quot;])
+app.mount(&quot;/public&quot;, public_app)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Serve a static HTML page from a different port that calls your API with <code>fetch</code>; watch the preflight in DevTools, then fix the CORS policy.</li></ul></div></section>
+<section id="caching-ratelimit"><h2 id="caching-ratelimit">Caching and rate limiting</h2><p>Three caching layers: in-process <code>IMemoryCache</code>, distributed <code>IDistributedCache</code> (Redis) and HTTP <em>output caching</em> / <code>Cache-Control</code> headers. .NET 7+ ships a rate-limiting middleware with fixed-window, sliding-window, token-bucket and concurrency limiters. Cache what is expensive and rarely changes; rate-limit what is abusable.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// In-memory cache
+builder.Services.AddMemoryCache();
+public class ProductService(IMemoryCache cache, AppDb db)
+{
+    public Task&lt;Product?&gt; Get(int id) =&gt; cache.GetOrCreateAsync($&quot;product:{id}&quot;, async e =&gt;
+    {
+        e.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5);
+        e.SlidingExpiration = TimeSpan.FromMinutes(1);
+        return await db.Products.FindAsync(id);
+    });
+}
+
+// Distributed (Redis)
+builder.Services.AddStackExchangeRedisCache(o =&gt; o.Configuration = &quot;localhost:6379&quot;);
+await cache.SetStringAsync(&quot;k&quot;, json, new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10) });
+
+// HybridCache (.NET 9): L1 memory + L2 distributed with stampede protection
+builder.Services.AddHybridCache();
+
+// Output caching (server-side HTTP response cache)
+builder.Services.AddOutputCache(o =&gt; o.AddPolicy(&quot;short&quot;, b =&gt; b.Expire(TimeSpan.FromSeconds(30)).SetVaryByQuery(&quot;page&quot;)));
+app.UseOutputCache();
+app.MapGet(&quot;/catalog&quot;, () =&gt; ...).CacheOutput(&quot;short&quot;);
+
+// Response headers for client/CDN caching
+app.MapGet(&quot;/logo&quot;, () =&gt; Results.File(&quot;logo.png&quot;)).WithMetadata(new ResponseCacheAttribute { Duration = 86400 });
+
+// Rate limiting (.NET 7+)
+builder.Services.AddRateLimiter(o =&gt;
+{
+    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    o.AddFixedWindowLimiter(&quot;fixed&quot;, l =&gt; { l.PermitLimit = 100; l.Window = TimeSpan.FromMinutes(1); l.QueueLimit = 0; });
+    o.AddTokenBucketLimiter(&quot;burst&quot;, l =&gt; { l.TokenLimit = 20; l.TokensPerPeriod = 5; l.ReplenishmentPeriod = TimeSpan.FromSeconds(1); });
+    o.GlobalLimiter = PartitionedRateLimiter.Create&lt;HttpContext, string&gt;(ctx =&gt;
+        RateLimitPartition.GetSlidingWindowLimiter(ctx.Connection.RemoteIpAddress?.ToString() ?? &quot;anon&quot;,
+            _ =&gt; new() { PermitLimit = 1000, Window = TimeSpan.FromMinutes(1), SegmentsPerWindow = 6 }));
+});
+app.UseRateLimiter();
+app.MapPost(&quot;/login&quot;, ...).RequireRateLimiting(&quot;fixed&quot;);</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI, Request, Response
+from cachetools import TTLCache
+import asyncio, time
+
+app = FastAPI()
+
+# In-memory TTL cache (single process)
+product_cache: TTLCache = TTLCache(maxsize=10_000, ttl=300)
+cache_lock = asyncio.Lock()
+
+async def get_product(id: int):
+    if id in product_cache:
+        return product_cache[id]
+    async with cache_lock:                        # stampede protection
+        if id not in product_cache:
+            product_cache[id] = await db_find_product(id)
+    return product_cache[id]
+
+# Distributed (Redis)
+import redis.asyncio as redis
+r = redis.Redis()
+await r.set(&quot;k&quot;, json_text, ex=600)
+
+# Response headers for client/CDN caching
+@app.get(&quot;/logo&quot;)
+def logo(response: Response):
+    response.headers[&quot;Cache-Control&quot;] = &quot;public, max-age=86400&quot;
+    return FileResponse(&quot;logo.png&quot;)
+
+# Rate limiting: `slowapi` (or `fastapi-limiter` with Redis)
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+limiter = Limiter(key_func=get_remote_address, default_limits=[&quot;1000/minute&quot;])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+@app.post(&quot;/login&quot;)
+@limiter.limit(&quot;100/minute&quot;)
+async def login(request: Request): ...
+
+# Hand-rolled token bucket for reference
+class TokenBucket:
+    def __init__(self, capacity, refill_per_sec):
+        self.cap, self.rate, self.tokens, self.ts = capacity, refill_per_sec, capacity, time.monotonic()
+    def allow(self) -&gt; bool:
+        now = time.monotonic(); self.tokens = min(self.cap, self.tokens + (now - self.ts) * self.rate); self.ts = now
+        if self.tokens &gt;= 1: self.tokens -= 1; return True
+        return False</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Cache invalidation strategies (TTL, event-driven, cache-aside vs write-through), the thundering-herd problem, and which limiter to use for “burst but not sustained” traffic (token bucket).</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Add a 60-second output cache to a slow endpoint and prove the second call is fast. Then add a 5-requests-per-10-seconds limiter and hit it with a loop.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/aspnet/core/web-api/" target="_blank" rel="noopener">ASP.NET Core Web API docs</a></li><li><a href="https://learn.microsoft.com/aspnet/core/fundamentals/minimal-apis" target="_blank" rel="noopener">Minimal APIs overview</a></li><li><a href="https://learn.microsoft.com/aspnet/core/fundamentals/middleware/" target="_blank" rel="noopener">Middleware</a> — the pipeline explained</li><li><a href="https://learn.microsoft.com/aspnet/core/fundamentals/dependency-injection" target="_blank" rel="noopener">Dependency injection in ASP.NET Core</a></li><li><a href="https://learn.microsoft.com/aspnet/core/fundamentals/http-requests" target="_blank" rel="noopener">IHttpClientFactory</a></li><li><a href="https://learn.microsoft.com/aspnet/core/fundamentals/error-handling" target="_blank" rel="noopener">Handle errors (ProblemDetails)</a></li><li><a href="https://fastapi.tiangolo.com/" target="_blank" rel="noopener">FastAPI docs</a> — Python counterpart</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

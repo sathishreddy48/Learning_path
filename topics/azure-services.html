@@ -1,0 +1,825 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure Services for .NET — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="azure-services">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 12 of 13</div>
+  <h1>Azure Services for .NET</h1>
+  <p class="lede">Not an Azure certification course — a working map of the services you will be asked about, what each is for, the one design decision that matters, and the SDK code to talk to it. Every sample uses <code>DefaultAzureCredential</code> so it works locally (<code>az login</code>) and in Azure (managed identity) without secrets.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#app-service">App Service</a></li><li><a href="#functions">Azure Functions</a></li><li><a href="#storage">Azure Storage: Blobs, Queues, Tables</a></li><li><a href="#service-bus">Service Bus</a></li><li><a href="#event-hubs">Event Hubs</a></li><li><a href="#cosmos">Cosmos DB</a></li><li><a href="#azure-sql">Azure SQL Database</a></li><li><a href="#key-vault">Key Vault</a></li><li><a href="#managed-identity">Managed Identity and DefaultAzureCredential</a></li><li><a href="#app-insights">Application Insights and Azure Monitor</a></li><li><a href="#aks-container-apps">AKS and Azure Container Apps</a></li></ol>
+  </div>
+
+<section id="app-service"><h2 id="app-service">App Service</h2><p>PaaS hosting for web apps and APIs: deploy code or a container, get TLS, custom domains, deployment slots (blue/green with swap), autoscale, built-in auth (“Easy Auth”), and health-check-based instance replacement. The decision that matters: Linux vs Windows plan, and plan tier for scale-out and VNet integration. Use slots for zero-downtime deploys and <code>WEBSITE_RUN_FROM_PACKAGE</code> for atomic deployments.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># Create and deploy a .NET API
+az group create -n rg-shop -l westeurope
+az appservice plan create -g rg-shop -n plan-shop --sku P1v3 --is-linux
+az webapp create -g rg-shop -p plan-shop -n shop-api --runtime &quot;DOTNETCORE:9.0&quot;
+
+# App settings = environment variables (double underscore for sections)
+az webapp config appsettings set -g rg-shop -n shop-api --settings \
+  ASPNETCORE_ENVIRONMENT=Production \
+  ConnectionStrings__Default=&quot;@Microsoft.KeyVault(SecretUri=https://shop-kv.vault.azure.net/secrets/SqlConnection/)&quot; \
+  WEBSITE_RUN_FROM_PACKAGE=1
+
+# Managed identity so the app can read Key Vault / Storage without secrets
+az webapp identity assign -g rg-shop -n shop-api
+
+# Health check + always on
+az webapp config set -g rg-shop -n shop-api --generic-configurations &#x27;{&quot;healthCheckPath&quot;: &quot;/health/ready&quot;}&#x27; --always-on true
+
+# Zip deploy to a staging slot, then swap
+dotnet publish -c Release -o ./publish &amp;&amp; (cd publish &amp;&amp; zip -r ../app.zip .)
+az webapp deployment slot create -g rg-shop -n shop-api --slot staging
+az webapp deploy -g rg-shop -n shop-api --slot staging --src-path app.zip --type zip
+az webapp deployment slot swap -g rg-shop -n shop-api --slot staging --target-slot production
+
+# Logs
+az webapp log tail -g rg-shop -n shop-api</code></pre><pre data-lang="csharp" hidden><code>// Program.cs additions that matter on App Service
+var builder = WebApplication.CreateBuilder(args);
+
+// Behind the App Service front end: trust forwarded headers so redirects/HSTS see https
+builder.Services.Configure&lt;ForwardedHeadersOptions&gt;(o =&gt;
+    o.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto);
+
+// Health endpoint used by the platform&#x27;s Health check feature
+builder.Services.AddHealthChecks().AddSqlServer(builder.Configuration.GetConnectionString(&quot;Default&quot;)!);
+
+// Application Insights (see below) — instrumentation via connection string app setting
+builder.Services.AddApplicationInsightsTelemetry();
+
+var app = builder.Build();
+app.UseForwardedHeaders();
+app.MapHealthChecks(&quot;/health/ready&quot;);
+app.Run();
+
+// Easy Auth: when enabled, App Service injects headers you can read
+app.MapGet(&quot;/me&quot;, (HttpContext ctx) =&gt; new
+{
+    id = ctx.Request.Headers[&quot;X-MS-CLIENT-PRINCIPAL-ID&quot;].ToString(),
+    name = ctx.Request.Headers[&quot;X-MS-CLIENT-PRINCIPAL-NAME&quot;].ToString()
+});
+// Or decode X-MS-CLIENT-PRINCIPAL (base64 JSON with claims) for roles.
+
+// Slot-sticky settings: mark connection strings/feature flags &quot;deployment slot setting&quot; so staging keeps its own.</code></pre><pre data-lang="python" hidden><code># az webapp create ... --runtime &quot;PYTHON:3.12&quot;
+# Startup command (App Service setting):  gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:8000 main:app
+from fastapi import FastAPI, Request
+import base64, json
+
+app = FastAPI()
+
+# App Service terminates TLS; run uvicorn/gunicorn with --proxy-headers (default in the gunicorn worker)
+
+@app.get(&quot;/health/ready&quot;)
+def ready(): return {&quot;status&quot;: &quot;Healthy&quot;}
+
+# Easy Auth headers
+@app.get(&quot;/me&quot;)
+def me(request: Request):
+    principal = request.headers.get(&quot;X-MS-CLIENT-PRINCIPAL&quot;)
+    claims = json.loads(base64.b64decode(principal)) if principal else {}
+    return {&quot;id&quot;: request.headers.get(&quot;X-MS-CLIENT-PRINCIPAL-ID&quot;),
+            &quot;name&quot;: request.headers.get(&quot;X-MS-CLIENT-PRINCIPAL-NAME&quot;),
+            &quot;claims&quot;: claims.get(&quot;claims&quot;, [])}
+
+# Application Insights: pip install azure-monitor-opentelemetry
+from azure.monitor.opentelemetry import configure_azure_monitor
+configure_azure_monitor()          # reads APPLICATIONINSIGHTS_CONNECTION_STRING</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Deployment slots and what “swap” does (VIP swap after warm-up), when to move to Container Apps/AKS (sidecars, custom networking, event-driven scale-to-zero), and how scale-out affects in-memory caches and SignalR.</p></div></section>
+<section id="functions"><h2 id="functions">Azure Functions</h2><p>Event-driven compute: a function runs when a trigger fires (HTTP, timer, queue, Service Bus, Event Hubs, Cosmos change feed, blob). Bindings inject inputs and outputs so you write almost no plumbing. .NET uses the <em>isolated worker</em> model (your process, any .NET version). Consumption plan scales to zero; Premium/Dedicated/Flex for VNet, no cold start, longer runs. Durable Functions add orchestrations (fan-out/fan-in, human interaction, sagas) on top.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// func init --worker-runtime dotnet-isolated ; func new
+// Program.cs
+var host = new HostBuilder()
+    .ConfigureFunctionsWebApplication()
+    .ConfigureServices(s =&gt;
+    {
+        s.AddApplicationInsightsTelemetryWorkerService();
+        s.ConfigureFunctionsApplicationInsights();
+        s.AddSingleton(new BlobServiceClient(new Uri(&quot;https://shopstorage.blob.core.windows.net&quot;), new DefaultAzureCredential()));
+    })
+    .Build();
+host.Run();
+
+public class OrderFunctions(ILogger&lt;OrderFunctions&gt; log)
+{
+    // HTTP trigger
+    [Function(&quot;PlaceOrder&quot;)]
+    [ServiceBusOutput(&quot;order-placed&quot;, Connection = &quot;ServiceBus&quot;)]        // output binding: return value is sent
+    public async Task&lt;OrderPlaced&gt; PlaceOrder([HttpTrigger(AuthorizationLevel.Function, &quot;post&quot;, Route = &quot;orders&quot;)] HttpRequestData req)
+    {
+        var order = await req.ReadFromJsonAsync&lt;Order&gt;();
+        log.LogInformation(&quot;Placing {Sku}&quot;, order!.Sku);
+        return new OrderPlaced(Guid.NewGuid(), order.Total);
+    }
+
+    // Queue trigger with a blob input binding
+    [Function(&quot;Invoice&quot;)]
+    public async Task Invoice(
+        [ServiceBusTrigger(&quot;order-placed&quot;, &quot;invoicing&quot;, Connection = &quot;ServiceBus&quot;)] OrderPlaced e,
+        [BlobInput(&quot;templates/invoice.html&quot;)] string template,
+        FunctionContext ctx)
+    {
+        // at-least-once: make this idempotent on e.OrderId
+    }
+
+    // Timer (NCRONTAB: sec min hour day month dow)
+    [Function(&quot;Nightly&quot;)]
+    public void Nightly([TimerTrigger(&quot;0 0 2 * * *&quot;)] TimerInfo t) { }
+
+    // Cosmos change feed
+    [Function(&quot;OnProductChanged&quot;)]
+    public void OnProductChanged([CosmosDBTrigger(&quot;shop&quot;, &quot;products&quot;, Connection = &quot;Cosmos&quot;, LeaseContainerName = &quot;leases&quot;, CreateLeaseContainerIfNotExists = true)] IReadOnlyList&lt;Product&gt; changes) { }
+}
+
+// Durable orchestration: fan-out/fan-in with retries
+[Function(nameof(ProcessBatch))]
+public static async Task&lt;int&gt; ProcessBatch([OrchestrationTrigger] TaskOrchestrationContext ctx)
+{
+    var ids = await ctx.CallActivityAsync&lt;int[]&gt;(&quot;GetIds&quot;);
+    var tasks = ids.Select(id =&gt; ctx.CallActivityAsync&lt;bool&gt;(&quot;ProcessOne&quot;, id,
+        new TaskOptions(new TaskRetryOptions(new RetryPolicy(3, TimeSpan.FromSeconds(5))))));
+    var results = await Task.WhenAll(tasks);
+    return results.Count(r =&gt; r);
+}
+// local.settings.json holds connection names; host.json tunes batch sizes/retries.</code></pre><pre data-lang="python" hidden><code># func init --python ; func new  (v2 programming model, decorators)
+import azure.functions as func
+import logging, json, uuid
+
+app = func.FunctionApp()
+
+# HTTP trigger with a Service Bus output binding
+@app.route(route=&quot;orders&quot;, methods=[&quot;POST&quot;], auth_level=func.AuthLevel.FUNCTION)
+@app.service_bus_topic_output(arg_name=&quot;out&quot;, topic_name=&quot;order-placed&quot;, connection=&quot;ServiceBus&quot;)
+def place_order(req: func.HttpRequest, out: func.Out[str]) -&gt; func.HttpResponse:
+    order = req.get_json()
+    logging.info(&quot;Placing %s&quot;, order[&quot;sku&quot;])
+    out.set(json.dumps({&quot;order_id&quot;: str(uuid.uuid4()), &quot;total&quot;: order[&quot;total&quot;]}))
+    return func.HttpResponse(status_code=202)
+
+# Service Bus trigger + blob input
+@app.service_bus_topic_trigger(arg_name=&quot;msg&quot;, topic_name=&quot;order-placed&quot;, subscription_name=&quot;invoicing&quot;, connection=&quot;ServiceBus&quot;)
+@app.blob_input(arg_name=&quot;template&quot;, path=&quot;templates/invoice.html&quot;, connection=&quot;Storage&quot;)
+def invoice(msg: func.ServiceBusMessage, template: str):
+    event = json.loads(msg.get_body().decode())
+    # idempotent on event[&quot;order_id&quot;]
+
+# Timer
+@app.timer_trigger(arg_name=&quot;t&quot;, schedule=&quot;0 0 2 * * *&quot;)
+def nightly(t: func.TimerRequest): ...
+
+# Cosmos change feed
+@app.cosmos_db_trigger(arg_name=&quot;docs&quot;, database_name=&quot;shop&quot;, container_name=&quot;products&quot;, connection=&quot;Cosmos&quot;,
+                       lease_container_name=&quot;leases&quot;, create_lease_container_if_not_exists=True)
+def on_product_changed(docs: func.DocumentList): ...
+
+# Durable Functions (azure-functions-durable)
+import azure.durable_functions as df
+@app.orchestration_trigger(context_name=&quot;ctx&quot;)
+def process_batch(ctx: df.DurableOrchestrationContext):
+    ids = yield ctx.call_activity(&quot;get_ids&quot;)
+    retry = df.RetryOptions(first_retry_interval_in_milliseconds=5000, max_number_of_attempts=3)
+    results = yield ctx.task_all([ctx.call_activity_with_retry(&quot;process_one&quot;, retry, i) for i in ids])
+    return sum(results)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Cold starts and how to mitigate them (Premium/Flex, keep-alive); why triggers are at-least-once; Durable Functions replay semantics (orchestrator code must be deterministic); Functions vs a queue consumer in a container.</p></div></section>
+<section id="storage"><h2 id="storage">Azure Storage: Blobs, Queues, Tables</h2><p>One storage account, several services. <strong>Blob</strong>: objects (files, images, backups) with hot/cool/archive tiers, SAS tokens for delegated access, lifecycle policies. <strong>Queue</strong>: simple at-least-once messaging (64 KB messages, 7-day TTL) — cheaper and simpler than Service Bus when you don't need topics/sessions/ordering. <strong>Table</strong>: cheap key-value NoSQL (PartitionKey + RowKey) — largely superseded by Cosmos DB's Table API for scale.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Azure.Storage.Blobs / Azure.Storage.Queues / Azure.Data.Tables
+var cred = new DefaultAzureCredential();
+var blobs = new BlobServiceClient(new Uri(&quot;https://shopstorage.blob.core.windows.net&quot;), cred);
+
+// Upload / download with metadata and content type
+var container = blobs.GetBlobContainerClient(&quot;invoices&quot;);
+await container.CreateIfNotExistsAsync();
+var blob = container.GetBlobClient($&quot;2024/{orderId}.pdf&quot;);
+await blob.UploadAsync(pdfStream, new BlobUploadOptions
+{
+    HttpHeaders = new BlobHttpHeaders { ContentType = &quot;application/pdf&quot; },
+    Metadata = new Dictionary&lt;string, string&gt; { [&quot;orderId&quot;] = orderId.ToString() },
+    AccessTier = AccessTier.Cool
+});
+using var download = await blob.OpenReadAsync();
+
+// List with prefix (hierarchical listing)
+await foreach (var item in container.GetBlobsAsync(prefix: &quot;2024/&quot;)) Console.WriteLine(item.Name);
+
+// User-delegation SAS: time-limited URL, no account key involved
+var key = await blobs.GetUserDelegationKeyAsync(DateTimeOffset.UtcNow, DateTimeOffset.UtcNow.AddHours(1));
+var sas = new BlobSasBuilder(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(15)) { BlobContainerName = &quot;invoices&quot;, BlobName = blob.Name };
+var url = new BlobUriBuilder(blob.Uri) { Sas = sas.ToSasQueryParameters(key, blobs.AccountName) }.ToUri();
+
+// Queue: enqueue, dequeue with visibility timeout, delete on success
+var queue = new QueueClient(new Uri(&quot;https://shopstorage.queue.core.windows.net/thumbnails&quot;), cred);
+await queue.SendMessageAsync(BinaryData.FromObjectAsJson(new { blob = blob.Name }));
+QueueMessage[] msgs = await queue.ReceiveMessagesAsync(maxMessages: 10, visibilityTimeout: TimeSpan.FromMinutes(2));
+foreach (var m in msgs)
+{
+    if (m.DequeueCount &gt; 5) { /* poison: move to a dead-letter queue yourself */ }
+    await Process(m.Body.ToObjectFromJson&lt;ThumbJob&gt;());
+    await queue.DeleteMessageAsync(m.MessageId, m.PopReceipt);
+}
+
+// Table: PartitionKey + RowKey, transactions within a partition
+var table = new TableClient(new Uri(&quot;https://shopstorage.table.core.windows.net&quot;), &quot;audit&quot;, cred);
+await table.UpsertEntityAsync(new TableEntity(partitionKey: &quot;order-42&quot;, rowKey: DateTime.UtcNow.Ticks.ToString()) { [&quot;event&quot;] = &quot;shipped&quot; });
+await foreach (var e in table.QueryAsync&lt;TableEntity&gt;(x =&gt; x.PartitionKey == &quot;order-42&quot;)) Console.WriteLine(e[&quot;event&quot;]);</code></pre><pre data-lang="python" hidden><code># pip install azure-storage-blob azure-storage-queue azure-data-tables azure-identity
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient, ContentSettings, StandardBlobTier, generate_blob_sas, BlobSasPermissions
+from azure.storage.queue import QueueClient
+from azure.data.tables import TableClient
+from datetime import datetime, timedelta, timezone
+import json
+
+cred = DefaultAzureCredential()
+blobs = BlobServiceClient(&quot;https://shopstorage.blob.core.windows.net&quot;, credential=cred)
+
+container = blobs.get_container_client(&quot;invoices&quot;)
+container.create_container() if not container.exists() else None
+blob = container.get_blob_client(f&quot;2024/{order_id}.pdf&quot;)
+blob.upload_blob(pdf_bytes, overwrite=True,
+                 content_settings=ContentSettings(content_type=&quot;application/pdf&quot;),
+                 metadata={&quot;orderId&quot;: str(order_id)}, standard_blob_tier=StandardBlobTier.COOL)
+data = blob.download_blob().readall()
+
+for item in container.list_blobs(name_starts_with=&quot;2024/&quot;): print(item.name)
+
+# User-delegation SAS
+now = datetime.now(timezone.utc)
+udk = blobs.get_user_delegation_key(now, now + timedelta(hours=1))
+sas = generate_blob_sas(blobs.account_name, &quot;invoices&quot;, blob.blob_name, user_delegation_key=udk,
+                        permission=BlobSasPermissions(read=True), expiry=now + timedelta(minutes=15))
+url = f&quot;{blob.url}?{sas}&quot;
+
+# Queue
+queue = QueueClient(&quot;https://shopstorage.queue.core.windows.net&quot;, &quot;thumbnails&quot;, credential=cred)
+queue.send_message(json.dumps({&quot;blob&quot;: blob.blob_name}))
+for m in queue.receive_messages(max_messages=10, visibility_timeout=120):
+    if m.dequeue_count &gt; 5: ...          # poison handling is yours
+    process(json.loads(m.content))
+    queue.delete_message(m)
+
+# Table
+table = TableClient(&quot;https://shopstorage.table.core.windows.net&quot;, &quot;audit&quot;, credential=cred)
+table.upsert_entity({&quot;PartitionKey&quot;: &quot;order-42&quot;, &quot;RowKey&quot;: str(datetime.now().timestamp()), &quot;event&quot;: &quot;shipped&quot;})
+for e in table.query_entities(&quot;PartitionKey eq &#x27;order-42&#x27;&quot;): print(e[&quot;event&quot;])</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Storage Queue vs Service Bus (ordering, sessions, topics, dead-lettering, message size, transactions); blob tiers and lifecycle; why SAS + managed identity beats account keys.</p></div></section>
+<section id="service-bus"><h2 id="service-bus">Service Bus</h2><p>Enterprise messaging: <strong>queues</strong> (point-to-point, competing consumers) and <strong>topics/subscriptions</strong> (pub/sub with SQL/correlation filters). Features that justify it over Storage Queues: dead-letter queues, sessions (ordered, stateful streams per key), duplicate detection, scheduled delivery, transactions, auto-forwarding, and up to 100 MB messages on Premium. Peek-lock delivery = at-least-once; make consumers idempotent.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Azure.Messaging.ServiceBus
+var client = new ServiceBusClient(&quot;shop-bus.servicebus.windows.net&quot;, new DefaultAzureCredential());
+
+// Send with metadata; sessions for ordering per customer
+await using var sender = client.CreateSender(&quot;order-placed&quot;);
+await sender.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(evt))
+{
+    MessageId = $&quot;order-{evt.OrderId}&quot;,                 // duplicate detection window (e.g. 10 min)
+    SessionId = evt.CustomerId,                           // ordered per customer (session-enabled entity)
+    Subject = &quot;OrderPlaced&quot;,
+    ApplicationProperties = { [&quot;region&quot;] = &quot;eu&quot;, [&quot;traceparent&quot;] = Activity.Current?.Id },
+    ScheduledEnqueueTime = DateTimeOffset.UtcNow.AddMinutes(5),   // optional delay
+    TimeToLive = TimeSpan.FromDays(1)
+});
+
+// Batch for throughput
+using var batch = await sender.CreateMessageBatchAsync();
+foreach (var e in events) if (!batch.TryAddMessage(new ServiceBusMessage(BinaryData.FromObjectAsJson(e)))) { await sender.SendMessagesAsync(batch); /* new batch */ }
+
+// Processor with peek-lock, concurrency and explicit settlement
+var processor = client.CreateProcessor(&quot;order-placed&quot;, &quot;invoicing&quot;, new ServiceBusProcessorOptions
+{
+    MaxConcurrentCalls = 16, AutoCompleteMessages = false, PrefetchCount = 32,
+    MaxAutoLockRenewalDuration = TimeSpan.FromMinutes(5)
+});
+processor.ProcessMessageAsync += async args =&gt;
+{
+    try
+    {
+        var e = args.Message.Body.ToObjectFromJson&lt;OrderPlaced&gt;();
+        await Handle(e);                                       // idempotent on MessageId
+        await args.CompleteMessageAsync(args.Message);
+    }
+    catch (TransientException) { await args.AbandonMessageAsync(args.Message); }            // redelivered; DeliveryCount++
+    catch (Exception ex) { await args.DeadLetterMessageAsync(args.Message, &quot;ProcessingFailed&quot;, ex.Message); }
+};
+processor.ProcessErrorAsync += args =&gt; { Console.WriteLine(args.Exception); return Task.CompletedTask; };
+await processor.StartProcessingAsync();
+
+// Sessions: one handler owns a session at a time → ordered processing per SessionId
+var sessionProcessor = client.CreateSessionProcessor(&quot;order-placed&quot;, &quot;shipping&quot;, new ServiceBusSessionProcessorOptions { MaxConcurrentSessions = 8 });
+
+// Subscription filters (management): only EU orders
+// await admin.CreateRuleAsync(&quot;order-placed&quot;, &quot;eu-warehouse&quot;, new CreateRuleOptions(&quot;eu&quot;, new SqlRuleFilter(&quot;region = &#x27;eu&#x27;&quot;)));
+
+// Dead-letter inspection
+var dlq = client.CreateReceiver(&quot;order-placed&quot;, &quot;invoicing&quot;, new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter });</code></pre><pre data-lang="python" hidden><code># pip install azure-servicebus azure-identity
+from azure.servicebus.aio import ServiceBusClient
+from azure.servicebus import ServiceBusMessage, ServiceBusSubQueue
+from azure.identity.aio import DefaultAzureCredential
+from datetime import datetime, timedelta, timezone
+import json, asyncio
+
+async def main():
+    async with DefaultAzureCredential() as cred, ServiceBusClient(&quot;shop-bus.servicebus.windows.net&quot;, cred) as client:
+        # Send with sessions, dedupe id, scheduling
+        async with client.get_topic_sender(&quot;order-placed&quot;) as sender:
+            msg = ServiceBusMessage(json.dumps(evt), message_id=f&quot;order-{evt[&#x27;order_id&#x27;]}&quot;, session_id=evt[&quot;customer_id&quot;],
+                                    subject=&quot;OrderPlaced&quot;, application_properties={&quot;region&quot;: &quot;eu&quot;},
+                                    scheduled_enqueue_time_utc=datetime.now(timezone.utc) + timedelta(minutes=5),
+                                    time_to_live=timedelta(days=1))
+            await sender.send_messages(msg)
+
+            # Batch
+            batch = await sender.create_message_batch()
+            for e in events: batch.add_message(ServiceBusMessage(json.dumps(e)))
+            await sender.send_messages(batch)
+
+        # Receive with peek-lock and explicit settlement
+        async with client.get_subscription_receiver(&quot;order-placed&quot;, &quot;invoicing&quot;, prefetch_count=32) as receiver:
+            async for msg in receiver:
+                try:
+                    await handle(json.loads(str(msg)))          # idempotent on msg.message_id
+                    await receiver.complete_message(msg)
+                except TransientError:
+                    await receiver.abandon_message(msg)
+                except Exception as ex:
+                    await receiver.dead_letter_message(msg, reason=&quot;ProcessingFailed&quot;, error_description=str(ex))
+
+        # Sessions: accept the next available session and process it in order
+        async with client.get_subscription_receiver(&quot;order-placed&quot;, &quot;shipping&quot;, session_id=None) as session_receiver:
+            async for msg in session_receiver: ...
+
+        # Dead-letter inspection
+        async with client.get_subscription_receiver(&quot;order-placed&quot;, &quot;invoicing&quot;, sub_queue=ServiceBusSubQueue.DEAD_LETTER) as dlq: ...
+
+asyncio.run(main())</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Peek-lock vs receive-and-delete; what happens when the lock expires mid-processing (redelivery → duplicates); sessions for ordering; when to choose Event Hubs or Event Grid instead.</p></div></section>
+<section id="event-hubs"><h2 id="event-hubs">Event Hubs</h2><p>High-throughput event streaming (Kafka-compatible): millions of events per second into partitions, retained for 1–90 days, read by consumer groups with checkpointed offsets. This is telemetry, click streams, IoT and change data — not commands. Producers pick a partition key for ordering; consumers use the <code>EventProcessorClient</code> with Blob Storage checkpoints so a crashed reader resumes where it left off.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Azure.Messaging.EventHubs + Azure.Messaging.EventHubs.Processor
+var cred = new DefaultAzureCredential();
+
+// Producer: batch by partition key for ordering per device
+await using var producer = new EventHubProducerClient(&quot;shop-hub.servicebus.windows.net&quot;, &quot;telemetry&quot;, cred);
+using var batch = await producer.CreateBatchAsync(new CreateBatchOptions { PartitionKey = deviceId });
+foreach (var reading in readings)
+    if (!batch.TryAdd(new EventData(BinaryData.FromObjectAsJson(reading)) { ContentType = &quot;application/json&quot; }))
+        throw new InvalidOperationException(&quot;event too large for batch&quot;);
+await producer.SendAsync(batch);
+
+// Consumer: processor with checkpoints in Blob Storage, one instance per partition across your replicas
+var checkpoints = new BlobContainerClient(new Uri(&quot;https://shopstorage.blob.core.windows.net/checkpoints&quot;), cred);
+var processor = new EventProcessorClient(checkpoints, &quot;$Default&quot;, &quot;shop-hub.servicebus.windows.net&quot;, &quot;telemetry&quot;, cred);
+
+processor.ProcessEventAsync += async args =&gt;
+{
+    if (args.Data is null) return;
+    var reading = args.Data.EventBody.ToObjectFromJson&lt;Reading&gt;();
+    await Aggregate(reading, args.Partition.PartitionId);
+    if (args.Data.SequenceNumber % 100 == 0)               // checkpoint periodically, not per event
+        await args.UpdateCheckpointAsync(args.CancellationToken);
+};
+processor.ProcessErrorAsync += args =&gt; { Console.WriteLine($&quot;{args.PartitionId}: {args.Exception}&quot;); return Task.CompletedTask; };
+await processor.StartProcessingAsync();
+
+// Kafka clients work too (Confluent.Kafka) with bootstrap server shop-hub.servicebus.windows.net:9093 + SASL/OAUTHBEARER.
+
+// Capture: automatically land events in Blob/ADLS as Avro for batch analytics.
+// Schema Registry: Azure.Data.SchemaRegistry + Avro serializer for typed, versioned payloads.</code></pre><pre data-lang="python" hidden><code># pip install azure-eventhub azure-eventhub-checkpointstoreblob-aio azure-identity
+from azure.eventhub.aio import EventHubProducerClient, EventHubConsumerClient
+from azure.eventhub import EventData
+from azure.eventhub.extensions.checkpointstoreblobaio import BlobCheckpointStore
+from azure.identity.aio import DefaultAzureCredential
+import json, asyncio
+
+async def produce(readings, device_id):
+    async with DefaultAzureCredential() as cred:
+        producer = EventHubProducerClient(&quot;shop-hub.servicebus.windows.net&quot;, &quot;telemetry&quot;, cred)
+        async with producer:
+            batch = await producer.create_batch(partition_key=device_id)
+            for r in readings:
+                batch.add(EventData(json.dumps(r)))
+            await producer.send_batch(batch)
+
+async def consume():
+    async with DefaultAzureCredential() as cred:
+        checkpoints = BlobCheckpointStore(&quot;https://shopstorage.blob.core.windows.net&quot;, &quot;checkpoints&quot;, credential=cred)
+        consumer = EventHubConsumerClient(&quot;shop-hub.servicebus.windows.net&quot;, &quot;telemetry&quot;, &quot;$Default&quot;, cred,
+                                          checkpoint_store=checkpoints)
+
+        async def on_event(partition_context, event):
+            reading = json.loads(event.body_as_str())
+            await aggregate(reading, partition_context.partition_id)
+            if event.sequence_number % 100 == 0:
+                await partition_context.update_checkpoint(event)
+
+        async with consumer:
+            await consumer.receive(on_event=on_event, starting_position=&quot;-1&quot;)   # from the beginning
+
+# Kafka clients: confluent-kafka / aiokafka with bootstrap.servers=shop-hub.servicebus.windows.net:9093</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Event Hubs vs Service Bus (stream + offsets vs queue + settlement); partitions and consumer groups; checkpointing trade-offs (frequency vs reprocessing on crash); throughput units / processing units.</p></div></section>
+<section id="cosmos"><h2 id="cosmos">Cosmos DB</h2><p>Globally distributed, multi-model NoSQL with single-digit-millisecond latency and five consistency levels. The <strong>partition key</strong> is the whole design: choose a high-cardinality key that appears in most queries so reads are single-partition, and keep hot partitions under the 20 GB / 10k RU/s logical limit. Model for the access pattern (embed vs reference), budget in Request Units, and use the change feed for downstream processing.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Microsoft.Azure.Cosmos
+var cosmos = new CosmosClient(&quot;https://shop-cosmos.documents.azure.com:443/&quot;, new DefaultAzureCredential(),
+    new CosmosClientOptions { SerializerOptions = new() { PropertyNamingPolicy = CosmosPropertyNamingPolicy.CamelCase }, ApplicationRegion = Regions.WestEurope });
+var db = (await cosmos.CreateDatabaseIfNotExistsAsync(&quot;shop&quot;)).Database;
+var orders = (await db.CreateContainerIfNotExistsAsync(new ContainerProperties(&quot;orders&quot;, &quot;/customerId&quot;)
+{
+    IndexingPolicy = { IncludedPaths = { new IncludedPath { Path = &quot;/*&quot; } }, ExcludedPaths = { new ExcludedPath { Path = &quot;/lines/*&quot; } } },
+    DefaultTimeToLive = -1
+}, throughput: ThroughputProperties.CreateAutoscaleThroughput(4000))).Container;
+
+public record Order(string id, string customerId, decimal total, string status, List&lt;Line&gt; lines, int? ttl = null);
+
+// Point read: cheapest operation (1 RU per KB) — needs id + partition key
+var order = await orders.ReadItemAsync&lt;Order&gt;(id, new PartitionKey(customerId));
+
+// Create / upsert with optimistic concurrency (ETag)
+var created = await orders.CreateItemAsync(new Order(Guid.NewGuid().ToString(), &quot;c-42&quot;, 99m, &quot;open&quot;, lines), new PartitionKey(&quot;c-42&quot;));
+Console.WriteLine($&quot;{created.RequestCharge} RU&quot;);
+try
+{
+    await orders.ReplaceItemAsync(order.Resource with { status = &quot;shipped&quot; }, id, new PartitionKey(customerId),
+        new ItemRequestOptions { IfMatchEtag = order.ETag });
+}
+catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed) { /* someone else changed it */ }
+
+// Patch (partial update) — avoids read-modify-write
+await orders.PatchItemAsync&lt;Order&gt;(id, new PartitionKey(customerId), new[] { PatchOperation.Set(&quot;/status&quot;, &quot;delivered&quot;) });
+
+// Single-partition query (fast, cheap) vs cross-partition fan-out (expensive)
+var q = new QueryDefinition(&quot;SELECT * FROM o WHERE o.customerId = @c AND o.status = @s&quot;).WithParameter(&quot;@c&quot;, &quot;c-42&quot;).WithParameter(&quot;@s&quot;, &quot;open&quot;);
+using var it = orders.GetItemQueryIterator&lt;Order&gt;(q, requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(&quot;c-42&quot;) });
+while (it.HasMoreResults) foreach (var o in await it.ReadNextAsync()) Console.WriteLine(o.id);
+
+// LINQ
+var open = orders.GetItemLinqQueryable&lt;Order&gt;(requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(&quot;c-42&quot;) })
+                 .Where(o =&gt; o.status == &quot;open&quot;).ToFeedIterator();
+
+// Transactional batch: all-or-nothing within one partition key
+await orders.CreateTransactionalBatch(new PartitionKey(&quot;c-42&quot;)).CreateItem(o1).UpsertItem(o2).ExecuteAsync();
+
+// Change feed → projections, notifications (or the Functions trigger)
+var cf = orders.GetChangeFeedProcessorBuilder&lt;Order&gt;(&quot;projections&quot;, (changes, ct) =&gt; Project(changes))
+               .WithInstanceName(Environment.MachineName).WithLeaseContainer(leases).Build();
+await cf.StartAsync();
+
+// Handle 429 (throttled): SDK retries with backoff (MaxRetryAttemptsOnRateLimitedRequests); watch x-ms-retry-after-ms.</code></pre><pre data-lang="python" hidden><code># pip install azure-cosmos azure-identity
+from azure.cosmos.aio import CosmosClient
+from azure.cosmos import PartitionKey, exceptions
+from azure.identity.aio import DefaultAzureCredential
+import uuid, asyncio
+
+async def main():
+    async with DefaultAzureCredential() as cred, CosmosClient(&quot;https://shop-cosmos.documents.azure.com:443/&quot;, cred) as client:
+        db = await client.create_database_if_not_exists(&quot;shop&quot;)
+        orders = await db.create_container_if_not_exists(
+            id=&quot;orders&quot;, partition_key=PartitionKey(path=&quot;/customerId&quot;),
+            indexing_policy={&quot;includedPaths&quot;: [{&quot;path&quot;: &quot;/*&quot;}], &quot;excludedPaths&quot;: [{&quot;path&quot;: &quot;/lines/*&quot;}]},
+            offer_throughput=4000)    # or ThroughputProperties for autoscale
+
+        # Point read
+        order = await orders.read_item(item=id, partition_key=customer_id)
+        print(orders.client_connection.last_response_headers[&quot;x-ms-request-charge&quot;], &quot;RU&quot;)
+
+        # Create + optimistic concurrency via ETag
+        doc = {&quot;id&quot;: str(uuid.uuid4()), &quot;customerId&quot;: &quot;c-42&quot;, &quot;total&quot;: 99, &quot;status&quot;: &quot;open&quot;, &quot;lines&quot;: []}
+        created = await orders.create_item(doc)
+        try:
+            await orders.replace_item(created[&quot;id&quot;], {**created, &quot;status&quot;: &quot;shipped&quot;},
+                                      etag=created[&quot;_etag&quot;], match_condition=MatchConditions.IfNotModified)
+        except exceptions.CosmosHttpResponseError as ex:
+            if ex.status_code == 412: ...      # changed by someone else
+
+        # Patch
+        await orders.patch_item(item=id, partition_key=customer_id, patch_operations=[{&quot;op&quot;: &quot;set&quot;, &quot;path&quot;: &quot;/status&quot;, &quot;value&quot;: &quot;delivered&quot;}])
+
+        # Single-partition query
+        async for o in orders.query_items(
+            &quot;SELECT * FROM o WHERE o.customerId = @c AND o.status = @s&quot;,
+            parameters=[{&quot;name&quot;: &quot;@c&quot;, &quot;value&quot;: &quot;c-42&quot;}, {&quot;name&quot;: &quot;@s&quot;, &quot;value&quot;: &quot;open&quot;}],
+            partition_key=&quot;c-42&quot;):
+            print(o[&quot;id&quot;])
+
+        # Transactional batch (SDK ≥ 4.7)
+        await orders.execute_item_batch([(&quot;create&quot;, (o1,)), (&quot;upsert&quot;, (o2,))], partition_key=&quot;c-42&quot;)
+
+        # Change feed
+        async for change in orders.query_items_change_feed(is_start_from_beginning=True, partition_key=&quot;c-42&quot;):
+            ...
+
+asyncio.run(main())
+# 429s: the SDK retries; tune retry_total / retry_backoff_max on the client.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Partition key selection (cardinality, query alignment, write distribution); embed vs reference; RU cost of point read vs query vs cross-partition; consistency levels (strong → eventual) and what “session” actually guarantees; when Cosmos is the wrong choice (relational joins, ad-hoc analytics).</p></div></section>
+<section id="azure-sql"><h2 id="azure-sql">Azure SQL Database</h2><p>Managed SQL Server: automatic backups with point-in-time restore, geo-replication and failover groups, elastic pools for many small databases, serverless tier that pauses, Hyperscale for very large DBs. Connect with Entra ID authentication and managed identity — no passwords in config. Expect transient errors during platform maintenance: enable connection resiliency (EF <code>EnableRetryOnFailure</code>, <code>SqlClient</code> retry logic).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Connection string with managed identity — no password anywhere
+// &quot;Server=tcp:shop-sql.database.windows.net,1433;Database=shop;Authentication=Active Directory Default;Encrypt=True;&quot;
+builder.Services.AddDbContext&lt;AppDb&gt;(o =&gt; o.UseSqlServer(cs, sql =&gt;
+{
+    sql.EnableRetryOnFailure(maxRetryCount: 5, maxRetryDelay: TimeSpan.FromSeconds(10), errorNumbersToAdd: null);
+    sql.CommandTimeout(30);
+}));
+
+// Raw SqlClient with built-in retry logic (Microsoft.Data.SqlClient 3+)
+var options = new SqlRetryLogicOption { NumberOfTries = 5, DeltaTime = TimeSpan.FromSeconds(1), MaxTimeInterval = TimeSpan.FromSeconds(20) };
+await using var conn = new SqlConnection(cs) { RetryLogicProvider = SqlConfigurableRetryFactory.CreateExponentialRetryProvider(options) };
+await conn.OpenAsync();
+
+// Grant the app&#x27;s managed identity access (run once as an Entra admin on the database):
+//   CREATE USER [shop-api] FROM EXTERNAL PROVIDER;
+//   ALTER ROLE db_datareader ADD MEMBER [shop-api];
+//   ALTER ROLE db_datawriter ADD MEMBER [shop-api];
+
+// Failover groups: use the listener endpoint so failover is transparent
+//   Server=tcp:shop-fog.database.windows.net   (read-write)    shop-fog.secondary.database.windows.net (read-only)
+// Route reporting queries to the secondary:  ApplicationIntent=ReadOnly in the connection string.
+
+// Performance: Query Store + automatic tuning (CREATE INDEX / FORCE PLAN), sys.dm_db_resource_stats for DTU/vCore usage.
+// Hot paths: parameterised queries (plan cache), covering indexes, avoid SELECT *, batch inserts with TVPs / SqlBulkCopy.</code></pre><pre data-lang="python" hidden><code># pip install &quot;sqlalchemy&quot; pyodbc azure-identity   (ODBC Driver 18 installed on the host/container)
+from sqlalchemy import create_engine, event
+from azure.identity import DefaultAzureCredential
+import struct
+
+# Option 1: ODBC driver does the Entra auth (works on App Service / Container Apps with managed identity)
+cs = (&quot;mssql+pyodbc://@shop-sql.database.windows.net:1433/shop&quot;
+      &quot;?driver=ODBC+Driver+18+for+SQL+Server&amp;Authentication=ActiveDirectoryMsi&amp;Encrypt=yes&quot;)
+engine = create_engine(cs, pool_pre_ping=True, pool_recycle=1800)   # pre_ping survives platform failovers
+
+# Option 2: inject a token yourself (works everywhere DefaultAzureCredential does)
+cred = DefaultAzureCredential()
+SQL_COPT_SS_ACCESS_TOKEN = 1256
+@event.listens_for(engine, &quot;do_connect&quot;)
+def provide_token(dialect, conn_rec, cargs, cparams):
+    token = cred.get_token(&quot;https://database.windows.net/.default&quot;).token.encode(&quot;utf-16-le&quot;)
+    cparams[&quot;attrs_before&quot;] = {SQL_COPT_SS_ACCESS_TOKEN: struct.pack(f&quot;&lt;I{len(token)}s&quot;, len(token), token)}
+
+# Transient-error retries: wrap units of work with tenacity on OperationalError (see EF page),
+# and keep transactions short so retries are safe.
+
+# Read scale-out: a second engine with ApplicationIntent=ReadOnly against the failover-group listener.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>DTU vs vCore, elastic pools, serverless auto-pause; failover groups vs geo-replication; why transient faults happen and how the app should react; Entra auth + managed identity instead of SQL logins.</p></div></section>
+<section id="key-vault"><h2 id="key-vault">Key Vault</h2><p>Central store for <strong>secrets</strong> (connection strings, API keys), <strong>keys</strong> (encryption, signing — the key never leaves the HSM) and <strong>certificates</strong> (with auto-renewal). Access via RBAC and managed identity; every access is audited. Reference secrets from App Service settings, load them into <code>IConfiguration</code> at startup, and cache — Key Vault is not built for per-request reads.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Azure.Security.KeyVault.Secrets / Keys / Certificates
+var cred = new DefaultAzureCredential();
+var vault = new Uri(&quot;https://shop-kv.vault.azure.net/&quot;);
+
+// Load all secrets into configuration at startup (secret &quot;ConnectionStrings--Default&quot; → &quot;ConnectionStrings:Default&quot;)
+builder.Configuration.AddAzureKeyVault(vault, cred, new AzureKeyVaultConfigurationOptions { ReloadInterval = TimeSpan.FromMinutes(30) });
+
+// Read one secret on demand (cache it!)
+var secrets = new SecretClient(vault, cred);
+KeyVaultSecret s = await secrets.GetSecretAsync(&quot;StripeApiKey&quot;);
+string apiKey = s.Value;
+
+// Set / rotate
+await secrets.SetSecretAsync(&quot;StripeApiKey&quot;, newKey);
+await foreach (var v in secrets.GetPropertiesOfSecretVersionsAsync(&quot;StripeApiKey&quot;)) Console.WriteLine($&quot;{v.Version} {v.CreatedOn}&quot;);
+
+// Keys: encrypt/sign without ever seeing the key material
+var keys = new KeyClient(vault, cred);
+var key = await keys.GetKeyAsync(&quot;data-key&quot;);
+var crypto = new CryptographyClient(key.Value.Id, cred);
+EncryptResult enc = await crypto.EncryptAsync(EncryptionAlgorithm.RsaOaep256, plaintext);
+SignResult sig = await crypto.SignDataAsync(SignatureAlgorithm.RS256, payload);
+
+// Certificates: get the private key as X509 for Kestrel / client auth
+var certs = new CertificateClient(vault, cred);
+var pfx = await secrets.GetSecretAsync(&quot;api-tls&quot;);                     // certificate&#x27;s secret form = PFX
+var x509 = new X509Certificate2(Convert.FromBase64String(pfx.Value.Value));
+
+// RBAC (az cli):  az role assignment create --assignee &lt;principalId&gt; --role &quot;Key Vault Secrets User&quot; --scope &lt;vaultResourceId&gt;
+// App Service reference:  @Microsoft.KeyVault(VaultName=shop-kv;SecretName=StripeApiKey)
+// Rate limits: ~2000 ops/10s per vault — cache secrets, don&#x27;t read per request.</code></pre><pre data-lang="python" hidden><code># pip install azure-keyvault-secrets azure-keyvault-keys azure-keyvault-certificates azure-identity
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
+from azure.keyvault.keys import KeyClient
+from azure.keyvault.keys.crypto import CryptographyClient, EncryptionAlgorithm, SignatureAlgorithm
+from functools import lru_cache
+import base64
+
+cred = DefaultAzureCredential()
+vault = &quot;https://shop-kv.vault.azure.net/&quot;
+secrets = SecretClient(vault, cred)
+
+@lru_cache(maxsize=64)                                  # cache — Key Vault is rate-limited
+def secret(name: str) -&gt; str:
+    return secrets.get_secret(name).value
+
+api_key = secret(&quot;StripeApiKey&quot;)
+
+# Set / rotate / list versions
+secrets.set_secret(&quot;StripeApiKey&quot;, new_key)
+for v in secrets.list_properties_of_secret_versions(&quot;StripeApiKey&quot;): print(v.version, v.created_on)
+
+# Keys: crypto operations inside the vault/HSM
+keys = KeyClient(vault, cred)
+key = keys.get_key(&quot;data-key&quot;)
+crypto = CryptographyClient(key, cred)
+enc = crypto.encrypt(EncryptionAlgorithm.rsa_oaep_256, plaintext)
+sig = crypto.sign(SignatureAlgorithm.rs256, digest)
+
+# Certificate with private key (secret form = PFX)
+pfx_bytes = base64.b64decode(secrets.get_secret(&quot;api-tls&quot;).value)
+
+# Load into settings at startup (pydantic-settings custom source) rather than reading per request.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Secrets vs keys vs certificates; managed identity + RBAC over access policies; caching and rate limits; how App Service Key Vault references work; soft-delete and purge protection for compliance.</p></div></section>
+<section id="managed-identity"><h2 id="managed-identity">Managed Identity and DefaultAzureCredential</h2><p>A managed identity is an Entra ID identity that Azure manages for a resource (system-assigned: tied to one resource; user-assigned: shared, survives resource deletion). Grant it RBAC roles, and the SDKs get tokens from the platform's IMDS endpoint — no secrets in config, nothing to rotate. <code>DefaultAzureCredential</code> tries environment → workload identity → managed identity → Azure CLI/VS/PowerShell, so the same code works locally and deployed.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Azure.Identity
+// Local dev: `az login` (or Visual Studio sign-in) → DefaultAzureCredential uses your account.
+// Deployed: managed identity is picked up automatically.
+var cred = new DefaultAzureCredential(new DefaultAzureCredentialOptions
+{
+    ManagedIdentityClientId = builder.Configuration[&quot;AZURE_CLIENT_ID&quot;],   // set for user-assigned identity
+    ExcludeInteractiveBrowserCredential = true
+});
+
+// Register once, share everywhere
+builder.Services.AddSingleton&lt;TokenCredential&gt;(cred);
+builder.Services.AddAzureClients(c =&gt;
+{
+    c.UseCredential(cred);
+    c.AddBlobServiceClient(new Uri(&quot;https://shopstorage.blob.core.windows.net&quot;));
+    c.AddServiceBusClientWithNamespace(&quot;shop-bus.servicebus.windows.net&quot;);
+    c.AddSecretClient(new Uri(&quot;https://shop-kv.vault.azure.net/&quot;));
+});
+
+// Calling YOUR OWN API with a managed identity (app role on the API&#x27;s app registration)
+var token = await cred.GetTokenAsync(new TokenRequestContext(new[] { &quot;api://orders/.default&quot; }));
+http.DefaultRequestHeaders.Authorization = new(&quot;Bearer&quot;, token.Token);
+
+// Faster startup in production: skip the dev credentials
+TokenCredential prod = new ChainedTokenCredential(new ManagedIdentityCredential(clientId), new AzureCliCredential());
+
+// Infra (az cli)
+//   az webapp identity assign -g rg-shop -n shop-api                              # system-assigned
+//   az identity create -g rg-shop -n id-shop; az webapp identity assign ... --identities &lt;id-resource-id&gt;   # user-assigned
+//   az role assignment create --assignee &lt;principalId&gt; --role &quot;Storage Blob Data Contributor&quot; --scope &lt;storageId&gt;
+//   az role assignment create --assignee &lt;principalId&gt; --role &quot;Azure Service Bus Data Sender&quot; --scope &lt;namespaceId&gt;
+// AKS: Workload Identity federates a Kubernetes service account to a user-assigned identity.</code></pre><pre data-lang="python" hidden><code># pip install azure-identity
+import os
+from azure.identity import DefaultAzureCredential, ManagedIdentityCredential, AzureCliCredential, ChainedTokenCredential
+
+# Same code locally (az login) and in Azure (managed identity)
+cred = DefaultAzureCredential(
+    managed_identity_client_id=os.getenv(&quot;AZURE_CLIENT_ID&quot;),   # user-assigned identity
+    exclude_interactive_browser_credential=True,
+)
+
+# Share one credential across clients
+from azure.storage.blob import BlobServiceClient
+from azure.servicebus import ServiceBusClient
+from azure.keyvault.secrets import SecretClient
+blobs = BlobServiceClient(&quot;https://shopstorage.blob.core.windows.net&quot;, credential=cred)
+bus = ServiceBusClient(&quot;shop-bus.servicebus.windows.net&quot;, credential=cred)
+secrets = SecretClient(&quot;https://shop-kv.vault.azure.net/&quot;, credential=cred)
+
+# Calling your own API
+token = cred.get_token(&quot;api://orders/.default&quot;).token
+headers = {&quot;Authorization&quot;: f&quot;Bearer {token}&quot;}
+
+# Production-only chain (faster startup, no dev fallbacks except CLI)
+prod = ChainedTokenCredential(ManagedIdentityCredential(client_id=os.getenv(&quot;AZURE_CLIENT_ID&quot;)), AzureCliCredential())
+
+# Async variants live in azure.identity.aio and must be closed:  async with DefaultAzureCredential() as cred: ...</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>System- vs user-assigned; how the token is obtained (IMDS at 169.254.169.254 — which is why SSRF protection matters); RBAC data-plane roles vs control-plane roles; what to do when a service does not support managed identity (Key Vault reference for the secret).</p></div></section>
+<section id="app-insights"><h2 id="app-insights">Application Insights and Azure Monitor</h2><p>Application Insights collects requests, dependencies, exceptions, traces, custom events/metrics and live metrics, and correlates them across services (application map, end-to-end transaction view). It sits on Log Analytics, queried with <strong>KQL</strong>. In .NET 8+ the recommended path is the OpenTelemetry-based <code>Azure.Monitor.OpenTelemetry.AspNetCore</code> distro; the classic SDK still works. Sample in production to control cost.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Azure.Monitor.OpenTelemetry.AspNetCore (OTel distro) — reads APPLICATIONINSIGHTS_CONNECTION_STRING
+builder.Services.AddOpenTelemetry().UseAzureMonitor(o =&gt; o.SamplingRatio = 0.2f);   // 20% of traces
+builder.Services.ConfigureOpenTelemetryTracerProvider(t =&gt; t.AddSource(&quot;Shop.Orders&quot;));
+builder.Services.ConfigureOpenTelemetryMeterProvider(m =&gt; m.AddMeter(&quot;Shop.Orders&quot;));
+
+// Classic SDK alternative
+// builder.Services.AddApplicationInsightsTelemetry();
+// public class OrderService(TelemetryClient telemetry) { telemetry.TrackEvent(&quot;OrderPlaced&quot;, new Dictionary&lt;string,string&gt;{[&quot;channel&quot;]=&quot;web&quot;}); }
+
+// Custom telemetry through standard .NET APIs (flows to App Insights via OTel)
+private static readonly ActivitySource Source = new(&quot;Shop.Orders&quot;);
+private static readonly Meter Meter = new(&quot;Shop.Orders&quot;);
+private static readonly Counter&lt;long&gt; Placed = Meter.CreateCounter&lt;long&gt;(&quot;orders.placed&quot;);
+
+public async Task Place(Order o)
+{
+    using var span = Source.StartActivity(&quot;PlaceOrder&quot;);          // → dependency/request in App Insights
+    span?.SetTag(&quot;order.channel&quot;, o.Channel);
+    Placed.Add(1, new KeyValuePair&lt;string, object?&gt;(&quot;channel&quot;, o.Channel));   // → customMetrics
+    log.LogInformation(&quot;Order {OrderId} placed&quot;, o.Id);                       // → traces with OrderId dimension
+}
+
+// Enrich every request with user/tenant (ITelemetryInitializer in classic SDK, or a processor in OTel)
+// Drop noisy telemetry: health checks, static files → t.AddAspNetCoreInstrumentation(o =&gt; o.Filter = ctx =&gt; !ctx.Request.Path.StartsWithSegments(&quot;/health&quot;))
+
+/* KQL you will actually run
+requests | where timestamp &gt; ago(1h) | summarize p50=percentile(duration,50), p99=percentile(duration,99), count() by name | order by p99 desc
+exceptions | where timestamp &gt; ago(24h) | summarize count() by problemId, outerMessage | top 20 by count_
+dependencies | where success == false | summarize count() by target, resultCode
+traces | where customDimensions.OrderId == &quot;42&quot; | order by timestamp asc
+*/
+// Alerts: failed requests %, P99 latency, exception rate, availability tests (ping /health/ready from 5 regions).</code></pre><pre data-lang="python" hidden><code># pip install azure-monitor-opentelemetry
+from azure.monitor.opentelemetry import configure_azure_monitor
+from opentelemetry import trace, metrics
+from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
+import logging
+
+configure_azure_monitor(                       # reads APPLICATIONINSIGHTS_CONNECTION_STRING
+    logger_name=&quot;shop&quot;,                        # forwards this logger&#x27;s records as traces
+    sampling_ratio=0.2,
+    instrumentation_options={&quot;fastapi&quot;: {&quot;enabled&quot;: True}, &quot;httpx&quot;: {&quot;enabled&quot;: True}, &quot;sqlalchemy&quot;: {&quot;enabled&quot;: True}},
+)
+
+tracer = trace.get_tracer(&quot;shop.orders&quot;)
+meter = metrics.get_meter(&quot;shop.orders&quot;)
+placed = meter.create_counter(&quot;orders.placed&quot;)
+log = logging.getLogger(&quot;shop&quot;)
+
+async def place(order):
+    with tracer.start_as_current_span(&quot;PlaceOrder&quot;) as span:      # → request/dependency
+        span.set_attribute(&quot;order.channel&quot;, order.channel)
+        placed.add(1, {&quot;channel&quot;: order.channel})                 # → customMetrics
+        log.info(&quot;Order %s placed&quot;, order.id, extra={&quot;OrderId&quot;: order.id})   # → traces with dimension
+
+# Same KQL queries apply — the tables (requests, dependencies, exceptions, traces, customMetrics) are shared.
+# Live Metrics and the application map work the same for Python services.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Distributed correlation (operation_Id / traceparent); sampling and its effect on counts (itemCount); which table each signal lands in; how you'd set up an SLO alert; cost controls (sampling, daily cap, retention).</p></div></section>
+<section id="aks-container-apps"><h2 id="aks-container-apps">AKS and Azure Container Apps</h2><p>Two ways to run containers. <strong>Azure Container Apps</strong>: serverless containers on managed Kubernetes you never see — revisions, traffic splitting, KEDA scale-to-zero on HTTP/queue depth, Dapr sidecars. <strong>AKS</strong>: full Kubernetes when you need custom networking, operators, GPU nodes, or the whole ecosystem. Default to Container Apps for microservices; go to AKS when you hit its limits.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># ---- Azure Container Apps ----
+az containerapp env create -g rg-shop -n env-shop -l westeurope
+az acr build -r shopacr -t orders-api:1.0.0 .                                  # build in the cloud
+
+az containerapp create -g rg-shop -n orders-api --environment env-shop \
+  --image shopacr.azurecr.io/orders-api:1.0.0 --registry-server shopacr.azurecr.io --registry-identity system \
+  --target-port 8080 --ingress external --min-replicas 0 --max-replicas 10 \
+  --system-assigned \
+  --env-vars ASPNETCORE_ENVIRONMENT=Production ServiceBus__Namespace=shop-bus.servicebus.windows.net \
+  --scale-rule-name http --scale-rule-type http --scale-rule-http-concurrency 50
+
+# Scale a worker on Service Bus queue length (KEDA)
+az containerapp create -g rg-shop -n invoice-worker --environment env-shop --image shopacr.azurecr.io/invoice-worker:1.0.0 \
+  --min-replicas 0 --max-replicas 20 \
+  --scale-rule-name sb --scale-rule-type azure-servicebus \
+  --scale-rule-metadata queueName=order-placed namespace=shop-bus messageCount=100 \
+  --scale-rule-identity system
+
+# Blue/green: new revision gets 10% of traffic
+az containerapp update -g rg-shop -n orders-api --image shopacr.azurecr.io/orders-api:1.1.0 --revision-suffix v110
+az containerapp ingress traffic set -g rg-shop -n orders-api --revision-weight orders-api--v100=90 orders-api--v110=10
+
+# ---- AKS ----
+az aks create -g rg-shop -n aks-shop --node-count 3 --enable-managed-identity --enable-oidc-issuer --enable-workload-identity --attach-acr shopacr
+az aks get-credentials -g rg-shop -n aks-shop
+kubectl apply -f k8s/
+kubectl rollout status deployment/orders-api</code></pre><pre data-lang="yaml" hidden><code># k8s/orders-api.yaml — the same app on AKS
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: orders-api }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: orders-api } }
+  template:
+    metadata:
+      labels: { app: orders-api, azure.workload.identity/use: &quot;true&quot; }
+    spec:
+      serviceAccountName: orders-api            # federated to a user-assigned identity (Workload Identity)
+      containers:
+        - name: api
+          image: shopacr.azurecr.io/orders-api:1.0.0
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: ASPNETCORE_ENVIRONMENT, value: Production }
+            - { name: ConnectionStrings__Default, valueFrom: { secretKeyRef: { name: sql, key: connection } } }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits:   { cpu: &quot;1&quot;,  memory: 512Mi }     # .NET GC reads the cgroup limit
+          readinessProbe: { httpGet: { path: /health/ready, port: 8080 }, periodSeconds: 5 }
+          livenessProbe:  { httpGet: { path: /health/live,  port: 8080 }, periodSeconds: 10 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: orders-api }
+spec: { selector: { app: orders-api }, ports: [{ port: 80, targetPort: 8080 }] }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: orders-api }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: orders-api }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics: [{ type: Resource, resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } } }]</code></pre><pre data-lang="python" hidden><code># The FastAPI container deploys identically — only the image and port change.
+# Things to get right inside the container:
+
+# 1) Bind to 0.0.0.0 and honour the PORT / target-port
+#    CMD [&quot;uvicorn&quot;, &quot;main:app&quot;, &quot;--host&quot;, &quot;0.0.0.0&quot;, &quot;--port&quot;, &quot;8080&quot;, &quot;--workers&quot;, &quot;2&quot;]
+
+# 2) Graceful shutdown: uvicorn handles SIGTERM; finish in-flight requests, close clients in lifespan
+from contextlib import asynccontextmanager
+@asynccontextmanager
+async def lifespan(app):
+    app.state.http = httpx.AsyncClient()
+    yield
+    await app.state.http.aclose()
+
+# 3) Readiness/liveness endpoints (see Microservices page)
+
+# 4) Workload identity on AKS / system identity on Container Apps → DefaultAzureCredential just works
+#    (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE are injected on AKS)
+
+# 5) KEDA scaling for a Python worker on Service Bus queue depth is the same CLI as above.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>When Container Apps is enough vs when you need AKS; how KEDA scales on queue depth; revisions and traffic splitting; resource requests/limits and how the .NET GC reacts to cgroup limits; Workload Identity vs pod-managed identity.</p></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/dotnet/azure/sdk/azure-sdk-for-dotnet" target="_blank" rel="noopener">Azure SDK for .NET</a></li><li><a href="https://learn.microsoft.com/azure/developer/python/sdk/azure-sdk-overview" target="_blank" rel="noopener">Azure SDK for Python</a></li><li><a href="https://learn.microsoft.com/azure/architecture/" target="_blank" rel="noopener">Azure Architecture Center</a> — reference architectures + decision trees</li><li><a href="https://learn.microsoft.com/azure/architecture/guide/technology-choices/compute-decision-tree" target="_blank" rel="noopener">Choose an Azure compute service</a></li><li><a href="https://learn.microsoft.com/azure/service-bus-messaging/compare-messaging-services" target="_blank" rel="noopener">Choose a messaging service</a> — Service Bus vs Event Hubs vs Event Grid vs Storage Queues</li><li><a href="https://learn.microsoft.com/azure/cosmos-db/nosql/model-partition-example" target="_blank" rel="noopener">Cosmos DB modeling and partitioning</a></li><li><a href="https://learn.microsoft.com/cli/azure/" target="_blank" rel="noopener">Azure CLI reference</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

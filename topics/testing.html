@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testing (essentials) — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="testing">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 7 of 13</div>
+  <h1>Testing (essentials)</h1>
+  <p class="lede">Enough testing to be credible in an interview and productive on a team: the xUnit shape, how to isolate with mocks, readable assertions, and one integration test that boots the real API in memory. pytest equivalents on every sample.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#xunit-basics">xUnit basics and Arrange-Act-Assert</a></li><li><a href="#theory">Data-driven tests: [Theory], [InlineData], [MemberData]</a></li><li><a href="#moq">Isolating with Moq</a></li><li><a href="#fluent-assertions">Readable assertions with FluentAssertions</a></li><li><a href="#integration">One integration test with WebApplicationFactory</a></li></ol>
+  </div>
+
+<section id="xunit-basics"><h2 id="xunit-basics">xUnit basics and Arrange-Act-Assert</h2><p>A test class per unit, a <code>[Fact]</code> per behaviour, named so a failure reads like a sentence. Structure every test as Arrange / Act / Assert. xUnit creates a new instance of the class per test, so the constructor is your setup and <code>IDisposable</code> is teardown.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code>dotnet new xunit -n Shop.Tests
+dotnet add Shop.Tests reference Shop
+dotnet add Shop.Tests package FluentAssertions
+dotnet add Shop.Tests package Moq
+dotnet test --filter &quot;FullyQualifiedName~CartTests&quot;</code></pre><pre data-lang="csharp" hidden><code>public class CartTests : IDisposable
+{
+    private readonly Cart _cart = new();          // fresh per test (constructor = setup)
+
+    [Fact]
+    public void Add_SameSkuTwice_MergesIntoOneLine()
+    {
+        // Arrange
+        var sku = &quot;A1&quot;;
+
+        // Act
+        _cart.Add(sku, qty: 1);
+        _cart.Add(sku, qty: 2);
+
+        // Assert
+        Assert.Single(_cart.Lines);
+        Assert.Equal(3, _cart.Lines[0].Qty);
+    }
+
+    [Fact]
+    public void Add_ZeroQty_Throws()
+    {
+        var ex = Assert.Throws&lt;ArgumentOutOfRangeException&gt;(() =&gt; _cart.Add(&quot;A1&quot;, 0));
+        Assert.Equal(&quot;qty&quot;, ex.ParamName);
+    }
+
+    [Fact]
+    public async Task Checkout_EmptyCart_ReturnsFailure()
+    {
+        var result = await _cart.CheckoutAsync();
+        Assert.False(result.Ok);
+    }
+
+    public void Dispose() { /* teardown */ }
+}
+
+// Shared expensive setup across tests in a class: IClassFixture&lt;T&gt;
+public class DbFixture : IAsyncLifetime { public AppDb Db = null!; public Task InitializeAsync() { ...; return Task.CompletedTask; } public Task DisposeAsync() =&gt; Task.CompletedTask; }
+public class RepoTests(DbFixture fx) : IClassFixture&lt;DbFixture&gt; { }</code></pre><pre data-lang="python" hidden><code># pip install pytest pytest-asyncio
+# tests/test_cart.py — run with: pytest -k cart
+import pytest
+from shop.cart import Cart
+
+@pytest.fixture
+def cart():                              # fresh per test (fixture = setup; yield = teardown)
+    c = Cart()
+    yield c
+    # teardown here
+
+def test_add_same_sku_twice_merges_into_one_line(cart):
+    # Arrange
+    sku = &quot;A1&quot;
+    # Act
+    cart.add(sku, qty=1)
+    cart.add(sku, qty=2)
+    # Assert
+    assert len(cart.lines) == 1
+    assert cart.lines[0].qty == 3
+
+def test_add_zero_qty_raises(cart):
+    with pytest.raises(ValueError, match=&quot;qty&quot;):
+        cart.add(&quot;A1&quot;, 0)
+
+@pytest.mark.asyncio
+async def test_checkout_empty_cart_returns_failure(cart):
+    result = await cart.checkout()
+    assert not result.ok
+
+# Shared expensive setup: scope=&quot;module&quot; / &quot;session&quot;
+@pytest.fixture(scope=&quot;module&quot;)
+def db():
+    engine = create_engine(&quot;sqlite://&quot;); Base.metadata.create_all(engine)
+    yield engine</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write tests for a <code>Money</code> type: addition, different currencies throw, equality. Name each test as a sentence.</li></ul></div></section>
+<section id="theory"><h2 id="theory">Data-driven tests: [Theory], [InlineData], [MemberData]</h2><p>One test body, many inputs. <code>[InlineData]</code> for literals, <code>[MemberData]</code>/<code>[ClassData]</code> for objects. Each case shows up as its own test in the runner. pytest's <code>@pytest.mark.parametrize</code> is identical.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class PasswordPolicyTests
+{
+    [Theory]
+    [InlineData(&quot;short&quot;, false)]
+    [InlineData(&quot;longenoughbutnodigits&quot;, false)]
+    [InlineData(&quot;correct-horse-battery-9&quot;, true)]
+    public void IsStrong_ReturnsExpected(string password, bool expected)
+    {
+        Assert.Equal(expected, PasswordPolicy.IsStrong(password));
+    }
+
+    public static IEnumerable&lt;object[]&gt; Discounts =&gt; new[]
+    {
+        new object[] { new Order(Total: 10m), 10m },
+        new object[] { new Order(Total: 100m), 90m },
+    };
+
+    [Theory, MemberData(nameof(Discounts))]
+    public void Price_AppliesDiscountOver50(Order order, decimal expected)
+    {
+        Assert.Equal(expected, Pricing.Price(order));
+    }
+}</code></pre><pre data-lang="python" hidden><code>import pytest
+from shop.security import is_strong
+from shop.pricing import price, Order
+
+@pytest.mark.parametrize(&quot;password, expected&quot;, [
+    (&quot;short&quot;, False),
+    (&quot;longenoughbutnodigits&quot;, False),
+    (&quot;correct-horse-battery-9&quot;, True),
+])
+def test_is_strong_returns_expected(password, expected):
+    assert is_strong(password) == expected
+
+@pytest.mark.parametrize(&quot;order, expected&quot;, [
+    (Order(total=10), 10),
+    (Order(total=100), 90),
+], ids=[&quot;under-50&quot;, &quot;over-50&quot;])
+def test_price_applies_discount_over_50(order, expected):
+    assert price(order) == expected</code></pre></div></section>
+<section id="moq"><h2 id="moq">Isolating with Moq</h2><p>Mock the interfaces around the unit so the test runs fast and deterministically. Set up return values, verify calls, and — importantly — do not over-verify; assert outcomes, not implementation details. Python's <code>unittest.mock</code> is built in.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class OrderServiceTests
+{
+    private readonly Mock&lt;IOrderRepo&gt; _repo = new();
+    private readonly Mock&lt;IEmailSender&gt; _email = new();
+    private readonly Mock&lt;IClock&gt; _clock = new();
+    private readonly OrderService _sut;
+
+    public OrderServiceTests()
+    {
+        _clock.Setup(c =&gt; c.UtcNow).Returns(new DateTime(2024, 1, 1));
+        _sut = new OrderService(_repo.Object, _email.Object, _clock.Object);
+    }
+
+    [Fact]
+    public async Task Place_ValidOrder_SavesAndEmails()
+    {
+        _repo.Setup(r =&gt; r.Add(It.IsAny&lt;Order&gt;())).ReturnsAsync(42);
+
+        var id = await _sut.Place(new OrderDto(&quot;A1&quot;, 2, &quot;a@x.com&quot;));
+
+        Assert.Equal(42, id);
+        _repo.Verify(r =&gt; r.Add(It.Is&lt;Order&gt;(o =&gt; o.Sku == &quot;A1&quot; &amp;&amp; o.Created == new DateTime(2024, 1, 1))), Times.Once);
+        _email.Verify(e =&gt; e.Send(&quot;a@x.com&quot;, It.IsAny&lt;string&gt;(), It.IsAny&lt;string&gt;()), Times.Once);
+    }
+
+    [Fact]
+    public async Task Place_WhenRepoThrows_DoesNotEmail()
+    {
+        _repo.Setup(r =&gt; r.Add(It.IsAny&lt;Order&gt;())).ThrowsAsync(new DbException(&quot;down&quot;));
+
+        await Assert.ThrowsAsync&lt;DbException&gt;(() =&gt; _sut.Place(new OrderDto(&quot;A1&quot;, 2, &quot;a@x.com&quot;)));
+
+        _email.VerifyNoOtherCalls();
+    }
+}
+// Alternatives: NSubstitute (terser syntax), hand-written fakes for simple interfaces</code></pre><pre data-lang="python" hidden><code>from unittest.mock import Mock, AsyncMock, ANY
+from datetime import datetime
+import pytest
+from shop.orders import OrderService, OrderDto, Order
+
+@pytest.fixture
+def deps():
+    repo = Mock(); repo.add = AsyncMock(return_value=42)
+    email = Mock(); email.send = AsyncMock()
+    clock = Mock(); clock.utc_now.return_value = datetime(2024, 1, 1)
+    return repo, email, clock
+
+@pytest.mark.asyncio
+async def test_place_valid_order_saves_and_emails(deps):
+    repo, email, clock = deps
+    sut = OrderService(repo, email, clock)
+
+    id = await sut.place(OrderDto(&quot;A1&quot;, 2, &quot;a@x.com&quot;))
+
+    assert id == 42
+    repo.add.assert_awaited_once()
+    order = repo.add.await_args.args[0]
+    assert order.sku == &quot;A1&quot; and order.created == datetime(2024, 1, 1)
+    email.send.assert_awaited_once_with(&quot;a@x.com&quot;, ANY, ANY)
+
+@pytest.mark.asyncio
+async def test_place_when_repo_raises_does_not_email(deps):
+    repo, email, clock = deps
+    repo.add.side_effect = RuntimeError(&quot;down&quot;)
+    sut = OrderService(repo, email, clock)
+
+    with pytest.raises(RuntimeError):
+        await sut.place(OrderDto(&quot;A1&quot;, 2, &quot;a@x.com&quot;))
+
+    email.send.assert_not_awaited()
+
+# patch() for module-level dependencies:  with patch(&quot;shop.orders.now&quot;) as now: ...</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Mocks vs stubs vs fakes; why you inject <code>IClock</code>/<code>TimeProvider</code> instead of calling <code>DateTime.UtcNow</code>; why mocking <code>DbContext</code> is a bad idea (use SQLite in-memory or Testcontainers).</p></div></section>
+<section id="fluent-assertions"><h2 id="fluent-assertions">Readable assertions with FluentAssertions</h2><p>FluentAssertions turns <code>Assert.Equal(expected, actual)</code> into <code>actual.Should().Be(expected)</code> with far better failure messages, especially for collections and object graphs. pytest already rewrites <code>assert</code> to show detailed diffs.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>using FluentAssertions;
+
+result.Should().NotBeNull();
+result.Total.Should().Be(30m).And.BePositive();
+result.Lines.Should().HaveCount(2).And.OnlyContain(l =&gt; l.Qty &gt; 0);
+result.Lines.Select(l =&gt; l.Sku).Should().BeEquivalentTo(new[] { &quot;A1&quot;, &quot;B2&quot; });   // order-insensitive
+result.Should().BeEquivalentTo(expectedDto, o =&gt; o.Excluding(x =&gt; x.Created));  // deep structural compare
+name.Should().StartWith(&quot;Ord&quot;).And.HaveLength(8);
+
+Func&lt;Task&gt; act = () =&gt; service.Place(badOrder);
+await act.Should().ThrowAsync&lt;ValidationException&gt;().WithMessage(&quot;*qty*&quot;);
+
+// Events
+using var monitor = ticker.Monitor();
+ticker.Price = 120;
+monitor.Should().Raise(&quot;PriceChanged&quot;);
+
+// Execution time
+Func&lt;Task&gt; slow = () =&gt; service.Report();
+await slow.Should().CompleteWithinAsync(TimeSpan.FromSeconds(1));</code></pre><pre data-lang="python" hidden><code>import pytest, re
+
+assert result is not None
+assert result.total == 30 and result.total &gt; 0
+assert len(result.lines) == 2 and all(l.qty &gt; 0 for l in result.lines)
+assert sorted(l.sku for l in result.lines) == [&quot;A1&quot;, &quot;B2&quot;]
+assert {k: v for k, v in vars(result).items() if k != &quot;created&quot;} == vars(expected_dto)
+assert name.startswith(&quot;Ord&quot;) and len(name) == 8
+
+with pytest.raises(ValidationError, match=re.compile(&quot;qty&quot;)):
+    await service.place(bad_order)
+
+# pytest.approx for floats
+assert total == pytest.approx(0.3)
+
+# Timing
+import time
+t0 = time.perf_counter(); await service.report(); assert time.perf_counter() - t0 &lt; 1.0</code></pre></div></section>
+<section id="integration"><h2 id="integration">One integration test with WebApplicationFactory</h2><p>Boot the real API in memory, swap the database for SQLite/Testcontainers, and call it with <code>HttpClient</code>. One or two of these per feature catch the wiring bugs unit tests cannot: routing, DI, serialization, middleware, auth. FastAPI's <code>TestClient</code> does the same.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// dotnet add package Microsoft.AspNetCore.Mvc.Testing
+public class ApiFactory : WebApplicationFactory&lt;Program&gt;
+{
+    protected override void ConfigureWebHost(IWebHostBuilder b)
+    {
+        b.UseEnvironment(&quot;Testing&quot;);
+        b.ConfigureServices(services =&gt;
+        {
+            services.RemoveAll&lt;DbContextOptions&lt;AppDb&gt;&gt;();
+            services.AddDbContext&lt;AppDb&gt;(o =&gt; o.UseSqlite(&quot;DataSource=:memory:&quot;));
+            services.AddScoped&lt;IEmailSender, FakeEmailSender&gt;();                 // no real email
+            services.AddAuthentication(&quot;Test&quot;).AddScheme&lt;AuthenticationSchemeOptions, TestAuthHandler&gt;(&quot;Test&quot;, _ =&gt; { });
+        });
+    }
+}
+
+public class OrdersApiTests(ApiFactory factory) : IClassFixture&lt;ApiFactory&gt;
+{
+    private readonly HttpClient _client = factory.CreateClient();
+
+    [Fact]
+    public async Task Post_then_Get_roundtrips()
+    {
+        var create = await _client.PostAsJsonAsync(&quot;/orders&quot;, new { sku = &quot;A1&quot;, qty = 2 });
+        create.StatusCode.Should().Be(HttpStatusCode.Created);
+        var location = create.Headers.Location!;
+
+        var order = await _client.GetFromJsonAsync&lt;OrderDto&gt;(location);
+        order!.Sku.Should().Be(&quot;A1&quot;);
+    }
+
+    [Fact]
+    public async Task Post_invalid_returns_ProblemDetails()
+    {
+        var resp = await _client.PostAsJsonAsync(&quot;/orders&quot;, new { sku = &quot;&quot;, qty = 0 });
+        resp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        var problem = await resp.Content.ReadFromJsonAsync&lt;ValidationProblemDetails&gt;();
+        problem!.Errors.Should().ContainKey(&quot;Qty&quot;);
+    }
+}
+// Program.cs needs:  public partial class Program { }   (for top-level statements)
+// Real database: Testcontainers.MsSql / Testcontainers.PostgreSql spin up Docker per test class</code></pre><pre data-lang="python" hidden><code># pip install httpx pytest
+import pytest
+from fastapi.testclient import TestClient
+from shop.main import app
+from shop.deps import get_db, get_email_sender
+
+@pytest.fixture
+def client():
+    engine = create_engine(&quot;sqlite://&quot;, connect_args={&quot;check_same_thread&quot;: False})
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine)
+
+    def override_db():
+        with TestSession() as s: yield s
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_email_sender] = lambda: FakeEmailSender()
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+def test_post_then_get_roundtrips(client):
+    create = client.post(&quot;/orders&quot;, json={&quot;sku&quot;: &quot;A1&quot;, &quot;qty&quot;: 2})
+    assert create.status_code == 201
+    location = create.headers[&quot;location&quot;]
+
+    order = client.get(location).json()
+    assert order[&quot;sku&quot;] == &quot;A1&quot;
+
+def test_post_invalid_returns_problem(client):
+    resp = client.post(&quot;/orders&quot;, json={&quot;sku&quot;: &quot;&quot;, &quot;qty&quot;: 0})
+    assert resp.status_code in (400, 422)
+    assert any(e[&quot;loc&quot;][-1] == &quot;qty&quot; for e in resp.json()[&quot;detail&quot;])
+
+# Real database: `testcontainers` package — PostgresContainer(&quot;postgres:16&quot;)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Test pyramid: many unit, some integration, few end-to-end. Know what <code>WebApplicationFactory</code> replaces (the real host, on an in-memory server) and how to swap services for the test.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Add one integration test to a project you have, that fails when you remove <code>app.UseAuthorization()</code>.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/dotnet/core/testing/unit-testing-with-dotnet-test" target="_blank" rel="noopener">Unit testing C# with xUnit</a></li><li><a href="https://learn.microsoft.com/aspnet/core/test/integration-tests" target="_blank" rel="noopener">Integration tests in ASP.NET Core</a> — WebApplicationFactory</li><li><a href="https://github.com/devlooped/moq/wiki/Quickstart" target="_blank" rel="noopener">Moq quickstart</a></li><li><a href="https://fluentassertions.com/introduction" target="_blank" rel="noopener">FluentAssertions docs</a></li><li><a href="https://docs.pytest.org/" target="_blank" rel="noopener">pytest docs</a></li><li><a href="https://fastapi.tiangolo.com/tutorial/testing/" target="_blank" rel="noopener">Testing FastAPI</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

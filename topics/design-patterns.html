@@ -1,0 +1,995 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Patterns & SOLID — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="design-patterns">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 6 of 13</div>
+  <h1>Design Patterns & SOLID</h1>
+  <p class="lede">Patterns are vocabulary for design conversations. Each one below has a minimal C# implementation and its idiomatic Python form — which is often simpler, because first-class functions and duck typing remove a lot of ceremony. Focus on <em>when</em> to use each and what problem it solves.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#srp">S — Single Responsibility</a></li><li><a href="#ocp">O — Open/Closed</a></li><li><a href="#lsp">L — Liskov Substitution</a></li><li><a href="#isp">I — Interface Segregation</a></li><li><a href="#dip">D — Dependency Inversion</a></li><li><a href="#singleton">Singleton</a></li><li><a href="#factory">Factory Method and Abstract Factory</a></li><li><a href="#builder">Builder</a></li><li><a href="#adapter">Adapter</a></li><li><a href="#decorator">Decorator</a></li><li><a href="#facade">Facade</a></li><li><a href="#strategy">Strategy</a></li><li><a href="#observer">Observer</a></li><li><a href="#command">Command</a></li><li><a href="#mediator">Mediator (and MediatR)</a></li><li><a href="#di-ioc">Dependency Injection and IoC containers</a></li><li><a href="#repository-uow">Repository and Unit of Work</a></li><li><a href="#cqrs">CQRS — an introduction</a></li></ol>
+  </div>
+
+<section id="srp"><h2 id="srp">S — Single Responsibility</h2><p>A class should have one reason to change. The smell: a class that talks to the database, formats output and sends email. Split by <em>axis of change</em> — persistence, presentation and notification evolve independently.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// ✗ Before: three reasons to change
+public class InvoiceService
+{
+    public void Process(Invoice inv)
+    {
+        using var conn = new SqlConnection(cs); /* save */ ;
+        var html = $&quot;&lt;h1&gt;Invoice {inv.Id}&lt;/h1&gt;&lt;p&gt;{inv.Total:C}&lt;/p&gt;&quot;;
+        new SmtpClient().Send(&quot;billing@x.com&quot;, inv.Email, &quot;Invoice&quot;, html);
+    }
+}
+
+// ✓ After: each part has one job and can be tested/replaced alone
+public interface IInvoiceRepository { Task Save(Invoice inv); }
+public interface IInvoiceRenderer  { string Render(Invoice inv); }
+public interface IEmailSender      { Task Send(string to, string subject, string body); }
+
+public class InvoiceService(IInvoiceRepository repo, IInvoiceRenderer renderer, IEmailSender email)
+{
+    public async Task Process(Invoice inv)
+    {
+        await repo.Save(inv);
+        await email.Send(inv.Email, &quot;Invoice&quot;, renderer.Render(inv));
+    }
+}</code></pre><pre data-lang="python" hidden><code># ✗ Before
+class InvoiceService:
+    def process(self, inv):
+        db.save(inv)
+        html = f&quot;&lt;h1&gt;Invoice {inv.id}&lt;/h1&gt;&lt;p&gt;{inv.total:.2f}&lt;/p&gt;&quot;
+        smtplib.SMTP(&quot;mail&quot;).sendmail(&quot;billing@x.com&quot;, inv.email, html)
+
+# ✓ After — protocols describe the collaborators
+from typing import Protocol
+
+class InvoiceRepository(Protocol):
+    def save(self, inv) -&gt; None: ...
+class InvoiceRenderer(Protocol):
+    def render(self, inv) -&gt; str: ...
+class EmailSender(Protocol):
+    def send(self, to: str, subject: str, body: str) -&gt; None: ...
+
+class InvoiceService:
+    def __init__(self, repo: InvoiceRepository, renderer: InvoiceRenderer, email: EmailSender):
+        self.repo, self.renderer, self.email = repo, renderer, email
+
+    def process(self, inv) -&gt; None:
+        self.repo.save(inv)
+        self.email.send(inv.email, &quot;Invoice&quot;, self.renderer.render(inv))</code></pre></div></section>
+<section id="ocp"><h2 id="ocp">O — Open/Closed</h2><p>Open for extension, closed for modification: add behaviour by adding new types, not by editing a growing <code>switch</code>. The usual mechanism is polymorphism (Strategy) — or, in .NET, registering additional implementations in DI and iterating <code>IEnumerable&lt;T&gt;</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// ✗ Every new discount edits this method
+decimal Apply(Order o, string kind) =&gt; kind switch
+{
+    &quot;seasonal&quot; =&gt; o.Total * 0.9m,
+    &quot;loyalty&quot;  =&gt; o.Total - 5,
+    _ =&gt; o.Total
+};
+
+// ✓ New discount = new class; nothing existing changes
+public interface IDiscount { bool AppliesTo(Order o); decimal Apply(decimal total); }
+
+public class SeasonalDiscount : IDiscount
+{
+    public bool AppliesTo(Order o) =&gt; DateTime.UtcNow.Month == 12;
+    public decimal Apply(decimal total) =&gt; total * 0.9m;
+}
+public class LoyaltyDiscount : IDiscount
+{
+    public bool AppliesTo(Order o) =&gt; o.Customer.Orders &gt; 10;
+    public decimal Apply(decimal total) =&gt; total - 5;
+}
+
+public class PricingService(IEnumerable&lt;IDiscount&gt; discounts)
+{
+    public decimal Price(Order o) =&gt;
+        discounts.Where(d =&gt; d.AppliesTo(o)).Aggregate(o.Total, (t, d) =&gt; d.Apply(t));
+}
+// builder.Services.AddScoped&lt;IDiscount, SeasonalDiscount&gt;();  AddScoped&lt;IDiscount, LoyaltyDiscount&gt;();</code></pre><pre data-lang="python" hidden><code>from typing import Protocol, Callable
+from datetime import datetime
+
+class Discount(Protocol):
+    def applies_to(self, order) -&gt; bool: ...
+    def apply(self, total: float) -&gt; float: ...
+
+class SeasonalDiscount:
+    def applies_to(self, order): return datetime.utcnow().month == 12
+    def apply(self, total): return total * 0.9
+
+class LoyaltyDiscount:
+    def applies_to(self, order): return order.customer.orders &gt; 10
+    def apply(self, total): return total - 5
+
+class PricingService:
+    def __init__(self, discounts: list[Discount]): self.discounts = discounts
+    def price(self, order) -&gt; float:
+        total = order.total
+        for d in self.discounts:
+            if d.applies_to(order): total = d.apply(total)
+        return total
+
+# Or a registry of plain functions — often enough in Python
+DISCOUNTS: list[tuple[Callable, Callable]] = []
+def discount(pred):
+    def reg(fn): DISCOUNTS.append((pred, fn)); return fn
+    return reg
+
+@discount(lambda o: datetime.utcnow().month == 12)
+def seasonal(total): return total * 0.9</code></pre></div></section>
+<section id="lsp"><h2 id="lsp">L — Liskov Substitution</h2><p>Subtypes must be usable wherever the base type is expected without surprising the caller: no strengthened preconditions, no weakened postconditions, no exceptions the base would not throw. The classic violation is <code>Square : Rectangle</code>; the .NET one is a read-only collection that throws on <code>Add</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// ✗ Square breaks Rectangle&#x27;s contract (setting Width changes Height)
+public class Rectangle { public virtual int Width { get; set; } public virtual int Height { get; set; } public int Area =&gt; Width * Height; }
+public class Square : Rectangle
+{
+    public override int Width  { set { base.Width = value; base.Height = value; } }
+    public override int Height { set { base.Width = value; base.Height = value; } }
+}
+void Test(Rectangle r) { r.Width = 4; r.Height = 5; Debug.Assert(r.Area == 20); }   // fails for Square
+
+// ✓ Model the real relationship: both are Shapes; neither is the other
+public interface IShape { int Area { get; } }
+public record Rectangle(int Width, int Height) : IShape { public int Area =&gt; Width * Height; }
+public record Square(int Side) : IShape { public int Area =&gt; Side * Side; }
+
+// ✗ .NET example: a subtype that throws where the base doesn&#x27;t
+public class ReadOnlyList&lt;T&gt; : List&lt;T&gt;
+{
+    public new void Add(T item) =&gt; throw new NotSupportedException();   // callers with List&lt;T&gt; break
+}
+// ✓ Expose IReadOnlyList&lt;T&gt; instead, so the type itself says what is allowed</code></pre><pre data-lang="python" hidden><code># ✗ Square breaks Rectangle&#x27;s contract
+class Rectangle:
+    def __init__(self, w, h): self._w, self._h = w, h
+    @property
+    def width(self): return self._w
+    @width.setter
+    def width(self, v): self._w = v
+    @property
+    def height(self): return self._h
+    @height.setter
+    def height(self, v): self._h = v
+    @property
+    def area(self): return self._w * self._h
+
+class Square(Rectangle):
+    @Rectangle.width.setter
+    def width(self, v): self._w = self._h = v
+    @Rectangle.height.setter
+    def height(self, v): self._w = self._h = v
+
+def test(r: Rectangle):
+    r.width, r.height = 4, 5
+    assert r.area == 20          # fails for Square
+
+# ✓ Separate immutable shapes sharing a protocol
+from dataclasses import dataclass
+@dataclass(frozen=True)
+class Rectangle:
+    width: int; height: int
+    @property
+    def area(self): return self.width * self.height
+
+@dataclass(frozen=True)
+class Square:
+    side: int
+    @property
+    def area(self): return self.side ** 2
+
+# Duck typing makes LSP about behaviour: if it quacks like the base, it must quack correctly.</code></pre></div></section>
+<section id="isp"><h2 id="isp">I — Interface Segregation</h2><p>Clients should not depend on methods they do not use. Fat interfaces force <code>NotImplementedException</code> stubs and make mocking painful. Split into role interfaces; a class can implement several.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// ✗ One fat interface; a read-only report source must stub Save/Delete
+public interface IRepository&lt;T&gt;
+{
+    Task&lt;T?&gt; Get(int id); Task&lt;List&lt;T&gt;&gt; All(); Task Save(T e); Task Delete(int id); Task&lt;int&gt; Count();
+}
+
+// ✓ Role interfaces; compose what you need
+public interface IReadRepository&lt;T&gt;  { Task&lt;T?&gt; Get(int id); Task&lt;List&lt;T&gt;&gt; All(); }
+public interface IWriteRepository&lt;T&gt; { Task Save(T e); Task Delete(int id); }
+
+public class SqlRepository&lt;T&gt; : IReadRepository&lt;T&gt;, IWriteRepository&lt;T&gt; { /* full */ }
+public class ReportSource : IReadRepository&lt;Report&gt; { /* only reads */ }
+
+public class ReportController(IReadRepository&lt;Report&gt; reports) { }   // cannot accidentally write
+
+// .NET BCL does this: IEnumerable → ICollection → IList; IReadOnlyList vs IList</code></pre><pre data-lang="python" hidden><code>from typing import Protocol, Optional
+
+# ✓ Small protocols; implement any subset
+class Reader(Protocol):
+    def get(self, id: int) -&gt; Optional[object]: ...
+    def all(self) -&gt; list: ...
+
+class Writer(Protocol):
+    def save(self, e) -&gt; None: ...
+    def delete(self, id: int) -&gt; None: ...
+
+class SqlRepository:                  # satisfies both structurally
+    def get(self, id): ...
+    def all(self): ...
+    def save(self, e): ...
+    def delete(self, id): ...
+
+class ReportSource:                   # satisfies Reader only
+    def get(self, id): ...
+    def all(self): ...
+
+class ReportController:
+    def __init__(self, reports: Reader): self.reports = reports
+
+# Python&#x27;s ABCs are already segregated: collections.abc.Sized, Iterable, Container, Mapping…</code></pre></div></section>
+<section id="dip"><h2 id="dip">D — Dependency Inversion</h2><p>High-level policy should not depend on low-level details; both depend on abstractions, and the abstraction is owned by the high-level side. In practice: constructor-inject interfaces, let the composition root (DI container) choose implementations. This is what makes code testable.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// ✗ High-level OrderService constructs and depends on a concrete SmtpMailer
+public class OrderService
+{
+    private readonly SmtpMailer _mailer = new(&quot;smtp.example.com&quot;);
+    public void Place(Order o) { /* ... */ _mailer.Send(o.Email, &quot;Thanks&quot;); }
+}
+
+// ✓ Depend on an abstraction the domain owns; details plug in from outside
+public interface INotifier { Task Notify(string to, string message); }     // defined next to OrderService
+
+public class OrderService(INotifier notifier)
+{
+    public async Task Place(Order o) { /* ... */ await notifier.Notify(o.Email, &quot;Thanks&quot;); }
+}
+
+// Infrastructure implements it
+public class SmtpNotifier(SmtpClient smtp) : INotifier { public Task Notify(string to, string m) =&gt; smtp.SendAsync(to, m); }
+public class FakeNotifier : INotifier { public List&lt;string&gt; Sent = new(); public Task Notify(string to, string m) { Sent.Add(m); return Task.CompletedTask; } }
+
+// Composition root
+builder.Services.AddScoped&lt;INotifier, SmtpNotifier&gt;();
+builder.Services.AddScoped&lt;OrderService&gt;();
+
+// Test
+var fake = new FakeNotifier();
+await new OrderService(fake).Place(order);
+Assert.Single(fake.Sent);</code></pre><pre data-lang="python" hidden><code>from typing import Protocol
+
+# ✓ Abstraction owned by the domain module
+class Notifier(Protocol):
+    def notify(self, to: str, message: str) -&gt; None: ...
+
+class OrderService:
+    def __init__(self, notifier: Notifier): self.notifier = notifier
+    def place(self, order):
+        ...
+        self.notifier.notify(order.email, &quot;Thanks&quot;)
+
+# Infrastructure implementations
+class SmtpNotifier:
+    def __init__(self, smtp): self.smtp = smtp
+    def notify(self, to, message): self.smtp.sendmail(&quot;billing@x.com&quot;, to, message)
+
+class FakeNotifier:
+    def __init__(self): self.sent = []
+    def notify(self, to, message): self.sent.append(message)
+
+# Composition root (a function; or a container like `dependency-injector`)
+def build_order_service(settings) -&gt; OrderService:
+    return OrderService(SmtpNotifier(smtplib.SMTP(settings.smtp_host)))
+
+# Test
+fake = FakeNotifier()
+OrderService(fake).place(order)
+assert len(fake.sent) == 1</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Be ready to define all five in one sentence each and give a real example from your own code for at least two. DIP vs DI vs IoC container is a common trick question: DIP is the principle, DI is the technique, the container is a tool.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take a 200-line class from a past project and list which SOLID principles it violates; sketch the split.</li></ul></div></section>
+<section id="singleton"><h2 id="singleton">Singleton</h2><p>One instance, globally accessible. In modern .NET you almost never write one — register the type as a singleton in DI and inject it. If you must, use <code>Lazy&lt;T&gt;</code> for thread-safe lazy initialisation. In Python, a module-level instance <em>is</em> a singleton.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Thread-safe lazy singleton (when DI is not available)
+public sealed class Config
+{
+    private static readonly Lazy&lt;Config&gt; _instance = new(() =&gt; new Config());
+    public static Config Instance =&gt; _instance.Value;
+    private Config() { /* load once */ }
+    public string ConnectionString { get; } = &quot;...&quot;;
+}
+var cs = Config.Instance.ConnectionString;
+
+// Preferred: the container owns the lifetime, the class stays testable
+builder.Services.AddSingleton&lt;IClock, SystemClock&gt;();
+public class OrderService(IClock clock) { }
+
+// Pitfalls: hidden global state, hard to test, captive dependencies if the singleton
+// takes scoped services (see Web API → DI).</code></pre><pre data-lang="python" hidden><code># A module-level object is the idiomatic singleton (modules are imported once)
+# config.py
+class Config:
+    def __init__(self): self.connection_string = &quot;...&quot;
+config = Config()
+
+# elsewhere: from config import config
+
+# Lazy, cached factory
+from functools import lru_cache
+@lru_cache(maxsize=None)
+def get_config() -&gt; Config:
+    return Config()
+
+# Class-based (rarely needed)
+class Singleton:
+    _instance = None
+    def __new__(cls, *a, **kw):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance</code></pre></div></section>
+<section id="factory"><h2 id="factory">Factory Method and Abstract Factory</h2><p>Factories centralise object creation so callers depend on an interface, not a constructor. Factory Method: one method that returns the right subtype. Abstract Factory: a family of related objects (e.g. all the parts for one database provider). In .NET, <code>IHttpClientFactory</code>, <code>ILoggerFactory</code> and <code>Func&lt;T&gt;</code> injection are factories.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public interface IExporter { byte[] Export(Report r); }
+public class CsvExporter : IExporter { public byte[] Export(Report r) =&gt; ...; }
+public class PdfExporter : IExporter { public byte[] Export(Report r) =&gt; ...; }
+
+// Factory method
+public static class ExporterFactory
+{
+    public static IExporter Create(string format) =&gt; format.ToLowerInvariant() switch
+    {
+        &quot;csv&quot; =&gt; new CsvExporter(),
+        &quot;pdf&quot; =&gt; new PdfExporter(),
+        _ =&gt; throw new NotSupportedException(format)
+    };
+}
+
+// DI-friendly factory: resolve by key
+public interface IExporterFactory { IExporter For(string format); }
+public class ExporterFactory(IServiceProvider sp) : IExporterFactory
+{
+    public IExporter For(string format) =&gt; sp.GetRequiredKeyedService&lt;IExporter&gt;(format);
+}
+builder.Services.AddKeyedTransient&lt;IExporter, CsvExporter&gt;(&quot;csv&quot;);
+builder.Services.AddKeyedTransient&lt;IExporter, PdfExporter&gt;(&quot;pdf&quot;);
+
+// Abstract factory: a family that must match
+public interface IDbFactory { IDbConnection Connection(); IQueryBuilder Builder(); }
+public class SqlServerFactory : IDbFactory { /* SqlConnection + T-SQL builder */ }
+public class PostgresFactory  : IDbFactory { /* NpgsqlConnection + PG builder */ }</code></pre><pre data-lang="python" hidden><code>from typing import Protocol, Callable
+
+class Exporter(Protocol):
+    def export(self, report) -&gt; bytes: ...
+
+class CsvExporter:
+    def export(self, report): ...
+class PdfExporter:
+    def export(self, report): ...
+
+# Factory method as a dict of constructors
+EXPORTERS: dict[str, Callable[[], Exporter]] = {&quot;csv&quot;: CsvExporter, &quot;pdf&quot;: PdfExporter}
+
+def create_exporter(fmt: str) -&gt; Exporter:
+    try:
+        return EXPORTERS[fmt.lower()]()
+    except KeyError:
+        raise ValueError(f&quot;unsupported format {fmt}&quot;)
+
+# Register new ones without touching the factory
+def register(fmt: str):
+    def deco(cls): EXPORTERS[fmt] = cls; return cls
+    return deco
+
+@register(&quot;xlsx&quot;)
+class XlsxExporter:
+    def export(self, report): ...
+
+# Abstract factory: a family of related objects
+class DbFactory(Protocol):
+    def connection(self): ...
+    def builder(self): ...
+class PostgresFactory:
+    def connection(self): return psycopg.connect(dsn)
+    def builder(self): return PgQueryBuilder()</code></pre></div></section>
+<section id="builder"><h2 id="builder">Builder</h2><p>Builders assemble complex objects step by step with a fluent API and validate at <code>Build()</code>. .NET is full of them: <code>WebApplicationBuilder</code>, <code>StringBuilder</code>, <code>ConfigurationBuilder</code>, <code>ModelBuilder</code>. Python usually prefers keyword arguments and dataclasses; builders appear for query/DSL construction.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class HttpRequestBuilder
+{
+    private string _method = &quot;GET&quot;;
+    private string? _url;
+    private readonly Dictionary&lt;string, string&gt; _headers = new();
+    private string? _body;
+
+    public HttpRequestBuilder Method(string m) { _method = m; return this; }
+    public HttpRequestBuilder Url(string u) { _url = u; return this; }
+    public HttpRequestBuilder Header(string k, string v) { _headers[k] = v; return this; }
+    public HttpRequestBuilder Json(object o) { _body = JsonSerializer.Serialize(o); _headers[&quot;Content-Type&quot;] = &quot;application/json&quot;; return this; }
+
+    public HttpRequestMessage Build()
+    {
+        if (_url is null) throw new InvalidOperationException(&quot;Url is required&quot;);
+        var req = new HttpRequestMessage(new HttpMethod(_method), _url);
+        foreach (var (k, v) in _headers) if (k != &quot;Content-Type&quot;) req.Headers.Add(k, v);
+        if (_body is not null) req.Content = new StringContent(_body, Encoding.UTF8, &quot;application/json&quot;);
+        return req;
+    }
+}
+
+var req = new HttpRequestBuilder().Method(&quot;POST&quot;).Url(&quot;https://api/x&quot;).Header(&quot;X-Trace&quot;, &quot;1&quot;).Json(new { a = 1 }).Build();
+
+// Records + `with` cover many &quot;builder&quot; needs for immutable data
+var opts = new RetryOptions() with { Attempts = 5, Delay = TimeSpan.FromSeconds(2) };</code></pre><pre data-lang="python" hidden><code>import json
+from dataclasses import dataclass, field
+
+class HttpRequestBuilder:
+    def __init__(self):
+        self._method, self._url, self._headers, self._body = &quot;GET&quot;, None, {}, None
+
+    def method(self, m): self._method = m; return self
+    def url(self, u): self._url = u; return self
+    def header(self, k, v): self._headers[k] = v; return self
+    def json(self, obj):
+        self._body = json.dumps(obj); self._headers[&quot;Content-Type&quot;] = &quot;application/json&quot;; return self
+
+    def build(self):
+        if self._url is None:
+            raise ValueError(&quot;url is required&quot;)
+        return httpx.Request(self._method, self._url, headers=self._headers, content=self._body)
+
+req = HttpRequestBuilder().method(&quot;POST&quot;).url(&quot;https://api/x&quot;).header(&quot;X-Trace&quot;, &quot;1&quot;).json({&quot;a&quot;: 1}).build()
+
+# Often keyword args + dataclasses.replace are enough
+@dataclass(frozen=True)
+class RetryOptions:
+    attempts: int = 3; delay: float = 1.0
+from dataclasses import replace
+opts = replace(RetryOptions(), attempts=5, delay=2.0)</code></pre></div></section>
+<section id="adapter"><h2 id="adapter">Adapter</h2><p>Adapter wraps an existing class so it satisfies the interface your code expects — the way to bring a third-party SDK or legacy class under your own abstraction without changing either side.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Your abstraction
+public interface IPaymentGateway { Task&lt;PaymentResult&gt; Charge(decimal amount, string token); }
+
+// Third-party SDK with a different shape
+public class StripeClient { public Task&lt;StripeCharge&gt; CreateCharge(long cents, string source, string currency) =&gt; ...; }
+
+// Adapter
+public class StripeAdapter(StripeClient stripe) : IPaymentGateway
+{
+    public async Task&lt;PaymentResult&gt; Charge(decimal amount, string token)
+    {
+        var c = await stripe.CreateCharge((long)(amount * 100), token, &quot;usd&quot;);
+        return new PaymentResult(c.Id, c.Status == &quot;succeeded&quot;);
+    }
+}
+builder.Services.AddScoped&lt;IPaymentGateway, StripeAdapter&gt;();
+
+// Also: wrapping static/legacy APIs so they can be mocked
+public interface IFileSystem { string ReadAllText(string path); }
+public class FileSystem : IFileSystem { public string ReadAllText(string p) =&gt; File.ReadAllText(p); }</code></pre><pre data-lang="python" hidden><code>from typing import Protocol
+from dataclasses import dataclass
+
+@dataclass
+class PaymentResult: id: str; succeeded: bool
+
+class PaymentGateway(Protocol):
+    def charge(self, amount: float, token: str) -&gt; PaymentResult: ...
+
+class StripeClient:                                    # third-party shape
+    def create_charge(self, cents: int, source: str, currency: str): ...
+
+class StripeAdapter:
+    def __init__(self, stripe: StripeClient): self.stripe = stripe
+    def charge(self, amount, token):
+        c = self.stripe.create_charge(int(amount * 100), token, &quot;usd&quot;)
+        return PaymentResult(c.id, c.status == &quot;succeeded&quot;)
+
+# Function adapter for a one-method interface
+def adapt_stripe(stripe: StripeClient):
+    def charge(amount, token):
+        c = stripe.create_charge(int(amount * 100), token, &quot;usd&quot;)
+        return PaymentResult(c.id, c.status == &quot;succeeded&quot;)
+    return charge</code></pre></div></section>
+<section id="decorator"><h2 id="decorator">Decorator</h2><p>Decorator wraps an object with the same interface to add behaviour — caching, logging, retries, authorisation — without touching the original. Chain as many as you like. Scrutor's <code>.Decorate&lt;&gt;()</code> makes registration easy. Python decorators are the function-level version of the same idea.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public interface IProductRepo { Task&lt;Product?&gt; Get(int id); }
+
+public class SqlProductRepo(AppDb db) : IProductRepo
+{
+    public Task&lt;Product?&gt; Get(int id) =&gt; db.Products.FindAsync(id).AsTask();
+}
+
+// Caching decorator
+public class CachedProductRepo(IProductRepo inner, IMemoryCache cache) : IProductRepo
+{
+    public Task&lt;Product?&gt; Get(int id) =&gt; cache.GetOrCreateAsync($&quot;product:{id}&quot;, e =&gt;
+    {
+        e.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5);
+        return inner.Get(id);
+    });
+}
+
+// Logging decorator
+public class LoggedProductRepo(IProductRepo inner, ILogger&lt;LoggedProductRepo&gt; log) : IProductRepo
+{
+    public async Task&lt;Product?&gt; Get(int id)
+    {
+        var sw = Stopwatch.StartNew();
+        try { return await inner.Get(id); }
+        finally { log.LogInformation(&quot;Get({Id}) took {Ms}ms&quot;, id, sw.ElapsedMilliseconds); }
+    }
+}
+
+// Registration (Scrutor): outermost last
+builder.Services.AddScoped&lt;IProductRepo, SqlProductRepo&gt;();
+builder.Services.Decorate&lt;IProductRepo, CachedProductRepo&gt;();
+builder.Services.Decorate&lt;IProductRepo, LoggedProductRepo&gt;();   // Logged(Cached(Sql))</code></pre><pre data-lang="python" hidden><code>import functools, time, logging
+from typing import Protocol
+
+class ProductRepo(Protocol):
+    def get(self, id: int): ...
+
+class SqlProductRepo:
+    def __init__(self, db): self.db = db
+    def get(self, id): return self.db.get(Product, id)
+
+# Object decorator (same interface, wraps inner)
+class CachedProductRepo:
+    def __init__(self, inner: ProductRepo): self.inner, self.cache = inner, {}
+    def get(self, id):
+        if id not in self.cache:
+            self.cache[id] = self.inner.get(id)
+        return self.cache[id]
+
+class LoggedProductRepo:
+    def __init__(self, inner: ProductRepo): self.inner = inner
+    def get(self, id):
+        t0 = time.perf_counter()
+        try: return self.inner.get(id)
+        finally: logging.info(&quot;get(%s) took %.1fms&quot;, id, (time.perf_counter() - t0) * 1000)
+
+repo = LoggedProductRepo(CachedProductRepo(SqlProductRepo(db)))
+
+# Function decorators are the same pattern at function level
+def timed(fn):
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        t0 = time.perf_counter()
+        try: return fn(*a, **kw)
+        finally: logging.info(&quot;%s took %.1fms&quot;, fn.__name__, (time.perf_counter() - t0) * 1000)
+    return wrapper
+
+@timed
+@functools.lru_cache
+def get_product(id): ...</code></pre></div></section>
+<section id="facade"><h2 id="facade">Facade</h2><p>A Facade gives a simple entry point over a messy subsystem. Application-service classes in layered architectures are facades: one <code>PlaceOrder()</code> that orchestrates inventory, payment and notification so controllers stay thin.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class CheckoutFacade(IInventory inventory, IPaymentGateway payments, IOrderRepo orders, INotifier notifier)
+{
+    public async Task&lt;OrderResult&gt; PlaceOrder(Cart cart, string paymentToken)
+    {
+        if (!await inventory.Reserve(cart.Items)) return OrderResult.OutOfStock();
+        var payment = await payments.Charge(cart.Total, paymentToken);
+        if (!payment.Succeeded) { await inventory.Release(cart.Items); return OrderResult.PaymentFailed(); }
+        var order = await orders.Create(cart, payment.Id);
+        await notifier.Notify(cart.Email, $&quot;Order {order.Id} confirmed&quot;);
+        return OrderResult.Success(order.Id);
+    }
+}
+
+// Controller stays a thin adapter to HTTP
+app.MapPost(&quot;/checkout&quot;, async (CheckoutDto dto, CheckoutFacade checkout) =&gt;
+    (await checkout.PlaceOrder(dto.Cart, dto.Token)) switch
+    {
+        { Ok: true } r =&gt; Results.Created($&quot;/orders/{r.OrderId}&quot;, r),
+        var r =&gt; Results.UnprocessableEntity(r.Reason)
+    });</code></pre><pre data-lang="python" hidden><code>class CheckoutFacade:
+    def __init__(self, inventory, payments, orders, notifier):
+        self.inventory, self.payments, self.orders, self.notifier = inventory, payments, orders, notifier
+
+    def place_order(self, cart, payment_token):
+        if not self.inventory.reserve(cart.items):
+            return OrderResult.out_of_stock()
+        payment = self.payments.charge(cart.total, payment_token)
+        if not payment.succeeded:
+            self.inventory.release(cart.items)
+            return OrderResult.payment_failed()
+        order = self.orders.create(cart, payment.id)
+        self.notifier.notify(cart.email, f&quot;Order {order.id} confirmed&quot;)
+        return OrderResult.success(order.id)
+
+@app.post(&quot;/checkout&quot;, status_code=201)
+def checkout(dto: CheckoutDto, facade: CheckoutFacade = Depends(get_checkout)):
+    result = facade.place_order(dto.cart, dto.token)
+    if not result.ok:
+        raise HTTPException(422, result.reason)
+    return result</code></pre></div></section>
+<section id="strategy"><h2 id="strategy">Strategy</h2><p>Strategy makes an algorithm swappable at runtime: define an interface, implement variants, inject the one you want. In C# a <code>Func&lt;&gt;</code> parameter is a lightweight strategy (<code>OrderBy(keySelector)</code>). In Python, just pass a function.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public interface IShippingStrategy { decimal Cost(Order o); }
+public class FlatRate : IShippingStrategy    { public decimal Cost(Order o) =&gt; 5m; }
+public class ByWeight : IShippingStrategy    { public decimal Cost(Order o) =&gt; o.WeightKg * 1.2m; }
+public class FreeOver50 : IShippingStrategy  { public decimal Cost(Order o) =&gt; o.Total &gt; 50 ? 0 : 5m; }
+
+public class ShippingCalculator(IShippingStrategy strategy)
+{
+    public decimal Calculate(Order o) =&gt; strategy.Cost(o);
+}
+
+// Choose at runtime
+IShippingStrategy s = o.Country == &quot;US&quot; ? new FreeOver50() : new ByWeight();
+var cost = new ShippingCalculator(s).Calculate(o);
+
+// Lightweight: delegates
+Func&lt;Order, decimal&gt; flat = _ =&gt; 5m;
+decimal Calculate(Order o, Func&lt;Order, decimal&gt; strategy) =&gt; strategy(o);
+
+// Also Comparer&lt;T&gt; for sort strategies
+var byName = Comparer&lt;Person&gt;.Create((a, b) =&gt; string.Compare(a.Name, b.Name, StringComparison.Ordinal));
+people.Sort(byName);</code></pre><pre data-lang="python" hidden><code>from typing import Callable
+
+# Strategies are just callables
+def flat_rate(order) -&gt; float: return 5.0
+def by_weight(order) -&gt; float: return order.weight_kg * 1.2
+def free_over_50(order) -&gt; float: return 0.0 if order.total &gt; 50 else 5.0
+
+class ShippingCalculator:
+    def __init__(self, strategy: Callable[[object], float]): self.strategy = strategy
+    def calculate(self, order): return self.strategy(order)
+
+strategy = free_over_50 if order.country == &quot;US&quot; else by_weight
+cost = ShippingCalculator(strategy).calculate(order)
+
+# Sort strategies: key functions
+people.sort(key=lambda p: p.name)</code></pre></div></section>
+<section id="observer"><h2 id="observer">Observer</h2><p>Observer lets many subscribers react to a change without the subject knowing them. C# has it built in as <code>event</code>, plus <code>IObservable&lt;T&gt;</code> (Rx) for push streams. Beware of leaks: subscribers must unsubscribe or they keep the subject alive.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class StockTicker
+{
+    public event EventHandler&lt;PriceChangedEventArgs&gt;? PriceChanged;
+
+    private decimal _price;
+    public decimal Price
+    {
+        get =&gt; _price;
+        set
+        {
+            if (value == _price) return;
+            var old = _price; _price = value;
+            PriceChanged?.Invoke(this, new PriceChangedEventArgs(old, value));   // ?. handles no subscribers
+        }
+    }
+}
+public record PriceChangedEventArgs(decimal Old, decimal New);
+
+var ticker = new StockTicker();
+EventHandler&lt;PriceChangedEventArgs&gt; alert = (s, e) =&gt; { if (e.New &gt; e.Old * 1.1m) Console.WriteLine(&quot;spike&quot;); };
+ticker.PriceChanged += alert;
+ticker.Price = 100; ticker.Price = 120;
+ticker.PriceChanged -= alert;              // unsubscribe to avoid leaks
+
+// Rx for streams: System.Reactive
+var prices = Observable.FromEventPattern&lt;PriceChangedEventArgs&gt;(ticker, nameof(ticker.PriceChanged))
+    .Select(e =&gt; e.EventArgs.New)
+    .Buffer(TimeSpan.FromSeconds(1))
+    .Subscribe(batch =&gt; Console.WriteLine($&quot;{batch.Count} ticks&quot;));</code></pre><pre data-lang="python" hidden><code>from typing import Callable
+from dataclasses import dataclass
+
+@dataclass
+class PriceChanged: old: float; new: float
+
+class StockTicker:
+    def __init__(self):
+        self._price = 0.0
+        self._subscribers: list[Callable[[PriceChanged], None]] = []
+
+    def subscribe(self, fn):   self._subscribers.append(fn); return lambda: self._subscribers.remove(fn)
+
+    @property
+    def price(self): return self._price
+    @price.setter
+    def price(self, value):
+        if value == self._price: return
+        old, self._price = self._price, value
+        for fn in list(self._subscribers):
+            fn(PriceChanged(old, value))
+
+ticker = StockTicker()
+unsubscribe = ticker.subscribe(lambda e: print(&quot;spike&quot;) if e.new &gt; e.old * 1.1 else None)
+ticker.price = 100; ticker.price = 120
+unsubscribe()
+
+# Weak references avoid keeping subscribers alive: weakref.WeakMethod / WeakSet
+# Streams: RxPY (`reactivex`) mirrors System.Reactive</code></pre></div></section>
+<section id="command"><h2 id="command">Command</h2><p>Command turns a request into an object: it can be queued, logged, retried and undone. Undo/redo stacks, job queues and CQRS commands all use it. In .NET, MediatR's <code>IRequest</code> handlers are commands with a dispatcher.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public interface ICommand { void Execute(); void Undo(); }
+
+public class MoveCommand(Shape shape, int dx, int dy) : ICommand
+{
+    public void Execute() =&gt; shape.Move(dx, dy);
+    public void Undo() =&gt; shape.Move(-dx, -dy);
+}
+
+public class CommandHistory
+{
+    private readonly Stack&lt;ICommand&gt; _done = new(), _undone = new();
+    public void Run(ICommand c) { c.Execute(); _done.Push(c); _undone.Clear(); }
+    public void Undo() { if (_done.TryPop(out var c)) { c.Undo(); _undone.Push(c); } }
+    public void Redo() { if (_undone.TryPop(out var c)) { c.Execute(); _done.Push(c); } }
+}
+
+var history = new CommandHistory();
+history.Run(new MoveCommand(shape, 10, 0));
+history.Undo();
+
+// Queued commands: serialise and process later (see Threading → Channels)
+public record SendEmailCommand(string To, string Subject) : ICommandMessage;</code></pre><pre data-lang="python" hidden><code>from typing import Protocol
+
+class Command(Protocol):
+    def execute(self) -&gt; None: ...
+    def undo(self) -&gt; None: ...
+
+class MoveCommand:
+    def __init__(self, shape, dx, dy): self.shape, self.dx, self.dy = shape, dx, dy
+    def execute(self): self.shape.move(self.dx, self.dy)
+    def undo(self): self.shape.move(-self.dx, -self.dy)
+
+class CommandHistory:
+    def __init__(self): self._done, self._undone = [], []
+    def run(self, c: Command): c.execute(); self._done.append(c); self._undone.clear()
+    def undo(self):
+        if self._done: c = self._done.pop(); c.undo(); self._undone.append(c)
+    def redo(self):
+        if self._undone: c = self._undone.pop(); c.execute(); self._done.append(c)
+
+history = CommandHistory()
+history.run(MoveCommand(shape, 10, 0))
+history.undo()
+
+# For fire-and-forget commands a closure/partial is enough:
+from functools import partial
+queue.put(partial(send_email, to=&quot;a@x.com&quot;, subject=&quot;Hi&quot;))</code></pre></div></section>
+<section id="mediator"><h2 id="mediator">Mediator (and MediatR)</h2><p>Mediator routes messages between components so they do not reference each other. In .NET the popular form is MediatR: controllers send a request object, exactly one handler processes it, and pipeline behaviours (validation, logging, transactions) wrap every handler. It is the usual backbone for CQRS.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// dotnet add package MediatR
+builder.Services.AddMediatR(c =&gt; c.RegisterServicesFromAssemblyContaining&lt;Program&gt;());
+builder.Services.AddTransient(typeof(IPipelineBehavior&lt;,&gt;), typeof(ValidationBehavior&lt;,&gt;));
+
+public record CreateOrder(string Sku, int Qty) : IRequest&lt;int&gt;;
+
+public class CreateOrderHandler(AppDb db) : IRequestHandler&lt;CreateOrder, int&gt;
+{
+    public async Task&lt;int&gt; Handle(CreateOrder cmd, CancellationToken ct)
+    {
+        var order = new Order { Sku = cmd.Sku, Qty = cmd.Qty };
+        db.Orders.Add(order);
+        await db.SaveChangesAsync(ct);
+        return order.Id;
+    }
+}
+
+// Cross-cutting behaviour applied to every request
+public class ValidationBehavior&lt;TReq, TRes&gt;(IEnumerable&lt;IValidator&lt;TReq&gt;&gt; validators) : IPipelineBehavior&lt;TReq, TRes&gt;
+{
+    public async Task&lt;TRes&gt; Handle(TReq req, RequestHandlerDelegate&lt;TRes&gt; next, CancellationToken ct)
+    {
+        var failures = validators.Select(v =&gt; v.Validate(req)).SelectMany(r =&gt; r.Errors).ToList();
+        if (failures.Count &gt; 0) throw new ValidationException(failures);
+        return await next();
+    }
+}
+
+// Notifications: many handlers
+public record OrderPlaced(int OrderId) : INotification;
+public class SendReceipt : INotificationHandler&lt;OrderPlaced&gt; { public Task Handle(OrderPlaced n, CancellationToken ct) =&gt; ...; }
+
+app.MapPost(&quot;/orders&quot;, async (CreateOrder cmd, IMediator mediator) =&gt; Results.Ok(await mediator.Send(cmd)));</code></pre><pre data-lang="python" hidden><code># No MediatR equivalent is standard; a small dispatcher is ~20 lines
+from typing import Callable, Any
+from dataclasses import dataclass
+
+@dataclass
+class CreateOrder: sku: str; qty: int
+
+class Mediator:
+    def __init__(self):
+        self._handlers: dict[type, Callable] = {}
+        self._behaviors: list[Callable] = []
+        self._listeners: dict[type, list[Callable]] = {}
+
+    def register(self, req_type, handler): self._handlers[req_type] = handler
+    def add_behavior(self, b): self._behaviors.append(b)
+    def subscribe(self, event_type, fn): self._listeners.setdefault(event_type, []).append(fn)
+
+    def send(self, request) -&gt; Any:
+        handler = self._handlers[type(request)]
+        call = lambda: handler(request)
+        for b in reversed(self._behaviors):          # wrap like middleware
+            call = (lambda nxt, beh: (lambda: beh(request, nxt)))(call, b)
+        return call()
+
+    def publish(self, event):
+        for fn in self._listeners.get(type(event), []): fn(event)
+
+def validation_behavior(request, next_):
+    if getattr(request, &quot;qty&quot;, 1) &lt;= 0: raise ValueError(&quot;qty&quot;)
+    return next_()
+
+def create_order_handler(cmd: CreateOrder) -&gt; int:
+    order = Order(sku=cmd.sku, qty=cmd.qty); db.add(order); db.commit(); return order.id
+
+mediator = Mediator()
+mediator.add_behavior(validation_behavior)
+mediator.register(CreateOrder, create_order_handler)
+
+@app.post(&quot;/orders&quot;)
+def create(cmd: CreateOrder): return mediator.send(cmd)</code></pre></div></section>
+<section id="di-ioc"><h2 id="di-ioc">Dependency Injection and IoC containers</h2><p>DI is the mechanism for DIP: dependencies are passed in, never <code>new</code>-ed inside. The container is the composition root that knows how to build the graph and manage lifetimes. Rules: constructor injection, depend on interfaces, no service locator, keep constructors cheap, register once. Python has no built-in container; FastAPI's <code>Depends</code> and plain factory functions cover most needs.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Registration
+builder.Services.AddSingleton&lt;IClock, SystemClock&gt;();
+builder.Services.AddScoped&lt;IOrderRepo, SqlOrderRepo&gt;();
+builder.Services.AddTransient&lt;IEmailSender, SmtpSender&gt;();
+builder.Services.AddScoped&lt;OrderService&gt;();                       // concrete, resolved by constructor
+builder.Services.AddSingleton(sp =&gt; new BlobServiceClient(cs));   // factory
+builder.Services.TryAddScoped&lt;ICache, MemoryCacheAdapter&gt;();      // only if not registered
+
+// Open generics
+builder.Services.AddScoped(typeof(IRepository&lt;&gt;), typeof(EfRepository&lt;&gt;));
+
+// Multiple implementations
+builder.Services.AddScoped&lt;IRule, RuleA&gt;(); builder.Services.AddScoped&lt;IRule, RuleB&gt;();
+public class Engine(IEnumerable&lt;IRule&gt; rules) { }
+
+// Assembly scanning (Scrutor)
+builder.Services.Scan(s =&gt; s.FromAssemblyOf&lt;Program&gt;().AddClasses(c =&gt; c.AssignableTo&lt;IHandler&gt;()).AsImplementedInterfaces().WithScopedLifetime());
+
+// ✗ Service locator anti-pattern — hides dependencies
+public class Bad(IServiceProvider sp) { void Do() =&gt; sp.GetRequiredService&lt;IOrderRepo&gt;(); }
+
+// ✓ Lazy / factory injection when you need deferred creation
+public class Good(Func&lt;IHeavy&gt; heavyFactory, Lazy&lt;IHeavy&gt; heavyLazy) { }
+builder.Services.AddTransient&lt;Func&lt;IHeavy&gt;&gt;(sp =&gt; () =&gt; sp.GetRequiredService&lt;IHeavy&gt;());
+
+// Creating a scope manually (background jobs)
+using var scope = app.Services.CreateScope();
+var svc = scope.ServiceProvider.GetRequiredService&lt;OrderService&gt;();</code></pre><pre data-lang="python" hidden><code># Manual composition root — explicit and testable
+def build_app(settings):
+    clock = SystemClock()
+    engine = create_engine(settings.db_url)
+    def order_repo(session): return SqlOrderRepo(session)
+    email = SmtpSender(settings.smtp)
+    return {&quot;clock&quot;: clock, &quot;engine&quot;: engine, &quot;email&quot;: email}
+
+# FastAPI Depends as the container
+from fastapi import Depends
+def get_session():
+    with SessionLocal() as s: yield s
+def get_order_repo(s=Depends(get_session)): return SqlOrderRepo(s)
+def get_order_service(repo=Depends(get_order_repo), email=Depends(get_email)):
+    return OrderService(repo, email)
+
+# A real container when the graph grows: `dependency-injector`
+from dependency_injector import containers, providers
+class Container(containers.DeclarativeContainer):
+    config = providers.Configuration()
+    clock = providers.Singleton(SystemClock)
+    engine = providers.Singleton(create_engine, config.db_url)
+    session = providers.Factory(SessionLocal)                       # transient
+    order_repo = providers.Factory(SqlOrderRepo, session=session)
+    order_service = providers.Factory(OrderService, repo=order_repo)
+
+container = Container(); container.config.db_url.from_env(&quot;DATABASE_URL&quot;)
+svc = container.order_service()
+
+# Test: override
+with container.order_repo.override(providers.Object(FakeRepo())):
+    svc = container.order_service()</code></pre></div></section>
+<section id="repository-uow"><h2 id="repository-uow">Repository and Unit of Work</h2><p>Repository hides data access behind a collection-like interface; Unit of Work groups changes into one commit. EF Core's <code>DbSet</code> and <code>DbContext</code> already <em>are</em> these, so a generic repository over EF adds little. A repository earns its place when it hides complex queries behind intention-revealing names, or when you need to swap the store in tests.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Intention-revealing repository (not a generic CRUD wrapper)
+public interface IOrderRepository
+{
+    Task&lt;Order?&gt; GetWithLines(int id, CancellationToken ct = default);
+    Task&lt;IReadOnlyList&lt;Order&gt;&gt; OverdueFor(int customerId, CancellationToken ct = default);
+    void Add(Order o);
+}
+
+public class EfOrderRepository(AppDb db) : IOrderRepository
+{
+    public Task&lt;Order?&gt; GetWithLines(int id, CancellationToken ct) =&gt;
+        db.Orders.Include(o =&gt; o.Lines).FirstOrDefaultAsync(o =&gt; o.Id == id, ct);
+    public async Task&lt;IReadOnlyList&lt;Order&gt;&gt; OverdueFor(int customerId, CancellationToken ct) =&gt;
+        await db.Orders.Where(o =&gt; o.CustomerId == customerId &amp;&amp; o.Due &lt; DateTime.UtcNow &amp;&amp; !o.Paid).ToListAsync(ct);
+    public void Add(Order o) =&gt; db.Orders.Add(o);
+}
+
+// Unit of Work: commit once per use case
+public interface IUnitOfWork { Task&lt;int&gt; Commit(CancellationToken ct = default); }
+public class EfUnitOfWork(AppDb db) : IUnitOfWork { public Task&lt;int&gt; Commit(CancellationToken ct) =&gt; db.SaveChangesAsync(ct); }
+
+public class PlaceOrderHandler(IOrderRepository orders, IInventoryRepository inventory, IUnitOfWork uow)
+{
+    public async Task Handle(PlaceOrder cmd, CancellationToken ct)
+    {
+        var order = Order.Create(cmd);
+        orders.Add(order);
+        await inventory.Reserve(order.Lines, ct);
+        await uow.Commit(ct);                       // one transaction for both repos (same DbContext)
+    }
+}
+// Both repos and the UoW share the scoped AppDb — that is what makes the commit atomic.</code></pre><pre data-lang="python" hidden><code>from typing import Protocol, Optional
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload, Session
+
+class OrderRepository(Protocol):
+    def get_with_lines(self, id: int) -&gt; Optional[Order]: ...
+    def overdue_for(self, customer_id: int) -&gt; list[Order]: ...
+    def add(self, order: Order) -&gt; None: ...
+
+class SqlOrderRepository:
+    def __init__(self, session: Session): self.s = session
+    def get_with_lines(self, id):
+        return self.s.scalar(select(Order).options(selectinload(Order.lines)).where(Order.id == id))
+    def overdue_for(self, customer_id):
+        return self.s.scalars(select(Order).where(Order.customer_id == customer_id, Order.due &lt; now(), Order.paid == False)).all()
+    def add(self, order): self.s.add(order)
+
+# Unit of Work as a context manager owning the session
+class UnitOfWork:
+    def __init__(self, session_factory): self._sf = session_factory
+    def __enter__(self):
+        self.session = self._sf()
+        self.orders = SqlOrderRepository(self.session)
+        self.inventory = SqlInventoryRepository(self.session)
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type: self.session.rollback()
+        self.session.close()
+    def commit(self): self.session.commit()
+
+def place_order(cmd, uow: UnitOfWork):
+    with uow:
+        order = Order.create(cmd)
+        uow.orders.add(order)
+        uow.inventory.reserve(order.lines)
+        uow.commit()                     # one transaction</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>“Do you need a repository over EF Core?” Balanced answer: EF is already a repository/UoW; add your own only for intention-revealing queries, to keep EF out of the domain, or for test seams — and never expose <code>IQueryable</code> from it.</p></div></section>
+<section id="cqrs"><h2 id="cqrs">CQRS — an introduction</h2><p>Command Query Responsibility Segregation: separate the write model (commands, validation, domain rules) from the read model (queries, DTOs, often denormalised). It starts as two folders and two handler types in one database; only some systems go on to separate stores and event sourcing. It pairs naturally with Mediator and Dapper-for-reads.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Write side: command + handler operating on the domain model via EF
+public record ShipOrder(int OrderId) : IRequest;
+public class ShipOrderHandler(AppDb db, IPublisher events) : IRequestHandler&lt;ShipOrder&gt;
+{
+    public async Task Handle(ShipOrder cmd, CancellationToken ct)
+    {
+        var order = await db.Orders.Include(o =&gt; o.Lines).FirstAsync(o =&gt; o.Id == cmd.OrderId, ct);
+        order.Ship();                                   // domain rule: throws if unpaid
+        await db.SaveChangesAsync(ct);
+        await events.Publish(new OrderShipped(order.Id), ct);
+    }
+}
+
+// Read side: query + handler returning a DTO, optimised SQL, no tracking
+public record OrderSummary(int Id, string Customer, decimal Total, string Status);
+public record GetOrderSummaries(int CustomerId) : IRequest&lt;IReadOnlyList&lt;OrderSummary&gt;&gt;;
+public class GetOrderSummariesHandler(IDbConnection conn) : IRequestHandler&lt;GetOrderSummaries, IReadOnlyList&lt;OrderSummary&gt;&gt;
+{
+    public async Task&lt;IReadOnlyList&lt;OrderSummary&gt;&gt; Handle(GetOrderSummaries q, CancellationToken ct) =&gt;
+        (await conn.QueryAsync&lt;OrderSummary&gt;(
+            &quot;SELECT o.Id, c.Name AS Customer, o.Total, o.Status FROM Orders o JOIN Customers c ON c.Id = o.CustomerId WHERE o.CustomerId = @CustomerId&quot;,
+            new { q.CustomerId })).ToList();
+}
+
+app.MapPost(&quot;/orders/{id}/ship&quot;, async (int id, IMediator m) =&gt; { await m.Send(new ShipOrder(id)); return Results.NoContent(); });
+app.MapGet(&quot;/customers/{id}/orders&quot;, async (int id, IMediator m) =&gt; await m.Send(new GetOrderSummaries(id)));
+
+// Going further: a projection updates a read table when OrderShipped is published → eventual consistency</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass
+from sqlalchemy import text
+
+# Write side
+@dataclass
+class ShipOrder: order_id: int
+
+def ship_order(cmd: ShipOrder, session, publish):
+    order = session.get(Order, cmd.order_id)
+    order.ship()                             # domain rule
+    session.commit()
+    publish(OrderShipped(order.id))
+
+# Read side: DTO + raw SQL, no ORM objects
+@dataclass
+class OrderSummary: id: int; customer: str; total: float; status: str
+
+@dataclass
+class GetOrderSummaries: customer_id: int
+
+def get_order_summaries(q: GetOrderSummaries, conn) -&gt; list[OrderSummary]:
+    rows = conn.execute(text(
+        &quot;SELECT o.id, c.name AS customer, o.total, o.status FROM orders o &quot;
+        &quot;JOIN customers c ON c.id = o.customer_id WHERE o.customer_id = :cid&quot;), {&quot;cid&quot;: q.customer_id}).mappings()
+    return [OrderSummary(**r) for r in rows]
+
+@app.post(&quot;/orders/{id}/ship&quot;, status_code=204)
+def ship(id: int, session=Depends(get_session)):
+    ship_order(ShipOrder(id), session, publish)
+
+@app.get(&quot;/customers/{id}/orders&quot;, response_model=list[OrderSummary])
+def summaries(id: int, conn=Depends(get_conn)):
+    return get_order_summaries(GetOrderSummaries(id), conn)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>CQRS is not event sourcing; you can have one without the other. Be able to say what problem it solves (different shapes and scaling needs for reads vs writes) and what it costs (eventual consistency, duplication).</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Refactor a CRUD controller into two command handlers and two query handlers using MediatR; keep the HTTP contract identical and prove it with the same integration tests.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://refactoring.guru/design-patterns/csharp" target="_blank" rel="noopener">Refactoring.Guru — design patterns</a> — clear catalogue with C# and Python examples</li><li><a href="https://learn.microsoft.com/dotnet/architecture/modern-web-apps-azure/architectural-principles" target="_blank" rel="noopener">Microsoft — Architectural principles</a> — SOLID and friends in the .NET context</li><li><a href="https://learn.microsoft.com/dotnet/core/extensions/dependency-injection-guidelines" target="_blank" rel="noopener">Dependency injection guidelines</a></li><li><a href="https://github.com/jbogard/MediatR" target="_blank" rel="noopener">MediatR</a> — mediator + CQRS handlers for .NET</li><li><a href="https://python-patterns.guide/" target="_blank" rel="noopener">Python Design Patterns (Brandon Rhodes)</a> — what changes in a dynamic language</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

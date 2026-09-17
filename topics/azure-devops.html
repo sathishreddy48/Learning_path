@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure DevOps — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="azure-devops">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 13 of 13</div>
+  <h1>Azure DevOps</h1>
+  <p class="lede">How a change gets from a work item to production. Most of this page is YAML rather than C#: a complete pipeline for a .NET API, broken down concept by concept, with the Python-app variant where the steps differ. The <code>az</code> CLI snippets let you script what the portal does.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#boards">Boards: work items, sprints and linking</a></li><li><a href="#repos">Repos: branching strategy and branch policies</a></li><li><a href="#pipeline-basics">A complete YAML pipeline for a .NET API</a></li><li><a href="#stages-jobs-steps">Stages, jobs and steps</a></li><li><a href="#variables">Variables, variable groups and secrets</a></li><li><a href="#templates">Templates: reuse across pipelines</a></li><li><a href="#environments">Environments, approvals and checks</a></li><li><a href="#artifacts">Artifacts: pipeline artifacts and Azure Artifacts feeds</a></li><li><a href="#service-connections">Service connections and identity</a></li><li><a href="#deploy-appservice">Deploying: App Service, containers, database migrations</a></li><li><a href="#release-strategies">Release strategies and rollback</a></li></ol>
+  </div>
+
+<section id="boards"><h2 id="boards">Boards: work items, sprints and linking</h2><p>Boards tracks work with a process (Agile: Epic → Feature → User Story → Task/Bug; Scrum uses PBIs). The habits that matter: link every PR and commit to a work item (<code>AB#123</code> in the commit message or PR), keep the sprint board honest, and use queries/dashboards for visibility. Automation: state transitions on PR completion, and pipeline runs showing linked work items.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><span class="code-note">C# shows the REST client; Python can use the `azure-devops` package with the same API surface</span></div><pre data-lang="bash"><code># Azure DevOps CLI (extension for az)
+az extension add --name azure-devops
+az devops configure --defaults organization=https://dev.azure.com/contoso project=Shop
+
+# Create and query work items
+az boards work-item create --type &quot;User Story&quot; --title &quot;Customers can download invoices&quot; --assigned-to me@contoso.com --iteration &quot;Shop\Sprint 12&quot;
+az boards work-item update --id 123 --state Active --fields &quot;System.Tags=payments;api&quot;
+az boards query --wiql &quot;SELECT [System.Id],[System.Title] FROM WorkItems WHERE [System.AssignedTo]=@Me AND [System.State]&lt;&gt;&#x27;Closed&#x27;&quot;
+
+# Link a work item from git: mention AB#123 in the commit / PR description
+git commit -m &quot;Add invoice download endpoint AB#123&quot;
+
+# Sprint capacity and iterations
+az boards iteration project list --depth 2
+az boards iteration team add --team &quot;Shop Team&quot; --id &lt;iteration-id&gt;</code></pre><pre data-lang="csharp" hidden><code>// Automating Boards from code: the REST client (Microsoft.TeamFoundationServer.Client)
+var connection = new VssConnection(new Uri(&quot;https://dev.azure.com/contoso&quot;), new VssBasicCredential(string.Empty, pat));
+var wit = connection.GetClient&lt;WorkItemTrackingHttpClient&gt;();
+
+// Create a bug from a production alert
+var patch = new JsonPatchDocument
+{
+    new JsonPatchOperation { Operation = Operation.Add, Path = &quot;/fields/System.Title&quot;, Value = $&quot;P1: {alert.Name}&quot; },
+    new JsonPatchOperation { Operation = Operation.Add, Path = &quot;/fields/Microsoft.VSTS.Common.Priority&quot;, Value = 1 },
+    new JsonPatchOperation { Operation = Operation.Add, Path = &quot;/fields/System.Tags&quot;, Value = &quot;incident;auto&quot; },
+    new JsonPatchOperation { Operation = Operation.Add, Path = &quot;/fields/System.Description&quot;, Value = alert.Details }
+};
+var bug = await wit.CreateWorkItemAsync(patch, &quot;Shop&quot;, &quot;Bug&quot;);
+
+// Query
+var result = await wit.QueryByWiqlAsync(new Wiql { Query = &quot;SELECT [System.Id] FROM WorkItems WHERE [System.State] = &#x27;Active&#x27; AND [System.WorkItemType] = &#x27;Bug&#x27;&quot; });
+var items = await wit.GetWorkItemsAsync(result.WorkItems.Select(w =&gt; w.Id), new[] { &quot;System.Title&quot;, &quot;System.AssignedTo&quot; });
+
+// Prefer a service principal / managed identity over a PAT in automation:
+// var cred = new VssAadCredential / use DefaultAzureCredential with scope 499b84ac-1321-427f-aa17-267ca6975798/.default</code></pre></div></section>
+<section id="repos"><h2 id="repos">Repos: branching strategy and branch policies</h2><p>Trunk-based development with short-lived feature branches and PRs into <code>main</code> is the default that scales. Branch policies on <code>main</code> enforce it: minimum reviewers, linked work items, comment resolution, a required build (the PR validation pipeline), and squash merge to keep history linear. Protect release branches the same way if you use them.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="yaml">YAML</button></div><pre data-lang="bash"><code># Branch policies via CLI (or Project Settings → Repos → Policies in the portal)
+REPO=$(az repos show --repository Shop --query id -o tsv)
+
+az repos policy approver-count create --repository-id $REPO --branch main --blocking true --enabled true \
+  --minimum-approver-count 2 --creator-vote-counts false --allow-downvotes false --reset-on-source-push true
+
+az repos policy work-item-linking create --repository-id $REPO --branch main --blocking true --enabled true
+az repos policy comment-required   create --repository-id $REPO --branch main --blocking true --enabled true
+
+# Required build: the PR validation pipeline must pass
+az repos policy build create --repository-id $REPO --branch main --blocking true --enabled true \
+  --build-definition-id 42 --display-name &quot;PR validation&quot; --queue-on-source-update-only true --valid-duration 720
+
+# Required reviewers for sensitive paths (CODEOWNERS-style)
+az repos policy required-reviewer create --repository-id $REPO --branch main --blocking true --enabled true \
+  --required-reviewer-ids security-team@contoso.com --path-filter &quot;/src/Shop.Security/*&quot;
+
+# Day-to-day
+git switch -c feature/invoice-download
+git push -u origin HEAD
+az repos pr create --source-branch feature/invoice-download --target-branch main --title &quot;Invoice download AB#123&quot; --auto-complete true --squash true --delete-source-branch true
+az repos pr list --status active --creator me@contoso.com</code></pre><pre data-lang="yaml" hidden><code># PR validation pipeline — runs on every PR to main, fast feedback only
+# azure-pipelines-pr.yml
+trigger: none                 # not on push
+pr:
+  branches: { include: [main, release/*] }
+  paths: { exclude: [docs/*, &#x27;*.md&#x27;] }
+
+pool: { vmImage: ubuntu-latest }
+
+steps:
+  - task: UseDotNet@2
+    inputs: { packageType: sdk, version: 9.0.x }
+  - script: dotnet restore
+  - script: dotnet build --no-restore -c Release -warnaserror
+  - script: dotnet format --verify-no-changes            # style gate
+  - script: dotnet test --no-build -c Release --logger trx --collect &quot;XPlat Code Coverage&quot;
+  - task: PublishTestResults@2
+    condition: always()
+    inputs: { testResultsFormat: VSTest, testResultsFiles: &#x27;**/*.trx&#x27; }
+  - task: PublishCodeCoverageResults@2
+    inputs: { summaryFileLocation: &#x27;$(Agent.TempDirectory)/**/coverage.cobertura.xml&#x27; }</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Trunk-based vs GitFlow and why most teams moved to the former; what a branch policy can enforce; squash vs merge commits; how you keep PRs small (feature flags instead of long branches).</p></div></section>
+<section id="pipeline-basics"><h2 id="pipeline-basics">A complete YAML pipeline for a .NET API</h2><p>Everything else on this page is a zoom-in on this file. It builds once, tests, publishes an artifact, and deploys the <em>same</em> artifact to staging then production with an approval gate. Read it top to bottom; the sections after explain each construct.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="yaml"><code># azure-pipelines.yml
+trigger:
+  branches: { include: [main] }
+  paths: { exclude: [docs/*] }
+pr: none
+
+variables:
+  - group: shop-common                   # variable group (Library): shared non-secret settings
+  - name: buildConfiguration
+    value: Release
+  - name: dotnetVersion
+    value: 9.0.x
+
+pool: { vmImage: ubuntu-latest }
+
+stages:
+  # ---------------- Build once ----------------
+  - stage: Build
+    jobs:
+      - job: BuildTest
+        steps:
+          - task: UseDotNet@2
+            inputs: { packageType: sdk, version: $(dotnetVersion) }
+
+          - task: Cache@2                           # NuGet cache between runs
+            inputs:
+              key: &#x27;nuget | &quot;$(Agent.OS)&quot; | **/packages.lock.json&#x27;
+              path: $(NUGET_PACKAGES)
+
+          - script: dotnet restore --locked-mode
+            displayName: Restore
+
+          - script: dotnet build --no-restore -c $(buildConfiguration) /p:Version=1.0.$(Build.BuildId)
+            displayName: Build
+
+          - script: dotnet test --no-build -c $(buildConfiguration) --logger trx --collect &quot;XPlat Code Coverage&quot; --results-directory $(Agent.TempDirectory)/tests
+            displayName: Test
+
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs: { testResultsFormat: VSTest, testResultsFiles: &#x27;$(Agent.TempDirectory)/tests/**/*.trx&#x27;, failTaskOnFailedTests: true }
+
+          - script: dotnet publish src/Shop.Api -c $(buildConfiguration) --no-build -o $(Build.ArtifactStagingDirectory)/api
+            displayName: Publish
+
+          - publish: $(Build.ArtifactStagingDirectory)/api
+            artifact: api                          # pipeline artifact consumed by deploy stages
+
+  # ---------------- Deploy to staging ----------------
+  - stage: Staging
+    dependsOn: Build
+    variables:
+      - group: shop-staging                  # linked to Key Vault for secrets
+    jobs:
+      - deployment: DeployStaging
+        environment: shop-staging            # environment = history + checks
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: api
+                - task: AzureWebApp@1
+                  inputs:
+                    azureSubscription: sc-shop-nonprod     # service connection
+                    appName: shop-api
+                    deployToSlotOrASE: true
+                    slotName: staging
+                    package: $(Pipeline.Workspace)/api
+                - script: curl -fsS https://shop-api-staging.azurewebsites.net/health/ready
+                  displayName: Smoke test
+
+  # ---------------- Production with approval ----------------
+  - stage: Production
+    dependsOn: Staging
+    condition: and(succeeded(), eq(variables[&#x27;Build.SourceBranch&#x27;], &#x27;refs/heads/main&#x27;))
+    jobs:
+      - deployment: DeployProd
+        environment: shop-production         # has an Approvals check → pauses here
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureAppServiceManage@0     # swap the already-warmed staging slot
+                  inputs:
+                    azureSubscription: sc-shop-prod
+                    Action: Swap Slots
+                    WebAppName: shop-api
+                    SourceSlot: staging</code></pre><pre data-lang="python" hidden><code># Same shape for a FastAPI app — only the Build stage steps differ
+stages:
+  - stage: Build
+    jobs:
+      - job: BuildTest
+        steps:
+          - task: UsePythonVersion@0
+            inputs: { versionSpec: &#x27;3.12&#x27; }
+
+          - task: Cache@2
+            inputs:
+              key: &#x27;pip | &quot;$(Agent.OS)&quot; | requirements.lock&#x27;
+              path: $(Pipeline.Workspace)/.pip
+
+          - script: |
+              python -m pip install --upgrade pip uv
+              uv sync --frozen
+            displayName: Install
+
+          - script: |
+              uv run ruff check .
+              uv run mypy src
+            displayName: Lint
+
+          - script: uv run pytest --junitxml=$(Agent.TempDirectory)/junit.xml --cov=src --cov-report=xml:$(Agent.TempDirectory)/coverage.xml
+            displayName: Test
+
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs: { testResultsFormat: JUnit, testResultsFiles: &#x27;$(Agent.TempDirectory)/junit.xml&#x27; }
+
+          - task: PublishCodeCoverageResults@2
+            inputs: { summaryFileLocation: &#x27;$(Agent.TempDirectory)/coverage.xml&#x27; }
+
+          # Deploy as a container (recommended for Python) rather than a zip
+          - task: Docker@2
+            inputs:
+              command: buildAndPush
+              repository: orders-api
+              containerRegistry: sc-acr
+              tags: |
+                $(Build.BuildId)
+                latest
+
+  # Deploy stages then use AzureWebAppContainer@1 or az containerapp update --image ...:$(Build.BuildId)</code></pre></div></section>
+<section id="stages-jobs-steps"><h2 id="stages-jobs-steps">Stages, jobs and steps</h2><p><strong>Steps</strong> run sequentially on one agent. A <strong>job</strong> is a set of steps on one agent (fresh VM per job); jobs in a stage run in parallel unless they <code>dependsOn</code> each other. A <strong>stage</strong> groups jobs and is the unit for approvals and conditions. A <strong>deployment job</strong> targets an environment and records what was deployed where. Use <code>matrix</code>/<code>parallel</code> strategies to fan out.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="yaml"><code>stages:
+  - stage: Test
+    jobs:
+      # Fan out across OS and SDK versions
+      - job: Matrix
+        strategy:
+          matrix:
+            linux_net9:   { image: ubuntu-latest,  sdk: 9.0.x }
+            windows_net9: { image: windows-latest, sdk: 9.0.x }
+            linux_net8:   { image: ubuntu-latest,  sdk: 8.0.x }
+          maxParallel: 3
+        pool: { vmImage: $(image) }
+        steps:
+          - task: UseDotNet@2
+            inputs: { packageType: sdk, version: $(sdk) }
+          - script: dotnet test
+
+      # Split slow tests across N agents
+      - job: Integration
+        strategy: { parallel: 4 }
+        steps:
+          - script: dotnet test --filter &quot;Category=Integration&quot; -- RunConfiguration.TestSessionTimeout=600000
+            env: { SLICE: $(System.JobPositionInPhase), SLICES: $(System.TotalJobsInPhase) }
+
+      # Runs after both, even if they failed
+      - job: Report
+        dependsOn: [Matrix, Integration]
+        condition: always()
+        steps:
+          - script: echo &quot;Matrix=$(MATRIX_RESULT)&quot;
+            env: { MATRIX_RESULT: $[ dependencies.Matrix.result ] }
+
+  - stage: Deploy
+    dependsOn: Test
+    condition: succeeded()
+    jobs:
+      - deployment: Web
+        environment: shop-staging
+        timeoutInMinutes: 20
+        strategy:
+          runOnce:                       # also: rolling, canary (for VM/K8s environments)
+            preDeploy:  { steps: [ { script: echo pre } ] }
+            deploy:     { steps: [ { script: echo deploy } ] }
+            routeTraffic: { steps: [ { script: echo route } ] }
+            postRouteTraffic: { steps: [ { script: echo verify } ] }
+            on:
+              failure: { steps: [ { script: echo rollback } ] }
+              success: { steps: [ { script: echo notify } ] }
+
+# Steps: script / bash / pwsh / task@version / checkout / download / publish / template
+# Every step supports: displayName, condition, continueOnError, timeoutInMinutes, env, workingDirectory</code></pre><pre data-lang="bash" hidden><code># Self-hosted agents when you need private network access or custom tooling
+# Download the agent from Project Settings → Agent pools → New agent, then:
+./config.sh --unattended --url https://dev.azure.com/contoso --auth pat --token $PAT --pool shop-private --agent $(hostname) --acceptTeeEula
+sudo ./svc.sh install &amp;&amp; sudo ./svc.sh start
+
+# Reference it in YAML:
+#   pool: { name: shop-private, demands: [ docker ] }
+
+# Container jobs: run steps inside an image on a hosted agent
+#   jobs:
+#     - job: InContainer
+#       container: mcr.microsoft.com/dotnet/sdk:9.0
+#       services:
+#         sql: { image: mcr.microsoft.com/mssql/server:2022-latest, env: { ACCEPT_EULA: Y, MSSQL_SA_PASSWORD: P@ssw0rd! }, ports: [&#x27;1433:1433&#x27;] }</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Explain why each job gets a fresh agent (and therefore why you publish/download artifacts), when you would use stages vs jobs, and how a deployment job differs from a normal job.</p></div></section>
+<section id="variables"><h2 id="variables">Variables, variable groups and secrets</h2><p>Variables come from YAML (<code>variables:</code>), variable groups in Library (optionally linked to Key Vault), pipeline UI settings, and runtime expressions. Two syntaxes: <code>$(var)</code> macro (expanded at runtime), <code>${{ variables.var }}</code> template expression (compile time), <code>$[variables.var]</code> runtime expression (for conditions). Secrets are masked in logs and must be mapped to <code>env:</code> explicitly for scripts.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="yaml"><code>variables:
+  - name: configuration
+    value: Release
+  - group: shop-common                                   # Library → Variable groups
+  - group: shop-keyvault                                 # linked to Key Vault: secrets become variables
+  - ${{ if eq(variables[&#x27;Build.SourceBranchName&#x27;], &#x27;main&#x27;) }}:   # compile-time branch on the branch
+      - name: environmentSuffix
+        value: prod
+  - ${{ else }}:
+      - name: environmentSuffix
+        value: dev
+
+steps:
+  # Macro syntax: expanded before the step runs
+  - script: dotnet build -c $(configuration)
+
+  # Secrets are NOT exposed as env vars automatically — map them
+  - script: dotnet ef database update
+    env:
+      ConnectionStrings__Default: $(SqlConnection)      # from the Key Vault group, masked in logs
+
+  # Set a variable for later steps / jobs / stages
+  - bash: |
+      VERSION=1.0.$(Build.BuildId)
+      echo &quot;##vso[task.setvariable variable=version]$VERSION&quot;                      # this job
+      echo &quot;##vso[task.setvariable variable=version;isOutput=true]$VERSION&quot;        # other jobs (needs step name)
+    name: SetVersion
+
+  - script: echo &quot;Version is $(version)&quot;
+
+jobs:
+  - job: Consumer
+    dependsOn: Producer
+    variables:
+      version: $[ dependencies.Producer.outputs[&#x27;SetVersion.version&#x27;] ]        # runtime expression
+    steps:
+      - script: echo $(version)
+
+# Predefined variables you use constantly:
+#   $(Build.BuildId) $(Build.BuildNumber) $(Build.SourceBranch) $(Build.SourceVersion) $(Build.Reason)
+#   $(Build.ArtifactStagingDirectory) $(Pipeline.Workspace) $(Agent.TempDirectory) $(System.DefaultWorkingDirectory)
+
+# Runtime parameters (typed, shown in the Run dialog)
+parameters:
+  - name: deployTo
+    type: string
+    default: staging
+    values: [staging, production]
+  - name: runLoadTests
+    type: boolean
+    default: false</code></pre><pre data-lang="bash" hidden><code># Manage variable groups from the CLI
+az pipelines variable-group create --name shop-common --variables Region=westeurope LogLevel=Information --authorize true
+az pipelines variable-group variable create --group-id 7 --name ApiBaseUrl --value https://shop-api.azurewebsites.net
+az pipelines variable-group variable create --group-id 7 --name SqlPassword --value &#x27;S3cret!&#x27; --secret true
+
+# Pipeline-level secret variable (Edit → Variables in the UI, or:)
+az pipelines variable create --pipeline-id 42 --name NUGET_TOKEN --value $TOKEN --secret true
+
+# Key Vault-linked group: Library → + Variable group → &quot;Link secrets from an Azure key vault as variables&quot;
+# (needs a service connection with Get/List on secrets; secrets refresh at run start)
+
+# Custom build number
+#   name: 1.0.$(Rev:r)                     # top of the YAML
+#   name: $(Date:yyyyMMdd)$(Rev:.r)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Macro vs template vs runtime expression syntax and when each is evaluated; why secrets need explicit env mapping; how to pass a value between jobs/stages; Key Vault-linked variable groups vs the AzureKeyVault@2 task.</p></div></section>
+<section id="templates"><h2 id="templates">Templates: reuse across pipelines</h2><p>Templates factor out steps, jobs, stages or variables into files with typed <code>parameters</code>, often in a central repo consumed via a <code>resources.repositories</code> reference. <em>Extends</em> templates enforce a required skeleton (security scans, approvals) that consuming pipelines cannot bypass — combine with a required-template check on the environment.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button></div><pre data-lang="yaml"><code># templates/dotnet-build.yml — step template with parameters
+parameters:
+  - name: project
+    type: string
+  - name: configuration
+    type: string
+    default: Release
+  - name: runTests
+    type: boolean
+    default: true
+
+steps:
+  - task: UseDotNet@2
+    inputs: { packageType: sdk, version: 9.0.x }
+  - script: dotnet build ${{ parameters.project }} -c ${{ parameters.configuration }}
+  - ${{ if parameters.runTests }}:
+      - script: dotnet test ${{ parameters.project }} --no-build -c ${{ parameters.configuration }}
+
+# ---------------------------------------------------------------
+# templates/deploy-webapp.yml — job template
+parameters:
+  - name: environment
+    type: string
+  - name: serviceConnection
+    type: string
+  - name: appName
+    type: string
+
+jobs:
+  - deployment: Deploy_${{ parameters.environment }}
+    environment: ${{ parameters.environment }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - download: current
+              artifact: api
+            - task: AzureWebApp@1
+              inputs:
+                azureSubscription: ${{ parameters.serviceConnection }}
+                appName: ${{ parameters.appName }}
+                package: $(Pipeline.Workspace)/api
+
+# ---------------------------------------------------------------
+# azure-pipelines.yml — consuming templates from a shared repo
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: Platform/pipeline-templates
+      ref: refs/tags/v2
+
+stages:
+  - stage: Build
+    jobs:
+      - job: Build
+        steps:
+          - template: templates/dotnet-build.yml@templates
+            parameters: { project: src/Shop.Api, runTests: true }
+          - publish: $(Build.ArtifactStagingDirectory)/api
+            artifact: api
+
+  - stage: Staging
+    jobs:
+      - template: templates/deploy-webapp.yml@templates
+        parameters: { environment: shop-staging, serviceConnection: sc-shop-nonprod, appName: shop-api }
+
+# ---------------------------------------------------------------
+# Extends template: the platform team owns the skeleton; teams fill in `buildSteps`
+# templates/secure-pipeline.yml
+parameters:
+  - name: buildSteps
+    type: stepList
+stages:
+  - stage: Build
+    jobs:
+      - job: Build
+        steps:
+          - task: CredScan@3                      # mandatory scans first
+          - ${{ parameters.buildSteps }}
+          - task: ComponentGovernanceComponentDetection@0
+
+# consuming pipeline:
+# extends:
+#   template: templates/secure-pipeline.yml@templates
+#   parameters:
+#     buildSteps:
+#       - script: dotnet build</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Step vs job vs stage templates; <code>template</code> include vs <code>extends</code>; why <code>${{ }}</code> is the only syntax inside templates for parameters; pinning template repos to a tag.</p></div></section>
+<section id="environments"><h2 id="environments">Environments, approvals and checks</h2><p>An <strong>environment</strong> is a named target (staging, production) with deployment history, traceability to work items/commits, and <strong>checks</strong>: manual approvals, business hours, branch control (only <code>main</code> may deploy), required template, Azure Monitor alert gates, invoke REST/Function gates, and exclusive lock. Checks run <em>before</em> the deployment job starts and are configured on the environment, not in YAML — so nobody can edit them out of a pipeline.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="yaml"><code># YAML side: just target the environment
+- stage: Production
+  jobs:
+    - deployment: DeployProd
+      environment: shop-production           # checks configured on this environment apply
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - download: current
+                artifact: api
+              - task: AzureWebApp@1
+                inputs: { azureSubscription: sc-shop-prod, appName: shop-api, package: $(Pipeline.Workspace)/api }
+
+# Environment with resources (Kubernetes namespace or VM) → richer strategies
+- deployment: DeployK8s
+  environment: shop-production.orders        # environment.resource
+  strategy:
+    canary:
+      increments: [10, 50]
+      preDeploy:  { steps: [ { script: echo baseline } ] }
+      deploy:
+        steps:
+          - task: KubernetesManifest@1
+            inputs:
+              action: deploy
+              strategy: canary
+              percentage: $(strategy.increment)
+              manifests: k8s/orders-api.yaml
+      postRouteTraffic:
+        steps:
+          - script: ./scripts/check-error-rate.sh    # fail → automatic rollback of the canary
+      on:
+        failure:
+          steps:
+            - task: KubernetesManifest@1
+              inputs: { action: reject, strategy: canary, manifests: k8s/orders-api.yaml }
+        success:
+          steps:
+            - task: KubernetesManifest@1
+              inputs: { action: promote, strategy: canary, manifests: k8s/orders-api.yaml }</code></pre><pre data-lang="bash" hidden><code># Environments and checks are configured in the portal (Pipelines → Environments → ... → Approvals and checks)
+# or via the REST API. Typical production set:
+#   • Approvals: 2 of [release-managers], timeout 24h, approver cannot be the requester
+#   • Branch control: refs/heads/main only, require branch protection
+#   • Business hours: Mon–Thu 09:00–16:00 CET
+#   • Required template: templates/secure-pipeline.yml@templates
+#   • Exclusive lock: one deployment at a time
+#   • Azure Monitor: no Sev0/1 alerts on the prod resource group in the last 30 min (evaluated after deploy in postRouteTraffic)
+
+# Same checks exist on service connections and agent pools — protect the prod service connection too.
+
+# REST: list environments / deployment history
+az devops invoke --area distributedtask --resource environments --route-parameters project=Shop --api-version 7.1-preview -o table
+az pipelines runs list --pipeline-ids 42 --branch main --top 5 -o table</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why checks live on the environment rather than in YAML; what “exclusive lock” prevents; how you would implement “deploy only if no active incident”; canary vs rolling vs runOnce strategies.</p></div></section>
+<section id="artifacts"><h2 id="artifacts">Artifacts: pipeline artifacts and Azure Artifacts feeds</h2><p>Two different things. <strong>Pipeline artifacts</strong> (<code>publish</code>/<code>download</code>) carry build output between jobs, stages and pipelines — build once, deploy the same bytes everywhere. <strong>Azure Artifacts</strong> hosts package feeds (NuGet, npm, PyPI, Maven, Universal Packages) with upstream sources to proxy nuget.org/PyPI, and retention/views (<code>@Local</code>, <code>@Prerelease</code>, <code>@Release</code>) for promotion.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="yaml"><code># Pipeline artifacts between stages
+- publish: $(Build.ArtifactStagingDirectory)/api
+  artifact: api
+
+- download: current            # in a later job/stage: everything published by this run
+  artifact: api
+  # lands in $(Pipeline.Workspace)/api
+
+# Consume an artifact from ANOTHER pipeline (e.g. a shared library build)
+resources:
+  pipelines:
+    - pipeline: shared           # alias
+      source: Platform.SharedLib # pipeline name
+      branch: main
+      trigger: true              # this pipeline runs when that one completes
+steps:
+  - download: shared
+    artifact: lib
+
+# Publish a NuGet package to an Azure Artifacts feed
+- script: dotnet pack src/Shop.Contracts -c Release -o $(Build.ArtifactStagingDirectory)/nupkg /p:PackageVersion=1.0.$(Build.BuildId)
+- task: NuGetAuthenticate@1
+- script: dotnet nuget push &quot;$(Build.ArtifactStagingDirectory)/nupkg/*.nupkg&quot; --source &quot;https://pkgs.dev.azure.com/contoso/_packaging/shop/nuget/v3/index.json&quot; --api-key az
+
+# Restore from the feed (nuget.config in the repo points at the feed; upstream to nuget.org enabled)
+- task: NuGetAuthenticate@1
+- script: dotnet restore --configfile nuget.config
+
+# Universal Packages for arbitrary blobs (ML models, tools)
+- task: UniversalPackages@0
+  inputs: { command: publish, publishDirectory: ./model, vstsFeedPublish: shop, vstsFeedPackagePublish: pricing-model, versionOption: patch }</code></pre><pre data-lang="python" hidden><code># Python packages on an Azure Artifacts feed (PyPI-compatible)
+# pip install artifacts-keyring twine build   (keyring handles auth locally; in pipelines use PipAuthenticate)
+
+# Build and publish (pipeline steps)
+#   - task: PipAuthenticate@1
+#     inputs: { artifactFeeds: shop }
+#   - script: |
+#       python -m build
+#       twine upload -r shop --config-file $(PYPIRC_PATH) dist/*
+#
+# Consume: pip.conf / pyproject with the feed as index-url and upstream to PyPI enabled on the feed
+#   [global]
+#   index-url = https://pkgs.dev.azure.com/contoso/_packaging/shop/pypi/simple/
+#
+#   - task: PipAuthenticate@1
+#     inputs: { artifactFeeds: shop, onlyAddExtraIndex: true }
+#   - script: pip install -r requirements.txt
+
+# Docker images go to Azure Container Registry (not Azure Artifacts):
+#   - task: Docker@2
+#     inputs: { command: buildAndPush, containerRegistry: sc-acr, repository: orders-api, tags: $(Build.BuildId) }</code></pre></div></section>
+<section id="service-connections"><h2 id="service-connections">Service connections and identity</h2><p>A service connection is how a pipeline authenticates to Azure, ACR, GitHub, SonarQube and so on. For Azure, use <strong>workload identity federation</strong> (OIDC — no secret to rotate) scoped to a resource group, and protect production connections with approvals and pipeline permissions. Never put subscription-wide Owner on a pipeline identity.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="yaml">YAML</button></div><pre data-lang="bash"><code># Create an Azure RM service connection with workload identity federation (recommended)
+# Portal: Project Settings → Service connections → New → Azure Resource Manager → Workload Identity federation (automatic)
+# CLI (manual federation):
+APP_ID=$(az ad app create --display-name sc-shop-prod --query appId -o tsv)
+SP_ID=$(az ad sp create --id $APP_ID --query id -o tsv)
+az role assignment create --assignee $SP_ID --role Contributor --scope /subscriptions/&lt;sub&gt;/resourceGroups/rg-shop
+az ad app federated-credential create --id $APP_ID --parameters &#x27;{
+  &quot;name&quot;: &quot;azdo-shop-prod&quot;,
+  &quot;issuer&quot;: &quot;https://vstoken.dev.azure.com/&lt;org-id&gt;&quot;,
+  &quot;subject&quot;: &quot;sc://contoso/Shop/sc-shop-prod&quot;,
+  &quot;audiences&quot;: [&quot;api://AzureADTokenExchange&quot;] }&#x27;
+az devops service-endpoint azurerm create --name sc-shop-prod --azure-rm-service-principal-id $APP_ID \
+  --azure-rm-subscription-id &lt;sub&gt; --azure-rm-subscription-name Prod --azure-rm-tenant-id &lt;tenant&gt;   # then switch auth to WIF in the portal
+
+# Restrict which pipelines may use it: Service connection → Security → Pipeline permissions (uncheck &quot;Grant access to all&quot;)
+# Add an approval check to sc-shop-prod so any first use by a pipeline needs sign-off.
+
+# Other connections you will create: Docker Registry (ACR, use managed identity or service principal),
+# GitHub (for repos/releases), Generic (REST gates), SonarCloud.</code></pre><pre data-lang="yaml" hidden><code># Using the connection in tasks
+- task: AzureCLI@2
+  inputs:
+    azureSubscription: sc-shop-prod           # the service connection name
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      az account show
+      az webapp config appsettings set -g rg-shop -n shop-api --settings Version=1.0.$(Build.BuildId)
+
+- task: AzureWebApp@1
+  inputs: { azureSubscription: sc-shop-prod, appName: shop-api, package: $(Pipeline.Workspace)/api }
+
+- task: AzureKeyVault@2                       # pull secrets at run time (alternative to a linked variable group)
+  inputs: { azureSubscription: sc-shop-prod, KeyVaultName: shop-kv, SecretsFilter: &#x27;SqlConnection,StripeApiKey&#x27;, RunAsPreJob: true }
+
+- task: Docker@2
+  inputs: { command: login, containerRegistry: sc-acr }
+
+# Bicep/Terraform infra from the same pipeline
+- task: AzureCLI@2
+  inputs:
+    azureSubscription: sc-shop-prod
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: az deployment group create -g rg-shop -f infra/main.bicep -p env=prod</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Workload identity federation vs service principal secret; least-privilege scoping; how you prevent a feature-branch pipeline from deploying to prod (branch control on the environment and connection); who can edit service connections.</p></div></section>
+<section id="deploy-appservice"><h2 id="deploy-appservice">Deploying: App Service, containers, database migrations</h2><p>Deploy the artifact, not the source. App Service: zip deploy to a slot, warm up, swap. Containers: push to ACR with the build ID as tag, then update the Container App / AKS manifest. Database: run migrations as an explicit, idempotent step <em>before</em> the app deploy, using a script or bundle produced at build time, from an agent that can reach the database.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="yaml"><code># App Service slot deploy + swap (zero downtime)
+- task: AzureWebApp@1
+  inputs:
+    azureSubscription: sc-shop-prod
+    appName: shop-api
+    deployToSlotOrASE: true
+    resourceGroupName: rg-shop
+    slotName: staging
+    package: $(Pipeline.Workspace)/api
+    appSettings: -Version 1.0.$(Build.BuildId) -ASPNETCORE_ENVIRONMENT Production
+- script: |
+    for i in $(seq 1 10); do curl -fsS https://shop-api-staging.azurewebsites.net/health/ready &amp;&amp; exit 0; sleep 6; done; exit 1
+  displayName: Warm up and verify
+- task: AzureAppServiceManage@0
+  inputs: { azureSubscription: sc-shop-prod, Action: Swap Slots, WebAppName: shop-api, ResourceGroupName: rg-shop, SourceSlot: staging }
+
+# EF Core migrations — bundle built once in the Build stage, executed here
+#   (Build stage:)  - script: dotnet ef migrations bundle --project src/Shop.Data --startup-project src/Shop.Api -o $(Build.ArtifactStagingDirectory)/migrate/efbundle --self-contained -r linux-x64
+#                   - publish: $(Build.ArtifactStagingDirectory)/migrate
+#                     artifact: migrate
+- download: current
+  artifact: migrate
+- task: AzureCLI@2                       # runs with the service connection&#x27;s identity → Entra auth to SQL
+  inputs:
+    azureSubscription: sc-shop-prod
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      chmod +x $(Pipeline.Workspace)/migrate/efbundle
+      $(Pipeline.Workspace)/migrate/efbundle --connection &quot;Server=tcp:shop-sql.database.windows.net;Database=shop;Authentication=Active Directory Default;Encrypt=True&quot;
+  displayName: Apply migrations
+  # Order: migrations (backward-compatible) → deploy app → cleanup migrations in a later release (expand/contract)
+
+# Container Apps
+- task: AzureCLI@2
+  inputs:
+    azureSubscription: sc-shop-prod
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      az containerapp update -g rg-shop -n orders-api --image shopacr.azurecr.io/orders-api:$(Build.BuildId) --revision-suffix b$(Build.BuildId)
+      az containerapp ingress traffic set -g rg-shop -n orders-api --revision-weight latest=100
+
+# AKS
+- task: KubernetesManifest@1
+  inputs:
+    action: deploy
+    connectionType: azureResourceManager
+    azureSubscriptionConnection: sc-shop-prod
+    azureResourceGroup: rg-shop
+    kubernetesCluster: aks-shop
+    namespace: shop
+    manifests: k8s/orders-api.yaml
+    containers: shopacr.azurecr.io/orders-api:$(Build.BuildId)</code></pre><pre data-lang="python" hidden><code># Python equivalents in the deploy stage
+
+# Alembic migrations (run from the built image or the agent)
+#   - task: AzureCLI@2
+#     inputs:
+#       azureSubscription: sc-shop-prod
+#       scriptType: bash
+#       scriptLocation: inlineScript
+#       inlineScript: |
+#         pip install -r requirements.txt
+#         DATABASE_URL=&quot;$(DatabaseUrl)&quot; alembic upgrade head
+
+# App Service (code deploy): zip the app and set the startup command
+#   - task: AzureWebApp@1
+#     inputs:
+#       azureSubscription: sc-shop-prod
+#       appName: shop-api-py
+#       package: $(Pipeline.Workspace)/app.zip
+#       runtimeStack: &#x27;PYTHON|3.12&#x27;
+#       startUpCommand: &#x27;gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:8000 main:app&#x27;
+
+# Container (preferred): same az containerapp update / KubernetesManifest steps with the Python image tag</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Build once / deploy many; slot swap mechanics and slot-sticky settings; why migrations run before the app and must be backward compatible; rollback options (swap back, previous revision, previous image tag).</p></div></section>
+<section id="release-strategies"><h2 id="release-strategies">Release strategies and rollback</h2><p><strong>Blue/green</strong>: two identical environments, switch traffic (slot swap). <strong>Canary</strong>: small percentage first, watch metrics, ramp. <strong>Rolling</strong>: replace instances a few at a time. <strong>Feature flags</strong>: deploy dark, enable per user/percentage, kill-switch without a deploy. Pick per risk: flags for behaviour changes, canary for infrastructure/runtime changes, blue/green when you need instant rollback. Always have a rehearsed rollback.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button></div><pre data-lang="yaml"><code># Canary on Container Apps with metric gate and automatic rollback
+- stage: Canary
+  jobs:
+    - deployment: Canary
+      environment: shop-production
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: AzureCLI@2
+                displayName: 10% to new revision
+                inputs:
+                  azureSubscription: sc-shop-prod
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    az containerapp update -g rg-shop -n orders-api --image shopacr.azurecr.io/orders-api:$(Build.BuildId) --revision-suffix b$(Build.BuildId)
+                    az containerapp ingress traffic set -g rg-shop -n orders-api --revision-weight latest=10
+              - task: AzureCLI@2
+                displayName: Watch error rate for 10 minutes
+                inputs:
+                  azureSubscription: sc-shop-prod
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    sleep 600
+                    ERR=$(az monitor app-insights query --app shop-ai --analytics-query \
+                      &quot;requests | where timestamp &gt; ago(10m) and cloud_RoleInstance contains &#x27;b$(Build.BuildId)&#x27; | summarize 100.0*countif(success==false)/count()&quot; \
+                      --query &quot;tables[0].rows[0][0]&quot; -o tsv)
+                    echo &quot;error rate: $ERR%&quot;
+                    awk &quot;BEGIN{exit !($ERR &gt; 1.0)}&quot; &amp;&amp; { echo &quot;##vso[task.logissue type=error]Error rate too high&quot;; exit 1; } || true
+          on:
+            failure:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Roll back canary
+                  inputs:
+                    azureSubscription: sc-shop-prod
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      PREV=$(az containerapp revision list -g rg-shop -n orders-api --query &quot;[?properties.trafficWeight==\`90\`].name | [0]&quot; -o tsv)
+                      az containerapp ingress traffic set -g rg-shop -n orders-api --revision-weight $PREV=100
+            success:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Promote to 100%
+                  inputs:
+                    azureSubscription: sc-shop-prod
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: az containerapp ingress traffic set -g rg-shop -n orders-api --revision-weight latest=100
+
+# Rollback for slot-based blue/green is just another swap:
+#   az webapp deployment slot swap -g rg-shop -n shop-api --slot staging --target-slot production
+# Rollback for a pipeline: re-run the last good run&#x27;s Production stage (&quot;Redeploy&quot; on the environment&#x27;s history).</code></pre><pre data-lang="csharp" hidden><code>// Feature flags decouple deploy from release — Microsoft.FeatureManagement + Azure App Configuration
+builder.Configuration.AddAzureAppConfiguration(o =&gt; o
+    .Connect(new Uri(appConfigUri), new DefaultAzureCredential())
+    .UseFeatureFlags(f =&gt; f.SetRefreshInterval(TimeSpan.FromSeconds(30))));
+builder.Services.AddAzureAppConfiguration().AddFeatureManagement().AddFeatureFilter&lt;PercentageFilter&gt;().AddFeatureFilter&lt;TargetingFilter&gt;();
+
+var app = builder.Build();
+app.UseAzureAppConfiguration();       // refresh middleware
+
+// Gate an endpoint
+app.MapGet(&quot;/invoices/{id}/download&quot;, [FeatureGate(&quot;InvoiceDownload&quot;)] (int id) =&gt; ...);
+
+// Branch in code
+public class CheckoutService(IFeatureManager features)
+{
+    public async Task&lt;decimal&gt; Total(Cart cart) =&gt;
+        await features.IsEnabledAsync(&quot;NewPricingEngine&quot;) ? _newPricing.Total(cart) : _legacyPricing.Total(cart);
+}
+
+// Flag definition in App Configuration (JSON):
+// { &quot;id&quot;: &quot;NewPricingEngine&quot;, &quot;enabled&quot;: true,
+//   &quot;conditions&quot;: { &quot;client_filters&quot;: [
+//     { &quot;name&quot;: &quot;Microsoft.Targeting&quot;, &quot;parameters&quot;: { &quot;Audience&quot;: { &quot;Users&quot;: [&quot;ada@contoso.com&quot;], &quot;Groups&quot;: [{ &quot;Name&quot;: &quot;beta&quot;, &quot;RolloutPercentage&quot;: 50 }], &quot;DefaultRolloutPercentage&quot;: 5 } } } ] } }
+
+// Kill switch = flip enabled:false; no pipeline run needed. Remove the flag (and the old path) once fully rolled out.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Compare the four strategies on rollback speed, blast radius and infrastructure cost; what metrics gate a canary; why feature flags need a removal plan; how you'd roll back a deploy that included a database migration.</p></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/azure/devops/pipelines/yaml-schema/" target="_blank" rel="noopener">Azure Pipelines YAML schema</a> — the reference you'll keep open</li><li><a href="https://learn.microsoft.com/azure/devops/pipelines/ecosystems/dotnet-core" target="_blank" rel="noopener">Build, test, and deploy .NET Core apps</a></li><li><a href="https://learn.microsoft.com/azure/devops/pipelines/process/templates" target="_blank" rel="noopener">Pipeline templates</a></li><li><a href="https://learn.microsoft.com/azure/devops/pipelines/process/environments" target="_blank" rel="noopener">Environments and approvals</a></li><li><a href="https://learn.microsoft.com/azure/devops/repos/git/branch-policies" target="_blank" rel="noopener">Branch policies</a></li><li><a href="https://learn.microsoft.com/azure/devops/pipelines/build/variables" target="_blank" rel="noopener">Predefined variables</a></li><li><a href="https://learn.microsoft.com/azure/devops/cli/" target="_blank" rel="noopener">Azure DevOps CLI</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

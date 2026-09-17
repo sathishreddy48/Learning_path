@@ -1,0 +1,1168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Core Concepts — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="core-concepts">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 1 of 13</div>
+  <h1>Core Concepts</h1>
+  <p class="lede">Everything else on this site assumes these. Each concept is shown in C# first with the closest Python equivalent beside it, so you can practise the same idea in both languages. Work top to bottom; the samples build on each other.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#types">Types, variables and type inference</a></li><li><a href="#value-reference">Value types vs reference types</a></li><li><a href="#strings">Strings and StringBuilder</a></li><li><a href="#control-flow">Control flow</a></li><li><a href="#collections">Collections: List, Dictionary, HashSet, Queue, Stack</a></li><li><a href="#classes">Classes, structs and records</a></li><li><a href="#properties">Properties, indexers and init-only setters</a></li><li><a href="#interfaces">Interfaces and abstract classes</a></li><li><a href="#inheritance">Inheritance and polymorphism</a></li><li><a href="#generics">Generics and constraints</a></li><li><a href="#delegates">Delegates, events and lambdas</a></li><li><a href="#linq">LINQ — query and method syntax</a></li><li><a href="#exceptions">Exceptions</a></li><li><a href="#nullable">Nullable types and pattern matching</a></li><li><a href="#extension-methods">Extension methods</a></li><li><a href="#idisposable">IDisposable and the using statement</a></li><li><a href="#async-intro">async / await — the basics</a></li></ol>
+  </div>
+
+<section id="types"><h2 id="types">Types, variables and type inference</h2><p>C# is statically typed: every variable has a compile-time type. <code>var</code> asks the compiler to infer it — the variable is still strongly typed. Python variables are names bound to objects; the object has a type, the name does not. Knowing the <em>default values</em> and <em>literal suffixes</em> is a common warm-up question.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>int count = 42;            // 32-bit signed integer
+long big = 9_000_000_000L; // digit separators, L suffix
+double ratio = 0.75;       // 64-bit float (default for literals)
+decimal price = 19.99m;    // 128-bit, base-10 — use for money
+bool ok = true;
+char c = &#x27;A&#x27;;
+string name = &quot;Ada&quot;;
+
+var inferred = 3.5;        // compiler infers double
+const int MaxRetries = 3;  // compile-time constant
+
+// Conversions
+int i = (int)ratio;                 // explicit cast: 0
+double d = count;                   // implicit widening
+int parsed = int.Parse(&quot;123&quot;);
+bool worked = int.TryParse(&quot;x&quot;, out int result); // false, result = 0
+
+Console.WriteLine($&quot;{name} has {count} items costing {price:C}&quot;);</code></pre><pre data-lang="python" hidden><code>count = 42                 # int (arbitrary precision)
+big = 9_000_000_000        # same int type; no overflow
+ratio = 0.75               # float (64-bit)
+from decimal import Decimal
+price = Decimal(&quot;19.99&quot;)   # base-10 decimal — use for money
+ok = True
+c = &quot;A&quot;                    # no char type; a 1-length str
+name = &quot;Ada&quot;
+
+inferred = 3.5             # names are untyped; objects are typed
+MAX_RETRIES = 3            # convention only — no const keyword
+
+# Conversions
+i = int(ratio)             # truncates: 0
+d = float(count)
+parsed = int(&quot;123&quot;)
+try:
+    result = int(&quot;x&quot;)
+except ValueError:
+    result = 0             # no TryParse; use try/except
+
+print(f&quot;{name} has {count} items costing ${price:,.2f}&quot;)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a function that takes a string and returns an <code>int?</code> (C#) / <code>int | None</code> (Python) — <code>null</code>/<code>None</code> when the text is not a number.</li><li>Show what <code>0.1 + 0.2 == 0.3</code> gives for <code>double</code>/<code>float</code> versus <code>decimal</code>/<code>Decimal</code> and explain why.</li></ul></div></section>
+<section id="value-reference"><h2 id="value-reference">Value types vs reference types</h2><p>Value types (<code>int</code>, <code>struct</code>, <code>enum</code>, tuples) hold their data directly and are copied on assignment. Reference types (<code>class</code>, <code>string</code>, arrays, delegates) hold a reference to an object on the heap; assignment copies the reference, so two variables point at the same object. Python has only references — but immutable objects (ints, strings, tuples) <em>behave</em> like values because they cannot change in place.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>struct Point { public int X; public int Y; }
+class Person { public string Name = &quot;&quot;; }
+
+var p1 = new Point { X = 1, Y = 2 };
+var p2 = p1;          // copy
+p2.X = 99;
+Console.WriteLine(p1.X); // 1 — p1 untouched
+
+var a = new Person { Name = &quot;Ada&quot; };
+var b = a;            // same object
+b.Name = &quot;Grace&quot;;
+Console.WriteLine(a.Name); // Grace
+
+// Strings are reference types but immutable
+string s1 = &quot;hi&quot;;
+string s2 = s1;
+s2 += &quot;!&quot;;            // creates a new string
+Console.WriteLine(s1); // hi
+
+// Passing by reference explicitly
+static void Bump(ref int n) =&gt; n++;
+int x = 1; Bump(ref x); // x == 2</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass
+
+@dataclass
+class Point:      # mutable → reference semantics
+    x: int
+    y: int
+
+p1 = Point(1, 2)
+p2 = p1           # same object!
+p2.x = 99
+print(p1.x)       # 99 — unlike a C# struct
+
+import copy
+p3 = copy.copy(p1)   # explicit copy if you want value semantics
+p3.x = 5
+print(p1.x)       # 99
+
+# Immutable objects act like values
+s1 = &quot;hi&quot;
+s2 = s1
+s2 += &quot;!&quot;         # rebinds s2 to a new str
+print(s1)         # hi
+
+# No ref parameters — return the new value or mutate a container
+def bump(n): return n + 1
+x = bump(1)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Expect “where does a struct live?” The honest answer: it depends on where it is declared — a local struct is on the stack, a struct field inside a class is on the heap with its owner. Boxing copies a value type into a heap object; see the Performance page.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a <code>struct Money(decimal Amount, string Currency)</code> and a class version; demonstrate the assignment difference in a small console program.</li></ul></div></section>
+<section id="strings"><h2 id="strings">Strings and StringBuilder</h2><p>Strings are immutable in both languages. Repeated concatenation in a loop allocates a new string each time — use <code>StringBuilder</code> (C#) or build a list and <code>"".join()</code> (Python). Interpolation, common methods and <code>Span</code>-free slicing are shown below.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>string s = &quot;  Hello, World  &quot;;
+s = s.Trim();                        // &quot;Hello, World&quot;
+bool starts = s.StartsWith(&quot;Hello&quot;);
+int idx = s.IndexOf(&quot;World&quot;);        // 7
+string upper = s.ToUpperInvariant();
+string sub = s.Substring(0, 5);      // &quot;Hello&quot;
+string sliced = s[^5..];             // &quot;World&quot; (ranges, C# 8)
+string[] parts = s.Split(&quot;, &quot;);      // [&quot;Hello&quot;, &quot;World&quot;]
+string joined = string.Join(&quot;-&quot;, parts);
+bool eq = string.Equals(&quot;a&quot;, &quot;A&quot;, StringComparison.OrdinalIgnoreCase);
+
+// Build efficiently
+var sb = new StringBuilder();
+for (int i = 0; i &lt; 5; i++) sb.Append(i).Append(&#x27;,&#x27;);
+string csv = sb.ToString().TrimEnd(&#x27;,&#x27;);   // &quot;0,1,2,3,4&quot;
+
+// Interpolation with format specifiers
+double pi = Math.PI;
+Console.WriteLine($&quot;{pi:F2} | {42,6} | {DateTime.Now:yyyy-MM-dd}&quot;);
+
+// Verbatim + raw strings
+string path = @&quot;C:\temp\file.txt&quot;;
+string json = &quot;&quot;&quot;
+    { &quot;name&quot;: &quot;Ada&quot; }
+    &quot;&quot;&quot;;</code></pre><pre data-lang="python" hidden><code>s = &quot;  Hello, World  &quot;
+s = s.strip()                        # &quot;Hello, World&quot;
+starts = s.startswith(&quot;Hello&quot;)
+idx = s.find(&quot;World&quot;)                # 7
+upper = s.upper()
+sub = s[0:5]                         # &quot;Hello&quot;
+sliced = s[-5:]                      # &quot;World&quot;
+parts = s.split(&quot;, &quot;)                # [&quot;Hello&quot;, &quot;World&quot;]
+joined = &quot;-&quot;.join(parts)
+eq = &quot;a&quot;.casefold() == &quot;A&quot;.casefold()
+
+# Build efficiently
+pieces = []
+for i in range(5):
+    pieces.append(str(i))
+csv = &quot;,&quot;.join(pieces)               # &quot;0,1,2,3,4&quot;
+
+# f-strings with format specifiers
+import math, datetime
+print(f&quot;{math.pi:.2f} | {42:&gt;6} | {datetime.date.today():%Y-%m-%d}&quot;)
+
+# Raw + multi-line strings
+path = r&quot;C:\temp\file.txt&quot;
+json_text = &quot;&quot;&quot;
+{ &quot;name&quot;: &quot;Ada&quot; }
+&quot;&quot;&quot;</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Reverse the words in a sentence (not the characters). Then do it without <code>Split</code>.</li><li>Count character frequency in a string using a dictionary; return the first non-repeating character.</li></ul></div></section>
+<section id="control-flow"><h2 id="control-flow">Control flow</h2><p>Loops and branches are near-identical. Differences worth knowing: C# <code>switch</code> supports pattern matching and a <code>switch</code> <em>expression</em>; Python 3.10 added <code>match</code>. C# <code>foreach</code> works over anything implementing <code>IEnumerable&lt;T&gt;</code>, just as Python <code>for</code> works over any iterable.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>int[] nums = { 3, 8, 1, 9 };
+
+foreach (var n in nums)
+    if (n % 2 == 0) Console.WriteLine($&quot;{n} even&quot;);
+    else Console.WriteLine($&quot;{n} odd&quot;);
+
+for (int i = 0; i &lt; nums.Length; i++) { /* index-based */ }
+
+int attempts = 0;
+while (attempts &lt; 3) attempts++;
+do { attempts--; } while (attempts &gt; 0);
+
+// switch statement with patterns
+object value = 42;
+switch (value)
+{
+    case int i when i &gt; 40: Console.WriteLine(&quot;big int&quot;); break;
+    case int i:             Console.WriteLine(&quot;int&quot;); break;
+    case string s:          Console.WriteLine($&quot;string {s}&quot;); break;
+    default:                Console.WriteLine(&quot;other&quot;); break;
+}
+
+// switch expression (C# 8)
+string Grade(int score) =&gt; score switch
+{
+    &gt;= 90 =&gt; &quot;A&quot;,
+    &gt;= 80 =&gt; &quot;B&quot;,
+    _     =&gt; &quot;C&quot;
+};
+
+// ternary and null-coalescing
+string label = nums.Length &gt; 3 ? &quot;many&quot; : &quot;few&quot;;
+string? maybe = null;
+string sure = maybe ?? &quot;default&quot;;</code></pre><pre data-lang="python" hidden><code>nums = [3, 8, 1, 9]
+
+for n in nums:
+    if n % 2 == 0:
+        print(f&quot;{n} even&quot;)
+    else:
+        print(f&quot;{n} odd&quot;)
+
+for i, n in enumerate(nums):
+    pass  # index-based
+
+attempts = 0
+while attempts &lt; 3:
+    attempts += 1
+# no do/while — use while True + break
+
+# match statement (3.10+)
+value = 42
+match value:
+    case int(i) if i &gt; 40:
+        print(&quot;big int&quot;)
+    case int():
+        print(&quot;int&quot;)
+    case str(s):
+        print(f&quot;string {s}&quot;)
+    case _:
+        print(&quot;other&quot;)
+
+def grade(score):
+    if score &gt;= 90: return &quot;A&quot;
+    if score &gt;= 80: return &quot;B&quot;
+    return &quot;C&quot;
+
+# conditional expression and &quot;or&quot; default
+label = &quot;many&quot; if len(nums) &gt; 3 else &quot;few&quot;
+maybe = None
+sure = maybe or &quot;default&quot;     # careful: &quot;&quot; and 0 are also falsy</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>FizzBuzz using a <code>switch</code> expression / <code>match</code> on a tuple <code>(n % 3, n % 5)</code>.</li></ul></div></section>
+<section id="collections"><h2 id="collections">Collections: List, Dictionary, HashSet, Queue, Stack</h2><p>The generic collections in <code>System.Collections.Generic</code> map cleanly to Python built-ins. Know the big-O of each operation: <code>List&lt;T&gt;</code> index O(1), insert-at-front O(n); <code>Dictionary</code>/<code>HashSet</code> average O(1); <code>Queue</code>/<code>Stack</code> O(1) at the ends. Prefer interfaces (<code>IList&lt;T&gt;</code>, <code>IReadOnlyList&lt;T&gt;</code>, <code>IEnumerable&lt;T&gt;</code>) in method signatures.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>var list = new List&lt;int&gt; { 3, 1, 2 };
+list.Add(4); list.Insert(0, 9); list.Remove(1);
+list.Sort();                          // in place
+bool has = list.Contains(2);
+int last = list[^1];
+
+var ages = new Dictionary&lt;string, int&gt; { [&quot;ada&quot;] = 36 };
+ages[&quot;grace&quot;] = 45;
+if (ages.TryGetValue(&quot;ada&quot;, out var age)) Console.WriteLine(age);
+ages.TryAdd(&quot;ada&quot;, 0);                // no throw if exists
+foreach (var (name, a) in ages) Console.WriteLine($&quot;{name}={a}&quot;);
+
+var seen = new HashSet&lt;string&gt; { &quot;a&quot;, &quot;b&quot; };
+bool added = seen.Add(&quot;a&quot;);           // false — already there
+seen.UnionWith(new[] { &quot;c&quot; });
+
+var queue = new Queue&lt;string&gt;();
+queue.Enqueue(&quot;first&quot;); queue.Enqueue(&quot;second&quot;);
+string next = queue.Dequeue();        // &quot;first&quot;
+
+var stack = new Stack&lt;int&gt;();
+stack.Push(1); stack.Push(2);
+int top = stack.Pop();                // 2
+
+// Immutable / read-only views
+IReadOnlyList&lt;int&gt; ro = list.AsReadOnly();
+var pq = new PriorityQueue&lt;string, int&gt;();   // .NET 6+
+pq.Enqueue(&quot;low&quot;, 5); pq.Enqueue(&quot;high&quot;, 1);
+Console.WriteLine(pq.Dequeue());      // high</code></pre><pre data-lang="python" hidden><code>lst = [3, 1, 2]
+lst.append(4); lst.insert(0, 9); lst.remove(1)
+lst.sort()                            # in place
+has = 2 in lst
+last = lst[-1]
+
+ages = {&quot;ada&quot;: 36}
+ages[&quot;grace&quot;] = 45
+if &quot;ada&quot; in ages: print(ages[&quot;ada&quot;])
+ages.setdefault(&quot;ada&quot;, 0)             # no overwrite if exists
+for name, a in ages.items(): print(f&quot;{name}={a}&quot;)
+
+seen = {&quot;a&quot;, &quot;b&quot;}
+before = len(seen); seen.add(&quot;a&quot;); added = len(seen) &gt; before
+seen |= {&quot;c&quot;}
+
+from collections import deque
+queue = deque()
+queue.append(&quot;first&quot;); queue.append(&quot;second&quot;)
+nxt = queue.popleft()                 # &quot;first&quot;
+
+stack = []
+stack.append(1); stack.append(2)
+top = stack.pop()                     # 2
+
+# Immutable / heap
+ro = tuple(lst)
+import heapq
+pq = []
+heapq.heappush(pq, (5, &quot;low&quot;)); heapq.heappush(pq, (1, &quot;high&quot;))
+print(heapq.heappop(pq)[1])           # high</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Classic follow-ups: what happens when a <code>Dictionary</code> key's <code>GetHashCode</code> changes after insertion (it becomes unreachable); why <code>List&lt;T&gt;.Remove</code> inside <code>foreach</code> throws; when to use <code>SortedDictionary</code> vs <code>SortedList</code>.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Group a list of words by their first letter into a <code>Dictionary&lt;char, List&lt;string&gt;&gt;</code> / <code>dict[str, list[str]]</code>.</li><li>Implement an LRU cache with a dictionary plus a linked list (C#: <code>LinkedList&lt;T&gt;</code>; Python: <code>OrderedDict</code>).</li></ul></div></section>
+<section id="classes"><h2 id="classes">Classes, structs and records</h2><p><code>class</code> = reference type with identity. <code>struct</code> = value type, keep small and immutable. <code>record</code> (C# 9) = reference type with value-based equality, <code>ToString</code>, deconstruction and <code>with</code> expressions — perfect for DTOs. <code>record struct</code> combines both. Python's <code>@dataclass</code> gives the same generated members; <code>frozen=True</code> makes it immutable like a positional record.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class Account
+{
+    private decimal _balance;                 // field
+    public string Owner { get; }              // read-only property
+    public decimal Balance =&gt; _balance;       // expression-bodied getter
+
+    public Account(string owner, decimal opening = 0)
+    {
+        Owner = owner ?? throw new ArgumentNullException(nameof(owner));
+        _balance = opening;
+    }
+
+    public void Deposit(decimal amount)
+    {
+        if (amount &lt;= 0) throw new ArgumentOutOfRangeException(nameof(amount));
+        _balance += amount;
+    }
+
+    public override string ToString() =&gt; $&quot;{Owner}: {Balance:C}&quot;;
+}
+
+public readonly struct Point(int X, int Y)   // primary ctor, C# 12
+{
+    public int X { get; } = X;
+    public int Y { get; } = Y;
+    public double Length =&gt; Math.Sqrt(X * X + Y * Y);
+}
+
+public record Person(string First, string Last)
+{
+    public string Full =&gt; $&quot;{First} {Last}&quot;;
+}
+
+var p1 = new Person(&quot;Ada&quot;, &quot;Lovelace&quot;);
+var p2 = p1 with { Last = &quot;Byron&quot; };       // non-destructive copy
+Console.WriteLine(p1 == new Person(&quot;Ada&quot;, &quot;Lovelace&quot;)); // True — value equality
+var (first, last) = p1;                    // deconstruction</code></pre><pre data-lang="python" hidden><code>class Account:
+    def __init__(self, owner: str, opening: float = 0):
+        if owner is None:
+            raise ValueError(&quot;owner&quot;)
+        self._owner = owner          # &quot;_&quot; = private by convention
+        self._balance = opening
+
+    @property
+    def owner(self) -&gt; str:          # read-only property
+        return self._owner
+
+    @property
+    def balance(self) -&gt; float:
+        return self._balance
+
+    def deposit(self, amount: float) -&gt; None:
+        if amount &lt;= 0:
+            raise ValueError(&quot;amount&quot;)
+        self._balance += amount
+
+    def __str__(self) -&gt; str:
+        return f&quot;{self.owner}: ${self.balance:,.2f}&quot;
+
+
+from dataclasses import dataclass, replace
+import math
+
+@dataclass(frozen=True)          # immutable, hashable — like a struct/record
+class Point:
+    x: int
+    y: int
+    @property
+    def length(self) -&gt; float:
+        return math.hypot(self.x, self.y)
+
+@dataclass(frozen=True)
+class Person:
+    first: str
+    last: str
+    @property
+    def full(self) -&gt; str:
+        return f&quot;{self.first} {self.last}&quot;
+
+p1 = Person(&quot;Ada&quot;, &quot;Lovelace&quot;)
+p2 = replace(p1, last=&quot;Byron&quot;)   # like `with`
+print(p1 == Person(&quot;Ada&quot;, &quot;Lovelace&quot;))   # True — value equality
+first, last = p1.first, p1.last</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Be ready to explain when you would choose a struct over a class (small, immutable, short-lived, avoid heap allocation) and what a record buys you over a class (equality, immutability, <code>with</code>).</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Model a <code>Money</code> record with <code>+</code> operator overloading that throws if currencies differ.</li><li>Write an <code>Employee</code> class with a computed <code>YearsOfService</code> property and a static factory method.</li></ul></div></section>
+<section id="properties"><h2 id="properties">Properties, indexers and init-only setters</h2><p>Properties are the public face of a class: auto-properties, computed getters, <code>init</code> setters for immutable-after-construction objects, and <code>required</code> members (C# 11) that force initialisation. Indexers let a type be used with <code>[]</code>. Python uses <code>@property</code> and the <code>__getitem__</code> / <code>__setitem__</code> dunder methods.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class Settings
+{
+    public required string Name { get; init; }   // must be set in initializer
+    public int Retries { get; set; } = 3;        // auto-property with default
+    public bool IsValid =&gt; Retries &gt;= 0;         // computed, no backing field
+
+    private int _timeout;
+    public int Timeout
+    {
+        get =&gt; _timeout;
+        set =&gt; _timeout = value &lt; 0 ? throw new ArgumentOutOfRangeException() : value;
+    }
+}
+
+public class Matrix
+{
+    private readonly double[,] _data = new double[3, 3];
+    public double this[int row, int col]            // indexer
+    {
+        get =&gt; _data[row, col];
+        set =&gt; _data[row, col] = value;
+    }
+}
+
+var s = new Settings { Name = &quot;prod&quot;, Retries = 5 };
+// s.Name = &quot;x&quot;;   // error: init-only
+var m = new Matrix(); m[0, 0] = 1.5;</code></pre><pre data-lang="python" hidden><code>class Settings:
+    def __init__(self, name: str, retries: int = 3):
+        self._name = name
+        self.retries = retries       # plain attribute
+        self._timeout = 0
+
+    @property
+    def name(self) -&gt; str:           # read-only after construction
+        return self._name
+
+    @property
+    def is_valid(self) -&gt; bool:      # computed
+        return self.retries &gt;= 0
+
+    @property
+    def timeout(self) -&gt; int:
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value: int) -&gt; None:
+        if value &lt; 0:
+            raise ValueError(&quot;timeout&quot;)
+        self._timeout = value
+
+
+class Matrix:
+    def __init__(self):
+        self._data = [[0.0] * 3 for _ in range(3)]
+    def __getitem__(self, idx):      # m[row, col]
+        r, c = idx
+        return self._data[r][c]
+    def __setitem__(self, idx, value):
+        r, c = idx
+        self._data[r][c] = value
+
+s = Settings(&quot;prod&quot;, retries=5)
+m = Matrix(); m[0, 0] = 1.5</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Build a <code>Temperature</code> type that stores Celsius and exposes a computed, settable <code>Fahrenheit</code> property.</li></ul></div></section>
+<section id="interfaces"><h2 id="interfaces">Interfaces and abstract classes</h2><p>An <em>interface</em> is a contract with no state (C# 8 allows default implementations). An <em>abstract class</em> can hold state and partial implementation, but a class can inherit only one. Rule of thumb: interface for “can do” capabilities, abstract class for shared “is a” skeletons. Python uses <code>abc.ABC</code> and <code>typing.Protocol</code> (structural typing — no explicit inheritance needed).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public interface IShape
+{
+    double Area();
+    string Describe() =&gt; $&quot;{GetType().Name} with area {Area():F2}&quot;; // default impl
+}
+
+public abstract class Shape : IShape
+{
+    public string Colour { get; init; } = &quot;black&quot;;     // shared state
+    public abstract double Area();                     // must override
+    public virtual string Describe() =&gt; $&quot;{Colour} {GetType().Name}&quot;;
+}
+
+public class Circle : Shape
+{
+    public double R { get; init; }
+    public override double Area() =&gt; Math.PI * R * R;
+}
+
+public class Square : Shape
+{
+    public double Side { get; init; }
+    public override double Area() =&gt; Side * Side;
+    public override string Describe() =&gt; base.Describe() + &quot; (four equal sides)&quot;;
+}
+
+IShape[] shapes = { new Circle { R = 1 }, new Square { Side = 2, Colour = &quot;red&quot; } };
+foreach (var s in shapes) Console.WriteLine(s.Describe());
+
+// Multiple interfaces are fine
+public interface IPersist { void Save(); }
+public class Document : IPersist, IDisposable
+{
+    public void Save() { }
+    public void Dispose() { }
+}</code></pre><pre data-lang="python" hidden><code>from abc import ABC, abstractmethod
+from typing import Protocol
+import math
+
+class Shape(ABC):                        # abstract base class
+    def __init__(self, colour: str = &quot;black&quot;):
+        self.colour = colour             # shared state
+
+    @abstractmethod
+    def area(self) -&gt; float: ...
+
+    def describe(self) -&gt; str:           # virtual by default
+        return f&quot;{self.colour} {type(self).__name__}&quot;
+
+class Circle(Shape):
+    def __init__(self, r: float, **kw):
+        super().__init__(**kw); self.r = r
+    def area(self) -&gt; float:
+        return math.pi * self.r ** 2
+
+class Square(Shape):
+    def __init__(self, side: float, **kw):
+        super().__init__(**kw); self.side = side
+    def area(self) -&gt; float:
+        return self.side ** 2
+    def describe(self) -&gt; str:
+        return super().describe() + &quot; (four equal sides)&quot;
+
+for s in (Circle(1), Square(2, colour=&quot;red&quot;)):
+    print(s.describe())
+
+# Protocol = structural interface: any object with save() satisfies it
+class Persistable(Protocol):
+    def save(self) -&gt; None: ...
+
+class Document:                          # no inheritance needed
+    def save(self) -&gt; None: ...
+
+def persist(p: Persistable) -&gt; None:
+    p.save()
+persist(Document())</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>“Interface vs abstract class?” is asked constantly. Mention default interface methods, the single-inheritance limit, and that interfaces are what you mock in tests.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Define <code>INotifier</code> with <code>Send(string)</code>, implement <code>EmailNotifier</code> and <code>SmsNotifier</code>, and write a method that takes an <code>IEnumerable&lt;INotifier&gt;</code> and broadcasts a message.</li></ul></div></section>
+<section id="inheritance"><h2 id="inheritance">Inheritance and polymorphism</h2><p><code>virtual</code> marks a method that can be overridden; <code>override</code> replaces it; <code>sealed</code> stops further overriding; <code>new</code> <em>hides</em> instead of overriding (almost always a bug). The runtime type decides which override runs — that is polymorphism. Python methods are always virtual; use <code>super()</code> to call up the chain.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class Animal
+{
+    public virtual string Speak() =&gt; &quot;...&quot;;
+    public string Intro() =&gt; $&quot;I say {Speak()}&quot;;   // calls the override
+}
+public class Dog : Animal
+{
+    public override string Speak() =&gt; &quot;Woof&quot;;
+}
+public class Puppy : Dog
+{
+    public sealed override string Speak() =&gt; &quot;Yip&quot;;  // no further overrides
+}
+public class Cat : Animal
+{
+    public new string Speak() =&gt; &quot;Meow&quot;;              // HIDES — avoid
+}
+
+Animal a = new Dog();
+Console.WriteLine(a.Intro());     // I say Woof   (runtime dispatch)
+Animal c = new Cat();
+Console.WriteLine(c.Speak());     // ...          (static type wins for `new`)
+Console.WriteLine(((Cat)c).Speak()); // Meow
+
+// Type tests
+if (a is Dog d) Console.WriteLine(d.Speak());
+var maybeCat = a as Cat;          // null, no exception</code></pre><pre data-lang="python" hidden><code>class Animal:
+    def speak(self) -&gt; str:
+        return &quot;...&quot;
+    def intro(self) -&gt; str:
+        return f&quot;I say {self.speak()}&quot;     # dynamic dispatch
+
+class Dog(Animal):
+    def speak(self) -&gt; str:
+        return &quot;Woof&quot;
+
+class Puppy(Dog):
+    def speak(self) -&gt; str:
+        return &quot;Yip&quot;                       # no sealed; convention only
+
+class Cat(Animal):
+    def speak(self) -&gt; str:                # always overrides; no &quot;hiding&quot;
+        return &quot;Meow&quot;
+
+a: Animal = Dog()
+print(a.intro())            # I say Woof
+c: Animal = Cat()
+print(c.speak())            # Meow
+
+# Type tests
+if isinstance(a, Dog):
+    print(a.speak())
+maybe_cat = a if isinstance(a, Cat) else None
+
+# Multiple inheritance exists — MRO resolves the order
+class Loud:
+    def speak(self): return super().speak().upper()
+class LoudDog(Loud, Dog): pass
+print(LoudDog().speak())    # WOOF
+print(LoudDog.__mro__)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Create a <code>Vehicle</code> hierarchy and demonstrate that changing a <code>virtual</code> method to <code>new</code> changes the output when called through the base type.</li></ul></div></section>
+<section id="generics"><h2 id="generics">Generics and constraints</h2><p>Generics give type-safe reuse without boxing: <code>List&lt;T&gt;</code>, <code>Dictionary&lt;TKey,TValue&gt;</code>, your own <code>Repository&lt;T&gt;</code>. Constraints (<code>where T : class, new(), IComparable&lt;T&gt;</code>) tell the compiler what you can do with <code>T</code>. Python's <code>typing.Generic</code>/<code>TypeVar</code> is for static checkers only — the runtime does not enforce it.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class Stack&lt;T&gt;
+{
+    private readonly List&lt;T&gt; _items = new();
+    public void Push(T item) =&gt; _items.Add(item);
+    public T Pop()
+    {
+        if (_items.Count == 0) throw new InvalidOperationException(&quot;empty&quot;);
+        var last = _items[^1]; _items.RemoveAt(_items.Count - 1); return last;
+    }
+    public bool TryPeek(out T? item)
+    {
+        item = _items.Count &gt; 0 ? _items[^1] : default;
+        return _items.Count &gt; 0;
+    }
+}
+
+// Generic method with constraints
+public static T Max&lt;T&gt;(IEnumerable&lt;T&gt; xs) where T : IComparable&lt;T&gt;
+{
+    T best = xs.First();
+    foreach (var x in xs) if (x.CompareTo(best) &gt; 0) best = x;
+    return best;
+}
+
+public interface IEntity { int Id { get; } }
+public class Repository&lt;T&gt; where T : class, IEntity, new()
+{
+    private readonly Dictionary&lt;int, T&gt; _store = new();
+    public void Add(T e) =&gt; _store[e.Id] = e;
+    public T? Get(int id) =&gt; _store.GetValueOrDefault(id);
+    public T Create() =&gt; new T();
+}
+
+var s = new Stack&lt;string&gt;(); s.Push(&quot;a&quot;);
+Console.WriteLine(Max(new[] { 3, 9, 2 }));   // 9 — T inferred as int
+
+// Variance: IEnumerable&lt;out T&gt; is covariant
+IEnumerable&lt;object&gt; objs = new List&lt;string&gt; { &quot;x&quot; };</code></pre><pre data-lang="python" hidden><code>from typing import Generic, TypeVar, Iterable, Protocol, Optional
+
+T = TypeVar(&quot;T&quot;)
+
+class Stack(Generic[T]):
+    def __init__(self) -&gt; None:
+        self._items: list[T] = []
+    def push(self, item: T) -&gt; None:
+        self._items.append(item)
+    def pop(self) -&gt; T:
+        if not self._items:
+            raise IndexError(&quot;empty&quot;)
+        return self._items.pop()
+    def peek(self) -&gt; Optional[T]:
+        return self._items[-1] if self._items else None
+
+# &quot;Constraint&quot; via a Protocol bound
+class Comparable(Protocol):
+    def __lt__(self, other) -&gt; bool: ...
+C = TypeVar(&quot;C&quot;, bound=Comparable)
+
+def max_of(xs: Iterable[C]) -&gt; C:
+    it = iter(xs); best = next(it)
+    for x in it:
+        if best &lt; x: best = x
+    return best
+
+class Entity(Protocol):
+    id: int
+E = TypeVar(&quot;E&quot;, bound=Entity)
+
+class Repository(Generic[E]):
+    def __init__(self) -&gt; None:
+        self._store: dict[int, E] = {}
+    def add(self, e: E) -&gt; None:
+        self._store[e.id] = e
+    def get(self, id: int) -&gt; Optional[E]:
+        return self._store.get(id)
+
+s: Stack[str] = Stack(); s.push(&quot;a&quot;)
+print(max_of([3, 9, 2]))     # 9
+
+# Python 3.12 syntax: class Stack[T]: ...  def max_of[C: Comparable](xs: Iterable[C]) -&gt; C: ...</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Know why generics beat <code>object</code> (no boxing, compile-time safety), what <code>default(T)</code> is, and the difference between covariance (<code>out</code>) and contravariance (<code>in</code>).</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a generic <code>Pair&lt;TFirst, TSecond&gt;</code> with a <code>Swap()</code> that returns <code>Pair&lt;TSecond, TFirst&gt;</code>.</li><li>Write <code>TryParse&lt;T&gt;</code> that works for any <code>T : IParsable&lt;T&gt;</code> (.NET 7 static abstract interface members).</li></ul></div></section>
+<section id="delegates"><h2 id="delegates">Delegates, events and lambdas</h2><p>A delegate is a type-safe function reference. You rarely declare your own — use <code>Func&lt;…&gt;</code> (returns a value), <code>Action&lt;…&gt;</code> (returns void) and <code>Predicate&lt;T&gt;</code>. Lambdas create delegate instances and can capture variables (closures). An <code>event</code> is a delegate field that outsiders can only subscribe to (<code>+=</code>/<code>-=</code>), not invoke. Python functions are first-class objects, so a “delegate” is just a function or <code>lambda</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Built-in delegate types
+Func&lt;int, int, int&gt; add = (a, b) =&gt; a + b;
+Action&lt;string&gt; log = msg =&gt; Console.WriteLine($&quot;[log] {msg}&quot;);
+Predicate&lt;int&gt; isEven = n =&gt; n % 2 == 0;
+
+Console.WriteLine(add(2, 3));         // 5
+log(&quot;hello&quot;);
+
+// Closures capture variables, not values
+int counter = 0;
+Action increment = () =&gt; counter++;
+increment(); increment();
+Console.WriteLine(counter);          // 2
+
+// Custom delegate + multicast
+public delegate void Notify(string message);
+Notify n = m =&gt; Console.WriteLine(&quot;A &quot; + m);
+n += m =&gt; Console.WriteLine(&quot;B &quot; + m);
+n(&quot;hi&quot;);                             // both run
+
+// Events
+public class Button
+{
+    public event EventHandler&lt;string&gt;? Clicked;      // null when no subscribers
+    public void Click() =&gt; Clicked?.Invoke(this, &quot;clicked at &quot; + DateTime.Now);
+}
+var b = new Button();
+b.Clicked += (sender, arg) =&gt; Console.WriteLine(arg);
+b.Click();
+
+// Higher-order function
+static IEnumerable&lt;T&gt; Where&lt;T&gt;(IEnumerable&lt;T&gt; xs, Func&lt;T, bool&gt; pred)
+{
+    foreach (var x in xs) if (pred(x)) yield return x;
+}</code></pre><pre data-lang="python" hidden><code># Functions are first-class; lambdas are single-expression
+add = lambda a, b: a + b
+def log(msg: str) -&gt; None:
+    print(f&quot;[log] {msg}&quot;)
+is_even = lambda n: n % 2 == 0
+
+print(add(2, 3))       # 5
+log(&quot;hello&quot;)
+
+# Closures capture variables (need nonlocal to rebind)
+def make_counter():
+    counter = 0
+    def increment():
+        nonlocal counter
+        counter += 1
+        return counter
+    return increment
+inc = make_counter(); inc(); print(inc())    # 2
+
+# &quot;Multicast&quot;: keep a list of callables
+handlers = [lambda m: print(&quot;A &quot; + m), lambda m: print(&quot;B &quot; + m)]
+for h in handlers: h(&quot;hi&quot;)
+
+# Events: a simple observer pattern
+from typing import Callable
+class Button:
+    def __init__(self):
+        self._clicked: list[Callable[[object, str], None]] = []
+    def on_clicked(self, handler):        # like +=
+        self._clicked.append(handler)
+    def click(self):
+        import datetime
+        for h in self._clicked:
+            h(self, f&quot;clicked at {datetime.datetime.now()}&quot;)
+
+b = Button()
+b.on_clicked(lambda sender, arg: print(arg))
+b.click()
+
+# Higher-order function
+def where(xs, pred):
+    for x in xs:
+        if pred(x):
+            yield x</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why <code>event</code> instead of a public delegate field? Encapsulation — subscribers cannot clear the list or raise the event. Also: the classic “closure in a loop” bug (C# <code>for</code> variable vs <code>foreach</code>).</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement a <code>Retry(Func&lt;T&gt; action, int times)</code> helper.</li><li>Write a <code>Stock</code> class that raises a <code>PriceChanged</code> event only when the price moves more than 5%.</li></ul></div></section>
+<section id="linq"><h2 id="linq">LINQ — query and method syntax</h2><p>LINQ is the single most-used C# feature in day-to-day code: <code>Where</code>, <code>Select</code>, <code>OrderBy</code>, <code>GroupBy</code>, <code>Join</code>, <code>Aggregate</code>, all lazily evaluated over <code>IEnumerable&lt;T&gt;</code>. Deferred execution means the query runs when you enumerate it — call <code>ToList()</code> to materialise. Python's comprehensions, generators and <code>itertools</code> cover the same ground.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>record Order(int Id, string Customer, decimal Total, DateTime Placed);
+var orders = new List&lt;Order&gt;
+{
+    new(1, &quot;ada&quot;, 120m, new(2024, 1, 5)),
+    new(2, &quot;grace&quot;, 80m, new(2024, 1, 7)),
+    new(3, &quot;ada&quot;, 45m, new(2024, 2, 1)),
+};
+
+// Method syntax (most common)
+var bigOrders = orders
+    .Where(o =&gt; o.Total &gt; 50)
+    .OrderByDescending(o =&gt; o.Total)
+    .Select(o =&gt; new { o.Customer, o.Total })
+    .ToList();
+
+// Query syntax — same thing
+var q = from o in orders
+        where o.Total &gt; 50
+        orderby o.Total descending
+        select new { o.Customer, o.Total };
+
+// Grouping and aggregation
+var byCustomer = orders
+    .GroupBy(o =&gt; o.Customer)
+    .Select(g =&gt; new { Customer = g.Key, Count = g.Count(), Spend = g.Sum(o =&gt; o.Total) });
+
+decimal total = orders.Sum(o =&gt; o.Total);
+var first = orders.FirstOrDefault(o =&gt; o.Customer == &quot;nobody&quot;);   // null
+bool any = orders.Any(o =&gt; o.Total &gt; 100);
+var top2 = orders.OrderBy(o =&gt; o.Placed).Take(2);
+var ids = orders.Select(o =&gt; o.Id).ToHashSet();
+var lookup = orders.ToDictionary(o =&gt; o.Id);
+var flat = new[] { new[] { 1, 2 }, new[] { 3 } }.SelectMany(x =&gt; x);   // 1,2,3
+var running = orders.Aggregate(0m, (acc, o) =&gt; acc + o.Total);
+
+// Deferred execution pitfall
+var lazy = orders.Where(o =&gt; o.Total &gt; 50);
+orders.Add(new(4, &quot;x&quot;, 999m, DateTime.Now));
+Console.WriteLine(lazy.Count());       // 3 — sees the new item</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass
+from datetime import datetime
+from itertools import groupby, chain, islice
+from functools import reduce
+
+@dataclass
+class Order:
+    id: int; customer: str; total: float; placed: datetime
+
+orders = [
+    Order(1, &quot;ada&quot;, 120, datetime(2024, 1, 5)),
+    Order(2, &quot;grace&quot;, 80, datetime(2024, 1, 7)),
+    Order(3, &quot;ada&quot;, 45, datetime(2024, 2, 1)),
+]
+
+# Comprehension + sorted
+big_orders = [
+    {&quot;customer&quot;: o.customer, &quot;total&quot;: o.total}
+    for o in sorted(orders, key=lambda o: o.total, reverse=True)
+    if o.total &gt; 50
+]
+
+# Grouping (groupby needs sorted input) and aggregation
+by_customer = []
+for key, grp in groupby(sorted(orders, key=lambda o: o.customer), key=lambda o: o.customer):
+    grp = list(grp)
+    by_customer.append({&quot;customer&quot;: key, &quot;count&quot;: len(grp), &quot;spend&quot;: sum(o.total for o in grp)})
+
+total = sum(o.total for o in orders)
+first = next((o for o in orders if o.customer == &quot;nobody&quot;), None)
+any_big = any(o.total &gt; 100 for o in orders)
+top2 = list(islice(sorted(orders, key=lambda o: o.placed), 2))
+ids = {o.id for o in orders}
+lookup = {o.id: o for o in orders}
+flat = list(chain.from_iterable([[1, 2], [3]]))          # 1,2,3
+running = reduce(lambda acc, o: acc + o.total, orders, 0)
+
+# Generators are lazy too
+lazy = (o for o in orders if o.total &gt; 50)
+orders.append(Order(4, &quot;x&quot;, 999, datetime.now()))
+print(sum(1 for _ in lazy))      # 3 — sees the new item</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Know <code>IEnumerable</code> vs <code>IQueryable</code> (in-memory vs translated to SQL by EF), why calling <code>.Count()</code> twice runs the query twice, and the <code>First</code>/<code>FirstOrDefault</code>/<code>Single</code> semantics.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Given a list of employees with department and salary: top-paid employee per department, departments with average salary above X, and a comma-separated list of names per department.</li><li>Implement your own <code>Where</code> and <code>Select</code> as extension methods using <code>yield return</code>.</li></ul></div></section>
+<section id="exceptions"><h2 id="exceptions">Exceptions</h2><p>Throw specific exception types; catch only what you can handle; <code>finally</code> (or <code>using</code>) for cleanup. <code>throw;</code> preserves the stack trace, <code>throw ex;</code> resets it. Exception filters (<code>when</code>) avoid catch-and-rethrow. Custom exceptions derive from <code>Exception</code> and add context. Python follows the same shape with <code>try/except/else/finally</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class InsufficientFundsException : Exception
+{
+    public decimal Shortfall { get; }
+    public InsufficientFundsException(decimal shortfall)
+        : base($&quot;Short by {shortfall:C}&quot;) =&gt; Shortfall = shortfall;
+}
+
+decimal Withdraw(decimal balance, decimal amount)
+{
+    if (amount &lt;= 0) throw new ArgumentOutOfRangeException(nameof(amount));
+    if (amount &gt; balance) throw new InsufficientFundsException(amount - balance);
+    return balance - amount;
+}
+
+try
+{
+    Withdraw(10, 50);
+}
+catch (InsufficientFundsException ex) when (ex.Shortfall &gt; 100)   // filter
+{
+    Console.WriteLine(&quot;way too short&quot;);
+}
+catch (InsufficientFundsException ex)
+{
+    Console.WriteLine(ex.Message);
+}
+catch (Exception ex)
+{
+    Console.WriteLine($&quot;unexpected: {ex}&quot;);
+    throw;                 // rethrow, keep stack trace
+}
+finally
+{
+    Console.WriteLine(&quot;always runs&quot;);
+}
+
+// Wrapping with context
+try { File.ReadAllText(&quot;missing.txt&quot;); }
+catch (IOException ex) { throw new InvalidOperationException(&quot;Config load failed&quot;, ex); }
+
+// Cleanup without try/finally
+using var reader = new StreamReader(&quot;data.txt&quot;);   // Dispose() at scope end</code></pre><pre data-lang="python" hidden><code>class InsufficientFundsError(Exception):
+    def __init__(self, shortfall: float):
+        super().__init__(f&quot;Short by ${shortfall:,.2f}&quot;)
+        self.shortfall = shortfall
+
+def withdraw(balance: float, amount: float) -&gt; float:
+    if amount &lt;= 0:
+        raise ValueError(&quot;amount must be positive&quot;)
+    if amount &gt; balance:
+        raise InsufficientFundsError(amount - balance)
+    return balance - amount
+
+try:
+    withdraw(10, 50)
+except InsufficientFundsError as ex:
+    if ex.shortfall &gt; 100:          # no filter syntax; branch inside
+        print(&quot;way too short&quot;)
+    else:
+        print(ex)
+except Exception as ex:
+    print(f&quot;unexpected: {ex!r}&quot;)
+    raise                           # rethrow, keep traceback
+else:
+    print(&quot;runs only if no exception&quot;)
+finally:
+    print(&quot;always runs&quot;)
+
+# Wrapping with context (exception chaining)
+try:
+    open(&quot;missing.txt&quot;).read()
+except OSError as ex:
+    raise RuntimeError(&quot;Config load failed&quot;) from ex
+
+# Cleanup without try/finally
+with open(&quot;data.txt&quot;) as reader:    # closed at block end
+    ...</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Exceptions are for exceptional paths — they are expensive (stack unwinding). For expected failures return a result type or use the <code>Try</code> pattern. Never swallow with an empty <code>catch</code>.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a <code>Result&lt;T&gt;</code> type (Success/Failure) and refactor <code>Withdraw</code> to return it instead of throwing.</li></ul></div></section>
+<section id="nullable"><h2 id="nullable">Nullable types and pattern matching</h2><p>Nullable reference types (<code>string?</code>) make the compiler warn when you might dereference <code>null</code>. <code>Nullable&lt;T&gt;</code> / <code>int?</code> adds null to value types. Operators: <code>?.</code>, <code>??</code>, <code>??=</code>, <code>!</code>. Pattern matching (<code>is</code>, <code>switch</code>, property/tuple/list patterns) replaces long <code>if</code> chains. Python's <code>Optional[T]</code> is checker-only; <code>match</code> covers the patterns.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>#nullable enable
+string? maybe = GetName();               // may be null
+int len = maybe?.Length ?? 0;            // safe navigation + default
+maybe ??= &quot;anonymous&quot;;                   // assign if null
+string definitely = maybe!;              // &quot;I know better&quot; — use sparingly
+
+int? age = null;
+if (age.HasValue) Console.WriteLine(age.Value);
+int a = age.GetValueOrDefault(18);
+
+// Patterns
+object o = new Point(3, 4);
+if (o is Point { X: &gt; 0, Y: &gt; 0 } p)           // property pattern + declaration
+    Console.WriteLine($&quot;first quadrant {p}&quot;);
+
+string Classify(object x) =&gt; x switch
+{
+    null              =&gt; &quot;null&quot;,
+    int n when n &lt; 0  =&gt; &quot;negative int&quot;,
+    int               =&gt; &quot;int&quot;,
+    string { Length: 0 } =&gt; &quot;empty string&quot;,
+    string s          =&gt; $&quot;string of {s.Length}&quot;,
+    Point(0, 0)       =&gt; &quot;origin&quot;,         // positional pattern (deconstruct)
+    Point(var px, _)  =&gt; $&quot;x={px}&quot;,
+    IEnumerable&lt;int&gt; xs =&gt; $&quot;{xs.Count()} ints&quot;,
+    _                 =&gt; &quot;unknown&quot;
+};
+
+// Tuple and list patterns (C# 11)
+string Move(int dx, int dy) =&gt; (dx, dy) switch
+{
+    (0, 0) =&gt; &quot;stay&quot;, (_, 0) =&gt; &quot;horizontal&quot;, (0, _) =&gt; &quot;vertical&quot;, _ =&gt; &quot;diagonal&quot;
+};
+bool StartsWithOne(int[] xs) =&gt; xs is [1, ..];
+
+record Point(int X, int Y);</code></pre><pre data-lang="python" hidden><code>from typing import Optional
+
+maybe: Optional[str] = get_name()         # may be None
+length = len(maybe) if maybe is not None else 0
+if maybe is None:
+    maybe = &quot;anonymous&quot;
+# walrus for &quot;assign if None&quot; one-liners:  maybe = maybe or &quot;anonymous&quot;
+
+age: Optional[int] = None
+if age is not None: print(age)
+a = age if age is not None else 18
+
+from dataclasses import dataclass
+@dataclass
+class Point:
+    x: int; y: int
+
+# Patterns (3.10+)
+o = Point(3, 4)
+match o:
+    case Point(x=x, y=y) if x &gt; 0 and y &gt; 0:
+        print(f&quot;first quadrant {o}&quot;)
+
+def classify(x) -&gt; str:
+    match x:
+        case None:                  return &quot;null&quot;
+        case int(n) if n &lt; 0:       return &quot;negative int&quot;
+        case int():                 return &quot;int&quot;
+        case &quot;&quot;:                    return &quot;empty string&quot;
+        case str(s):                return f&quot;string of {len(s)}&quot;
+        case Point(x=0, y=0):       return &quot;origin&quot;
+        case Point(x=px):           return f&quot;x={px}&quot;
+        case [int(), *_]:           return &quot;list of ints&quot;
+        case _:                     return &quot;unknown&quot;
+
+def move(dx: int, dy: int) -&gt; str:
+    match (dx, dy):
+        case (0, 0): return &quot;stay&quot;
+        case (_, 0): return &quot;horizontal&quot;
+        case (0, _): return &quot;vertical&quot;
+        case _:      return &quot;diagonal&quot;
+
+def starts_with_one(xs: list[int]) -&gt; bool:
+    match xs:
+        case [1, *_]: return True
+        case _:       return False</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a <code>Describe(Shape)</code> function using a switch expression with property patterns for <code>Circle</code>, <code>Rectangle</code> (square vs not) and <code>null</code>.</li></ul></div></section>
+<section id="extension-methods"><h2 id="extension-methods">Extension methods</h2><p>An extension method is a static method in a static class whose first parameter is marked <code>this</code>. It lets you “add” methods to types you do not own — LINQ is built this way. They are resolved at compile time and cannot access private members. Python lets you monkey-patch a class attribute at runtime, but the idiomatic equivalent is a plain helper function.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public static class StringExtensions
+{
+    public static bool IsNullOrBlank(this string? s) =&gt; string.IsNullOrWhiteSpace(s);
+
+    public static string Truncate(this string s, int max, string suffix = &quot;…&quot;)
+        =&gt; s.Length &lt;= max ? s : s[..max] + suffix;
+
+    public static string ToSlug(this string s)
+        =&gt; string.Join(&quot;-&quot;, s.ToLowerInvariant().Split(&#x27; &#x27;, StringSplitOptions.RemoveEmptyEntries));
+}
+
+public static class EnumerableExtensions
+{
+    public static IEnumerable&lt;IEnumerable&lt;T&gt;&gt; Batch&lt;T&gt;(this IEnumerable&lt;T&gt; xs, int size)
+    {
+        var bucket = new List&lt;T&gt;(size);
+        foreach (var x in xs)
+        {
+            bucket.Add(x);
+            if (bucket.Count == size) { yield return bucket; bucket = new List&lt;T&gt;(size); }
+        }
+        if (bucket.Count &gt; 0) yield return bucket;
+    }
+}
+
+Console.WriteLine(&quot;Hello World Again&quot;.ToSlug());          // hello-world-again
+Console.WriteLine(&quot;a long sentence&quot;.Truncate(6));        // a long…
+foreach (var b in Enumerable.Range(1, 7).Batch(3))
+    Console.WriteLine(string.Join(&quot;,&quot;, b));              // 1,2,3 / 4,5,6 / 7</code></pre><pre data-lang="python" hidden><code># Idiomatic Python: plain helper functions
+def is_blank(s: str | None) -&gt; bool:
+    return s is None or not s.strip()
+
+def truncate(s: str, max_len: int, suffix: str = &quot;…&quot;) -&gt; str:
+    return s if len(s) &lt;= max_len else s[:max_len] + suffix
+
+def to_slug(s: str) -&gt; str:
+    return &quot;-&quot;.join(s.lower().split())
+
+def batch(xs, size: int):
+    bucket = []
+    for x in xs:
+        bucket.append(x)
+        if len(bucket) == size:
+            yield bucket; bucket = []
+    if bucket:
+        yield bucket
+
+print(to_slug(&quot;Hello World Again&quot;))       # hello-world-again
+print(truncate(&quot;a long sentence&quot;, 6))    # a long…
+for b in batch(range(1, 8), 3):
+    print(&quot;,&quot;.join(map(str, b)))          # 1,2,3 / 4,5,6 / 7
+
+# Monkey-patching is possible on user classes (not on str) — generally avoid
+class Text(str): pass
+Text.to_slug = to_slug
+print(Text(&quot;Hello World&quot;).to_slug())</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write <code>IEnumerable&lt;T&gt;.ForEach(Action&lt;T&gt;)</code> and then explain why the BCL deliberately does not include it.</li><li>Add a <code>DateTime.IsWeekend()</code> extension.</li></ul></div></section>
+<section id="idisposable"><h2 id="idisposable">IDisposable and the using statement</h2><p>The GC reclaims memory, not file handles, sockets or DB connections. Types that own such resources implement <code>IDisposable</code>; callers wrap them in <code>using</code> so <code>Dispose()</code> runs even on exceptions. <code>IAsyncDisposable</code> + <code>await using</code> for async cleanup. Python's context managers (<code>with</code>, <code>__enter__</code>/<code>__exit__</code>, <code>contextlib</code>) are the exact analogue.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public sealed class TempFile : IDisposable
+{
+    public string Path { get; } = System.IO.Path.GetTempFileName();
+    private bool _disposed;
+
+    public void Write(string text)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        File.WriteAllText(Path, text);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        File.Delete(Path);
+        _disposed = true;
+        GC.SuppressFinalize(this);   // only matters if you also have a finalizer
+    }
+}
+
+// Block scoped
+using (var tf = new TempFile())
+{
+    tf.Write(&quot;hello&quot;);
+}   // Dispose() here, even if Write throws
+
+// Declaration form (C# 8) — disposed at end of enclosing scope
+using var conn = new SqlConnection(cs);
+await conn.OpenAsync();
+
+// Async disposal
+await using var stream = new FileStream(&quot;x.bin&quot;, FileMode.Create);
+
+// Multiple resources
+using var a = new TempFile();
+using var b = new TempFile();     // disposed in reverse order: b, then a</code></pre><pre data-lang="python" hidden><code>import os, tempfile
+from contextlib import contextmanager
+
+class TempFile:
+    def __init__(self):
+        fd, self.path = tempfile.mkstemp(); os.close(fd)
+        self._closed = False
+
+    def write(self, text: str) -&gt; None:
+        if self._closed:
+            raise ValueError(&quot;closed&quot;)
+        with open(self.path, &quot;w&quot;) as f:
+            f.write(text)
+
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False            # don&#x27;t swallow exceptions
+
+    def close(self):
+        if not self._closed:
+            os.remove(self.path); self._closed = True
+
+with TempFile() as tf:
+    tf.write(&quot;hello&quot;)
+# close() ran here, even if write raised
+
+# Generator-based context manager
+@contextmanager
+def temp_dir():
+    d = tempfile.mkdtemp()
+    try:
+        yield d
+    finally:
+        import shutil; shutil.rmtree(d)
+
+# Multiple resources; exited in reverse order
+with TempFile() as a, TempFile() as b:
+    pass
+
+# Async version
+# async with aiofiles.open(&quot;x.bin&quot;, &quot;wb&quot;) as stream: ...</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Explain the full Dispose pattern (<code>Dispose(bool disposing)</code>, finalizer, <code>GC.SuppressFinalize</code>) and why you rarely need it in managed-only code. Know that forgetting <code>using</code> on <code>HttpResponseMessage</code>/DB connections leaks handles until the GC gets around to it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a <code>Timer</code> class implementing <code>IDisposable</code> that logs elapsed time on dispose; use it with <code>using</code> around a block of work.</li></ul></div></section>
+<section id="async-intro"><h2 id="async-intro">async / await — the basics</h2><p><code>async</code> lets a method <code>await</code> a <code>Task</code> without blocking the thread — the method returns to its caller and resumes when the task completes. Return <code>Task</code> or <code>Task&lt;T&gt;</code> (never <code>async void</code> except event handlers). Do not block with <code>.Result</code>/<code>.Wait()</code>. Python's <code>asyncio</code> has the same shape with coroutines and an event loop. The Threading page goes much deeper.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>using var http = new HttpClient();
+
+async Task&lt;int&gt; GetLengthAsync(string url)
+{
+    string body = await http.GetStringAsync(url);   // thread is released here
+    return body.Length;
+}
+
+// Sequential vs concurrent
+int a = await GetLengthAsync(&quot;https://example.com&quot;);
+int b = await GetLengthAsync(&quot;https://example.org&quot;);     // waits for a first
+
+var tasks = new[] { &quot;https://example.com&quot;, &quot;https://example.org&quot; }
+    .Select(GetLengthAsync);
+int[] lengths = await Task.WhenAll(tasks);              // both in flight
+
+// Timeout / cancellation
+using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+try
+{
+    var resp = await http.GetAsync(&quot;https://example.com&quot;, cts.Token);
+}
+catch (OperationCanceledException) { Console.WriteLine(&quot;timed out&quot;); }
+
+// CPU-bound work: offload to the thread pool
+int result = await Task.Run(() =&gt; Enumerable.Range(1, 1_000_000).Sum());
+
+// Entry point
+static async Task Main() { await Task.Delay(100); }</code></pre><pre data-lang="python" hidden><code>import asyncio, httpx
+
+async def get_length(client: httpx.AsyncClient, url: str) -&gt; int:
+    resp = await client.get(url)        # event loop runs other tasks here
+    return len(resp.text)
+
+async def main():
+    async with httpx.AsyncClient() as client:
+        # Sequential vs concurrent
+        a = await get_length(client, &quot;https://example.com&quot;)
+        b = await get_length(client, &quot;https://example.org&quot;)
+
+        lengths = await asyncio.gather(
+            get_length(client, &quot;https://example.com&quot;),
+            get_length(client, &quot;https://example.org&quot;),
+        )
+
+        # Timeout / cancellation
+        try:
+            resp = await asyncio.wait_for(client.get(&quot;https://example.com&quot;), timeout=5)
+        except asyncio.TimeoutError:
+            print(&quot;timed out&quot;)
+
+    # CPU-bound work: offload to a thread/process
+    result = await asyncio.to_thread(lambda: sum(range(1, 1_000_001)))
+
+asyncio.run(main())</code></pre></div><div class="callout callout-warn"><span class="callout-title">Watch out</span><p><code>async void</code> cannot be awaited and its exceptions crash the process. <code>.Result</code> on a UI/ASP.NET-classic synchronisation context deadlocks. Both are top interview questions — see the Threading page.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write <code>FetchAllAsync(IEnumerable&lt;string&gt; urls)</code> that limits concurrency to 4 at a time (hint: <code>SemaphoreSlim</code> / <code>asyncio.Semaphore</code>).</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/dotnet/csharp/" target="_blank" rel="noopener">C# language reference (Microsoft Learn)</a> — the canonical reference</li><li><a href="https://learn.microsoft.com/dotnet/csharp/tour-of-csharp/" target="_blank" rel="noopener">C# tour for people who know another language</a></li><li><a href="https://docs.python.org/3/tutorial/" target="_blank" rel="noopener">Python tutorial (docs.python.org)</a></li><li><a href="https://learn.microsoft.com/dotnet/api/" target="_blank" rel="noopener">.NET API browser</a> — look up any BCL type</li><li><a href="https://learn.microsoft.com/dotnet/csharp/fundamentals/coding-style/coding-conventions" target="_blank" rel="noopener">C# coding conventions</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

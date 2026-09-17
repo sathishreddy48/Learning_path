@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Microservices — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="microservices">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 10 of 13</div>
+  <h1>Microservices</h1>
+  <p class="lede">How .NET services talk to each other and stay up when their neighbours don't. Each section is a pattern with the .NET implementation (and the Python equivalent) plus the trade-off you should be able to argue in a design interview.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#boundaries">Characteristics and service boundaries</a></li><li><a href="#gateway">API gateway and BFF</a></li><li><a href="#communication">Sync vs async communication: REST, gRPC, messaging</a></li><li><a href="#resilience">Resilience: retry, circuit breaker, timeout, bulkhead</a></li><li><a href="#saga-outbox">Sagas and the transactional outbox</a></li><li><a href="#health-checks">Health checks</a></li><li><a href="#observability">Observability: logs, metrics, traces with OpenTelemetry</a></li><li><a href="#docker">Docker and docker-compose for local development</a></li><li><a href="#configuration">Configuration across environments</a></li></ol>
+  </div>
+
+<section id="boundaries"><h2 id="boundaries">Characteristics and service boundaries</h2><p>A microservice owns its data, deploys independently, and communicates over the network. The hard part is the boundary: draw it around a business capability / bounded context (DDD), not a table or a layer. Too small = distributed monolith with chatty calls; too big = the monolith you left. Start with a modular monolith and extract when you have a reason (independent scaling, team ownership, different tech).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Modular monolith first: modules with public contracts, private everything else
+// src/Ordering/            src/Catalog/            src/Shared.Contracts/
+//   OrderingModule.cs        CatalogModule.cs         IProductLookup.cs
+
+public static class OrderingModule
+{
+    public static IServiceCollection AddOrdering(this IServiceCollection s, IConfiguration cfg)
+    {
+        s.AddDbContext&lt;OrderingDb&gt;(o =&gt; o.UseSqlServer(cfg.GetConnectionString(&quot;Ordering&quot;)));   // own schema/database
+        s.AddScoped&lt;IOrderService, OrderService&gt;();
+        return s;
+    }
+    public static IEndpointRouteBuilder MapOrdering(this IEndpointRouteBuilder e)
+    {
+        e.MapGroup(&quot;/orders&quot;).MapOrderEndpoints();
+        return e;
+    }
+}
+
+// Cross-module calls go through a narrow contract, never through the other module&#x27;s DbContext
+public interface IProductLookup { Task&lt;ProductSnapshot?&gt; Get(int id, CancellationToken ct); }
+
+// When you extract Catalog into its own service, only the IProductLookup implementation changes:
+public class HttpProductLookup(HttpClient http) : IProductLookup
+{
+    public Task&lt;ProductSnapshot?&gt; Get(int id, CancellationToken ct) =&gt; http.GetFromJsonAsync&lt;ProductSnapshot&gt;($&quot;/products/{id}&quot;, ct);
+}
+
+// Boundary smells: a &quot;shared&quot; database, a Customer table touched by 4 services, transactions across services.</code></pre><pre data-lang="python" hidden><code># Same shape in Python: packages as modules with explicit contracts
+# src/ordering/   src/catalog/   src/shared_contracts/product_lookup.py
+
+# shared_contracts/product_lookup.py
+from typing import Protocol, Optional
+class ProductLookup(Protocol):
+    async def get(self, id: int) -&gt; Optional[&quot;ProductSnapshot&quot;]: ...
+
+# ordering/module.py
+from fastapi import APIRouter
+router = APIRouter(prefix=&quot;/orders&quot;)
+
+def register(app, settings):
+    app.state.ordering_db = create_engine(settings.ordering_db)     # own database
+    app.include_router(router)
+
+# catalog/local_lookup.py — in-process implementation
+class LocalProductLookup:
+    async def get(self, id): return await catalog_repo.get(id)
+
+# catalog/http_lookup.py — after extraction, only this changes
+class HttpProductLookup:
+    def __init__(self, client): self.client = client
+    async def get(self, id):
+        r = await self.client.get(f&quot;/products/{id}&quot;)
+        return ProductSnapshot(**r.json()) if r.status_code == 200 else None
+
+# Enforce boundaries: import-linter (`pip install import-linter`) forbids ordering → catalog.internal imports</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Be ready to argue against microservices: what does the team gain, and what does it pay (network failures, data consistency, observability, deployment complexity)? Name the two or three reasons that justify extraction.</p></div></section>
+<section id="gateway"><h2 id="gateway">API gateway and BFF</h2><p>A gateway is the single entry point: routing, TLS termination, auth, rate limiting, request aggregation. YARP (Yet Another Reverse Proxy) is Microsoft's library for building one in ASP.NET Core; Azure API Management or an ingress controller are managed alternatives. A Backend-for-Frontend is a gateway shaped for one client (web vs mobile).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// dotnet add package Yarp.ReverseProxy
+builder.Services.AddReverseProxy().LoadFromConfig(builder.Configuration.GetSection(&quot;ReverseProxy&quot;));
+builder.Services.AddAuthentication().AddJwtBearer();
+builder.Services.AddRateLimiter(o =&gt; o.AddFixedWindowLimiter(&quot;per-ip&quot;, l =&gt; { l.PermitLimit = 100; l.Window = TimeSpan.FromMinutes(1); }));
+
+var app = builder.Build();
+app.UseRateLimiter();
+app.UseAuthentication(); app.UseAuthorization();
+app.MapReverseProxy().RequireAuthorization().RequireRateLimiting(&quot;per-ip&quot;);
+
+// appsettings.json
+// &quot;ReverseProxy&quot;: {
+//   &quot;Routes&quot;: {
+//     &quot;orders&quot;:  { &quot;ClusterId&quot;: &quot;orders&quot;,  &quot;Match&quot;: { &quot;Path&quot;: &quot;/api/orders/{**rest}&quot; },  &quot;Transforms&quot;: [{ &quot;PathRemovePrefix&quot;: &quot;/api&quot; }] },
+//     &quot;catalog&quot;: { &quot;ClusterId&quot;: &quot;catalog&quot;, &quot;Match&quot;: { &quot;Path&quot;: &quot;/api/catalog/{**rest}&quot; } }
+//   },
+//   &quot;Clusters&quot;: {
+//     &quot;orders&quot;:  { &quot;LoadBalancingPolicy&quot;: &quot;RoundRobin&quot;, &quot;Destinations&quot;: { &quot;a&quot;: { &quot;Address&quot;: &quot;http://orders-1:8080&quot; }, &quot;b&quot;: { &quot;Address&quot;: &quot;http://orders-2:8080&quot; } },
+//                  &quot;HealthCheck&quot;: { &quot;Active&quot;: { &quot;Enabled&quot;: true, &quot;Path&quot;: &quot;/health/ready&quot;, &quot;Interval&quot;: &quot;00:00:10&quot; } } },
+//     &quot;catalog&quot;: { &quot;Destinations&quot;: { &quot;a&quot;: { &quot;Address&quot;: &quot;http://catalog:8080&quot; } } }
+//   }
+// }
+
+// BFF: aggregate two downstream calls into one response for the mobile app
+app.MapGet(&quot;/bff/mobile/home&quot;, async (IHttpClientFactory f, ClaimsPrincipal user, CancellationToken ct) =&gt;
+{
+    var orders = f.CreateClient(&quot;orders&quot;).GetFromJsonAsync&lt;OrderSummary[]&gt;(&quot;/orders/recent&quot;, ct);
+    var promos = f.CreateClient(&quot;catalog&quot;).GetFromJsonAsync&lt;Promo[]&gt;(&quot;/promos&quot;, ct);
+    await Task.WhenAll(orders, promos);
+    return new { orders = orders.Result, promos = promos.Result };
+});</code></pre><pre data-lang="python" hidden><code># Python teams usually run a managed gateway (Kong, Traefik, nginx, APIM). A BFF in FastAPI:
+import asyncio, httpx
+from fastapi import FastAPI, Depends
+
+app = FastAPI()
+
+@app.get(&quot;/bff/mobile/home&quot;)
+async def home(user=Depends(require_user)):
+    async with httpx.AsyncClient() as c:
+        orders, promos = await asyncio.gather(
+            c.get(&quot;http://orders:8080/orders/recent&quot;, headers=auth_headers(user)),
+            c.get(&quot;http://catalog:8080/promos&quot;),
+        )
+    return {&quot;orders&quot;: orders.json(), &quot;promos&quot;: promos.json()}
+
+# Simple reverse proxy route with httpx streaming (for small setups)
+from fastapi import Request
+from fastapi.responses import StreamingResponse
+
+@app.api_route(&quot;/api/orders/{path:path}&quot;, methods=[&quot;GET&quot;, &quot;POST&quot;, &quot;PUT&quot;, &quot;DELETE&quot;])
+async def proxy_orders(path: str, request: Request):
+    url = f&quot;http://orders:8080/orders/{path}&quot;
+    async with httpx.AsyncClient() as c:
+        req = c.build_request(request.method, url, headers=dict(request.headers), content=await request.body())
+        resp = await c.send(req, stream=True)
+        return StreamingResponse(resp.aiter_raw(), status_code=resp.status_code, headers=dict(resp.headers))
+
+# nginx.conf equivalent:
+#   location /api/orders/ { proxy_pass http://orders:8080/orders/; }</code></pre></div></section>
+<section id="communication"><h2 id="communication">Sync vs async communication: REST, gRPC, messaging</h2><p>Synchronous (REST/gRPC) is simple and gives an immediate answer but couples availability: if the callee is down, you are down. Asynchronous messaging (Service Bus, RabbitMQ, Kafka) decouples in time — publish an event, let consumers catch up. Use sync for queries the user is waiting on; async for anything that can be eventually consistent. gRPC for internal high-throughput/typed calls.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// gRPC: contract in .proto, typed client/server, HTTP/2
+// orders.proto:  service Orders { rpc Get (GetOrderRequest) returns (OrderReply); }
+builder.Services.AddGrpc();
+app.MapGrpcService&lt;OrdersService&gt;();
+public class OrdersService(IOrderRepo repo) : Orders.OrdersBase
+{
+    public override async Task&lt;OrderReply&gt; Get(GetOrderRequest req, ServerCallContext ctx)
+        =&gt; (await repo.Get(req.Id, ctx.CancellationToken)) is { } o ? new OrderReply { Id = o.Id, Total = (double)o.Total }
+                                                                    : throw new RpcException(new Status(StatusCode.NotFound, &quot;no order&quot;));
+}
+builder.Services.AddGrpcClient&lt;Orders.OrdersClient&gt;(o =&gt; o.Address = new Uri(&quot;https://orders:5001&quot;));
+
+// Messaging with Azure Service Bus: publish an event after commit
+public record OrderPlaced(int OrderId, decimal Total, DateTime At);
+
+public class OrderPlacedPublisher(ServiceBusClient client)
+{
+    private readonly ServiceBusSender _sender = client.CreateSender(&quot;order-placed&quot;);   // topic
+    public Task Publish(OrderPlaced e, CancellationToken ct) =&gt;
+        _sender.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(e))
+        {
+            MessageId = $&quot;order-{e.OrderId}&quot;,              // enables duplicate detection
+            ContentType = &quot;application/json&quot;,
+            Subject = nameof(OrderPlaced)
+        }, ct);
+}
+
+// Consumer as a BackgroundService (idempotent!)
+public class InvoiceWorker(ServiceBusClient client, IServiceScopeFactory scopes) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        var processor = client.CreateProcessor(&quot;order-placed&quot;, &quot;invoicing&quot;, new ServiceBusProcessorOptions { MaxConcurrentCalls = 8 });
+        processor.ProcessMessageAsync += async args =&gt;
+        {
+            var e = args.Message.Body.ToObjectFromJson&lt;OrderPlaced&gt;();
+            using var scope = scopes.CreateScope();
+            var svc = scope.ServiceProvider.GetRequiredService&lt;IInvoiceService&gt;();
+            if (!await svc.AlreadyInvoiced(e.OrderId)) await svc.Create(e);     // idempotency check
+            await args.CompleteMessageAsync(args.Message);
+        };
+        processor.ProcessErrorAsync += args =&gt; { /* log */ return Task.CompletedTask; };
+        await processor.StartProcessingAsync(ct);
+        await Task.Delay(Timeout.Infinite, ct);
+    }
+}
+// MassTransit or NServiceBus abstract the broker and add retries, outbox and sagas.</code></pre><pre data-lang="python" hidden><code># gRPC: grpcio + grpcio-tools generate stubs from the same .proto
+#   python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. orders.proto
+import grpc, orders_pb2, orders_pb2_grpc
+class OrdersService(orders_pb2_grpc.OrdersServicer):
+    async def Get(self, request, context):
+        o = await repo.get(request.id)
+        if o is None:
+            await context.abort(grpc.StatusCode.NOT_FOUND, &quot;no order&quot;)
+        return orders_pb2.OrderReply(id=o.id, total=float(o.total))
+
+# Messaging with Azure Service Bus (azure-servicebus)
+from azure.servicebus.aio import ServiceBusClient
+from azure.servicebus import ServiceBusMessage
+import json, asyncio
+
+async def publish_order_placed(client: ServiceBusClient, event: dict):
+    async with client.get_topic_sender(&quot;order-placed&quot;) as sender:
+        await sender.send_messages(ServiceBusMessage(
+            json.dumps(event), message_id=f&quot;order-{event[&#x27;order_id&#x27;]}&quot;,
+            content_type=&quot;application/json&quot;, subject=&quot;OrderPlaced&quot;))
+
+async def invoice_worker(client: ServiceBusClient):
+    async with client.get_subscription_receiver(&quot;order-placed&quot;, &quot;invoicing&quot;, max_wait_time=30) as receiver:
+        async for msg in receiver:
+            event = json.loads(str(msg))
+            if not await invoices.already_invoiced(event[&quot;order_id&quot;]):   # idempotent
+                await invoices.create(event)
+            await receiver.complete_message(msg)
+
+# RabbitMQ: aio-pika; Kafka: aiokafka / confluent-kafka. FastStream wraps them with a MassTransit-like API.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Explain at-least-once delivery and why consumers must be idempotent; competing consumers vs pub/sub; when gRPC beats REST (streaming, typed contracts, internal traffic) and when it doesn't (browsers, debuggability).</p></div></section>
+<section id="resilience"><h2 id="resilience">Resilience: retry, circuit breaker, timeout, bulkhead</h2><p>Networks fail; design for it. <strong>Retry</strong> with exponential backoff and jitter for transient errors. <strong>Circuit breaker</strong> stops hammering a failing dependency and fails fast. <strong>Timeout</strong> bounds every call. <strong>Bulkhead</strong> isolates resource pools so one slow dependency cannot exhaust everything. Polly v8 / <code>Microsoft.Extensions.Resilience</code> compose these as a pipeline, and <code>AddStandardResilienceHandler</code> gives a sensible default for <code>HttpClient</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// dotnet add package Microsoft.Extensions.Http.Resilience
+builder.Services.AddHttpClient&lt;CatalogClient&gt;(c =&gt; c.BaseAddress = new Uri(&quot;http://catalog&quot;))
+    .AddStandardResilienceHandler(o =&gt;
+    {
+        o.Retry.MaxRetryAttempts = 3;
+        o.Retry.BackoffType = DelayBackoffType.Exponential;
+        o.Retry.UseJitter = true;
+        o.CircuitBreaker.FailureRatio = 0.5;
+        o.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(30);
+        o.CircuitBreaker.MinimumThroughput = 20;
+        o.CircuitBreaker.BreakDuration = TimeSpan.FromSeconds(15);
+        o.AttemptTimeout.Timeout = TimeSpan.FromSeconds(2);        // per try
+        o.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(10);  // overall
+    });
+
+// Custom pipeline for anything (not just HTTP)
+builder.Services.AddResiliencePipeline(&quot;db&quot;, p =&gt; p
+    .AddRetry(new RetryStrategyOptions
+    {
+        ShouldHandle = new PredicateBuilder().Handle&lt;SqlException&gt;(e =&gt; e.IsTransient),
+        MaxRetryAttempts = 3, Delay = TimeSpan.FromMilliseconds(200), BackoffType = DelayBackoffType.Exponential, UseJitter = true,
+        OnRetry = a =&gt; { Console.WriteLine($&quot;retry {a.AttemptNumber} after {a.RetryDelay}&quot;); return default; }
+    })
+    .AddCircuitBreaker(new CircuitBreakerStrategyOptions { FailureRatio = 0.3, MinimumThroughput = 10, BreakDuration = TimeSpan.FromSeconds(30) })
+    .AddTimeout(TimeSpan.FromSeconds(5)));
+
+public class Repo(ResiliencePipelineProvider&lt;string&gt; pipelines, AppDb db)
+{
+    public Task&lt;Order?&gt; Get(int id, CancellationToken ct) =&gt;
+        pipelines.GetPipeline(&quot;db&quot;).ExecuteAsync(async token =&gt; await db.Orders.FindAsync(new object[] { id }, token), ct).AsTask();
+}
+
+// Bulkhead: limit concurrency to a dependency
+.AddConcurrencyLimiter(permitLimit: 20, queueLimit: 50)
+
+// Fallback: degrade gracefully
+.AddFallback(new FallbackStrategyOptions&lt;Product[]&gt; { FallbackAction = _ =&gt; Outcome.FromResultAsValueTask(Array.Empty&lt;Product&gt;()) })
+
+// Rules: retry only idempotent operations; never retry on 4xx; cap total time; log circuit state changes.</code></pre><pre data-lang="python" hidden><code># pip install tenacity  (retries)   pip install pybreaker (circuit breaker)   httpx timeouts built in
+import httpx, asyncio, random
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type, before_sleep_log
+import pybreaker, logging
+
+TRANSIENT = (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError)
+
+catalog_breaker = pybreaker.CircuitBreaker(fail_max=10, reset_timeout=15)   # open after 10 failures, retry after 15s
+
+@retry(retry=retry_if_exception_type(TRANSIENT + (httpx.HTTPStatusError,)),
+       stop=stop_after_attempt(3), wait=wait_exponential_jitter(initial=0.2, max=2),
+       before_sleep=before_sleep_log(logging.getLogger(), logging.WARNING), reraise=True)
+@catalog_breaker
+async def get_product(client: httpx.AsyncClient, id: int):
+    r = await client.get(f&quot;/products/{id}&quot;, timeout=httpx.Timeout(2.0))     # per-try timeout
+    if r.status_code &gt;= 500: r.raise_for_status()                            # retry 5xx only
+    return r.json()
+
+async def get_product_with_total_timeout(client, id):
+    try:
+        return await asyncio.wait_for(get_product(client, id), timeout=10)  # overall budget
+    except (asyncio.TimeoutError, pybreaker.CircuitBreakerError):
+        return None                                                          # fallback
+
+# Bulkhead: semaphore per dependency
+catalog_slots = asyncio.Semaphore(20)
+async def bounded_get(client, id):
+    async with catalog_slots:
+        return await get_product(client, id)
+
+# Rules are the same: idempotent-only retries, no retry on 4xx, cap total time, log breaker state.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Draw the circuit-breaker state machine (closed → open → half-open). Explain retry storms and why jitter matters. Say which operations are safe to retry.</p></div></section>
+<section id="saga-outbox"><h2 id="saga-outbox">Sagas and the transactional outbox</h2><p>No distributed transactions. A <strong>saga</strong> is a sequence of local transactions with compensating actions for rollback — choreographed by events or orchestrated by a coordinator. The <strong>outbox pattern</strong> solves “save to DB and publish an event atomically”: write the event to an outbox table in the same transaction, and a relay publishes it afterwards. Together they give reliable, eventually-consistent workflows.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Outbox: event saved in the same transaction as the business change
+public class OutboxMessage { public Guid Id { get; set; } public string Type { get; set; } = &quot;&quot;; public string Payload { get; set; } = &quot;&quot;; public DateTime Created { get; set; } public DateTime? Processed { get; set; } }
+
+public class PlaceOrderHandler(AppDb db)
+{
+    public async Task Handle(PlaceOrder cmd, CancellationToken ct)
+    {
+        var order = Order.Create(cmd);
+        db.Orders.Add(order);
+        db.Outbox.Add(new OutboxMessage
+        {
+            Id = Guid.NewGuid(), Type = nameof(OrderPlaced), Created = DateTime.UtcNow,
+            Payload = JsonSerializer.Serialize(new OrderPlaced(order.Id, order.Total, DateTime.UtcNow))
+        });
+        await db.SaveChangesAsync(ct);      // ONE transaction: order + outbox row
+    }
+}
+
+// Relay: polls the outbox and publishes (at-least-once → consumers idempotent)
+public class OutboxRelay(IServiceScopeFactory scopes, IEventPublisher bus) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+        while (await timer.WaitForNextTickAsync(ct))
+        {
+            using var scope = scopes.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService&lt;AppDb&gt;();
+            var batch = await db.Outbox.Where(m =&gt; m.Processed == null).OrderBy(m =&gt; m.Created).Take(50).ToListAsync(ct);
+            foreach (var m in batch)
+            {
+                await bus.Publish(m.Type, m.Payload, m.Id, ct);   // messageId = m.Id for dedupe
+                m.Processed = DateTime.UtcNow;
+            }
+            await db.SaveChangesAsync(ct);
+        }
+    }
+}
+
+// Orchestrated saga (MassTransit state machine, sketch)
+public class OrderSaga : MassTransitStateMachine&lt;OrderState&gt;
+{
+    public State AwaitingPayment { get; private set; } = null!;
+    public Event&lt;OrderPlaced&gt; Placed { get; private set; } = null!;
+    public Event&lt;PaymentFailed&gt; Failed { get; private set; } = null!;
+    public OrderSaga()
+    {
+        InstanceState(x =&gt; x.CurrentState);
+        Initially(When(Placed).Publish(ctx =&gt; new ReserveInventory(ctx.Message.OrderId)).TransitionTo(AwaitingPayment));
+        During(AwaitingPayment, When(Failed).Publish(ctx =&gt; new ReleaseInventory(ctx.Message.OrderId)).Finalize());   // compensation
+    }
+}</code></pre><pre data-lang="python" hidden><code># Outbox with SQLAlchemy: same transaction for order + outbox row
+import json, uuid, asyncio
+from datetime import datetime, timezone
+
+class OutboxMessage(Base):
+    __tablename__ = &quot;outbox&quot;
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    type: Mapped[str]; payload: Mapped[str]
+    created: Mapped[datetime]; processed: Mapped[datetime | None]
+
+def place_order(cmd, session):
+    with session.begin():
+        order = Order.create(cmd); session.add(order); session.flush()
+        session.add(OutboxMessage(id=uuid.uuid4(), type=&quot;OrderPlaced&quot;, created=datetime.now(timezone.utc),
+                                  payload=json.dumps({&quot;order_id&quot;: order.id, &quot;total&quot;: float(order.total)})))
+    # committed atomically
+
+async def outbox_relay(session_factory, publish):
+    while True:
+        with session_factory() as s, s.begin():
+            batch = s.scalars(select(OutboxMessage).where(OutboxMessage.processed == None)
+                              .order_by(OutboxMessage.created).limit(50).with_for_update(skip_locked=True)).all()
+            for m in batch:
+                await publish(m.type, m.payload, message_id=str(m.id))
+                m.processed = datetime.now(timezone.utc)
+        await asyncio.sleep(2)
+
+# Choreographed saga: each service reacts to events and emits its own
+async def on_order_placed(event):            # inventory service
+    if await reserve(event[&quot;order_id&quot;]): await publish(&quot;InventoryReserved&quot;, event)
+    else: await publish(&quot;InventoryFailed&quot;, event)
+
+async def on_payment_failed(event):          # inventory service — compensation
+    await release(event[&quot;order_id&quot;])
+
+# Orchestrated sagas in Python: Temporal (temporalio) gives durable workflows with compensations built in.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Choreography vs orchestration trade-offs; what happens if the relay crashes after publishing but before marking processed (duplicate → idempotent consumer); why the outbox beats “publish then save” and “save then publish”.</p></div></section>
+<section id="health-checks"><h2 id="health-checks">Health checks</h2><p>Liveness (“is the process alive?”) and readiness (“can it serve traffic?”) endpoints let orchestrators restart or drain instances. ASP.NET Core's health-check middleware composes checks for the DB, message broker, downstream APIs and disk. Keep liveness trivial so a slow dependency does not cause restart loops.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>builder.Services.AddHealthChecks()
+    .AddCheck(&quot;self&quot;, () =&gt; HealthCheckResult.Healthy(), tags: [&quot;live&quot;])
+    .AddSqlServer(cs, name: &quot;sql&quot;, tags: [&quot;ready&quot;])                         // AspNetCore.HealthChecks.SqlServer
+    .AddAzureServiceBusTopic(sbConn, &quot;order-placed&quot;, name: &quot;bus&quot;, tags: [&quot;ready&quot;])
+    .AddUrlGroup(new Uri(&quot;http://catalog/health/live&quot;), name: &quot;catalog&quot;, tags: [&quot;ready&quot;])
+    .AddCheck&lt;QueueDepthCheck&gt;(&quot;queue-depth&quot;, tags: [&quot;ready&quot;]);
+
+public class QueueDepthCheck(Channel&lt;Job&gt; ch) : IHealthCheck
+{
+    public Task&lt;HealthCheckResult&gt; CheckHealthAsync(HealthCheckContext ctx, CancellationToken ct)
+    {
+        var depth = ch.Reader.Count;
+        return Task.FromResult(depth &gt; 10_000 ? HealthCheckResult.Degraded($&quot;queue {depth}&quot;) : HealthCheckResult.Healthy());
+    }
+}
+
+var app = builder.Build();
+app.MapHealthChecks(&quot;/health/live&quot;,  new() { Predicate = r =&gt; r.Tags.Contains(&quot;live&quot;) });
+app.MapHealthChecks(&quot;/health/ready&quot;, new()
+{
+    Predicate = r =&gt; r.Tags.Contains(&quot;ready&quot;),
+    ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse      // JSON with per-check detail
+});
+
+// Kubernetes
+// livenessProbe:  { httpGet: { path: /health/live,  port: 8080 }, periodSeconds: 10 }
+// readinessProbe: { httpGet: { path: /health/ready, port: 8080 }, periodSeconds: 5, failureThreshold: 3 }
+// Azure App Service: Health check path = /health/ready</code></pre><pre data-lang="python" hidden><code>from fastapi import FastAPI, Response
+import asyncio, httpx
+from sqlalchemy import text
+
+app = FastAPI()
+
+@app.get(&quot;/health/live&quot;)
+def live():
+    return {&quot;status&quot;: &quot;Healthy&quot;}                     # trivial: process is up
+
+async def check_sql():
+    with engine.connect() as c: c.execute(text(&quot;SELECT 1&quot;))
+    return &quot;Healthy&quot;
+
+async def check_catalog():
+    async with httpx.AsyncClient(timeout=2) as c:
+        r = await c.get(&quot;http://catalog/health/live&quot;)
+        return &quot;Healthy&quot; if r.status_code == 200 else &quot;Unhealthy&quot;
+
+async def check_queue_depth():
+    return &quot;Degraded&quot; if jobs.qsize() &gt; 10_000 else &quot;Healthy&quot;
+
+@app.get(&quot;/health/ready&quot;)
+async def ready(response: Response):
+    names = [&quot;sql&quot;, &quot;catalog&quot;, &quot;queue-depth&quot;]
+    results = await asyncio.gather(check_sql(), check_catalog(), check_queue_depth(), return_exceptions=True)
+    entries = {n: (&quot;Unhealthy&quot; if isinstance(r, Exception) else r) for n, r in zip(names, results)}
+    status = &quot;Unhealthy&quot; if &quot;Unhealthy&quot; in entries.values() else (&quot;Degraded&quot; if &quot;Degraded&quot; in entries.values() else &quot;Healthy&quot;)
+    response.status_code = 503 if status == &quot;Unhealthy&quot; else 200
+    return {&quot;status&quot;: status, &quot;entries&quot;: entries}
+
+# Kubernetes probes and App Service health-check path are identical to the .NET side.</code></pre></div></section>
+<section id="observability"><h2 id="observability">Observability: logs, metrics, traces with OpenTelemetry</h2><p>Three signals: structured <strong>logs</strong> with correlation IDs, <strong>metrics</strong> for dashboards and alerts, distributed <strong>traces</strong> that follow one request across services. OpenTelemetry is the vendor-neutral SDK; export to Application Insights, Jaeger/Tempo, Prometheus/Grafana. .NET propagates the W3C <code>traceparent</code> header automatically through <code>HttpClient</code> and ASP.NET Core.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// dotnet add package OpenTelemetry.Extensions.Hosting OpenTelemetry.Instrumentation.AspNetCore
+//                    OpenTelemetry.Instrumentation.Http OpenTelemetry.Exporter.OpenTelemetryProtocol Azure.Monitor.OpenTelemetry.AspNetCore
+builder.Logging.AddOpenTelemetry(o =&gt; { o.IncludeScopes = true; o.IncludeFormattedMessage = true; });
+
+builder.Services.AddOpenTelemetry()
+    .ConfigureResource(r =&gt; r.AddService(&quot;orders-api&quot;, serviceVersion: &quot;1.4.0&quot;))
+    .WithTracing(t =&gt; t
+        .AddAspNetCoreInstrumentation(o =&gt; o.Filter = ctx =&gt; !ctx.Request.Path.StartsWithSegments(&quot;/health&quot;))
+        .AddHttpClientInstrumentation()
+        .AddEntityFrameworkCoreInstrumentation()
+        .AddSource(&quot;Shop.Orders&quot;)                       // your ActivitySource
+        .AddOtlpExporter())                             // OTEL_EXPORTER_OTLP_ENDPOINT
+    .WithMetrics(m =&gt; m
+        .AddAspNetCoreInstrumentation().AddHttpClientInstrumentation().AddRuntimeInstrumentation()
+        .AddMeter(&quot;Shop.Orders&quot;)
+        .AddOtlpExporter());
+// Azure: builder.Services.AddOpenTelemetry().UseAzureMonitor();
+
+// Structured logging with scopes → every log line inside carries OrderId
+public class OrderService(ILogger&lt;OrderService&gt; log)
+{
+    private static readonly ActivitySource _trace = new(&quot;Shop.Orders&quot;);
+    public async Task Place(PlaceOrder cmd)
+    {
+        using var activity = _trace.StartActivity(&quot;PlaceOrder&quot;);
+        using var scope = log.BeginScope(new Dictionary&lt;string, object&gt; { [&quot;OrderId&quot;] = cmd.OrderId });
+        activity?.SetTag(&quot;order.total&quot;, cmd.Total);
+        log.LogInformation(&quot;Placing order for {Customer} with {LineCount} lines&quot;, cmd.Customer, cmd.Lines.Count);
+        try { /* ... */ }
+        catch (Exception ex) { activity?.SetStatus(ActivityStatusCode.Error, ex.Message); log.LogError(ex, &quot;Order failed&quot;); throw; }
+    }
+}
+
+// Correlation across the bus: put Activity.Current?.Id into the message&#x27;s ApplicationProperties[&quot;traceparent&quot;]
+// and start a linked Activity in the consumer.</code></pre><pre data-lang="python" hidden><code># pip install opentelemetry-distro opentelemetry-exporter-otlp opentelemetry-instrumentation-fastapi \
+#             opentelemetry-instrumentation-httpx opentelemetry-instrumentation-sqlalchemy
+# Zero-code:  opentelemetry-instrument --service_name orders-api uvicorn main:app
+from opentelemetry import trace, metrics
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+import logging, structlog
+
+resource = Resource.create({&quot;service.name&quot;: &quot;orders-api&quot;, &quot;service.version&quot;: &quot;1.4.0&quot;})
+provider = TracerProvider(resource=resource)
+provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))     # OTEL_EXPORTER_OTLP_ENDPOINT
+trace.set_tracer_provider(provider)
+
+FastAPIInstrumentor.instrument_app(app, excluded_urls=&quot;health&quot;)
+HTTPXClientInstrumentor().instrument()                                   # propagates traceparent
+SQLAlchemyInstrumentor().instrument(engine=engine)
+# Azure: from azure.monitor.opentelemetry import configure_azure_monitor; configure_azure_monitor()
+
+tracer = trace.get_tracer(&quot;shop.orders&quot;)
+log = structlog.get_logger()
+
+async def place(cmd):
+    with tracer.start_as_current_span(&quot;PlaceOrder&quot;) as span:
+        span.set_attribute(&quot;order.total&quot;, cmd.total)
+        structlog.contextvars.bind_contextvars(order_id=cmd.order_id)    # ≈ BeginScope
+        log.info(&quot;placing order&quot;, customer=cmd.customer, line_count=len(cmd.lines))
+        try:
+            ...
+        except Exception as ex:
+            span.record_exception(ex); span.set_status(trace.StatusCode.ERROR)
+            log.exception(&quot;order failed&quot;); raise
+        finally:
+            structlog.contextvars.unbind_contextvars(&quot;order_id&quot;)
+
+# Bus correlation: inject() the current context into message headers; extract() in the consumer
+from opentelemetry.propagate import inject, extract
+headers = {}; inject(headers)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>What is a trace vs a span; how does context propagate across HTTP and a message bus; what you would alert on (error rate, P99 latency, saturation) vs just dashboard.</p></div></section>
+<section id="docker"><h2 id="docker">Docker and docker-compose for local development</h2><p>Multi-stage Dockerfiles keep images small: build with the SDK image, run on the ASP.NET runtime image as a non-root user. Compose runs the service plus its dependencies (SQL Server, Redis, Service Bus emulator, Jaeger) with one command. .NET Aspire is the newer alternative for orchestrating local dev without YAML.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># Dockerfile (multi-stage, .NET)
+# ---------------------------------------------------------------
+# FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+# WORKDIR /src
+# COPY *.sln ./
+# COPY src/Orders.Api/*.csproj src/Orders.Api/
+# RUN dotnet restore src/Orders.Api                       # cached layer unless csproj changes
+# COPY . .
+# RUN dotnet publish src/Orders.Api -c Release -o /app --no-restore
+#
+# FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
+# WORKDIR /app
+# COPY --from=build /app .
+# USER app                                                # non-root (built into .NET 8+ images)
+# EXPOSE 8080
+# ENV ASPNETCORE_URLS=http://+:8080 DOTNET_gcServer=1
+# HEALTHCHECK CMD curl -f http://localhost:8080/health/live || exit 1
+# ENTRYPOINT [&quot;dotnet&quot;, &quot;Orders.Api.dll&quot;]
+
+docker build -t orders-api:dev .
+docker run --rm -p 8080:8080 -e ConnectionStrings__Default=&quot;Server=host.docker.internal,1433;...&quot; orders-api:dev
+
+# Or let the SDK build the image (no Dockerfile):
+dotnet publish -c Release /t:PublishContainer -p:ContainerImageName=orders-api</code></pre><pre data-lang="yaml" hidden><code># docker-compose.yml — the service plus its dependencies
+services:
+  orders-api:
+    build: .
+    ports: [&quot;8080:8080&quot;]
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Default: &quot;Server=sql;Database=Orders;User Id=sa;Password=Your_password123;TrustServerCertificate=True&quot;
+      Redis__Configuration: &quot;redis:6379&quot;
+      OTEL_EXPORTER_OTLP_ENDPOINT: &quot;http://jaeger:4317&quot;
+    depends_on:
+      sql: { condition: service_healthy }
+      redis: { condition: service_started }
+
+  sql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment: { ACCEPT_EULA: &quot;Y&quot;, MSSQL_SA_PASSWORD: &quot;Your_password123&quot; }
+    ports: [&quot;1433:1433&quot;]
+    healthcheck:
+      test: [&quot;CMD-SHELL&quot;, &quot;/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Your_password123 -C -Q &#x27;SELECT 1&#x27; || exit 1&quot;]
+      interval: 10s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: [&quot;6379:6379&quot;]
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports: [&quot;16686:16686&quot;, &quot;4317:4317&quot;]      # UI + OTLP gRPC
+
+# docker compose up --build
+# docker compose logs -f orders-api</code></pre><pre data-lang="python" hidden><code># Dockerfile (Python / FastAPI)
+# ---------------------------------------------------------------
+# FROM python:3.12-slim AS build
+# WORKDIR /app
+# RUN pip install --no-cache-dir uv
+# COPY pyproject.toml uv.lock ./
+# RUN uv sync --frozen --no-dev                             # cached unless lock changes
+# COPY . .
+#
+# FROM python:3.12-slim AS runtime
+# WORKDIR /app
+# COPY --from=build /app /app
+# RUN useradd -m app &amp;&amp; chown -R app /app
+# USER app
+# EXPOSE 8080
+# ENV PATH=&quot;/app/.venv/bin:$PATH&quot;
+# HEALTHCHECK CMD python -c &quot;import urllib.request as u; u.urlopen(&#x27;http://localhost:8080/health/live&#x27;)&quot; || exit 1
+# CMD [&quot;uvicorn&quot;, &quot;main:app&quot;, &quot;--host&quot;, &quot;0.0.0.0&quot;, &quot;--port&quot;, &quot;8080&quot;, &quot;--workers&quot;, &quot;2&quot;]
+
+# compose service entry:
+#   orders-api:
+#     build: .
+#     environment:
+#       DATABASE_URL: postgresql+psycopg://app:pw@postgres/orders
+#       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+#     depends_on: { postgres: { condition: service_healthy } }
+#   postgres:
+#     image: postgres:16
+#     environment: { POSTGRES_USER: app, POSTGRES_PASSWORD: pw, POSTGRES_DB: orders }
+#     healthcheck: { test: [&quot;CMD-SHELL&quot;, &quot;pg_isready -U app&quot;], interval: 5s, retries: 10 }</code></pre></div></section>
+<section id="configuration"><h2 id="configuration">Configuration across environments</h2><p>One image, many environments: configuration comes from the environment, not from the build. Layer <code>appsettings.json</code> (defaults) → <code>appsettings.{Environment}.json</code> → environment variables → Key Vault / App Configuration. Bind to typed options with validation so a missing setting fails at startup, not at 3 a.m. Feature flags let you ship dark.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Layering is automatic with WebApplication.CreateBuilder; add centralised config for services
+builder.Configuration.AddAzureAppConfiguration(o =&gt; o
+    .Connect(new Uri(appConfigUri), new DefaultAzureCredential())
+    .Select(&quot;Orders:*&quot;, labelFilter: builder.Environment.EnvironmentName)
+    .ConfigureRefresh(r =&gt; r.Register(&quot;Orders:Sentinel&quot;, refreshAll: true).SetRefreshInterval(TimeSpan.FromSeconds(30)))
+    .UseFeatureFlags());
+builder.Services.AddAzureAppConfiguration().AddFeatureManagement();
+
+// Typed, validated options
+public class OrdersOptions
+{
+    public const string Section = &quot;Orders&quot;;
+    [Required, Url] public string CatalogUrl { get; set; } = &quot;&quot;;
+    [Range(1, 100)] public int MaxLines { get; set; } = 50;
+    public bool EnableExpressShipping { get; set; }
+}
+builder.Services.AddOptions&lt;OrdersOptions&gt;().BindConfiguration(OrdersOptions.Section).ValidateDataAnnotations().ValidateOnStart();
+
+// Consume: IOptions (singleton snapshot), IOptionsSnapshot (per request, reloads), IOptionsMonitor (live + change callbacks)
+public class Checkout(IOptionsMonitor&lt;OrdersOptions&gt; opts, IFeatureManager features)
+{
+    public async Task Run()
+    {
+        var o = opts.CurrentValue;
+        if (await features.IsEnabledAsync(&quot;ExpressShipping&quot;)) { /* dark-launched path */ }
+    }
+}
+
+// Environment variables (Compose / K8s / App Service):  Orders__CatalogUrl=http://catalog   ASPNETCORE_ENVIRONMENT=Staging
+// Dev secrets: dotnet user-secrets;  Prod secrets: Key Vault reference in App Configuration or AddAzureKeyVault</code></pre><pre data-lang="python" hidden><code># pydantic-settings layers env vars, .env and secrets directories; validated at import
+from pydantic import AnyHttpUrl, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class OrdersSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix=&quot;ORDERS_&quot;, env_file=&quot;.env&quot;, secrets_dir=&quot;/run/secrets&quot;, extra=&quot;ignore&quot;)
+    catalog_url: AnyHttpUrl
+    max_lines: int = Field(50, ge=1, le=100)
+    enable_express_shipping: bool = False
+
+settings = OrdersSettings()      # ValidationError at startup if ORDERS_CATALOG_URL is missing
+
+# Environment variables: ORDERS_CATALOG_URL=http://catalog  ENVIRONMENT=staging
+# Per-environment files: env_file=(&quot;.env&quot;, f&quot;.env.{os.getenv(&#x27;ENVIRONMENT&#x27;,&#x27;dev&#x27;)}&quot;)
+
+# Azure App Configuration + feature flags
+from azure.appconfiguration.provider import load, SettingSelector
+from azure.identity import DefaultAzureCredential
+config = load(endpoint=app_config_uri, credential=DefaultAzureCredential(),
+              selects=[SettingSelector(key_filter=&quot;Orders:*&quot;, label_filter=env)],
+              feature_flag_enabled=True, refresh_on=[(&quot;Orders:Sentinel&quot;, env)], refresh_interval=30)
+from featuremanagement import FeatureManager
+features = FeatureManager(config)
+if features.is_enabled(&quot;ExpressShipping&quot;): ...
+
+# Live reload: call config.refresh() periodically (e.g. in a middleware or background task)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Run your API with three different <code>ASPNETCORE_ENVIRONMENT</code> values and prove via a debug endpoint which configuration source won for a given key.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/dotnet/architecture/microservices/" target="_blank" rel="noopener">.NET Microservices: Architecture for Containerized .NET Applications</a> — the free Microsoft e-book</li><li><a href="https://microservices.io/patterns/" target="_blank" rel="noopener">Microservices.io patterns</a> — Chris Richardson's pattern catalogue</li><li><a href="https://learn.microsoft.com/dotnet/core/resilience/" target="_blank" rel="noopener">Polly / Microsoft.Extensions.Resilience</a></li><li><a href="https://microsoft.github.io/reverse-proxy/" target="_blank" rel="noopener">YARP reverse proxy</a></li><li><a href="https://opentelemetry.io/docs/languages/net/" target="_blank" rel="noopener">OpenTelemetry .NET</a></li><li><a href="https://learn.microsoft.com/dotnet/aspire/" target="_blank" rel="noopener">.NET Aspire</a> — local orchestration + service defaults</li><li><a href="https://masstransit.io/" target="_blank" rel="noopener">MassTransit</a> — message bus abstraction with outbox/saga support</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

@@ -1,0 +1,834 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Threading & Async — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="threading">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 2 of 13</div>
+  <h1>Threading & Async</h1>
+  <p class="lede">Concurrency is where senior C# interviews go deep. This page covers the primitives (Thread, ThreadPool, Task), the async/await machinery, synchronisation, and the bugs every reviewer looks for. Python's threading/asyncio/multiprocessing sit alongside — with the GIL caveat called out where it matters.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#thread-threadpool">Thread and ThreadPool</a></li><li><a href="#tasks">Task and the Task Parallel Library</a></li><li><a href="#async-deep">async / await — how it really works</a></li><li><a href="#lock-monitor">lock and Monitor</a></li><li><a href="#mutex-semaphore">Mutex, Semaphore and SemaphoreSlim</a></li><li><a href="#interlocked">Interlocked, volatile and memory model</a></li><li><a href="#concurrent-collections">Concurrent collections</a></li><li><a href="#cancellation">CancellationToken</a></li><li><a href="#parallel">Parallel.For, Parallel.ForEachAsync and PLINQ</a></li><li><a href="#deadlocks">Deadlocks, ConfigureAwait and sync-over-async</a></li><li><a href="#channels">Channels and producer / consumer pipelines</a></li><li><a href="#gil">The Python GIL — what it changes</a></li></ol>
+  </div>
+
+<section id="thread-threadpool"><h2 id="thread-threadpool">Thread and ThreadPool</h2><p>A <code>Thread</code> is an OS thread: ~1 MB of stack, expensive to create, and you own its lifetime. The <code>ThreadPool</code> keeps a set of worker threads warm and hands them work items; nearly everything (Tasks, timers, async continuations) runs on it. Create raw threads only for long-running dedicated work. In Python, <code>threading.Thread</code> maps to an OS thread too — but the GIL means only one thread runs Python bytecode at a time.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Dedicated thread — long-running, you control it
+var worker = new Thread(() =&gt;
+{
+    Console.WriteLine($&quot;worker on thread {Environment.CurrentManagedThreadId}&quot;);
+    Thread.Sleep(500);
+})
+{ IsBackground = true, Name = &quot;worker-1&quot; };   // background: doesn&#x27;t keep process alive
+worker.Start();
+worker.Join();                                 // wait for it
+
+// Thread pool — short work items, no lifetime management
+ThreadPool.QueueUserWorkItem(_ =&gt; Console.WriteLine(&quot;pool work&quot;));
+
+ThreadPool.GetAvailableThreads(out int workers, out int io);
+Console.WriteLine($&quot;pool: {workers} worker, {io} IO threads free&quot;);
+
+// Thread-local state
+var local = new ThreadLocal&lt;int&gt;(() =&gt; Environment.CurrentManagedThreadId);
+[ThreadStatic] static int _perThread;         // static per thread
+
+// Passing data and getting a result back needs your own plumbing —
+// this is exactly what Task&lt;T&gt; wraps for you.</code></pre><pre data-lang="python" hidden><code>import threading, time
+
+def work():
+    print(f&quot;worker on thread {threading.current_thread().name}&quot;)
+    time.sleep(0.5)
+
+worker = threading.Thread(target=work, name=&quot;worker-1&quot;, daemon=True)  # daemon ≈ IsBackground
+worker.start()
+worker.join()
+
+# Thread pool — short work items
+from concurrent.futures import ThreadPoolExecutor
+with ThreadPoolExecutor(max_workers=4) as pool:
+    pool.submit(lambda: print(&quot;pool work&quot;))
+
+# Thread-local state
+local = threading.local()
+local.value = threading.get_ident()
+
+# GIL: threads help for I/O-bound work (network, disk) because the GIL is
+# released while waiting. For CPU-bound work use multiprocessing instead.
+from multiprocessing import Pool
+def square(n): return n * n
+if __name__ == &quot;__main__&quot;:
+    with Pool() as p:
+        print(p.map(square, range(5)))</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Foreground vs background threads; why thread-pool starvation happens (blocking calls inside pool threads) and how <code>async</code> fixes it; what <code>Thread.Sleep</code> vs <code>Task.Delay</code> do to the thread.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Start 5 threads that each increment a shared counter 1,000 times without a lock. Print the result. Then fix it (see the lock section).</li></ul></div></section>
+<section id="tasks"><h2 id="tasks">Task and the Task Parallel Library</h2><p>A <code>Task</code> represents an asynchronous operation and its eventual result/exception. <code>Task.Run</code> queues CPU work to the pool; I/O APIs return Tasks without using a thread at all. Compose with <code>WhenAll</code>, <code>WhenAny</code>, <code>ContinueWith</code> (prefer <code>await</code>). Python's closest match is <code>asyncio.Task</code> (single-threaded) or <code>concurrent.futures.Future</code> (thread/process pool).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// CPU-bound work on the pool
+Task&lt;long&gt; sumTask = Task.Run(() =&gt;
+{
+    long s = 0;
+    for (int i = 0; i &lt; 10_000_000; i++) s += i;
+    return s;
+});
+long sum = await sumTask;
+
+// Fan-out / fan-in
+Task&lt;string&gt;[] downloads = urls.Select(u =&gt; http.GetStringAsync(u)).ToArray();
+string[] pages = await Task.WhenAll(downloads);
+
+// First one wins (e.g. hedged requests)
+Task&lt;string&gt; fastest = await Task.WhenAny(downloads);
+Console.WriteLine((await fastest).Length);
+
+// Exceptions: WhenAll wraps all failures in an AggregateException on the task,
+// but `await` rethrows just the first one. Inspect the rest if you need them:
+var all = Task.WhenAll(downloads);
+try { await all; }
+catch { foreach (var ex in all.Exception!.InnerExceptions) Console.WriteLine(ex.Message); }
+
+// Task states and status
+Console.WriteLine(sumTask.Status);            // RanToCompletion
+Console.WriteLine(sumTask.IsCompletedSuccessfully);
+
+// Already-completed tasks (cheap, no allocation for common values)
+Task&lt;int&gt; ready = Task.FromResult(42);
+Task done = Task.CompletedTask;
+
+// TaskCompletionSource: bridge callback APIs into Tasks
+var tcs = new TaskCompletionSource&lt;string&gt;();
+someEvent += (s, e) =&gt; tcs.TrySetResult(e.Data);
+string data = await tcs.Task;</code></pre><pre data-lang="python" hidden><code>import asyncio
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+# CPU-bound: process pool (bypasses the GIL)
+def big_sum():
+    return sum(range(10_000_000))
+
+async def main():
+    loop = asyncio.get_running_loop()
+    with ProcessPoolExecutor() as pool:
+        total = await loop.run_in_executor(pool, big_sum)
+
+    # Fan-out / fan-in with coroutines
+    async with httpx.AsyncClient() as client:
+        pages = await asyncio.gather(*(client.get(u) for u in urls))
+
+        # First one wins
+        tasks = [asyncio.create_task(client.get(u)) for u in urls]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending: t.cancel()
+
+    # gather with return_exceptions keeps all failures
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    for r in results:
+        if isinstance(r, Exception): print(r)
+
+    # Future you complete yourself (like TaskCompletionSource)
+    fut = loop.create_future()
+    loop.call_later(0.1, fut.set_result, &quot;data&quot;)
+    print(await fut)
+
+asyncio.run(main())
+
+# Thread-pool futures for blocking I/O libraries
+with ThreadPoolExecutor() as pool:
+    futs = [pool.submit(requests.get, u) for u in urls]
+    for f in as_completed(futs):
+        print(f.result().status_code)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Download N URLs with <code>WhenAll</code>, then again with a limit of 3 concurrent requests. Measure both with <code>Stopwatch</code>.</li><li>Wrap a <code>Timer</code> callback in a <code>TaskCompletionSource</code> so it can be awaited.</li></ul></div></section>
+<section id="async-deep"><h2 id="async-deep">async / await — how it really works</h2><p>The compiler rewrites an <code>async</code> method into a state machine. At each <code>await</code> on an incomplete task it captures the current context, registers a continuation and <em>returns</em> — no thread is blocked. When the awaited task completes, the continuation is scheduled (on the captured <code>SynchronizationContext</code> if any, otherwise the thread pool). <code>ValueTask</code> avoids a heap allocation for hot paths that usually complete synchronously. Python coroutines work the same way on a single-threaded event loop.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// What the compiler does with this…
+async Task&lt;int&gt; CountAsync(Stream s)
+{
+    var buf = new byte[4096];
+    int total = 0, read;
+    while ((read = await s.ReadAsync(buf)) &gt; 0)   // ← suspension point
+        total += read;
+    return total;
+}
+// …is roughly: a struct with a MoveNext() that switches on a state field,
+// an AsyncTaskMethodBuilder to produce the Task, and awaiter.OnCompleted(MoveNext).
+
+// Return types
+async Task DoAsync() { await Task.Delay(10); }             // no result
+async Task&lt;int&gt; GetAsync() =&gt; 42;                          // completes synchronously — still allocates a Task
+async ValueTask&lt;int&gt; GetFastAsync() =&gt; 42;                 // no allocation on the sync path
+async void Button_Click(object s, EventArgs e) { }         // ONLY for event handlers
+
+// Eliding async/await: return the task directly if you don&#x27;t need to await it
+Task&lt;string&gt; Load() =&gt; http.GetStringAsync(url);           // fine, but exceptions/using behave differently
+
+// Async streams (C# 8)
+async IAsyncEnumerable&lt;int&gt; Ticks(CancellationToken ct = default)
+{
+    for (int i = 0; ; i++) { await Task.Delay(1000, ct); yield return i; }
+}
+await foreach (var t in Ticks().WithCancellation(cts.Token)) Console.WriteLine(t);
+
+// Exceptions surface where you await, not where you call
+Task faulted = ThrowsAsync();       // no exception yet
+try { await faulted; } catch (InvalidOperationException) { }</code></pre><pre data-lang="python" hidden><code>import asyncio
+
+# A coroutine is a generator-like object driven by the event loop
+async def count(stream) -&gt; int:
+    total = 0
+    while chunk := await stream.read(4096):   # ← suspension point
+        total += len(chunk)
+    return total
+
+# Return types: every `async def` returns a coroutine; wrap in a Task to schedule
+async def do(): await asyncio.sleep(0.01)
+async def get() -&gt; int: return 42
+
+# Async generators (like IAsyncEnumerable)
+async def ticks():
+    i = 0
+    while True:
+        await asyncio.sleep(1); yield i; i += 1
+
+async def main():
+    async for t in ticks():
+        print(t)
+        if t &gt; 3: break
+
+    # Exceptions surface where you await
+    task = asyncio.create_task(throws())     # scheduled, not raised yet
+    try:
+        await task
+    except RuntimeError:
+        pass
+
+asyncio.run(main())
+
+# Under the hood: `await` yields control to the loop; the loop resumes the
+# coroutine (via coro.send()) when the awaited future completes. One thread,
+# no locks needed for coroutine-to-coroutine state — but a blocking call
+# (time.sleep, requests.get) stalls the entire loop.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Be able to draw the state machine on a whiteboard, explain what thread the continuation runs on, why <code>async void</code> is dangerous, and when <code>ValueTask</code> is worth it (and its “await once only” rule).</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write an <code>async</code> method with two awaits, compile with <code>dotnet build</code>, and inspect the generated state machine with ILSpy/dnSpy.</li><li>Convert a synchronous file-copy routine to async streaming with a progress callback.</li></ul></div></section>
+<section id="lock-monitor"><h2 id="lock-monitor">lock and Monitor</h2><p><code>lock (obj) { … }</code> compiles to <code>Monitor.Enter</code>/<code>Exit</code> in a try/finally. It is re-entrant (the same thread can re-acquire), works only within one process, and should guard a <em>private</em> object — never <code>this</code>, a string, or a type. .NET 9 adds a dedicated <code>System.Threading.Lock</code> type. <code>Monitor.Wait</code>/<code>Pulse</code> implement condition variables. Python's <code>threading.Lock</code>/<code>RLock</code>/<code>Condition</code> match one-to-one.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class Counter
+{
+    private readonly object _gate = new();     // private, dedicated lock object
+    private int _count;
+
+    public void Increment()
+    {
+        lock (_gate) { _count++; }            // Monitor.Enter/Exit + try/finally
+    }
+    public int Value { get { lock (_gate) return _count; } }
+}
+
+// .NET 9: System.Threading.Lock — faster, cannot be misused with Monitor
+private readonly Lock _lock = new();
+void Work() { using (_lock.EnterScope()) { /* critical section */ } }
+
+// Monitor with timeout — avoid waiting forever
+if (Monitor.TryEnter(_gate, TimeSpan.FromSeconds(1)))
+{
+    try { /* work */ } finally { Monitor.Exit(_gate); }
+}
+
+// Condition variable: bounded buffer
+private readonly Queue&lt;int&gt; _q = new();
+public void Produce(int x)
+{
+    lock (_gate)
+    {
+        while (_q.Count &gt;= 10) Monitor.Wait(_gate);   // releases lock while waiting
+        _q.Enqueue(x);
+        Monitor.PulseAll(_gate);
+    }
+}
+public int Consume()
+{
+    lock (_gate)
+    {
+        while (_q.Count == 0) Monitor.Wait(_gate);
+        var x = _q.Dequeue();
+        Monitor.PulseAll(_gate);
+        return x;
+    }
+}
+
+// NEVER: lock(this), lock(typeof(X)), lock(&quot;string&quot;), or await inside lock</code></pre><pre data-lang="python" hidden><code>import threading
+from collections import deque
+
+class Counter:
+    def __init__(self):
+        self._gate = threading.Lock()     # RLock() if re-entrancy is needed
+        self._count = 0
+
+    def increment(self):
+        with self._gate:                  # acquire/release, exception-safe
+            self._count += 1
+
+    @property
+    def value(self):
+        with self._gate:
+            return self._count
+
+# Timeout on acquire
+gate = threading.Lock()
+if gate.acquire(timeout=1.0):
+    try:
+        pass  # work
+    finally:
+        gate.release()
+
+# Condition variable: bounded buffer
+class BoundedBuffer:
+    def __init__(self, cap=10):
+        self._q = deque(); self._cap = cap
+        self._cv = threading.Condition()   # wraps an RLock
+
+    def produce(self, x):
+        with self._cv:
+            self._cv.wait_for(lambda: len(self._q) &lt; self._cap)
+            self._q.append(x)
+            self._cv.notify_all()
+
+    def consume(self):
+        with self._cv:
+            self._cv.wait_for(lambda: len(self._q) &gt; 0)
+            x = self._q.popleft()
+            self._cv.notify_all()
+            return x
+
+# Note: `x += 1` is NOT atomic in Python either — the GIL does not save you.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why not <code>lock(this)</code>? Anyone holding a reference can lock it too and deadlock you. Why can't you <code>await</code> inside <code>lock</code>? The continuation may resume on a different thread which does not own the monitor — use <code>SemaphoreSlim(1,1)</code> instead.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement a thread-safe <code>BankAccount</code> with <code>Transfer(from, to, amount)</code> that never deadlocks even when two threads transfer in opposite directions (hint: lock ordering).</li></ul></div></section>
+<section id="mutex-semaphore"><h2 id="mutex-semaphore">Mutex, Semaphore and SemaphoreSlim</h2><p><code>Mutex</code> is a kernel object — slower than <code>lock</code>, but it works <em>across processes</em> (single-instance apps). <code>Semaphore</code>/<code>SemaphoreSlim</code> allow N concurrent holders — throttling. <code>SemaphoreSlim</code> is the one to use in-process and it has <code>WaitAsync</code>, making it the standard async-compatible lock. Python's <code>threading.Semaphore</code> and <code>asyncio.Semaphore</code> mirror these; cross-process locks use file locks.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Cross-process single instance
+using var mutex = new Mutex(initiallyOwned: false, name: @&quot;Global\MyApp.SingleInstance&quot;);
+if (!mutex.WaitOne(TimeSpan.Zero))
+{
+    Console.WriteLine(&quot;already running&quot;); return;
+}
+try { RunApp(); } finally { mutex.ReleaseMutex(); }
+
+// Throttle concurrent async work to 4
+private static readonly SemaphoreSlim _throttle = new(4, 4);
+
+async Task&lt;string&gt; FetchAsync(string url)
+{
+    await _throttle.WaitAsync();
+    try { return await http.GetStringAsync(url); }
+    finally { _throttle.Release(); }
+}
+var results = await Task.WhenAll(urls.Select(FetchAsync));   // never more than 4 in flight
+
+// Async &quot;lock&quot;
+private readonly SemaphoreSlim _asyncLock = new(1, 1);
+async Task UpdateAsync()
+{
+    await _asyncLock.WaitAsync();
+    try { await SaveAsync(); }              // awaiting inside is fine here
+    finally { _asyncLock.Release(); }
+}
+
+// Other primitives worth knowing
+var gate = new ManualResetEventSlim(false);   // signal many waiters; stays set
+var auto = new AutoResetEvent(false);          // signals one waiter, resets
+var barrier = new Barrier(3);                  // all 3 phases sync up
+var cde = new CountdownEvent(5);               // wait for 5 signals
+var rw = new ReaderWriterLockSlim();           // many readers / one writer</code></pre><pre data-lang="python" hidden><code>import asyncio, threading
+
+# Cross-process single instance: use a file lock (fcntl on Unix, msvcrt on Windows)
+import fcntl
+lock_file = open(&quot;/tmp/myapp.lock&quot;, &quot;w&quot;)
+try:
+    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print(&quot;already running&quot;); raise SystemExit
+
+# Throttle concurrent async work to 4
+throttle = asyncio.Semaphore(4)
+
+async def fetch(client, url):
+    async with throttle:
+        return (await client.get(url)).text
+
+async def main():
+    async with httpx.AsyncClient() as client:
+        results = await asyncio.gather(*(fetch(client, u) for u in urls))
+
+# Async lock
+async_lock = asyncio.Lock()
+async def update():
+    async with async_lock:
+        await save()
+
+# Thread-based equivalents
+sem = threading.Semaphore(4)
+with sem:
+    pass
+
+# Other primitives
+event = threading.Event()      # set()/wait(); like ManualResetEvent
+barrier = threading.Barrier(3)
+# ReaderWriterLock: not in stdlib; use `readerwriterlock` package or roll your own</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Build a rate limiter allowing 10 requests per second using <code>SemaphoreSlim</code> + a timer release, then test it with 100 concurrent tasks.</li></ul></div></section>
+<section id="interlocked"><h2 id="interlocked">Interlocked, volatile and memory model</h2><p><code>Interlocked</code> gives lock-free atomic operations (increment, add, exchange, compare-and-swap) using CPU instructions — far cheaper than a lock for a single variable. <code>volatile</code> only prevents caching/reordering of a single read or write; it does not make <code>x++</code> atomic. The compare-and-swap loop is the building block of every lock-free structure. Python has no equivalent: use a lock, or <code>itertools.count</code>/queue-based designs.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>private int _hits;
+private long _bytes;
+private object? _cache;
+
+void Hit() =&gt; Interlocked.Increment(ref _hits);              // atomic ++
+void Add(long n) =&gt; Interlocked.Add(ref _bytes, n);
+int Read() =&gt; Volatile.Read(ref _hits);                      // fresh read
+
+// Compare-and-swap loop: lock-free &quot;set max&quot;
+private int _max;
+void RecordSample(int value)
+{
+    int current;
+    do
+    {
+        current = _max;
+        if (value &lt;= current) return;
+    } while (Interlocked.CompareExchange(ref _max, value, current) != current);
+}
+
+// Lazy init without a lock (idempotent factory)
+object GetCache()
+{
+    var c = Volatile.Read(ref _cache);
+    if (c != null) return c;
+    var fresh = new object();
+    return Interlocked.CompareExchange(ref _cache, fresh, null) ?? fresh;
+}
+
+// Exchange: swap out a buffer atomically
+List&lt;string&gt; Drain() =&gt; Interlocked.Exchange(ref _buffer, new List&lt;string&gt;());
+
+// volatile: visibility only, NOT atomicity
+private volatile bool _stop;        // ok: a flag another thread polls
+private volatile int _counter;      // _counter++ is STILL a race</code></pre><pre data-lang="python" hidden><code>import threading, itertools
+
+# No Interlocked in Python. Options:
+
+# 1) A lock (simple, correct)
+class Hits:
+    def __init__(self):
+        self._n = 0; self._lock = threading.Lock()
+    def hit(self):
+        with self._lock: self._n += 1
+
+# 2) itertools.count is atomic under the GIL for next()
+counter = itertools.count()
+def hit(): return next(counter)
+
+# 3) Compare-and-swap emulated with a lock
+class MaxTracker:
+    def __init__(self):
+        self._max = 0; self._lock = threading.Lock()
+    def record(self, value):
+        with self._lock:
+            if value &gt; self._max: self._max = value
+
+# Visibility: the GIL makes simple attribute reads/writes visible across
+# threads, so there is no `volatile`. Compound operations still need a lock.
+
+# For truly parallel counters use multiprocessing.Value
+from multiprocessing import Value
+shared = Value(&quot;i&quot;, 0)
+with shared.get_lock():
+    shared.value += 1</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>“Is <code>i++</code> thread safe?” — no (read, add, write). “Does <code>volatile</code> fix it?” — no. “What does?” — <code>Interlocked.Increment</code> or a lock. Bonus: explain the ABA problem for CAS.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement a lock-free stack with <code>Interlocked.CompareExchange</code> on a node pointer; stress test it with 8 threads.</li></ul></div></section>
+<section id="concurrent-collections"><h2 id="concurrent-collections">Concurrent collections</h2><p><code>ConcurrentDictionary</code>, <code>ConcurrentQueue</code>, <code>ConcurrentBag</code>, <code>BlockingCollection</code> are safe for multi-threaded access without external locks. Watch for compound operations: <code>GetOrAdd</code>'s factory can run more than once; use <code>Lazy&lt;T&gt;</code> if it must run exactly once. Python's <code>queue.Queue</code> is thread-safe; <code>dict</code> operations are atomic under the GIL but compound updates still race.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>var cache = new ConcurrentDictionary&lt;string, int&gt;();
+cache[&quot;a&quot;] = 1;
+int v = cache.GetOrAdd(&quot;b&quot;, key =&gt; Compute(key));      // factory may run twice under contention
+cache.AddOrUpdate(&quot;a&quot;, 1, (key, old) =&gt; old + 1);      // atomic update
+cache.TryRemove(&quot;a&quot;, out _);
+cache.TryUpdate(&quot;b&quot;, newValue: 5, comparisonValue: 2); // CAS-style
+
+// Exactly-once expensive factory
+var lazyCache = new ConcurrentDictionary&lt;string, Lazy&lt;int&gt;&gt;();
+int once = lazyCache.GetOrAdd(&quot;k&quot;, k =&gt; new Lazy&lt;int&gt;(() =&gt; Compute(k))).Value;
+
+// Producer / consumer with BlockingCollection
+using var jobs = new BlockingCollection&lt;string&gt;(boundedCapacity: 100);
+var consumer = Task.Run(() =&gt;
+{
+    foreach (var job in jobs.GetConsumingEnumerable())   // blocks until item or completion
+        Process(job);
+});
+foreach (var f in files) jobs.Add(f);
+jobs.CompleteAdding();
+await consumer;
+
+// Queue / Bag
+var q = new ConcurrentQueue&lt;int&gt;(); q.Enqueue(1); q.TryDequeue(out int head);
+var bag = new ConcurrentBag&lt;int&gt;();  // unordered, optimised for same-thread add/take
+
+// Immutable collections: safe by construction, copy-on-write
+var list = ImmutableList&lt;int&gt;.Empty.Add(1).Add(2);
+ImmutableInterlocked.Update(ref _shared, l =&gt; l.Add(3));</code></pre><pre data-lang="python" hidden><code>import threading, queue
+from collections import defaultdict
+
+# dict: single ops are atomic under the GIL; compound ops are not
+cache = {}
+cache_lock = threading.Lock()
+def get_or_add(key):
+    with cache_lock:
+        if key not in cache:
+            cache[key] = compute(key)     # runs exactly once
+        return cache[key]
+
+# functools.lru_cache is thread-safe for memoisation
+from functools import lru_cache
+@lru_cache(maxsize=None)
+def compute_cached(key): return compute(key)
+
+# Producer / consumer with queue.Queue (bounded)
+jobs: queue.Queue = queue.Queue(maxsize=100)
+SENTINEL = object()
+
+def consumer():
+    while True:
+        job = jobs.get()            # blocks until item
+        if job is SENTINEL: break
+        process(job); jobs.task_done()
+
+t = threading.Thread(target=consumer); t.start()
+for f in files: jobs.put(f)
+jobs.put(SENTINEL); t.join()
+
+# asyncio version
+import asyncio
+aq: asyncio.Queue = asyncio.Queue(maxsize=100)
+
+# Immutable: tuples/frozensets; or copy-on-write with a lock
+snapshot = tuple(some_list)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Word-count a directory of text files using <code>Parallel.ForEach</code> and a <code>ConcurrentDictionary&lt;string,int&gt;</code>. Compare timing with a single-threaded version.</li></ul></div></section>
+<section id="cancellation"><h2 id="cancellation">CancellationToken</h2><p>Cancellation in .NET is cooperative: a <code>CancellationTokenSource</code> owns the state, hands out a <code>CancellationToken</code>, and callees check <code>IsCancellationRequested</code> / call <code>ThrowIfCancellationRequested()</code> / pass the token to async APIs. Always accept a token as the last parameter of async methods and pass it all the way down. Python's <code>asyncio.Task.cancel()</code> injects <code>CancelledError</code> at the next await; threads have no cancellation and use a flag/<code>Event</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>async Task ProcessAsync(IEnumerable&lt;string&gt; items, CancellationToken ct = default)
+{
+    foreach (var item in items)
+    {
+        ct.ThrowIfCancellationRequested();          // cheap check in loops
+        await http.GetAsync(item, ct);              // pass it down
+        await Task.Delay(100, ct);
+    }
+}
+
+// Timeout
+using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+try { await ProcessAsync(items, cts.Token); }
+catch (OperationCanceledException) { Console.WriteLine(&quot;cancelled or timed out&quot;); }
+
+// Link a caller&#x27;s token with your own timeout
+using var linked = CancellationTokenSource.CreateLinkedTokenSource(callerToken);
+linked.CancelAfter(TimeSpan.FromSeconds(5));
+
+// Register a callback on cancel
+using var reg = cts.Token.Register(() =&gt; Console.WriteLine(&quot;cancel requested&quot;));
+
+// Cancel from elsewhere (e.g. UI button or Ctrl+C)
+Console.CancelKeyPress += (s, e) =&gt; { e.Cancel = true; cts.Cancel(); };
+
+// In ASP.NET Core the framework gives you one per request
+app.MapGet(&quot;/report&quot;, async (CancellationToken ct) =&gt; await BuildReportAsync(ct));
+
+// Making a non-cancellable API cancellable (abandons it, doesn&#x27;t stop it)
+var work = LegacyLongRunning();
+await work.WaitAsync(cts.Token);              // .NET 6+</code></pre><pre data-lang="python" hidden><code>import asyncio, threading, signal
+
+async def process(items, client):
+    for item in items:
+        await client.get(item)        # CancelledError raised here if cancelled
+        await asyncio.sleep(0.1)
+
+async def main():
+    async with httpx.AsyncClient() as client:
+        # Timeout
+        try:
+            await asyncio.wait_for(process(items, client), timeout=30)
+        except asyncio.TimeoutError:
+            print(&quot;timed out&quot;)
+
+        # Explicit cancel from elsewhere
+        task = asyncio.create_task(process(items, client))
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGINT, task.cancel)   # Ctrl+C
+        try:
+            await task
+        except asyncio.CancelledError:
+            print(&quot;cancelled&quot;)
+
+        # Cleanup that must run on cancel
+        try:
+            await process(items, client)
+        finally:
+            await client.aclose()
+
+        # 3.11+: structured timeouts
+        async with asyncio.timeout(5):
+            await process(items, client)
+
+asyncio.run(main())
+
+# Threads: cooperative flag
+stop = threading.Event()
+def worker():
+    while not stop.is_set():
+        do_step()
+t = threading.Thread(target=worker); t.start()
+stop.set(); t.join()</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p><code>OperationCanceledException</code> vs <code>TaskCanceledException</code> (the latter derives from the former); why you should not catch cancellation and continue as success; <code>CancelAfter</code> vs <code>Task.Delay</code> race patterns.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a console app that starts a long loop and cleanly stops on Ctrl+C, logging how many items it finished.</li></ul></div></section>
+<section id="parallel"><h2 id="parallel">Parallel.For, Parallel.ForEachAsync and PLINQ</h2><p>Data parallelism for CPU-bound work: <code>Parallel.For</code>/<code>ForEach</code> partition a collection across cores; <code>Parallel.ForEachAsync</code> (.NET 6) does the same for async work with a degree-of-parallelism limit; PLINQ (<code>.AsParallel()</code>) parallelises a LINQ query. None of these help I/O-bound work — use Tasks for that. In Python, true CPU parallelism means <code>multiprocessing</code>/<code>ProcessPoolExecutor</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// CPU-bound over an array
+double[] data = Enumerable.Range(0, 1_000_000).Select(i =&gt; (double)i).ToArray();
+double[] results = new double[data.Length];
+Parallel.For(0, data.Length, i =&gt; results[i] = Math.Sqrt(data[i]));
+
+Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = 4 },
+    file =&gt; Compress(file));
+
+// Async-friendly (.NET 6+) — the right tool for &quot;N concurrent API calls&quot;
+await Parallel.ForEachAsync(urls,
+    new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct },
+    async (url, token) =&gt; await DownloadAsync(url, token));
+
+// PLINQ
+var primes = Enumerable.Range(2, 1_000_000)
+    .AsParallel()
+    .WithDegreeOfParallelism(Environment.ProcessorCount)
+    .Where(IsPrime)
+    .ToArray();                   // order not preserved unless .AsOrdered()
+
+// Thread-local accumulation avoids a shared lock
+long total = 0;
+Parallel.For(0, data.Length,
+    () =&gt; 0L,                                  // per-thread init
+    (i, state, local) =&gt; local + (long)data[i], // body
+    local =&gt; Interlocked.Add(ref total, local)); // merge
+
+// Break early
+Parallel.ForEach(items, (item, state) =&gt; { if (item.IsBad) state.Stop(); });</code></pre><pre data-lang="python" hidden><code>import math
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import asyncio
+
+data = [float(i) for i in range(1_000_000)]
+
+# CPU-bound: processes (each has its own GIL)
+def sqrt_chunk(chunk): return [math.sqrt(x) for x in chunk]
+def chunks(xs, n): return [xs[i::n] for i in range(n)]
+
+if __name__ == &quot;__main__&quot;:
+    with ProcessPoolExecutor() as pool:
+        parts = pool.map(sqrt_chunk, chunks(data, 8))
+    # note: pickling overhead — chunk the work, don&#x27;t send one item at a time
+
+    # I/O-bound with a thread pool (GIL released during I/O)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(compress, files))
+
+# Async-friendly with concurrency limit (≈ Parallel.ForEachAsync)
+async def download_all(urls, limit=8):
+    sem = asyncio.Semaphore(limit)
+    async def one(u):
+        async with sem: return await download(u)
+    return await asyncio.gather(*(one(u) for u in urls))
+
+# &quot;PLINQ&quot;: map over a process pool
+def is_prime(n): return n &gt; 1 and all(n % d for d in range(2, int(n ** 0.5) + 1))
+if __name__ == &quot;__main__&quot;:
+    with ProcessPoolExecutor() as pool:
+        flags = pool.map(is_prime, range(2, 200_000), chunksize=5000)
+        primes = [n for n, ok in zip(range(2, 200_000), flags) if ok]
+
+# NumPy gives vectorised parallelism without any of this for numeric work:
+# import numpy as np; np.sqrt(np.arange(1_000_000))</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Explain why <code>Parallel.ForEach</code> with <code>async</code> lambdas is a bug (it returns before the awaits finish) and what to use instead.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Compute the sum of primes below 2,000,000 sequentially, with PLINQ, and with <code>Parallel.For</code> + thread-local state. Compare timings.</li></ul></div></section>
+<section id="deadlocks"><h2 id="deadlocks">Deadlocks, ConfigureAwait and sync-over-async</h2><p>The classic .NET deadlock: code with a <code>SynchronizationContext</code> (UI, classic ASP.NET) blocks on <code>.Result</code>; the awaited continuation needs that same context to resume; nobody yields. ASP.NET Core has no sync context so this specific deadlock is gone — but thread-pool starvation from blocking is not. <code>ConfigureAwait(false)</code> says “don't resume on the captured context”; use it in libraries. Lock-ordering deadlocks are language-agnostic and Python has them too.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// THE deadlock (WinForms / WPF / old ASP.NET):
+void Button_Click(object s, EventArgs e)
+{
+    var data = LoadAsync().Result;      // blocks UI thread, waiting…
+}
+async Task&lt;string&gt; LoadAsync()
+{
+    var x = await http.GetStringAsync(url);   // …continuation needs the UI thread. Deadlock.
+    return x;
+}
+// Fix 1: async all the way
+async void Button_Click(object s, EventArgs e) { var data = await LoadAsync(); }
+// Fix 2 (library code): don&#x27;t capture the context
+async Task&lt;string&gt; LoadAsync()
+{
+    var x = await http.GetStringAsync(url).ConfigureAwait(false);
+    return x;
+}
+
+// Lock-ordering deadlock
+object a = new(), b = new();
+Task.Run(() =&gt; { lock (a) { Thread.Sleep(10); lock (b) { } } });
+Task.Run(() =&gt; { lock (b) { Thread.Sleep(10); lock (a) { } } });   // ← can deadlock
+// Fix: always acquire in the same global order, or use Monitor.TryEnter with timeout
+
+// Thread-pool starvation in ASP.NET Core
+app.MapGet(&quot;/bad&quot;, () =&gt; http.GetStringAsync(url).Result);   // ties up a pool thread per request
+app.MapGet(&quot;/good&quot;, async () =&gt; await http.GetStringAsync(url));
+
+// If you truly must call async from sync (legacy), at least avoid the context:
+var result = Task.Run(() =&gt; LoadAsync()).GetAwaiter().GetResult();
+
+// Diagnosing: dotnet-counters (ThreadPool Queue Length), dotnet-dump + `clrstack -all`</code></pre><pre data-lang="python" hidden><code>import asyncio, threading, time
+
+# Event-loop &quot;deadlock&quot;: blocking the loop thread stalls everything
+async def bad():
+    time.sleep(5)               # whole loop frozen; nothing else runs
+async def good():
+    await asyncio.sleep(5)      # loop keeps serving other tasks
+
+# Calling blocking code from async: offload it
+async def call_blocking():
+    return await asyncio.to_thread(legacy_blocking_call)
+
+# Calling async code from sync: asyncio.run() — but NOT from inside a running loop
+def sync_caller():
+    return asyncio.run(load())       # RuntimeError if a loop is already running
+
+# Lock-ordering deadlock with threads
+a, b = threading.Lock(), threading.Lock()
+def t1():
+    with a:
+        time.sleep(0.01)
+        with b: pass
+def t2():
+    with b:
+        time.sleep(0.01)
+        with a: pass            # ← can deadlock
+# Fix: acquire in a consistent order, or use acquire(timeout=...)
+
+# Diagnosing hung threads
+import faulthandler, sys
+faulthandler.dump_traceback(all_threads=True)      # prints every thread&#x27;s stack
+# or: python -X dev / py-spy dump --pid &lt;pid&gt;</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>This is the #1 async question. Walk through the deadlock step by step, state why ASP.NET Core does not have it, and give the “async all the way + ConfigureAwait(false) in libraries” rule.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Reproduce the deadlock in a WinForms/WPF app (or with a custom <code>SynchronizationContext</code> in a console app) and then fix it both ways.</li></ul></div></section>
+<section id="channels"><h2 id="channels">Channels and producer / consumer pipelines</h2><p><code>System.Threading.Channels</code> is the modern async producer/consumer primitive: a bounded or unbounded queue with <code>ChannelWriter</code>/<code>ChannelReader</code>, async <code>WriteAsync</code>/<code>ReadAllAsync</code>, backpressure and completion. Use it for pipelines and background processing in ASP.NET Core (with <code>BackgroundService</code>). Python's <code>asyncio.Queue</code> is the equivalent.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>var channel = Channel.CreateBounded&lt;string&gt;(new BoundedChannelOptions(100)
+{
+    FullMode = BoundedChannelFullMode.Wait,     // backpressure: producer awaits when full
+    SingleReader = false, SingleWriter = true
+});
+
+// Producer
+var producer = Task.Run(async () =&gt;
+{
+    foreach (var line in File.ReadLines(&quot;big.log&quot;))
+        await channel.Writer.WriteAsync(line);
+    channel.Writer.Complete();                  // signal end
+});
+
+// Consumers (fan-out)
+var consumers = Enumerable.Range(0, 4).Select(_ =&gt; Task.Run(async () =&gt;
+{
+    await foreach (var line in channel.Reader.ReadAllAsync())
+        Process(line);
+}));
+
+await Task.WhenAll(consumers.Append(producer));
+
+// ASP.NET Core: queue work from a request, process in a BackgroundService
+builder.Services.AddSingleton(Channel.CreateUnbounded&lt;EmailJob&gt;());
+builder.Services.AddHostedService&lt;EmailWorker&gt;();
+
+app.MapPost(&quot;/email&quot;, async (EmailJob job, Channel&lt;EmailJob&gt; ch) =&gt;
+{
+    await ch.Writer.WriteAsync(job);
+    return Results.Accepted();
+});
+
+public class EmailWorker(Channel&lt;EmailJob&gt; ch, ILogger&lt;EmailWorker&gt; log) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        await foreach (var job in ch.Reader.ReadAllAsync(ct))
+        {
+            try { await SendAsync(job, ct); }
+            catch (Exception ex) { log.LogError(ex, &quot;email failed&quot;); }
+        }
+    }
+}</code></pre><pre data-lang="python" hidden><code>import asyncio
+
+async def producer(q: asyncio.Queue):
+    with open(&quot;big.log&quot;) as f:
+        for line in f:
+            await q.put(line)          # awaits when the queue is full (backpressure)
+    await q.put(None)                  # sentinel = complete
+
+async def consumer(q: asyncio.Queue, cid: int):
+    while True:
+        line = await q.get()
+        if line is None:
+            await q.put(None)          # let the other consumers see it
+            break
+        process(line)
+        q.task_done()
+
+async def main():
+    q: asyncio.Queue = asyncio.Queue(maxsize=100)
+    await asyncio.gather(producer(q), *(consumer(q, i) for i in range(4)))
+
+asyncio.run(main())
+
+# FastAPI: queue work from a request, process in a background task
+from fastapi import FastAPI
+app = FastAPI()
+jobs: asyncio.Queue = asyncio.Queue()
+
+@app.on_event(&quot;startup&quot;)
+async def start_worker():
+    asyncio.create_task(email_worker())
+
+async def email_worker():
+    while True:
+        job = await jobs.get()
+        try:
+            await send(job)
+        except Exception as ex:
+            print(&quot;email failed&quot;, ex)
+
+@app.post(&quot;/email&quot;, status_code=202)
+async def enqueue(job: EmailJob):
+    await jobs.put(job)
+    return {&quot;queued&quot;: True}</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Build a 3-stage pipeline (read lines → parse → aggregate) with two channels; add a bounded capacity and observe backpressure with a slow final stage.</li></ul></div></section>
+<section id="gil"><h2 id="gil">The Python GIL — what it changes</h2><p>CPython's Global Interpreter Lock lets only one thread execute Python bytecode at a time. Threads still help for I/O-bound work (the GIL is released during blocking I/O and in many C extensions), but CPU-bound parallelism needs <code>multiprocessing</code>. Python 3.13 ships an experimental free-threaded build. If a .NET interviewer asks about Python, this is the point they want you to make; if a Python interviewer asks about .NET, the answer is “no GIL — threads run truly in parallel, so you must lock shared state.”</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// .NET: all cores, real parallelism, so shared state MUST be protected.
+var sw = Stopwatch.StartNew();
+long total = 0;
+Parallel.For(0, 8, _ =&gt;
+{
+    long local = 0;
+    for (int i = 0; i &lt; 50_000_000; i++) local += i % 7;
+    Interlocked.Add(ref total, local);
+});
+Console.WriteLine($&quot;{sw.ElapsedMilliseconds} ms on {Environment.ProcessorCount} cores&quot;);
+// scales roughly with core count</code></pre><pre data-lang="python" hidden><code>import time, threading
+from multiprocessing import Pool
+
+def burn(_):
+    local = 0
+    for i in range(50_000_000):
+        local += i % 7
+    return local
+
+if __name__ == &quot;__main__&quot;:
+    # Threads: no speedup for CPU-bound work (GIL)
+    t0 = time.perf_counter()
+    ts = [threading.Thread(target=burn, args=(0,)) for _ in range(8)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    print(f&quot;threads: {time.perf_counter() - t0:.1f}s&quot;)
+
+    # Processes: scales with cores
+    t0 = time.perf_counter()
+    with Pool(8) as p:
+        total = sum(p.map(burn, range(8)))
+    print(f&quot;processes: {time.perf_counter() - t0:.1f}s&quot;)
+
+    # Rule of thumb:
+    #   I/O-bound  → asyncio (or threads for blocking libs)
+    #   CPU-bound  → multiprocessing / NumPy / C extensions</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Run the Python sample above with 1, 2, 4 and 8 threads and processes; graph the timings and explain the shape.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/dotnet/csharp/asynchronous-programming/" target="_blank" rel="noopener">Asynchronous programming with async and await</a> — official guide</li><li><a href="https://learn.microsoft.com/dotnet/standard/asynchronous-programming-patterns/task-based-asynchronous-pattern-tap" target="_blank" rel="noopener">Task-based asynchronous pattern (TAP)</a></li><li><a href="https://learn.microsoft.com/archive/msdn-magazine/2013/march/async-await-best-practices-in-asynchronous-programming" target="_blank" rel="noopener">Stephen Cleary — Async/Await best practices</a> — the canonical article</li><li><a href="https://www.albahari.com/threading/" target="_blank" rel="noopener">Threading in C# (Joseph Albahari)</a> — free, deep, still accurate</li><li><a href="https://learn.microsoft.com/dotnet/core/extensions/channels" target="_blank" rel="noopener">System.Threading.Channels</a></li><li><a href="https://docs.python.org/3/library/asyncio.html" target="_blank" rel="noopener">Python asyncio docs</a></li><li><a href="https://docs.python.org/3/library/concurrent.futures.html" target="_blank" rel="noopener">Python concurrent.futures</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

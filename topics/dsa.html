@@ -1,0 +1,850 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Structures & Algorithms in C# — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="dsa">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 8 of 13</div>
+  <h1>Data Structures & Algorithms in C#</h1>
+  <p class="lede">Not a full algorithms course: this is the toolkit you actually reach for in a 45-minute coding interview, written the way you would write it live. Each pattern has a canonical problem, the C# solution, the Python solution, and a couple of variations to practise.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#arrays-strings">Arrays and strings</a></li><li><a href="#frequency-map">Dictionary frequency map</a></li><li><a href="#two-pointers">Two pointers</a></li><li><a href="#sliding-window">Sliding window</a></li><li><a href="#stack-queue">Stack and queue patterns</a></li><li><a href="#linked-list">Linked lists</a></li><li><a href="#binary-search">Binary search</a></li><li><a href="#sorting">Sorting and comparers</a></li><li><a href="#graphs">BFS and DFS on graphs and grids</a></li><li><a href="#heap">Heaps and PriorityQueue</a></li><li><a href="#dp">Dynamic programming — an introduction</a></li></ol>
+  </div>
+
+<section id="arrays-strings"><h2 id="arrays-strings">Arrays and strings</h2><p>Know the basics cold: in-place reversal, building results with <code>StringBuilder</code>/list-join, <code>Span&lt;T&gt;</code> for slicing without allocation, and <code>Array.Sort</code> + custom comparers. Canonical: reverse words in a string; check anagram.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Reverse a string in place (char array)
+static string Reverse(string s)
+{
+    var a = s.ToCharArray();
+    Array.Reverse(a);
+    return new string(a);
+}
+
+// Reverse the words: &quot;the sky is blue&quot; → &quot;blue is sky the&quot;
+static string ReverseWords(string s) =&gt;
+    string.Join(&#x27; &#x27;, s.Split(&#x27; &#x27;, StringSplitOptions.RemoveEmptyEntries).Reverse());
+
+// Anagram check: O(n) with a fixed-size count array
+static bool IsAnagram(string a, string b)
+{
+    if (a.Length != b.Length) return false;
+    var counts = new int[26];
+    for (int i = 0; i &lt; a.Length; i++) { counts[a[i] - &#x27;a&#x27;]++; counts[b[i] - &#x27;a&#x27;]--; }
+    return counts.All(c =&gt; c == 0);
+}
+
+// Rotate array right by k in place: reverse all, reverse first k, reverse rest
+static void Rotate(int[] nums, int k)
+{
+    k %= nums.Length;
+    Array.Reverse(nums); Array.Reverse(nums, 0, k); Array.Reverse(nums, k, nums.Length - k);
+}
+
+// Slicing without copying
+ReadOnlySpan&lt;char&gt; first3 = &quot;hello&quot;.AsSpan(0, 3);
+int[] tail = nums[2..];            // range (copies)</code></pre><pre data-lang="python" hidden><code>def reverse(s: str) -&gt; str:
+    return s[::-1]
+
+def reverse_words(s: str) -&gt; str:
+    return &quot; &quot;.join(reversed(s.split()))
+
+from collections import Counter
+def is_anagram(a: str, b: str) -&gt; bool:
+    return len(a) == len(b) and Counter(a) == Counter(b)
+
+def rotate(nums: list[int], k: int) -&gt; None:
+    k %= len(nums)
+    nums[:] = nums[-k:] + nums[:-k]      # in place via slice assignment
+
+# Slicing copies; use memoryview for bytes if it matters
+first3 = &quot;hello&quot;[:3]
+tail = nums[2:]</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Valid palindrome ignoring non-alphanumerics (two pointers).</li><li>Longest common prefix of an array of strings.</li><li>Group anagrams (dictionary keyed by sorted string or count tuple).</li></ul></div></section>
+<section id="frequency-map"><h2 id="frequency-map">Dictionary frequency map</h2><p>The single most common interview structure: count things in a <code>Dictionary&lt;TKey,int&gt;</code> then answer a question about the counts. Canonical: two-sum, first unique character, top-k frequent elements.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Two Sum: O(n) with a value→index map
+static int[] TwoSum(int[] nums, int target)
+{
+    var seen = new Dictionary&lt;int, int&gt;();
+    for (int i = 0; i &lt; nums.Length; i++)
+    {
+        if (seen.TryGetValue(target - nums[i], out var j)) return new[] { j, i };
+        seen[nums[i]] = i;
+    }
+    return Array.Empty&lt;int&gt;();
+}
+
+// First unique character
+static int FirstUnique(string s)
+{
+    var counts = new Dictionary&lt;char, int&gt;();
+    foreach (var c in s) counts[c] = counts.GetValueOrDefault(c) + 1;
+    for (int i = 0; i &lt; s.Length; i++) if (counts[s[i]] == 1) return i;
+    return -1;
+}
+
+// Top-k frequent: count, then sort or heap
+static int[] TopK(int[] nums, int k) =&gt;
+    nums.GroupBy(n =&gt; n)
+        .OrderByDescending(g =&gt; g.Count())
+        .Take(k)
+        .Select(g =&gt; g.Key)
+        .ToArray();
+
+// Idiom: CollectionsMarshal.GetValueRefOrAddDefault avoids double lookup (hot loops)
+ref var count = ref CollectionsMarshal.GetValueRefOrAddDefault(counts, key, out _);
+count++;</code></pre><pre data-lang="python" hidden><code>from collections import Counter, defaultdict
+
+def two_sum(nums: list[int], target: int) -&gt; list[int]:
+    seen: dict[int, int] = {}
+    for i, n in enumerate(nums):
+        if target - n in seen:
+            return [seen[target - n], i]
+        seen[n] = i
+    return []
+
+def first_unique(s: str) -&gt; int:
+    counts = Counter(s)
+    return next((i for i, c in enumerate(s) if counts[c] == 1), -1)
+
+def top_k(nums: list[int], k: int) -&gt; list[int]:
+    return [n for n, _ in Counter(nums).most_common(k)]
+
+# defaultdict for grouping
+groups = defaultdict(list)
+for word in words:
+    groups[&quot;&quot;.join(sorted(word))].append(word)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Subarray sum equals k (prefix-sum + map).</li><li>Longest consecutive sequence (HashSet).</li><li>Ransom note / can construct.</li></ul></div></section>
+<section id="two-pointers"><h2 id="two-pointers">Two pointers</h2><p>Two indices moving toward each other (sorted input) or in the same direction (fast/slow). Turns O(n²) pair searches into O(n). Canonical: two-sum on sorted array, container with most water, remove duplicates in place.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Pair with target sum in a sorted array
+static (int, int)? PairSum(int[] a, int target)
+{
+    int l = 0, r = a.Length - 1;
+    while (l &lt; r)
+    {
+        int s = a[l] + a[r];
+        if (s == target) return (l, r);
+        if (s &lt; target) l++; else r--;
+    }
+    return null;
+}
+
+// Container with most water
+static int MaxArea(int[] h)
+{
+    int l = 0, r = h.Length - 1, best = 0;
+    while (l &lt; r)
+    {
+        best = Math.Max(best, Math.Min(h[l], h[r]) * (r - l));
+        if (h[l] &lt; h[r]) l++; else r--;
+    }
+    return best;
+}
+
+// Remove duplicates from sorted array in place (slow/fast)
+static int RemoveDuplicates(int[] a)
+{
+    if (a.Length == 0) return 0;
+    int w = 1;
+    for (int r = 1; r &lt; a.Length; r++) if (a[r] != a[w - 1]) a[w++] = a[r];
+    return w;
+}
+
+// 3Sum: sort + fix one + two pointers, skipping duplicates
+static IList&lt;IList&lt;int&gt;&gt; ThreeSum(int[] nums)
+{
+    Array.Sort(nums); var res = new List&lt;IList&lt;int&gt;&gt;();
+    for (int i = 0; i &lt; nums.Length - 2; i++)
+    {
+        if (i &gt; 0 &amp;&amp; nums[i] == nums[i - 1]) continue;
+        int l = i + 1, r = nums.Length - 1;
+        while (l &lt; r)
+        {
+            int s = nums[i] + nums[l] + nums[r];
+            if (s == 0) { res.Add(new[] { nums[i], nums[l], nums[r] }); l++; r--; while (l &lt; r &amp;&amp; nums[l] == nums[l - 1]) l++; }
+            else if (s &lt; 0) l++; else r--;
+        }
+    }
+    return res;
+}</code></pre><pre data-lang="python" hidden><code>def pair_sum(a: list[int], target: int):
+    l, r = 0, len(a) - 1
+    while l &lt; r:
+        s = a[l] + a[r]
+        if s == target: return (l, r)
+        if s &lt; target: l += 1
+        else: r -= 1
+    return None
+
+def max_area(h: list[int]) -&gt; int:
+    l, r, best = 0, len(h) - 1, 0
+    while l &lt; r:
+        best = max(best, min(h[l], h[r]) * (r - l))
+        if h[l] &lt; h[r]: l += 1
+        else: r -= 1
+    return best
+
+def remove_duplicates(a: list[int]) -&gt; int:
+    if not a: return 0
+    w = 1
+    for r in range(1, len(a)):
+        if a[r] != a[w - 1]:
+            a[w] = a[r]; w += 1
+    return w
+
+def three_sum(nums: list[int]) -&gt; list[list[int]]:
+    nums.sort(); res = []
+    for i in range(len(nums) - 2):
+        if i and nums[i] == nums[i - 1]: continue
+        l, r = i + 1, len(nums) - 1
+        while l &lt; r:
+            s = nums[i] + nums[l] + nums[r]
+            if s == 0:
+                res.append([nums[i], nums[l], nums[r]]); l += 1; r -= 1
+                while l &lt; r and nums[l] == nums[l - 1]: l += 1
+            elif s &lt; 0: l += 1
+            else: r -= 1
+    return res</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Trapping rain water.</li><li>Sort colours (Dutch national flag, three pointers).</li><li>Move zeroes to the end preserving order.</li></ul></div></section>
+<section id="sliding-window"><h2 id="sliding-window">Sliding window</h2><p>A window <code>[l, r]</code> over a sequence, expanded with <code>r</code> and shrunk with <code>l</code> while a condition holds; state kept in a counter or running sum. Canonical: longest substring without repeats, minimum window substring, max sum subarray of size k.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Longest substring without repeating characters
+static int LengthOfLongestSubstring(string s)
+{
+    var last = new Dictionary&lt;char, int&gt;();
+    int best = 0, l = 0;
+    for (int r = 0; r &lt; s.Length; r++)
+    {
+        if (last.TryGetValue(s[r], out var idx) &amp;&amp; idx &gt;= l) l = idx + 1;   // jump past the repeat
+        last[s[r]] = r;
+        best = Math.Max(best, r - l + 1);
+    }
+    return best;
+}
+
+// Fixed window: max sum of k consecutive
+static int MaxSumK(int[] a, int k)
+{
+    int sum = a.Take(k).Sum(), best = sum;
+    for (int r = k; r &lt; a.Length; r++) { sum += a[r] - a[r - k]; best = Math.Max(best, sum); }
+    return best;
+}
+
+// Minimum window substring containing all chars of t
+static string MinWindow(string s, string t)
+{
+    var need = new Dictionary&lt;char, int&gt;();
+    foreach (var c in t) need[c] = need.GetValueOrDefault(c) + 1;
+    int missing = t.Length, l = 0, bestL = 0, bestLen = int.MaxValue;
+    for (int r = 0; r &lt; s.Length; r++)
+    {
+        if (need.TryGetValue(s[r], out var n)) { if (n &gt; 0) missing--; need[s[r]] = n - 1; }
+        while (missing == 0)
+        {
+            if (r - l + 1 &lt; bestLen) { bestLen = r - l + 1; bestL = l; }
+            if (need.TryGetValue(s[l], out var m)) { need[s[l]] = m + 1; if (m + 1 &gt; 0) missing++; }
+            l++;
+        }
+    }
+    return bestLen == int.MaxValue ? &quot;&quot; : s.Substring(bestL, bestLen);
+}</code></pre><pre data-lang="python" hidden><code>def length_of_longest_substring(s: str) -&gt; int:
+    last: dict[str, int] = {}
+    best = l = 0
+    for r, c in enumerate(s):
+        if c in last and last[c] &gt;= l:
+            l = last[c] + 1
+        last[c] = r
+        best = max(best, r - l + 1)
+    return best
+
+def max_sum_k(a: list[int], k: int) -&gt; int:
+    s = best = sum(a[:k])
+    for r in range(k, len(a)):
+        s += a[r] - a[r - k]; best = max(best, s)
+    return best
+
+from collections import Counter
+def min_window(s: str, t: str) -&gt; str:
+    need = Counter(t); missing = len(t)
+    l = 0; best = (0, float(&quot;inf&quot;))
+    for r, c in enumerate(s):
+        if need[c] &gt; 0: missing -= 1
+        need[c] -= 1
+        while missing == 0:
+            if r - l + 1 &lt; best[1] - best[0]: best = (l, r + 1)
+            need[s[l]] += 1
+            if need[s[l]] &gt; 0: missing += 1
+            l += 1
+    return &quot;&quot; if best[1] == float(&quot;inf&quot;) else s[best[0]:best[1]]</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Longest repeating character replacement (k swaps).</li><li>Permutation in string.</li><li>Sliding window maximum (monotonic deque).</li></ul></div></section>
+<section id="stack-queue"><h2 id="stack-queue">Stack and queue patterns</h2><p>Stack: matching/nesting, undo, monotonic stacks for “next greater element”. Queue: BFS, sliding window with deque, rate limiters. Canonical: valid parentheses, daily temperatures, min-stack.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Valid parentheses
+static bool IsValid(string s)
+{
+    var pairs = new Dictionary&lt;char, char&gt; { [&#x27;)&#x27;] = &#x27;(&#x27;, [&#x27;]&#x27;] = &#x27;[&#x27;, [&#x27;}&#x27;] = &#x27;{&#x27; };
+    var st = new Stack&lt;char&gt;();
+    foreach (var c in s)
+    {
+        if (pairs.ContainsValue(c)) st.Push(c);
+        else if (pairs.TryGetValue(c, out var open) &amp;&amp; (st.Count == 0 || st.Pop() != open)) return false;
+    }
+    return st.Count == 0;
+}
+
+// Monotonic stack: days until a warmer temperature
+static int[] DailyTemperatures(int[] t)
+{
+    var res = new int[t.Length]; var st = new Stack&lt;int&gt;();   // indices, decreasing temps
+    for (int i = 0; i &lt; t.Length; i++)
+    {
+        while (st.Count &gt; 0 &amp;&amp; t[st.Peek()] &lt; t[i]) { var j = st.Pop(); res[j] = i - j; }
+        st.Push(i);
+    }
+    return res;
+}
+
+// Min-stack: O(1) min via a parallel stack
+public class MinStack
+{
+    private readonly Stack&lt;int&gt; _s = new(), _min = new();
+    public void Push(int x) { _s.Push(x); _min.Push(_min.Count == 0 ? x : Math.Min(x, _min.Peek())); }
+    public int Pop() { _min.Pop(); return _s.Pop(); }
+    public int Min =&gt; _min.Peek();
+}
+
+// Queue via two stacks (amortised O(1))
+public class QueueViaStacks&lt;T&gt;
+{
+    private readonly Stack&lt;T&gt; _in = new(), _out = new();
+    public void Enqueue(T x) =&gt; _in.Push(x);
+    public T Dequeue() { if (_out.Count == 0) while (_in.Count &gt; 0) _out.Push(_in.Pop()); return _out.Pop(); }
+}</code></pre><pre data-lang="python" hidden><code>def is_valid(s: str) -&gt; bool:
+    pairs = {&quot;)&quot;: &quot;(&quot;, &quot;]&quot;: &quot;[&quot;, &quot;}&quot;: &quot;{&quot;}
+    st = []
+    for c in s:
+        if c in pairs.values(): st.append(c)
+        elif c in pairs and (not st or st.pop() != pairs[c]): return False
+    return not st
+
+def daily_temperatures(t: list[int]) -&gt; list[int]:
+    res = [0] * len(t); st = []            # indices with decreasing temps
+    for i, temp in enumerate(t):
+        while st and t[st[-1]] &lt; temp:
+            j = st.pop(); res[j] = i - j
+        st.append(i)
+    return res
+
+class MinStack:
+    def __init__(self): self._s, self._min = [], []
+    def push(self, x):
+        self._s.append(x); self._min.append(x if not self._min else min(x, self._min[-1]))
+    def pop(self): self._min.pop(); return self._s.pop()
+    @property
+    def min(self): return self._min[-1]
+
+class QueueViaStacks:
+    def __init__(self): self._in, self._out = [], []
+    def enqueue(self, x): self._in.append(x)
+    def dequeue(self):
+        if not self._out:
+            while self._in: self._out.append(self._in.pop())
+        return self._out.pop()
+
+# collections.deque is the real queue: append / popleft are O(1)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Evaluate reverse Polish notation.</li><li>Largest rectangle in histogram (monotonic stack).</li><li>Design a circular queue with a fixed array.</li></ul></div></section>
+<section id="linked-list"><h2 id="linked-list">Linked lists</h2><p>Pointer manipulation under pressure: reverse, detect cycle (Floyd), find middle, merge sorted lists, remove nth from end. Use a dummy head to avoid edge cases. .NET has <code>LinkedList&lt;T&gt;</code> for real code; interviews want the hand-rolled node.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class ListNode(int val, ListNode? next = null) { public int Val = val; public ListNode? Next = next; }
+
+// Reverse iteratively
+static ListNode? Reverse(ListNode? head)
+{
+    ListNode? prev = null;
+    while (head is not null) { var next = head.Next; head.Next = prev; prev = head; head = next; }
+    return prev;
+}
+
+// Cycle detection (fast/slow)
+static bool HasCycle(ListNode? head)
+{
+    var slow = head; var fast = head;
+    while (fast?.Next is not null) { slow = slow!.Next; fast = fast.Next.Next; if (slow == fast) return true; }
+    return false;
+}
+
+// Middle node
+static ListNode? Middle(ListNode? head)
+{
+    var slow = head; var fast = head;
+    while (fast?.Next is not null) { slow = slow!.Next; fast = fast.Next.Next; }
+    return slow;
+}
+
+// Merge two sorted lists with a dummy head
+static ListNode? Merge(ListNode? a, ListNode? b)
+{
+    var dummy = new ListNode(0); var tail = dummy;
+    while (a is not null &amp;&amp; b is not null)
+    {
+        if (a.Val &lt;= b.Val) { tail.Next = a; a = a.Next; } else { tail.Next = b; b = b.Next; }
+        tail = tail.Next;
+    }
+    tail.Next = a ?? b;
+    return dummy.Next;
+}
+
+// Remove nth from end: two pointers n apart
+static ListNode? RemoveNthFromEnd(ListNode? head, int n)
+{
+    var dummy = new ListNode(0, head); ListNode? fast = dummy, slow = dummy;
+    for (int i = 0; i &lt;= n; i++) fast = fast!.Next;
+    while (fast is not null) { fast = fast.Next; slow = slow!.Next; }
+    slow!.Next = slow.Next!.Next;
+    return dummy.Next;
+}</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class ListNode:
+    val: int
+    next: Optional[&quot;ListNode&quot;] = None
+
+def reverse(head):
+    prev = None
+    while head:
+        head.next, prev, head = prev, head, head.next
+    return prev
+
+def has_cycle(head) -&gt; bool:
+    slow = fast = head
+    while fast and fast.next:
+        slow, fast = slow.next, fast.next.next
+        if slow is fast: return True
+    return False
+
+def middle(head):
+    slow = fast = head
+    while fast and fast.next:
+        slow, fast = slow.next, fast.next.next
+    return slow
+
+def merge(a, b):
+    dummy = tail = ListNode(0)
+    while a and b:
+        if a.val &lt;= b.val: tail.next, a = a, a.next
+        else: tail.next, b = b, b.next
+        tail = tail.next
+    tail.next = a or b
+    return dummy.next
+
+def remove_nth_from_end(head, n):
+    dummy = ListNode(0, head); fast = slow = dummy
+    for _ in range(n + 1): fast = fast.next
+    while fast: fast, slow = fast.next, slow.next
+    slow.next = slow.next.next
+    return dummy.next</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Reorder list (L0→Ln→L1→Ln-1…): middle + reverse + merge.</li><li>Add two numbers represented as lists.</li><li>LRU cache with a doubly linked list + dictionary.</li></ul></div></section>
+<section id="binary-search"><h2 id="binary-search">Binary search</h2><p>Halve the search space each step on anything monotonic — sorted arrays, but also “smallest x such that f(x) is true” (answer-space search). Off-by-one bugs are the whole difficulty; settle on one template. .NET has <code>Array.BinarySearch</code> and Python has <code>bisect</code> for the plain case.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Template: lower bound (first index where a[i] &gt;= target)
+static int LowerBound(int[] a, int target)
+{
+    int lo = 0, hi = a.Length;              // hi is exclusive
+    while (lo &lt; hi)
+    {
+        int mid = lo + (hi - lo) / 2;         // avoids overflow
+        if (a[mid] &lt; target) lo = mid + 1; else hi = mid;
+    }
+    return lo;                              // == a.Length if none
+}
+
+// Exact search
+static int Search(int[] a, int target)
+{
+    int i = LowerBound(a, target);
+    return i &lt; a.Length &amp;&amp; a[i] == target ? i : -1;
+}
+
+// Rotated sorted array
+static int SearchRotated(int[] a, int t)
+{
+    int lo = 0, hi = a.Length - 1;
+    while (lo &lt;= hi)
+    {
+        int mid = (lo + hi) / 2;
+        if (a[mid] == t) return mid;
+        if (a[lo] &lt;= a[mid]) { if (a[lo] &lt;= t &amp;&amp; t &lt; a[mid]) hi = mid - 1; else lo = mid + 1; }
+        else                 { if (a[mid] &lt; t &amp;&amp; t &lt;= a[hi]) lo = mid + 1; else hi = mid - 1; }
+    }
+    return -1;
+}
+
+// Answer-space search: minimum eating speed to finish piles in h hours
+static int MinEatingSpeed(int[] piles, int h)
+{
+    int lo = 1, hi = piles.Max();
+    while (lo &lt; hi)
+    {
+        int k = lo + (hi - lo) / 2;
+        long hours = piles.Sum(p =&gt; (long)Math.Ceiling(p / (double)k));
+        if (hours &lt;= h) hi = k; else lo = k + 1;
+    }
+    return lo;
+}
+
+// Built-in
+int idx = Array.BinarySearch(a, target);      // negative = bitwise complement of insertion point</code></pre><pre data-lang="python" hidden><code>import bisect, math
+
+def lower_bound(a: list[int], target: int) -&gt; int:
+    lo, hi = 0, len(a)
+    while lo &lt; hi:
+        mid = (lo + hi) // 2
+        if a[mid] &lt; target: lo = mid + 1
+        else: hi = mid
+    return lo
+
+def search(a, target):
+    i = lower_bound(a, target)
+    return i if i &lt; len(a) and a[i] == target else -1
+
+def search_rotated(a, t):
+    lo, hi = 0, len(a) - 1
+    while lo &lt;= hi:
+        mid = (lo + hi) // 2
+        if a[mid] == t: return mid
+        if a[lo] &lt;= a[mid]:
+            if a[lo] &lt;= t &lt; a[mid]: hi = mid - 1
+            else: lo = mid + 1
+        else:
+            if a[mid] &lt; t &lt;= a[hi]: lo = mid + 1
+            else: hi = mid - 1
+    return -1
+
+def min_eating_speed(piles, h):
+    lo, hi = 1, max(piles)
+    while lo &lt; hi:
+        k = (lo + hi) // 2
+        if sum(math.ceil(p / k) for p in piles) &lt;= h: hi = k
+        else: lo = k + 1
+    return lo
+
+# Built-in
+i = bisect.bisect_left(a, target)     # lower bound
+j = bisect.bisect_right(a, target)    # upper bound</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>First and last position of element in sorted array.</li><li>Find peak element.</li><li>Median of two sorted arrays (hard).</li></ul></div></section>
+<section id="sorting"><h2 id="sorting">Sorting and comparers</h2><p><code>Array.Sort</code>/<code>List.Sort</code> are introsort (unstable, O(n log n)); LINQ <code>OrderBy</code> is stable. Write comparers with <code>Comparison&lt;T&gt;</code> or <code>IComparer&lt;T&gt;</code>. Know one O(n log n) algorithm well enough to write it (merge sort) and when counting/bucket sort wins.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Custom ordering
+people.Sort((a, b) =&gt; a.Age != b.Age ? a.Age.CompareTo(b.Age) : string.CompareOrdinal(a.Name, b.Name));
+var sorted = people.OrderBy(p =&gt; p.Age).ThenBy(p =&gt; p.Name).ToList();     // stable
+Array.Sort(keys, values);                                                  // parallel arrays
+people.Sort(Comparer&lt;Person&gt;.Create((a, b) =&gt; b.Score.CompareTo(a.Score))); // descending
+
+// IComparable&lt;T&gt; for a natural order
+public record Version(int Major, int Minor) : IComparable&lt;Version&gt;
+{
+    public int CompareTo(Version? o) =&gt; o is null ? 1 : Major != o.Major ? Major.CompareTo(o.Major) : Minor.CompareTo(o.Minor);
+}
+
+// Merge sort (stable, O(n log n), O(n) extra)
+static int[] MergeSort(int[] a)
+{
+    if (a.Length &lt;= 1) return a;
+    var mid = a.Length / 2;
+    var l = MergeSort(a[..mid]); var r = MergeSort(a[mid..]);
+    var res = new int[a.Length]; int i = 0, j = 0, k = 0;
+    while (i &lt; l.Length &amp;&amp; j &lt; r.Length) res[k++] = l[i] &lt;= r[j] ? l[i++] : r[j++];
+    while (i &lt; l.Length) res[k++] = l[i++];
+    while (j &lt; r.Length) res[k++] = r[j++];
+    return res;
+}
+
+// Counting sort when the range is small
+static int[] CountingSort(int[] a, int max)
+{
+    var counts = new int[max + 1];
+    foreach (var x in a) counts[x]++;
+    var res = new int[a.Length]; int k = 0;
+    for (int v = 0; v &lt;= max; v++) while (counts[v]-- &gt; 0) res[k++] = v;
+    return res;
+}
+
+// Quickselect for k-th largest: average O(n)</code></pre><pre data-lang="python" hidden><code># Custom ordering — key functions, always stable (Timsort)
+people.sort(key=lambda p: (p.age, p.name))
+people.sort(key=lambda p: p.score, reverse=True)
+from operator import attrgetter
+people.sort(key=attrgetter(&quot;age&quot;, &quot;name&quot;))
+
+# Natural order via dataclass(order=True) or functools.total_ordering
+from dataclasses import dataclass
+@dataclass(order=True)
+class Version:
+    major: int; minor: int
+
+def merge_sort(a: list[int]) -&gt; list[int]:
+    if len(a) &lt;= 1: return a
+    mid = len(a) // 2
+    l, r = merge_sort(a[:mid]), merge_sort(a[mid:])
+    res, i, j = [], 0, 0
+    while i &lt; len(l) and j &lt; len(r):
+        if l[i] &lt;= r[j]: res.append(l[i]); i += 1
+        else: res.append(r[j]); j += 1
+    return res + l[i:] + r[j:]
+
+def counting_sort(a: list[int], max_v: int) -&gt; list[int]:
+    counts = [0] * (max_v + 1)
+    for x in a: counts[x] += 1
+    return [v for v in range(max_v + 1) for _ in range(counts[v])]
+
+# k-th largest: heapq.nlargest(k, a)[-1] or quickselect</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Sort an array of 0/1/2 in one pass.</li><li>Merge intervals.</li><li>K closest points to origin (sort vs heap).</li></ul></div></section>
+<section id="graphs"><h2 id="graphs">BFS and DFS on graphs and grids</h2><p>Represent graphs as adjacency lists (<code>Dictionary&lt;int, List&lt;int&gt;&gt;</code>) or treat grids as implicit graphs. BFS (queue) for shortest path in unweighted graphs and level order; DFS (recursion or explicit stack) for connectivity, cycles and topological sort. Canonical: number of islands, clone graph, course schedule.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// BFS shortest path (unweighted)
+static int ShortestPath(Dictionary&lt;int, List&lt;int&gt;&gt; g, int src, int dst)
+{
+    var dist = new Dictionary&lt;int, int&gt; { [src] = 0 };
+    var q = new Queue&lt;int&gt;(); q.Enqueue(src);
+    while (q.Count &gt; 0)
+    {
+        var u = q.Dequeue();
+        if (u == dst) return dist[u];
+        foreach (var v in g.GetValueOrDefault(u, new()))
+            if (dist.TryAdd(v, dist[u] + 1)) q.Enqueue(v);
+    }
+    return -1;
+}
+
+// DFS on a grid: number of islands
+static int NumIslands(char[][] grid)
+{
+    int rows = grid.Length, cols = grid[0].Length, count = 0;
+    void Sink(int r, int c)
+    {
+        if (r &lt; 0 || c &lt; 0 || r &gt;= rows || c &gt;= cols || grid[r][c] != &#x27;1&#x27;) return;
+        grid[r][c] = &#x27;0&#x27;;
+        Sink(r + 1, c); Sink(r - 1, c); Sink(r, c + 1); Sink(r, c - 1);
+    }
+    for (int r = 0; r &lt; rows; r++) for (int c = 0; c &lt; cols; c++) if (grid[r][c] == &#x27;1&#x27;) { count++; Sink(r, c); }
+    return count;
+}
+
+// Topological sort (Kahn) — course schedule
+static bool CanFinish(int n, int[][] prereqs)
+{
+    var adj = new List&lt;int&gt;[n]; var indeg = new int[n];
+    for (int i = 0; i &lt; n; i++) adj[i] = new();
+    foreach (var p in prereqs) { adj[p[1]].Add(p[0]); indeg[p[0]]++; }
+    var q = new Queue&lt;int&gt;(Enumerable.Range(0, n).Where(i =&gt; indeg[i] == 0));
+    int seen = 0;
+    while (q.Count &gt; 0) { var u = q.Dequeue(); seen++; foreach (var v in adj[u]) if (--indeg[v] == 0) q.Enqueue(v); }
+    return seen == n;                       // false = cycle
+}
+
+// Dijkstra with PriorityQueue (.NET 6+)
+static int[] Dijkstra(List&lt;(int to, int w)&gt;[] g, int src)
+{
+    var dist = Enumerable.Repeat(int.MaxValue, g.Length).ToArray(); dist[src] = 0;
+    var pq = new PriorityQueue&lt;int, int&gt;(); pq.Enqueue(src, 0);
+    while (pq.TryDequeue(out var u, out var d))
+    {
+        if (d &gt; dist[u]) continue;
+        foreach (var (v, w) in g[u]) if (d + w &lt; dist[v]) { dist[v] = d + w; pq.Enqueue(v, dist[v]); }
+    }
+    return dist;
+}</code></pre><pre data-lang="python" hidden><code>from collections import deque, defaultdict
+import heapq
+
+def shortest_path(g: dict[int, list[int]], src: int, dst: int) -&gt; int:
+    dist = {src: 0}; q = deque([src])
+    while q:
+        u = q.popleft()
+        if u == dst: return dist[u]
+        for v in g.get(u, []):
+            if v not in dist:
+                dist[v] = dist[u] + 1; q.append(v)
+    return -1
+
+def num_islands(grid: list[list[str]]) -&gt; int:
+    rows, cols = len(grid), len(grid[0]); count = 0
+    def sink(r, c):
+        if r &lt; 0 or c &lt; 0 or r &gt;= rows or c &gt;= cols or grid[r][c] != &quot;1&quot;: return
+        grid[r][c] = &quot;0&quot;
+        for dr, dc in ((1,0),(-1,0),(0,1),(0,-1)): sink(r + dr, c + dc)
+    for r in range(rows):
+        for c in range(cols):
+            if grid[r][c] == &quot;1&quot;: count += 1; sink(r, c)
+    return count
+    # note: recursion limit ~1000 — use an explicit stack for big grids
+
+def can_finish(n: int, prereqs: list[list[int]]) -&gt; bool:
+    adj = defaultdict(list); indeg = [0] * n
+    for a, b in prereqs: adj[b].append(a); indeg[a] += 1
+    q = deque(i for i in range(n) if indeg[i] == 0); seen = 0
+    while q:
+        u = q.popleft(); seen += 1
+        for v in adj[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0: q.append(v)
+    return seen == n
+
+def dijkstra(g: list[list[tuple[int, int]]], src: int) -&gt; list[int]:
+    dist = [float(&quot;inf&quot;)] * len(g); dist[src] = 0
+    pq = [(0, src)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d &gt; dist[u]: continue
+        for v, w in g[u]:
+            if d + w &lt; dist[v]:
+                dist[v] = d + w; heapq.heappush(pq, (dist[v], v))
+    return dist</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Clone graph (BFS with a visited map).</li><li>Rotting oranges (multi-source BFS).</li><li>Word ladder.</li><li>Detect cycle in a directed graph with DFS colours.</li></ul></div></section>
+<section id="heap"><h2 id="heap">Heaps and PriorityQueue</h2><p>A heap gives O(log n) insert and O(1) peek of the min/max — perfect for “top k”, “k-th largest”, merging k sorted lists, and scheduling. .NET 6 added <code>PriorityQueue&lt;TElement, TPriority&gt;</code> (min-heap; negate for max). Python's <code>heapq</code> is a min-heap over lists.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// K-th largest: keep a min-heap of size k
+static int KthLargest(int[] nums, int k)
+{
+    var pq = new PriorityQueue&lt;int, int&gt;();
+    foreach (var n in nums) { pq.Enqueue(n, n); if (pq.Count &gt; k) pq.Dequeue(); }
+    return pq.Peek();
+}
+
+// Max-heap: negate the priority (or pass a custom comparer)
+var maxHeap = new PriorityQueue&lt;string, int&gt;(Comparer&lt;int&gt;.Create((a, b) =&gt; b.CompareTo(a)));
+
+// Merge k sorted lists
+static ListNode? MergeK(ListNode?[] lists)
+{
+    var pq = new PriorityQueue&lt;ListNode, int&gt;();
+    foreach (var l in lists) if (l is not null) pq.Enqueue(l, l.Val);
+    var dummy = new ListNode(0); var tail = dummy;
+    while (pq.TryDequeue(out var node, out _))
+    {
+        tail.Next = node; tail = node;
+        if (node.Next is not null) pq.Enqueue(node.Next, node.Next.Val);
+    }
+    return dummy.Next;
+}
+
+// Running median: max-heap for the low half, min-heap for the high half
+public class MedianFinder
+{
+    private readonly PriorityQueue&lt;int, int&gt; _low = new(Comparer&lt;int&gt;.Create((a, b) =&gt; b.CompareTo(a)));
+    private readonly PriorityQueue&lt;int, int&gt; _high = new();
+    public void Add(int x)
+    {
+        _low.Enqueue(x, x);
+        _high.Enqueue(_low.Peek(), _low.Dequeue());
+        if (_high.Count &gt; _low.Count) _low.Enqueue(_high.Peek(), _high.Dequeue());
+    }
+    public double Median =&gt; _low.Count &gt; _high.Count ? _low.Peek() : (_low.Peek() + _high.Peek()) / 2.0;
+}</code></pre><pre data-lang="python" hidden><code>import heapq
+
+def kth_largest(nums: list[int], k: int) -&gt; int:
+    heap = []
+    for n in nums:
+        heapq.heappush(heap, n)
+        if len(heap) &gt; k: heapq.heappop(heap)
+    return heap[0]
+# or: heapq.nlargest(k, nums)[-1]
+
+# Max-heap: push negatives
+max_heap = []; heapq.heappush(max_heap, -value)
+
+def merge_k(lists):
+    heap = [(l.val, i, l) for i, l in enumerate(lists) if l]   # i breaks ties (nodes aren&#x27;t comparable)
+    heapq.heapify(heap)
+    dummy = tail = ListNode(0)
+    while heap:
+        _, i, node = heapq.heappop(heap)
+        tail.next = tail = node
+        if node.next: heapq.heappush(heap, (node.next.val, i, node.next))
+    return dummy.next
+
+class MedianFinder:
+    def __init__(self): self.low, self.high = [], []      # low is a max-heap (negated)
+    def add(self, x):
+        heapq.heappush(self.low, -x)
+        heapq.heappush(self.high, -heapq.heappop(self.low))
+        if len(self.high) &gt; len(self.low):
+            heapq.heappush(self.low, -heapq.heappop(self.high))
+    @property
+    def median(self):
+        return -self.low[0] if len(self.low) &gt; len(self.high) else (-self.low[0] + self.high[0]) / 2</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Top k frequent words (heap with custom tie-break).</li><li>Task scheduler with cooldown.</li><li>Meeting rooms II (min-heap of end times).</li></ul></div></section>
+<section id="dp"><h2 id="dp">Dynamic programming — an introduction</h2><p>DP = recursion + memoisation over overlapping subproblems. Approach: define the state, write the recurrence, decide base cases, then either memoise top-down or fill a table bottom-up. Canonical starters: climbing stairs, coin change, longest increasing subsequence, 0/1 knapsack, edit distance.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Climbing stairs: f(n) = f(n-1) + f(n-2), O(1) space
+static int ClimbStairs(int n)
+{
+    int a = 1, b = 1;
+    for (int i = 2; i &lt;= n; i++) (a, b) = (b, a + b);
+    return b;
+}
+
+// Coin change (min coins): bottom-up
+static int CoinChange(int[] coins, int amount)
+{
+    var dp = new int[amount + 1]; Array.Fill(dp, amount + 1); dp[0] = 0;
+    for (int a = 1; a &lt;= amount; a++)
+        foreach (var c in coins) if (c &lt;= a) dp[a] = Math.Min(dp[a], dp[a - c] + 1);
+    return dp[amount] &gt; amount ? -1 : dp[amount];
+}
+
+// Top-down with memo: number of unique paths in a grid
+static long UniquePaths(int r, int c, Dictionary&lt;(int, int), long&gt;? memo = null)
+{
+    memo ??= new();
+    if (r == 1 || c == 1) return 1;
+    if (memo.TryGetValue((r, c), out var v)) return v;
+    return memo[(r, c)] = UniquePaths(r - 1, c, memo) + UniquePaths(r, c - 1, memo);
+}
+
+// Longest increasing subsequence: O(n log n) with patience sorting
+static int LIS(int[] nums)
+{
+    var tails = new List&lt;int&gt;();
+    foreach (var x in nums)
+    {
+        int i = tails.BinarySearch(x);
+        if (i &lt; 0) i = ~i;
+        if (i == tails.Count) tails.Add(x); else tails[i] = x;
+    }
+    return tails.Count;
+}
+
+// 0/1 knapsack: 1-D table, iterate capacity downwards
+static int Knapsack(int[] w, int[] v, int cap)
+{
+    var dp = new int[cap + 1];
+    for (int i = 0; i &lt; w.Length; i++)
+        for (int c = cap; c &gt;= w[i]; c--) dp[c] = Math.Max(dp[c], dp[c - w[i]] + v[i]);
+    return dp[cap];
+}</code></pre><pre data-lang="python" hidden><code>from functools import lru_cache
+import bisect
+
+def climb_stairs(n: int) -&gt; int:
+    a = b = 1
+    for _ in range(2, n + 1): a, b = b, a + b
+    return b
+
+def coin_change(coins: list[int], amount: int) -&gt; int:
+    dp = [amount + 1] * (amount + 1); dp[0] = 0
+    for a in range(1, amount + 1):
+        for c in coins:
+            if c &lt;= a: dp[a] = min(dp[a], dp[a - c] + 1)
+    return -1 if dp[amount] &gt; amount else dp[amount]
+
+@lru_cache(maxsize=None)          # top-down memo for free
+def unique_paths(r: int, c: int) -&gt; int:
+    if r == 1 or c == 1: return 1
+    return unique_paths(r - 1, c) + unique_paths(r, c - 1)
+
+def lis(nums: list[int]) -&gt; int:
+    tails = []
+    for x in nums:
+        i = bisect.bisect_left(tails, x)
+        if i == len(tails): tails.append(x)
+        else: tails[i] = x
+    return len(tails)
+
+def knapsack(w: list[int], v: list[int], cap: int) -&gt; int:
+    dp = [0] * (cap + 1)
+    for wi, vi in zip(w, v):
+        for c in range(cap, wi - 1, -1):
+            dp[c] = max(dp[c], dp[c - wi] + vi)
+    return dp[cap]</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Say the state and recurrence out loud before coding. Start top-down with memo if you are unsure; convert to bottom-up only if space or stack depth is a concern.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>House robber.</li><li>Longest common subsequence (2-D table).</li><li>Edit distance.</li><li>Word break.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://neetcode.io/roadmap" target="_blank" rel="noopener">NeetCode roadmap</a> — pattern-ordered problem list</li><li><a href="https://leetcode.com/problemset/" target="_blank" rel="noopener">LeetCode</a> — supports C# and Python</li><li><a href="https://learn.microsoft.com/dotnet/api/system.collections.generic" target="_blank" rel="noopener">System.Collections.Generic reference</a></li><li><a href="https://www.bigocheatsheet.com/" target="_blank" rel="noopener">Big-O cheat sheet</a></li><li><a href="https://docs.python.org/3/library/collections.html" target="_blank" rel="noopener">Python collections module</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

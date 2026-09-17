@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Entity Framework Core & Data Access — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="entity-framework">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Topic 5 of 13</div>
+  <h1>Entity Framework Core & Data Access</h1>
+  <p class="lede">EF Core is the default data layer for .NET. The page walks the lifecycle — model, migrate, query, save — and then the performance topics that separate a working app from a fast one. SQLAlchemy 2.0 is the Python counterpart on every sample.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#dbcontext">DbContext and entities</a></li><li><a href="#configuration">Model configuration: conventions, attributes, Fluent API</a></li><li><a href="#migrations">Migrations</a></li><li><a href="#crud">CRUD and SaveChanges</a></li><li><a href="#linq-sql">LINQ to SQL translation and IQueryable</a></li><li><a href="#relationships">Relationships and loading strategies</a></li><li><a href="#tracking">Change tracking vs AsNoTracking</a></li><li><a href="#transactions">Transactions and optimistic concurrency</a></li><li><a href="#n-plus-one">The N+1 problem and other performance traps</a></li><li><a href="#dapper">Dapper and when to skip the ORM</a></li></ol>
+  </div>
+
+<section id="dbcontext"><h2 id="dbcontext">DbContext and entities</h2><p>A <code>DbContext</code> is a unit of work plus an identity map: it tracks the entities you load, and <code>SaveChanges</code> writes the diff. It is cheap to create, <em>not</em> thread-safe, and scoped per request in ASP.NET Core. Entities are plain classes; navigation properties express relationships. SQLAlchemy's <code>Session</code> plays the same role.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class Blog
+{
+    public int Id { get; set; }
+    public required string Url { get; set; }
+    public List&lt;Post&gt; Posts { get; } = new();          // one-to-many navigation
+}
+
+public class Post
+{
+    public int Id { get; set; }
+    public required string Title { get; set; }
+    public string? Content { get; set; }
+    public DateTime Created { get; set; } = DateTime.UtcNow;
+    public int BlogId { get; set; }                    // FK by convention
+    public Blog Blog { get; set; } = null!;            // reference navigation
+}
+
+public class AppDb(DbContextOptions&lt;AppDb&gt; options) : DbContext(options)
+{
+    public DbSet&lt;Blog&gt; Blogs =&gt; Set&lt;Blog&gt;();
+    public DbSet&lt;Post&gt; Posts =&gt; Set&lt;Post&gt;();
+}
+
+// Registration (scoped) — Program.cs
+builder.Services.AddDbContext&lt;AppDb&gt;(o =&gt; o
+    .UseSqlServer(builder.Configuration.GetConnectionString(&quot;Default&quot;))
+    .EnableSensitiveDataLogging(builder.Environment.IsDevelopment())
+    .LogTo(Console.WriteLine, LogLevel.Information));
+
+// Pooling for high-throughput apps
+builder.Services.AddDbContextPool&lt;AppDb&gt;(o =&gt; o.UseNpgsql(cs));
+
+// Factory when you need a context outside DI scope (background jobs, Blazor)
+builder.Services.AddDbContextFactory&lt;AppDb&gt;(o =&gt; o.UseSqlite(&quot;Data Source=app.db&quot;));
+public class Job(IDbContextFactory&lt;AppDb&gt; factory)
+{
+    public async Task Run() { await using var db = await factory.CreateDbContextAsync(); }
+}</code></pre><pre data-lang="python" hidden><code># pip install sqlalchemy psycopg[binary]
+from datetime import datetime, timezone
+from sqlalchemy import ForeignKey, String, create_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session, sessionmaker
+
+class Base(DeclarativeBase): ...
+
+class Blog(Base):
+    __tablename__ = &quot;blogs&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)
+    url: Mapped[str] = mapped_column(String(200))
+    posts: Mapped[list[&quot;Post&quot;]] = relationship(back_populates=&quot;blog&quot;, cascade=&quot;all, delete-orphan&quot;)
+
+class Post(Base):
+    __tablename__ = &quot;posts&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    content: Mapped[str | None]
+    created: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
+    blog_id: Mapped[int] = mapped_column(ForeignKey(&quot;blogs.id&quot;))
+    blog: Mapped[Blog] = relationship(back_populates=&quot;posts&quot;)
+
+# Engine = connection pool (one per process); Session = unit of work (one per request)
+engine = create_engine(settings.database_url, echo=settings.debug)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+# FastAPI dependency: scoped session
+def get_db():
+    with SessionLocal() as db:
+        yield db
+
+# Async variant: create_async_engine + AsyncSession (sqlalchemy.ext.asyncio)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why is <code>DbContext</code> scoped and not singleton (not thread-safe, unbounded change tracker)? What does the change tracker do? What is the difference between <code>DbContext</code> pooling and connection pooling?</p></div></section>
+<section id="configuration"><h2 id="configuration">Model configuration: conventions, attributes, Fluent API</h2><p>EF discovers the model by convention (<code>Id</code> = key, <code>BlogId</code> = FK). Override with data annotations for simple things or the Fluent API in <code>OnModelCreating</code> for everything else — keys, indexes, value conversions, owned types, table splitting, global query filters. Keep configuration in <code>IEntityTypeConfiguration&lt;T&gt;</code> classes so the context stays small.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class PostConfiguration : IEntityTypeConfiguration&lt;Post&gt;
+{
+    public void Configure(EntityTypeBuilder&lt;Post&gt; b)
+    {
+        b.ToTable(&quot;Posts&quot;, &quot;blog&quot;);
+        b.HasKey(p =&gt; p.Id);
+        b.Property(p =&gt; p.Title).HasMaxLength(200).IsRequired();
+        b.Property(p =&gt; p.Content).HasColumnType(&quot;nvarchar(max)&quot;);
+        b.HasIndex(p =&gt; new { p.BlogId, p.Created }).IsDescending(false, true);
+
+        b.HasOne(p =&gt; p.Blog)
+         .WithMany(bl =&gt; bl.Posts)
+         .HasForeignKey(p =&gt; p.BlogId)
+         .OnDelete(DeleteBehavior.Cascade);
+
+        // Enum stored as string
+        b.Property(p =&gt; p.Status).HasConversion&lt;string&gt;();
+
+        // Owned type (value object stored in the same table)
+        b.OwnsOne(p =&gt; p.Author, a =&gt; { a.Property(x =&gt; x.Email).HasColumnName(&quot;AuthorEmail&quot;); });
+
+        // Concurrency token
+        b.Property(p =&gt; p.RowVersion).IsRowVersion();
+
+        // Soft delete via global query filter
+        b.HasQueryFilter(p =&gt; !p.IsDeleted);
+    }
+}
+
+public class AppDb : DbContext
+{
+    protected override void OnModelCreating(ModelBuilder mb)
+    {
+        mb.ApplyConfigurationsFromAssembly(typeof(AppDb).Assembly);
+        mb.HasDefaultSchema(&quot;blog&quot;);
+    }
+}
+
+// Attributes for simple cases
+public class Tag
+{
+    [Key] public int Id { get; set; }
+    [MaxLength(50), Required] public string Name { get; set; } = &quot;&quot;;
+    [Column(&quot;created_utc&quot;)] public DateTime Created { get; set; }
+}</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import Index, Enum, String, Text, ForeignKey, event
+from sqlalchemy.orm import Mapped, mapped_column, relationship, composite
+import enum
+from dataclasses import dataclass
+
+class Status(enum.Enum):
+    draft = &quot;draft&quot;; published = &quot;published&quot;
+
+@dataclass
+class Author:                     # value object (≈ owned type)
+    name: str; email: str
+
+class Post(Base):
+    __tablename__ = &quot;posts&quot;
+    __table_args__ = (
+        Index(&quot;ix_posts_blog_created&quot;, &quot;blog_id&quot;, &quot;created&quot;),
+        {&quot;schema&quot;: &quot;blog&quot;},
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    content: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[Status] = mapped_column(Enum(Status, native_enum=False))   # stored as string
+    author_name: Mapped[str]; author_email: Mapped[str] = mapped_column(&quot;AuthorEmail&quot;)
+    author: Mapped[Author] = composite(Author, &quot;author_name&quot;, &quot;author_email&quot;)
+    version_id: Mapped[int] = mapped_column(default=1)
+    is_deleted: Mapped[bool] = mapped_column(default=False)
+    blog_id: Mapped[int] = mapped_column(ForeignKey(&quot;blog.blogs.id&quot;, ondelete=&quot;CASCADE&quot;))
+    blog: Mapped[&quot;Blog&quot;] = relationship(back_populates=&quot;posts&quot;)
+
+    __mapper_args__ = {&quot;version_id_col&quot;: version_id}    # optimistic concurrency
+
+# Soft delete &quot;global filter&quot;: use a with_loader_criteria hook on every query
+from sqlalchemy.orm import with_loader_criteria
+@event.listens_for(Session, &quot;do_orm_execute&quot;)
+def _soft_delete(state):
+    if state.is_select and not state.execution_options.get(&quot;include_deleted&quot;):
+        state.statement = state.statement.options(
+            with_loader_criteria(Post, lambda cls: cls.is_deleted == False, include_aliases=True))</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Configure a many-to-many <code>Post ↔ Tag</code> with an explicit join entity that has a <code>Created</code> column.</li></ul></div></section>
+<section id="migrations"><h2 id="migrations">Migrations</h2><p>Migrations version your schema alongside the code. <code>dotnet ef migrations add</code> diffs the model against the last snapshot and generates <code>Up</code>/<code>Down</code>; <code>dotnet ef database update</code> applies them. In production apply via a migration bundle or SQL script in the pipeline — not <code>Migrate()</code> at startup on multiple instances. Alembic is the SQLAlchemy equivalent.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># Tooling
+dotnet tool install --global dotnet-ef
+dotnet add package Microsoft.EntityFrameworkCore.Design
+
+# Create and apply
+dotnet ef migrations add AddPostStatus
+dotnet ef database update
+
+# Roll back to a specific migration
+dotnet ef database update AddBlogs
+
+# Production: idempotent SQL script or a bundle executable
+dotnet ef migrations script --idempotent -o migrate.sql
+dotnet ef migrations bundle --self-contained -r linux-x64 -o efbundle
+./efbundle --connection &quot;$CONNECTION_STRING&quot;
+
+# Remove the last (unapplied) migration
+dotnet ef migrations remove</code></pre><pre data-lang="csharp" hidden><code>// Generated migration — edit when the diff isn&#x27;t what you want (data moves, custom SQL)
+public partial class AddPostStatus : Migration
+{
+    protected override void Up(MigrationBuilder mb)
+    {
+        mb.AddColumn&lt;string&gt;(name: &quot;Status&quot;, schema: &quot;blog&quot;, table: &quot;Posts&quot;,
+                             maxLength: 20, nullable: false, defaultValue: &quot;draft&quot;);
+        mb.Sql(&quot;UPDATE blog.Posts SET Status = &#x27;published&#x27; WHERE Published = 1&quot;);
+        mb.DropColumn(&quot;Published&quot;, &quot;Posts&quot;, schema: &quot;blog&quot;);
+    }
+    protected override void Down(MigrationBuilder mb)
+    {
+        mb.AddColumn&lt;bool&gt;(&quot;Published&quot;, &quot;Posts&quot;, schema: &quot;blog&quot;, defaultValue: false);
+        mb.Sql(&quot;UPDATE blog.Posts SET Published = 1 WHERE Status = &#x27;published&#x27;&quot;);
+        mb.DropColumn(&quot;Status&quot;, &quot;Posts&quot;, schema: &quot;blog&quot;);
+    }
+}
+
+// Dev-only auto-migrate (single instance)
+if (app.Environment.IsDevelopment())
+{
+    using var scope = app.Services.CreateScope();
+    await scope.ServiceProvider.GetRequiredService&lt;AppDb&gt;().Database.MigrateAsync();
+}
+
+// Seeding (EF 9: UseSeeding / UseAsyncSeeding)
+builder.Services.AddDbContext&lt;AppDb&gt;(o =&gt; o.UseSqlite(cs).UseAsyncSeeding(async (db, _, ct) =&gt;
+{
+    if (!await db.Set&lt;Blog&gt;().AnyAsync(ct)) { db.Add(new Blog { Url = &quot;https://example.com&quot; }); await db.SaveChangesAsync(ct); }
+}));</code></pre><pre data-lang="python" hidden><code># pip install alembic
+# alembic init migrations       → edit env.py: target_metadata = Base.metadata
+# alembic revision --autogenerate -m &quot;add post status&quot;
+# alembic upgrade head
+# alembic downgrade -1
+# alembic upgrade head --sql &gt; migrate.sql      # offline SQL for pipelines
+
+# migrations/versions/xxxx_add_post_status.py
+from alembic import op
+import sqlalchemy as sa
+
+revision = &quot;a1b2c3&quot;; down_revision = &quot;9f8e7d&quot;
+
+def upgrade():
+    op.add_column(&quot;posts&quot;, sa.Column(&quot;status&quot;, sa.String(20), nullable=False, server_default=&quot;draft&quot;), schema=&quot;blog&quot;)
+    op.execute(&quot;UPDATE blog.posts SET status = &#x27;published&#x27; WHERE published = true&quot;)
+    op.drop_column(&quot;posts&quot;, &quot;published&quot;, schema=&quot;blog&quot;)
+
+def downgrade():
+    op.add_column(&quot;posts&quot;, sa.Column(&quot;published&quot;, sa.Boolean, server_default=sa.false()), schema=&quot;blog&quot;)
+    op.execute(&quot;UPDATE blog.posts SET published = true WHERE status = &#x27;published&#x27;&quot;)
+    op.drop_column(&quot;posts&quot;, &quot;status&quot;, schema=&quot;blog&quot;)
+
+# Dev-only: Base.metadata.create_all(engine)  — never in production</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why not <code>Migrate()</code> at startup in production (race between instances, needs DDL rights, slow startup)? How do you make a breaking column change safely (expand → migrate data → contract, across two deploys)?</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Rename a column in a way that keeps existing data: add new column, copy, drop old — in one migration with custom SQL.</li></ul></div></section>
+<section id="crud"><h2 id="crud">CRUD and SaveChanges</h2><p><code>Add</code>/<code>Update</code>/<code>Remove</code> only change tracker state; <code>SaveChangesAsync</code> issues the SQL in a transaction. Load-then-modify is the normal update path (EF sends only changed columns). For bulk work, EF 7+ has <code>ExecuteUpdateAsync</code>/<code>ExecuteDeleteAsync</code> which skip the tracker entirely.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Create
+var blog = new Blog { Url = &quot;https://example.com&quot; };
+blog.Posts.Add(new Post { Title = &quot;Hello&quot; });
+db.Blogs.Add(blog);                       // graph is tracked, FK set automatically
+await db.SaveChangesAsync();              // INSERT blog; INSERT post
+
+// Read
+var post = await db.Posts.FindAsync(1);   // checks tracker first, then DB by PK
+var recent = await db.Posts.Where(p =&gt; p.Created &gt; DateTime.UtcNow.AddDays(-7))
+                           .OrderByDescending(p =&gt; p.Created).Take(10).ToListAsync();
+
+// Update (tracked): only the changed column is in the UPDATE
+post!.Title = &quot;Hello, world&quot;;
+await db.SaveChangesAsync();              // UPDATE Posts SET Title = @p0 WHERE Id = @p1
+
+// Update (disconnected, e.g. from a PUT body)
+db.Posts.Update(dto.ToEntity());          // marks ALL columns modified
+db.Entry(entity).Property(p =&gt; p.Title).IsModified = true;   // or be surgical
+
+// Delete
+db.Posts.Remove(post);
+await db.SaveChangesAsync();
+
+// Bulk without tracking (EF 7+)
+await db.Posts.Where(p =&gt; p.Created &lt; cutoff).ExecuteDeleteAsync();
+await db.Posts.Where(p =&gt; p.BlogId == 1).ExecuteUpdateAsync(s =&gt; s.SetProperty(p =&gt; p.Status, &quot;archived&quot;));
+
+// Upsert pattern
+var existing = await db.Tags.SingleOrDefaultAsync(t =&gt; t.Name == name);
+if (existing is null) db.Tags.Add(new Tag { Name = name }); else existing.Touched = DateTime.UtcNow;
+await db.SaveChangesAsync();
+
+// Inspect the tracker
+foreach (var e in db.ChangeTracker.Entries()) Console.WriteLine($&quot;{e.Entity.GetType().Name}: {e.State}&quot;);</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import select, update, delete
+from datetime import datetime, timedelta, timezone
+
+with SessionLocal() as db:
+    # Create
+    blog = Blog(url=&quot;https://example.com&quot;)
+    blog.posts.append(Post(title=&quot;Hello&quot;))
+    db.add(blog)                          # cascade adds the post
+    db.commit()                           # INSERT blog; INSERT post
+
+    # Read
+    post = db.get(Post, 1)                # identity map first, then DB by PK
+    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    recent = db.scalars(
+        select(Post).where(Post.created &gt; week_ago).order_by(Post.created.desc()).limit(10)
+    ).all()
+
+    # Update (tracked): only the changed column is in the UPDATE
+    post.title = &quot;Hello, world&quot;
+    db.commit()
+
+    # Update (disconnected): merge by PK
+    db.merge(Post(id=1, title=&quot;From DTO&quot;))
+    db.commit()
+
+    # Delete
+    db.delete(post); db.commit()
+
+    # Bulk without loading
+    db.execute(delete(Post).where(Post.created &lt; cutoff))
+    db.execute(update(Post).where(Post.blog_id == 1).values(status=&quot;archived&quot;))
+    db.commit()
+
+    # Upsert pattern
+    existing = db.scalar(select(Tag).where(Tag.name == name))
+    if existing is None: db.add(Tag(name=name))
+    else: existing.touched = datetime.now(timezone.utc)
+    db.commit()
+
+    # Inspect the unit of work
+    print(db.new, db.dirty, db.deleted)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a <code>PUT /posts/{id}</code> that loads, applies only the provided fields, and returns 404 / 204 correctly. Log the SQL to confirm only changed columns are updated.</li></ul></div></section>
+<section id="linq-sql"><h2 id="linq-sql">LINQ to SQL translation and IQueryable</h2><p>An <code>IQueryable</code> is an expression tree; EF translates it to SQL when you enumerate. Everything before <code>ToList()</code>/<code>AsEnumerable()</code> runs in the database; anything after runs in memory. Project with <code>Select</code> to fetch only needed columns. Watch for client evaluation of things EF cannot translate (custom methods) — EF Core throws instead of silently pulling the whole table.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Translated to SQL — fast
+var titles = await db.Posts
+    .Where(p =&gt; p.Blog.Url.StartsWith(&quot;https&quot;) &amp;&amp; p.Title.Contains(&quot;EF&quot;))   // LIKE
+    .OrderBy(p =&gt; p.Created)
+    .Select(p =&gt; new PostSummary(p.Id, p.Title, p.Blog.Url))               // projection → only 3 columns
+    .ToListAsync();
+
+// Aggregates and grouping translate too
+var perBlog = await db.Posts
+    .GroupBy(p =&gt; p.BlogId)
+    .Select(g =&gt; new { BlogId = g.Key, Count = g.Count(), Latest = g.Max(p =&gt; p.Created) })
+    .ToListAsync();
+
+// Paging
+var page = await db.Posts.OrderBy(p =&gt; p.Id).Skip((pageNo - 1) * size).Take(size).ToListAsync();
+
+// Client evaluation: this throws — Slugify can&#x27;t be translated
+// var bad = db.Posts.Where(p =&gt; Slugify(p.Title) == slug).ToList();
+var ok = db.Posts.AsEnumerable().Where(p =&gt; Slugify(p.Title) == slug);   // explicit: runs in memory (pulls all rows!)
+
+// Raw SQL when LINQ can&#x27;t express it (still composable)
+var hot = db.Posts.FromSql($&quot;SELECT * FROM blog.Posts WHERE Views &gt; {minViews}&quot;).Where(p =&gt; !p.IsDeleted);
+
+// See the SQL
+Console.WriteLine(db.Posts.Where(p =&gt; p.Id &gt; 5).ToQueryString());
+
+// Compiled query for hot paths
+private static readonly Func&lt;AppDb, int, Task&lt;Post?&gt;&gt; _byId =
+    EF.CompileAsyncQuery((AppDb db, int id) =&gt; db.Posts.FirstOrDefault(p =&gt; p.Id == id));
+
+// EF.Functions for provider-specific operators
+var like = db.Posts.Where(p =&gt; EF.Functions.Like(p.Title, &quot;%core%&quot;));</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import select, func, text
+
+# select() builds a statement; nothing runs until execute
+stmt = (
+    select(Post.id, Post.title, Blog.url)
+    .join(Post.blog)
+    .where(Blog.url.startswith(&quot;https&quot;), Post.title.contains(&quot;EF&quot;))   # LIKE
+    .order_by(Post.created)
+)
+titles = db.execute(stmt).all()                 # only 3 columns fetched
+
+# Aggregates and grouping
+per_blog = db.execute(
+    select(Post.blog_id, func.count().label(&quot;count&quot;), func.max(Post.created).label(&quot;latest&quot;))
+    .group_by(Post.blog_id)
+).all()
+
+# Paging
+page = db.scalars(select(Post).order_by(Post.id).offset((page_no - 1) * size).limit(size)).all()
+
+# Python function in a filter = must run in memory (pulls all rows!)
+ok = [p for p in db.scalars(select(Post)) if slugify(p.title) == slug]
+
+# Raw SQL, still composable via text()
+hot = db.scalars(select(Post).from_statement(text(&quot;SELECT * FROM blog.posts WHERE views &gt; :v&quot;)).params(v=min_views)).all()
+
+# See the SQL
+print(stmt.compile(compile_kwargs={&quot;literal_binds&quot;: True}))
+
+# Provider-specific functions
+like = select(Post).where(Post.title.ilike(&quot;%core%&quot;))</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Explain <code>IEnumerable</code> vs <code>IQueryable</code>, where the query executes, and why <code>Select</code>ing a DTO is the single biggest read-performance win.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take a query that does <code>.ToList()</code> then <code>.Where()</code> and move the filter before materialisation; compare the SQL with <code>ToQueryString()</code>.</li></ul></div></section>
+<section id="relationships"><h2 id="relationships">Relationships and loading strategies</h2><p>Three ways to load related data: <strong>eager</strong> (<code>Include</code>/<code>ThenInclude</code>), <strong>explicit</strong> (<code>Entry(x).Collection(...).LoadAsync()</code>), <strong>lazy</strong> (proxies, load on first access — convenient, dangerous). Or skip all three and project with <code>Select</code>. Use <code>AsSplitQuery</code> when includes create a cartesian explosion.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Eager
+var blogs = await db.Blogs
+    .Include(b =&gt; b.Posts.Where(p =&gt; !p.IsDeleted).OrderByDescending(p =&gt; p.Created).Take(5))   // filtered include
+        .ThenInclude(p =&gt; p.Tags)
+    .AsSplitQuery()          // one query per collection instead of a giant JOIN
+    .ToListAsync();
+
+// Explicit
+var blog = await db.Blogs.FirstAsync();
+await db.Entry(blog).Collection(b =&gt; b.Posts).LoadAsync();
+await db.Entry(post).Reference(p =&gt; p.Blog).LoadAsync();
+
+// Lazy (opt-in): Microsoft.EntityFrameworkCore.Proxies + virtual navigations
+builder.Services.AddDbContext&lt;AppDb&gt;(o =&gt; o.UseLazyLoadingProxies().UseSqlServer(cs));
+public virtual List&lt;Post&gt; Posts { get; set; } = new();
+// then blog.Posts triggers a query on first access — easy to N+1 by accident
+
+// Projection: often the best answer
+var view = await db.Blogs.Select(b =&gt; new
+{
+    b.Url,
+    PostCount = b.Posts.Count,
+    Latest = b.Posts.OrderByDescending(p =&gt; p.Created).Select(p =&gt; p.Title).FirstOrDefault()
+}).ToListAsync();
+
+// Many-to-many (EF 5+): implicit join table
+public class Post { public List&lt;Tag&gt; Tags { get; } = new(); }
+public class Tag  { public List&lt;Post&gt; Posts { get; } = new(); }
+// or with payload: explicit PostTag entity + two one-to-many
+
+// One-to-one
+mb.Entity&lt;User&gt;().HasOne(u =&gt; u.Profile).WithOne(p =&gt; p.User).HasForeignKey&lt;Profile&gt;(p =&gt; p.UserId);</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import select
+from sqlalchemy.orm import selectinload, joinedload, subqueryload, lazyload, raiseload
+
+# Eager — selectinload ≈ AsSplitQuery, joinedload ≈ single JOIN
+blogs = db.scalars(
+    select(Blog).options(selectinload(Blog.posts).selectinload(Post.tags))
+).unique().all()
+
+# Explicit
+blog = db.scalar(select(Blog).limit(1))
+db.refresh(blog, attribute_names=[&quot;posts&quot;])
+
+# Lazy is the DEFAULT in SQLAlchemy — blog.posts triggers a query on first access.
+# Make it fail loudly instead of silently N+1&#x27;ing:
+blogs = db.scalars(select(Blog).options(raiseload(&quot;*&quot;))).all()
+# or per relationship:  relationship(lazy=&quot;raise&quot;)
+
+# Projection
+from sqlalchemy import func
+latest = (select(Post.title).where(Post.blog_id == Blog.id)
+          .order_by(Post.created.desc()).limit(1).scalar_subquery())
+view = db.execute(
+    select(Blog.url, func.count(Post.id).label(&quot;post_count&quot;), latest.label(&quot;latest&quot;))
+    .outerjoin(Post).group_by(Blog.id)
+).all()
+
+# Many-to-many with an association table
+from sqlalchemy import Table, Column, ForeignKey
+post_tags = Table(&quot;post_tags&quot;, Base.metadata,
+                  Column(&quot;post_id&quot;, ForeignKey(&quot;posts.id&quot;), primary_key=True),
+                  Column(&quot;tag_id&quot;, ForeignKey(&quot;tags.id&quot;), primary_key=True))
+class Post(Base):
+    tags: Mapped[list[&quot;Tag&quot;]] = relationship(secondary=post_tags, back_populates=&quot;posts&quot;)
+
+# One-to-one: relationship(uselist=False) on both sides</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>When does <code>Include</code> hurt (cartesian explosion with multiple collections → split query)? Why is lazy loading off by default in EF Core? When would you still pick it?</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Load 10 blogs with their posts and tags three ways (Include, split query, projection). Count the queries and the bytes transferred with logging on.</li></ul></div></section>
+<section id="tracking"><h2 id="tracking">Change tracking vs AsNoTracking</h2><p>Every tracked entity costs memory and a snapshot for diffing. Read-only queries should use <code>AsNoTracking()</code> — or set it as the default and opt in to tracking for writes. <code>AsNoTrackingWithIdentityResolution</code> still de-duplicates references. Tracked entities also give you the identity map: the same row is the same object within a context.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Read-only: no tracking, ~2x faster, less memory
+var posts = await db.Posts.AsNoTracking().Where(p =&gt; p.BlogId == 1).ToListAsync();
+posts[0].Title = &quot;changed&quot;;
+await db.SaveChangesAsync();          // nothing happens — not tracked
+
+// Keep identity resolution without tracking
+var withRefs = await db.Posts.AsNoTrackingWithIdentityResolution().Include(p =&gt; p.Blog).ToListAsync();
+
+// Make no-tracking the default for the context
+builder.Services.AddDbContext&lt;AppDb&gt;(o =&gt; o.UseSqlServer(cs)
+    .UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking));
+var editable = await db.Posts.AsTracking().FirstAsync(p =&gt; p.Id == id);   // opt in for writes
+
+// Identity map: same row → same instance
+var a = await db.Posts.FirstAsync(p =&gt; p.Id == 1);
+var b = await db.Posts.FirstAsync(p =&gt; p.Id == 1);
+Console.WriteLine(ReferenceEquals(a, b));   // True (tracked)
+
+// Attach / detach
+db.Attach(entityFromCache);                  // state Unchanged, now tracked
+db.Entry(entity).State = EntityState.Detached;
+db.ChangeTracker.Clear();                    // drop everything (long-running contexts)
+
+// Projections are never tracked
+var dtos = await db.Posts.Select(p =&gt; new PostDto(p.Id, p.Title)).ToListAsync();</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+with SessionLocal() as db:
+    # Every ORM object loaded is tracked (in the identity map) by default
+    a = db.get(Post, 1)
+    b = db.scalar(select(Post).where(Post.id == 1))
+    print(a is b)          # True — identity map
+
+    # &quot;No tracking&quot;: query columns/tuples instead of entities
+    rows = db.execute(select(Post.id, Post.title).where(Post.blog_id == 1)).all()
+
+    # Or expunge after loading
+    post = db.get(Post, 1)
+    db.expunge(post)       # detached; changes no longer flushed
+    post.title = &quot;changed&quot;
+    db.commit()            # nothing happens
+
+    # Attach a detached object
+    db.add(post)           # or db.merge(post) to copy state onto the tracked instance
+
+    # Clear the unit of work in long-running sessions
+    db.expunge_all()
+
+    # Read-only sessions: autoflush=False and never commit
+    ro = Session(engine, autoflush=False)</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Benchmark loading 50k rows tracked vs <code>AsNoTracking</code> with <code>BenchmarkDotNet</code> or a <code>Stopwatch</code>; note memory as well as time.</li></ul></div></section>
+<section id="transactions"><h2 id="transactions">Transactions and optimistic concurrency</h2><p><code>SaveChanges</code> is already atomic. Wrap multiple saves (or EF + Dapper) in <code>BeginTransactionAsync</code>. For concurrent edits, use a concurrency token (<code>rowversion</code>) so the second writer gets <code>DbUpdateConcurrencyException</code> instead of silently overwriting — then resolve (client wins, store wins, merge). Use the execution strategy for transient-failure retries on Azure SQL.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Explicit transaction across multiple operations
+await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+try
+{
+    db.Orders.Add(order);
+    await db.SaveChangesAsync();
+    await db.Database.ExecuteSqlAsync($&quot;UPDATE Inventory SET Qty = Qty - {order.Qty} WHERE Sku = {order.Sku}&quot;);
+    await tx.CommitAsync();
+}
+catch { await tx.RollbackAsync(); throw; }
+
+// With retries on transient errors (Azure SQL): wrap the whole unit in the strategy
+builder.Services.AddDbContext&lt;AppDb&gt;(o =&gt; o.UseSqlServer(cs, s =&gt; s.EnableRetryOnFailure(3)));
+var strategy = db.Database.CreateExecutionStrategy();
+await strategy.ExecuteAsync(async () =&gt;
+{
+    await using var tx = await db.Database.BeginTransactionAsync();
+    /* ... */
+    await tx.CommitAsync();
+});
+
+// Optimistic concurrency with rowversion
+public class Product { public byte[] RowVersion { get; set; } = null!; }   // b.Property(p =&gt; p.RowVersion).IsRowVersion();
+
+var product = await db.Products.FindAsync(id);
+product!.Price = newPrice;
+try
+{
+    await db.SaveChangesAsync();   // UPDATE ... WHERE Id = @id AND RowVersion = @rv  → 0 rows = conflict
+}
+catch (DbUpdateConcurrencyException ex)
+{
+    var entry = ex.Entries.Single();
+    var dbValues = await entry.GetDatabaseValuesAsync();
+    if (dbValues is null) return Results.NotFound();            // deleted meanwhile
+    // Store wins: entry.Reload();   Client wins: entry.OriginalValues.SetValues(dbValues); retry save
+    return Results.Conflict(new { current = dbValues.ToObject() });
+}
+
+// Share a connection/transaction with Dapper
+var conn = db.Database.GetDbConnection();
+await conn.ExecuteAsync(&quot;INSERT ...&quot;, param, transaction: db.Database.CurrentTransaction?.GetDbTransaction());</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import text
+from sqlalchemy.orm.exc import StaleDataError
+from sqlalchemy.exc import OperationalError
+
+# Session already wraps work in a transaction; commit() ends it
+with SessionLocal() as db:
+    with db.begin():                      # explicit; rollback on exception
+        db.add(order)
+        db.flush()                         # send INSERT now, stay in tx
+        db.execute(text(&quot;UPDATE inventory SET qty = qty - :q WHERE sku = :s&quot;), {&quot;q&quot;: order.qty, &quot;s&quot;: order.sku})
+    # committed here
+
+# Isolation level
+with engine.connect().execution_options(isolation_level=&quot;REPEATABLE READ&quot;) as conn: ...
+
+# Retry on transient errors: tenacity around the whole unit of work
+from tenacity import retry, retry_if_exception_type, stop_after_attempt
+@retry(retry=retry_if_exception_type(OperationalError), stop=stop_after_attempt(3))
+def place_order(order):
+    with SessionLocal() as db, db.begin():
+        db.add(order)
+
+# Optimistic concurrency with version_id_col
+class Product(Base):
+    version_id: Mapped[int]
+    __mapper_args__ = {&quot;version_id_col&quot;: version_id}
+
+with SessionLocal() as db:
+    product = db.get(Product, id)
+    product.price = new_price
+    try:
+        db.commit()        # UPDATE ... WHERE id=? AND version_id=?  → 0 rows = StaleDataError
+    except StaleDataError:
+        db.rollback()
+        db.refresh(product)              # store wins; or re-apply client values and retry
+        raise HTTPException(409, &quot;modified by someone else&quot;)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Optimistic vs pessimistic concurrency, why <code>rowversion</code> beats a timestamp, what isolation level means for phantom reads, and why you should not hold a transaction across an <code>await</code> to an external service.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Open two contexts, load the same product in both, save a price change in each, and handle the conflict with a 409 that returns the current database values.</li></ul></div></section>
+<section id="n-plus-one"><h2 id="n-plus-one">The N+1 problem and other performance traps</h2><p>N+1: one query for the list, then one query <em>per item</em> for a navigation — 101 round-trips for 100 rows. Caused by lazy loading or by looping over entities and touching navigations. Fix with <code>Include</code>, projection, or batching. Other traps: loading whole entities to count them, <code>Contains</code> with huge lists, missing indexes, and <code>ToList()</code> too early.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// N+1 — 1 + N queries
+var blogs = await db.Blogs.ToListAsync();
+foreach (var b in blogs)
+    Console.WriteLine($&quot;{b.Url}: {b.Posts.Count}&quot;);       // lazy-load or empty list — either way wrong
+
+// Fix 1: Include
+var blogs2 = await db.Blogs.Include(b =&gt; b.Posts).ToListAsync();
+
+// Fix 2: projection (best — one query, minimal columns)
+var counts = await db.Blogs.Select(b =&gt; new { b.Url, Count = b.Posts.Count }).ToListAsync();
+
+// Fix 3: batch load then join in memory
+var ids = blogs.Select(b =&gt; b.Id).ToList();
+var posts = await db.Posts.Where(p =&gt; ids.Contains(p.BlogId)).ToListAsync();
+var byBlog = posts.ToLookup(p =&gt; p.BlogId);
+
+// Other traps
+var n = (await db.Posts.ToListAsync()).Count;               // ✗ loads everything
+var n2 = await db.Posts.CountAsync();                        // ✓
+bool exists = await db.Posts.AnyAsync(p =&gt; p.Id == id);     // ✓ not FirstOrDefault != null
+
+var all = db.Posts.ToList().Where(p =&gt; p.Title.Contains(&quot;x&quot;));   // ✗ filter in memory
+var some = db.Posts.Where(p =&gt; p.Title.Contains(&quot;x&quot;)).ToList();  // ✓ filter in SQL
+
+// Huge IN lists: chunk or use a temp table / TVP
+foreach (var chunk in ids.Chunk(1000)) { /* query per chunk */ }
+
+// Find the problem: log SQL, count queries in tests
+builder.Services.AddDbContext&lt;AppDb&gt;(o =&gt; o.UseSqlServer(cs).LogTo(Console.WriteLine, new[] { DbLoggerCategory.Database.Command.Name }));
+// MiniProfiler or EF Core interceptors can assert &quot;at most N queries per request&quot;</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload, raiseload
+
+# N+1 — 1 + N queries (lazy loading is the default!)
+blogs = db.scalars(select(Blog)).all()
+for b in blogs:
+    print(b.url, len(b.posts))            # each b.posts fires a SELECT
+
+# Fix 1: eager load
+blogs = db.scalars(select(Blog).options(selectinload(Blog.posts))).all()
+
+# Fix 2: projection
+counts = db.execute(
+    select(Blog.url, func.count(Post.id)).outerjoin(Post).group_by(Blog.id)
+).all()
+
+# Fix 3: batch load then group in memory
+ids = [b.id for b in blogs]
+posts = db.scalars(select(Post).where(Post.blog_id.in_(ids))).all()
+from collections import defaultdict
+by_blog = defaultdict(list)
+for p in posts: by_blog[p.blog_id].append(p)
+
+# Make accidental lazy loads fail in tests
+blogs = db.scalars(select(Blog).options(raiseload(&quot;*&quot;))).all()
+
+# Other traps
+n = len(db.scalars(select(Post)).all())                    # ✗
+n = db.scalar(select(func.count()).select_from(Post))      # ✓
+exists = db.scalar(select(Post.id).where(Post.id == id).limit(1)) is not None
+
+# Find the problem: engine echo, or count statements in tests
+from sqlalchemy import event
+count = 0
+@event.listens_for(engine, &quot;before_cursor_execute&quot;)
+def _count(*a): global count; count += 1</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Describe how you would find an N+1 in production (query logging, APM showing hundreds of identical queries per request) and the three fixes.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write an integration test that asserts an endpoint runs at most 2 SQL queries using an EF Core <code>DbCommandInterceptor</code>.</li></ul></div></section>
+<section id="dapper"><h2 id="dapper">Dapper and when to skip the ORM</h2><p>Dapper maps SQL results to objects with almost no overhead; you write the SQL. Use it for reporting queries, hot read paths, stored procedures and anywhere EF's generated SQL is not good enough. Mixing is normal: EF for writes and the domain model, Dapper for reads. In Python the equivalent is SQLAlchemy Core or the raw DB-API driver.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// dotnet add package Dapper
+using var conn = new SqlConnection(cs);
+
+// Query to objects — parameters are always parameterised
+var posts = await conn.QueryAsync&lt;PostSummary&gt;(
+    &quot;SELECT p.Id, p.Title, b.Url AS BlogUrl FROM blog.Posts p JOIN blog.Blogs b ON b.Id = p.BlogId WHERE p.Created &gt; @Since&quot;,
+    new { Since = DateTime.UtcNow.AddDays(-7) });
+
+var one = await conn.QuerySingleOrDefaultAsync&lt;Post&gt;(&quot;SELECT * FROM blog.Posts WHERE Id = @Id&quot;, new { Id = id });
+int count = await conn.ExecuteScalarAsync&lt;int&gt;(&quot;SELECT COUNT(*) FROM blog.Posts&quot;);
+
+// Insert with output
+int newId = await conn.ExecuteScalarAsync&lt;int&gt;(
+    &quot;INSERT INTO blog.Posts (Title, BlogId) OUTPUT INSERTED.Id VALUES (@Title, @BlogId)&quot;, post);
+
+// Multi-mapping (1:N in one query)
+var blogs = new Dictionary&lt;int, Blog&gt;();
+await conn.QueryAsync&lt;Blog, Post, Blog&gt;(
+    &quot;SELECT b.*, p.* FROM blog.Blogs b LEFT JOIN blog.Posts p ON p.BlogId = b.Id&quot;,
+    (b, p) =&gt;
+    {
+        if (!blogs.TryGetValue(b.Id, out var blog)) blogs[b.Id] = blog = b;
+        if (p is not null) blog.Posts.Add(p);
+        return blog;
+    }, splitOn: &quot;Id&quot;);
+
+// Stored procedure
+var rows = await conn.QueryAsync&lt;Report&gt;(&quot;dbo.MonthlyReport&quot;, new { Month = 3 }, commandType: CommandType.StoredProcedure);
+
+// Multiple result sets
+using var grid = await conn.QueryMultipleAsync(&quot;SELECT * FROM Blogs; SELECT * FROM Posts;&quot;);
+var bs = await grid.ReadAsync&lt;Blog&gt;(); var ps = await grid.ReadAsync&lt;Post&gt;();
+
+// Bulk insert: SqlBulkCopy (SQL Server) beats any ORM by orders of magnitude
+using var bulk = new SqlBulkCopy(conn) { DestinationTableName = &quot;blog.Posts&quot; };
+await bulk.WriteToServerAsync(dataTable);</code></pre><pre data-lang="python" hidden><code># SQLAlchemy Core: SQL-first, tuple results, no unit of work
+from sqlalchemy import text
+from datetime import datetime, timedelta, timezone
+
+with engine.connect() as conn:
+    rows = conn.execute(
+        text(&quot;SELECT p.id, p.title, b.url AS blog_url FROM blog.posts p &quot;
+             &quot;JOIN blog.blogs b ON b.id = p.blog_id WHERE p.created &gt; :since&quot;),
+        {&quot;since&quot;: datetime.now(timezone.utc) - timedelta(days=7)},
+    ).mappings().all()                     # list of dict-like rows
+
+    one = conn.execute(text(&quot;SELECT * FROM blog.posts WHERE id = :id&quot;), {&quot;id&quot;: id}).mappings().first()
+    count = conn.scalar(text(&quot;SELECT COUNT(*) FROM blog.posts&quot;))
+
+    new_id = conn.scalar(
+        text(&quot;INSERT INTO blog.posts (title, blog_id) VALUES (:title, :blog_id) RETURNING id&quot;),
+        {&quot;title&quot;: &quot;x&quot;, &quot;blog_id&quot;: 1})
+    conn.commit()
+
+    # Stored procedure (PostgreSQL function / SQL Server EXEC)
+    report = conn.execute(text(&quot;EXEC dbo.MonthlyReport @Month=:m&quot;), {&quot;m&quot;: 3}).mappings().all()
+
+# Map rows to dataclasses yourself
+from dataclasses import dataclass
+@dataclass
+class PostSummary: id: int; title: str; blog_url: str
+summaries = [PostSummary(**r) for r in rows]
+
+# Bulk insert: COPY (PostgreSQL) via psycopg
+with psycopg.connect(dsn) as pg, pg.cursor() as cur:
+    with cur.copy(&quot;COPY blog.posts (title, blog_id) FROM STDIN&quot;) as copy:
+        for row in data: copy.write_row(row)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>EF vs Dapper: productivity and change tracking vs control and raw speed. Know that both parameterise SQL, that Dapper has no migrations or tracking, and when you'd combine them.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement the same “top 10 posts with blog URL” query in EF (projection) and Dapper; compare generated SQL and timing over 100 iterations.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/ef/core/" target="_blank" rel="noopener">EF Core documentation</a></li><li><a href="https://learn.microsoft.com/ef/core/performance/" target="_blank" rel="noopener">EF Core performance guidance</a> — read this before any interview</li><li><a href="https://learn.microsoft.com/ef/core/managing-schemas/migrations/" target="_blank" rel="noopener">Migrations overview</a></li><li><a href="https://learn.microsoft.com/ef/core/querying/related-data/" target="_blank" rel="noopener">Loading related data</a></li><li><a href="https://github.com/DapperLib/Dapper" target="_blank" rel="noopener">Dapper</a> — micro-ORM</li><li><a href="https://docs.sqlalchemy.org/en/20/tutorial/" target="_blank" rel="noopener">SQLAlchemy 2.0 ORM tutorial</a> — Python counterpart</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>
