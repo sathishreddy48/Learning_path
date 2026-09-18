@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Infrastructure as Code: Bicep &amp; Terraform — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="infrastructure-as-code">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › DevOps › Topic 22 of 23</div>
+  <h1>Infrastructure as Code: Bicep &amp; Terraform</h1>
+  <p class="lede">Every environment on this site — the App Service, the SQL server, the private endpoints — should exist because a file in git says so. This page teaches the two tools you will meet on Azure, Bicep and Terraform, with the same workload written in both, and the pipeline pattern that makes infrastructure changes reviewable and reversible.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#why">Why IaC, and ARM → Bicep → Terraform</a></li><li><a href="#bicep">Bicep: resources, parameters, modules, existing</a></li><li><a href="#bicep-deploy">Deploying Bicep: what-if, modes and deployment stacks</a></li><li><a href="#terraform">Terraform: providers, resources, variables, modules</a></li><li><a href="#state">Terraform state: backends, locking, workspaces</a></li><li><a href="#pipeline">IaC in the pipeline: plan → review → apply</a></li><li><a href="#testing">Testing, policy and drift</a></li><li><a href="#choosing">Bicep vs Terraform vs Pulumi</a></li></ol>
+  </div>
+
+<section id="why"><h2 id="why">Why IaC, and ARM → Bicep → Terraform</h2><p>Infrastructure as code gives you review, repeatability, drift detection and disaster recovery for free. Azure's native engine is <strong>ARM</strong> (JSON templates, deployment API). <strong>Bicep</strong> is a DSL that compiles to ARM — first-party, no state file, day-zero support for new resources. <strong>Terraform</strong> is multi-cloud with a state file and a plan/apply workflow, the <code>azurerm</code> provider (curated) and <code>azapi</code> (raw ARM for anything new).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button></div><pre data-lang="bash"><code># Tooling
+az bicep install &amp;&amp; az bicep version
+brew install terraform tflint           # or winget / apt
+terraform -version
+
+# The same intent, three ways
+az deployment group create -g rg-shop --template-file main.bicep --parameters env=dev        # Bicep → ARM deployment
+az bicep build --file main.bicep                                                            # see the ARM JSON it produces
+terraform -chdir=infra init &amp;&amp; terraform -chdir=infra plan -var env=dev                      # Terraform → provider API calls
+
+# Decompile existing ARM / export a resource group as a starting point (rarely clean, always a starting point)
+az group export -g rg-shop &gt; rg.json &amp;&amp; az bicep decompile --file rg.json</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Declarative vs imperative; idempotency; why Bicep has no state (ARM is the state) and what that costs (no delete of removed resources without stacks/complete mode); provider lag and <code>azapi</code>; where you would still click in the portal (nowhere in prod).</p></div></section>
+<section id="bicep"><h2 id="bicep">Bicep: resources, parameters, modules, existing</h2><p>A Bicep file declares resources with symbolic names; references between them create implicit dependencies. <strong>Parameters</strong> (with decorators for validation and <code>@secure()</code>), <strong>variables</strong>, <strong>outputs</strong>, <strong>modules</strong> (a file or a registry reference), <strong>existing</strong> to reference resources you do not own, loops and conditions. Keep environment differences in <code>.bicepparam</code> files.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bicep">Bicep</button><button role="tab" aria-selected="false" data-lang="bicep">prod.bicepparam</button></div><pre data-lang="bicep"><code>// main.bicep — App Service + SQL + Key Vault wiring, with a module for the web tier
+targetScope = &#x27;resourceGroup&#x27;
+
+@allowed([&#x27;dev&#x27;, &#x27;test&#x27;, &#x27;prod&#x27;])
+param env string
+param location string = resourceGroup().location
+@secure()
+param sqlAdminPassword string
+param tags object = { env: env, owner: &#x27;shop-team&#x27; }
+
+var isProd = env == &#x27;prod&#x27;
+var suffix = &#x27;${env}-${uniqueString(resourceGroup().id)}&#x27;
+
+resource kv &#x27;Microsoft.KeyVault/vaults@2023-07-01&#x27; = {
+  name: &#x27;kv-shop-${suffix}&#x27;
+  location: location
+  tags: tags
+  properties: { tenantId: tenant().tenantId, sku: { family: &#x27;A&#x27;, name: &#x27;standard&#x27; }, enableRbacAuthorization: true, enablePurgeProtection: isProd ? true : null, publicNetworkAccess: &#x27;Disabled&#x27; }
+}
+
+resource sql &#x27;Microsoft.Sql/servers@2023-08-01-preview&#x27; = {
+  name: &#x27;sql-shop-${suffix}&#x27;
+  location: location
+  tags: tags
+  properties: { administratorLogin: &#x27;sqladmin&#x27;, administratorLoginPassword: sqlAdminPassword, minimalTlsVersion: &#x27;1.2&#x27;, publicNetworkAccess: &#x27;Disabled&#x27; }
+  resource db &#x27;databases&#x27; = { name: &#x27;shopdb&#x27;, location: location, sku: isProd ? { name: &#x27;GP_Gen5_4&#x27; } : { name: &#x27;GP_S_Gen5_1&#x27; }, properties: { zoneRedundant: isProd } }
+}
+
+module web &#x27;modules/web.bicep&#x27; = {
+  name: &#x27;web-${env}&#x27;
+  params: { location: location, env: env, tags: tags, sku: isProd ? &#x27;P1v3&#x27; : &#x27;B1&#x27;, instances: isProd ? 3 : 1, keyVaultName: kv.name, sqlFqdn: sql.properties.fullyQualifiedDomainName }
+}
+
+// Reference something the platform team owns
+resource logs &#x27;Microsoft.OperationalInsights/workspaces@2023-09-01&#x27; existing = { name: &#x27;law-platform&#x27;, scope: resourceGroup(&#x27;rg-platform-logs&#x27;) }
+
+// Give the web app&#x27;s identity access to Key Vault (role assignment names must be deterministic GUIDs)
+resource kvSecretsUser &#x27;Microsoft.Authorization/roleAssignments@2022-04-01&#x27; = {
+  scope: kv
+  name: guid(kv.id, web.outputs.principalId, &#x27;Key Vault Secrets User&#x27;)
+  properties: { principalId: web.outputs.principalId, principalType: &#x27;ServicePrincipal&#x27;, roleDefinitionId: subscriptionResourceId(&#x27;Microsoft.Authorization/roleDefinitions&#x27;, &#x27;4633458b-17de-408a-b874-0445c86b69e6&#x27;) }
+}
+
+// One private endpoint per service, from a loop
+var peTargets = [ { name: &#x27;sql&#x27;, id: sql.id, group: &#x27;sqlServer&#x27; }, { name: &#x27;kv&#x27;, id: kv.id, group: &#x27;vault&#x27; } ]
+module pe &#x27;br/public:avm/res/network/private-endpoint:0.9.0&#x27; = [for t in peTargets: {
+  name: &#x27;pe-${t.name}-${env}&#x27;
+  params: { name: &#x27;pe-${t.name}-shop-${env}&#x27;, location: location, subnetResourceId: peSubnetId, privateLinkServiceConnections: [ { name: t.name, properties: { privateLinkServiceId: t.id, groupIds: [ t.group ] } } ] }
+}]
+
+output webUrl string = web.outputs.url
+output sqlFqdn string = sql.properties.fullyQualifiedDomainName</code></pre><pre data-lang="bicep" hidden><code>using &#x27;./main.bicep&#x27;
+
+param env = &#x27;prod&#x27;
+param location = &#x27;westeurope&#x27;
+param sqlAdminPassword = az.getSecret(&#x27;&lt;sub-id&gt;&#x27;, &#x27;rg-platform&#x27;, &#x27;kv-platform&#x27;, &#x27;sql-admin-password&#x27;)   // pulled from Key Vault at deploy time</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Implicit vs explicit dependsOn; modules and the public registry (Azure Verified Modules); <code>existing</code> and cross-RG scope; deterministic names for role assignments; idempotent re-runs; what happens when you remove a resource from the file (nothing — see stacks).</p></div></section>
+<section id="bicep-deploy"><h2 id="bicep-deploy">Deploying Bicep: what-if, modes and deployment stacks</h2><p>Deploy at resource group, subscription, management group or tenant scope. <strong>what-if</strong> previews changes (your "plan"). Incremental mode (default) never deletes; <strong>deployment stacks</strong> track the resources a template created so removing one from the file deletes it (with deny settings to protect them from out-of-band edits). Deployment history lives on the scope.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="yaml">Pipeline</button></div><pre data-lang="bash"><code># Validate, preview, deploy
+az bicep lint --file main.bicep
+az deployment group validate -g rg-shop-prod --template-file main.bicep --parameters prod.bicepparam
+az deployment group what-if  -g rg-shop-prod --template-file main.bicep --parameters prod.bicepparam --result-format FullResourcePayloads
+az deployment group create   -g rg-shop-prod --template-file main.bicep --parameters prod.bicepparam --name &quot;shop-$(date +%Y%m%d%H%M)&quot; --query properties.outputs
+
+# Subscription scope (creates the RG too)
+az deployment sub create -l westeurope --template-file main.sub.bicep --parameters env=prod
+
+# Deployment stacks: the file is the whole truth — removed resources get deleted; deny out-of-band writes
+az stack group create -g rg-shop-prod -n shop --template-file main.bicep --parameters prod.bicepparam   --action-on-unmanage deleteResources --deny-settings-mode denyWriteAndDelete --deny-settings-excluded-principals &lt;pipeline-sp-oid&gt; --yes
+az stack group show -g rg-shop-prod -n shop --query &quot;resources[].id&quot;
+
+# Inspect a failed deployment
+az deployment operation group list -g rg-shop-prod -n shop-202609181200 --query &quot;[?properties.provisioningState==&#x27;Failed&#x27;].{r:properties.targetResource.id, err:properties.statusMessage.error.message}&quot;</code></pre><pre data-lang="yaml" hidden><code># Azure Pipelines: what-if on PR, deploy on main with an approval on the environment
+- stage: Preview
+  jobs:
+    - job: whatif
+      steps:
+        - task: AzureCLI@2
+          inputs:
+            azureSubscription: sc-shop-prod
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              az bicep lint --file infra/main.bicep
+              az deployment group what-if -g rg-shop-prod --template-file infra/main.bicep --parameters infra/prod.bicepparam --no-pretty-print &gt; whatif.json
+              cat whatif.json
+        - publish: whatif.json
+          artifact: whatif
+- stage: Deploy
+  dependsOn: Preview
+  condition: and(succeeded(), eq(variables[&#x27;Build.SourceBranch&#x27;], &#x27;refs/heads/main&#x27;))
+  jobs:
+    - deployment: infra
+      environment: shop-prod           # approval + check that the what-if artifact was reviewed
+      strategy: { runOnce: { deploy: { steps: [
+        { task: AzureCLI@2, inputs: { azureSubscription: sc-shop-prod, scriptType: bash, scriptLocation: inlineScript,
+          inlineScript: az deployment group create -g rg-shop-prod --template-file infra/main.bicep --parameters infra/prod.bicepparam } } ] } } }</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Incremental vs complete mode; what-if limitations (noise, nested modules); deployment stacks vs Terraform state; how you protect prod from portal changes; secrets in parameters (<code>@secure</code>, Key Vault references, never in the pipeline log).</p></div></section>
+<section id="terraform"><h2 id="terraform">Terraform: providers, resources, variables, modules</h2><p>Terraform reads <code>*.tf</code> files in a directory, builds a dependency graph, compares it with <strong>state</strong> and calls provider APIs. Structure: <code>providers.tf</code>, <code>variables.tf</code>, <code>main.tf</code>, <code>outputs.tf</code>, a <code>modules/</code> directory, and per-environment <code>*.tfvars</code>. Pin provider versions. Use <code>for_each</code> over <code>count</code> for stable addresses.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="hcl">Terraform</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="hcl"><code># providers.tf
+terraform {
+  required_version = &quot;&gt;= 1.9&quot;
+  required_providers {
+    azurerm = { source = &quot;hashicorp/azurerm&quot;, version = &quot;~&gt; 4.0&quot; }
+    azapi   = { source = &quot;azure/azapi&quot;,       version = &quot;~&gt; 2.0&quot; }
+  }
+  backend &quot;azurerm&quot; {}          # values supplied at init (see next section)
+}
+provider &quot;azurerm&quot; {
+  features { key_vault { purge_soft_delete_on_destroy = false } }
+  use_oidc = true               # workload identity federation from the pipeline
+}
+
+# variables.tf
+variable &quot;env&quot;      { type = string; validation { condition = contains([&quot;dev&quot;, &quot;test&quot;, &quot;prod&quot;], var.env); error_message = &quot;env must be dev|test|prod&quot; } }
+variable &quot;location&quot; { type = string; default = &quot;westeurope&quot; }
+variable &quot;sql_admin_password&quot; { type = string; sensitive = true }
+locals { is_prod = var.env == &quot;prod&quot;; tags = { env = var.env, owner = &quot;shop-team&quot; } }
+
+# main.tf
+resource &quot;azurerm_resource_group&quot; &quot;shop&quot; { name = &quot;rg-shop-${var.env}&quot;; location = var.location; tags = local.tags }
+
+resource &quot;azurerm_key_vault&quot; &quot;kv&quot; {
+  name                       = &quot;kv-shop-${var.env}-${random_string.suffix.result}&quot;
+  location                   = azurerm_resource_group.shop.location
+  resource_group_name        = azurerm_resource_group.shop.name
+  tenant_id                  = data.azurerm_client_config.current.tenant_id
+  sku_name                   = &quot;standard&quot;
+  rbac_authorization_enabled = true
+  purge_protection_enabled   = local.is_prod
+  public_network_access_enabled = false
+  tags = local.tags
+}
+
+resource &quot;azurerm_mssql_server&quot; &quot;sql&quot; {
+  name = &quot;sql-shop-${var.env}-${random_string.suffix.result}&quot;; location = var.location; resource_group_name = azurerm_resource_group.shop.name
+  version = &quot;12.0&quot;; administrator_login = &quot;sqladmin&quot;; administrator_login_password = var.sql_admin_password
+  minimum_tls_version = &quot;1.2&quot;; public_network_access_enabled = false
+}
+resource &quot;azurerm_mssql_database&quot; &quot;db&quot; {
+  name = &quot;shopdb&quot;; server_id = azurerm_mssql_server.sql.id
+  sku_name = local.is_prod ? &quot;GP_Gen5_4&quot; : &quot;GP_S_Gen5_1&quot;; zone_redundant = local.is_prod
+}
+
+module &quot;web&quot; {
+  source        = &quot;./modules/web&quot;
+  env           = var.env
+  location      = var.location
+  rg_name       = azurerm_resource_group.shop.name
+  sku           = local.is_prod ? &quot;P1v3&quot; : &quot;B1&quot;
+  instances     = local.is_prod ? 3 : 1
+  key_vault_id  = azurerm_key_vault.kv.id
+  sql_fqdn      = azurerm_mssql_server.sql.fully_qualified_domain_name
+  tags          = local.tags
+}
+
+resource &quot;azurerm_role_assignment&quot; &quot;web_kv&quot; {
+  scope = azurerm_key_vault.kv.id; role_definition_name = &quot;Key Vault Secrets User&quot;; principal_id = module.web.principal_id
+}
+
+# Private endpoints from a map — stable addresses, easy to add one
+locals { pe = { sql = { id = azurerm_mssql_server.sql.id, group = &quot;sqlServer&quot; }, kv = { id = azurerm_key_vault.kv.id, group = &quot;vault&quot; } } }
+resource &quot;azurerm_private_endpoint&quot; &quot;pe&quot; {
+  for_each = local.pe
+  name = &quot;pe-${each.key}-shop-${var.env}&quot;; location = var.location; resource_group_name = azurerm_resource_group.shop.name; subnet_id = var.pe_subnet_id
+  private_service_connection { name = each.key; private_connection_resource_id = each.value.id; subresource_names = [each.value.group]; is_manual_connection = false }
+}
+
+# Brand-new resource type not in azurerm yet? azapi speaks raw ARM.
+resource &quot;azapi_resource&quot; &quot;new_thing&quot; {
+  type = &quot;Microsoft.App/sessionPools@2024-10-02-preview&quot;; name = &quot;sp-shop-${var.env}&quot;; parent_id = azurerm_resource_group.shop.id; location = var.location
+  body = { properties = { poolManagementType = &quot;Dynamic&quot;, containerType = &quot;PythonLTS&quot;, scaleConfiguration = { maxConcurrentSessions = 10 } } }
+}
+
+# outputs.tf
+output &quot;web_url&quot;  { value = module.web.url }
+output &quot;sql_fqdn&quot; { value = azurerm_mssql_server.sql.fully_qualified_domain_name }</code></pre><pre data-lang="bash" hidden><code>terraform fmt -recursive &amp;&amp; terraform validate
+terraform plan  -var-file=env/prod.tfvars -out=prod.tfplan
+terraform show -json prod.tfplan | jq &#x27;.resource_changes[] | select(.change.actions != [&quot;no-op&quot;]) | {addr: .address, actions: .change.actions}&#x27;
+terraform apply prod.tfplan                       # applies exactly what was reviewed
+terraform output -json
+
+# Day-2
+terraform state list ; terraform state show azurerm_key_vault.kv
+terraform import azurerm_resource_group.legacy /subscriptions/&lt;sub&gt;/resourceGroups/rg-legacy     # adopt existing resources (or an import {} block)
+terraform state mv module.web.azurerm_linux_web_app.api module.web.azurerm_linux_web_app.app       # refactor without recreate (or moved {} block)
+terraform plan -destroy -target=module.web       # see the blast radius before removing something</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Plan/apply and why you apply a saved plan; <code>for_each</code> vs <code>count</code>; module design and versioning; <code>import</code>/<code>moved</code> blocks for refactoring; sensitive values in state; provider version pinning and upgrade strategy.</p></div></section>
+<section id="state"><h2 id="state">Terraform state: backends, locking, workspaces</h2><p>State maps addresses to real resource IDs and caches attributes — it contains secrets, so it lives in a locked-down remote backend, never in git. On Azure: a storage account with versioning, soft delete and blob leases for <strong>locking</strong>. One state per environment (separate backends or keys) beats workspaces for anything serious. Drift: <code>plan</code> shows it; <code>refresh-only</code> accepts it.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="hcl">Terraform</button></div><pre data-lang="bash"><code># Backend storage: versioned, locked down, identity-auth only
+az storage account create -g rg-tfstate -n sttfstateshop --sku Standard_GZRS --allow-blob-public-access false --allow-shared-key-access false --min-tls-version TLS1_2
+az storage account blob-service-properties update -g rg-tfstate -n sttfstateshop --enable-versioning true --enable-delete-retention true --delete-retention-days 30
+az storage container create --account-name sttfstateshop -n tfstate --auth-mode login
+az role assignment create --assignee &lt;pipeline-sp&gt; --role &quot;Storage Blob Data Contributor&quot; --scope $(az storage account show -g rg-tfstate -n sttfstateshop --query id -o tsv)
+
+# Init per environment with a partial backend config
+terraform init -reconfigure   -backend-config=&quot;resource_group_name=rg-tfstate&quot; -backend-config=&quot;storage_account_name=sttfstateshop&quot;   -backend-config=&quot;container_name=tfstate&quot; -backend-config=&quot;key=shop/prod.tfstate&quot; -backend-config=&quot;use_azuread_auth=true&quot; -backend-config=&quot;use_oidc=true&quot;
+
+# Locks are blob leases: a crashed run leaves one behind
+terraform force-unlock &lt;lock-id&gt;
+
+# Drift
+terraform plan -refresh-only                       # what changed outside Terraform?
+terraform apply -refresh-only                      # accept reality into state (no infra change)</code></pre><pre data-lang="hcl" hidden><code># Layout that scales: one root module per environment, shared modules, no workspaces
+# infra/
+#   modules/web/  modules/data/  modules/network/
+#   envs/dev/   { main.tf, backend.hcl, terraform.tfvars }
+#   envs/prod/  { main.tf, backend.hcl, terraform.tfvars }
+#
+# envs/prod/backend.hcl
+resource_group_name  = &quot;rg-tfstate&quot;
+storage_account_name = &quot;sttfstateshop&quot;
+container_name       = &quot;tfstate&quot;
+key                  = &quot;shop/prod.tfstate&quot;
+use_azuread_auth     = true
+
+# Read outputs of another state (e.g. the platform team&#x27;s network) instead of hard-coding IDs
+data &quot;terraform_remote_state&quot; &quot;network&quot; {
+  backend = &quot;azurerm&quot;
+  config  = { resource_group_name = &quot;rg-tfstate&quot;, storage_account_name = &quot;sttfstateplatform&quot;, container_name = &quot;tfstate&quot;, key = &quot;network/prod.tfstate&quot;, use_azuread_auth = true }
+}
+# → data.terraform_remote_state.network.outputs.pe_subnet_id</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>What is in state and why it is sensitive; locking and what happens without it; workspaces vs directories; splitting state to limit blast radius; recovering from a corrupted/lost state (versioning, import); remote state vs data sources for cross-team references.</p></div></section>
+<section id="pipeline"><h2 id="pipeline">IaC in the pipeline: plan → review → apply</h2><p>The pattern is identical for both tools: on PR run lint + validate + <strong>plan/what-if</strong> and post it to the PR; on merge, apply the <em>same</em> plan after an environment approval. Authenticate with workload identity federation (OIDC), never a secret. Run policy checks against the plan before anyone reviews it.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">GitHub Actions</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="yaml"><code>name: infra
+on:
+  pull_request: { paths: [infra/**] }
+  push: { branches: [main], paths: [infra/**] }
+permissions: { id-token: write, contents: read, pull-requests: write }
+env: { ARM_USE_OIDC: &quot;true&quot;, ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}, ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}, ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }} }
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: infra/envs/prod } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.9.5 }
+      - run: terraform init -backend-config=backend.hcl
+      - run: terraform fmt -check &amp;&amp; terraform validate
+      - uses: terraform-linters/setup-tflint@v4
+      - run: tflint --recursive
+      - run: terraform plan -out=tfplan -input=false
+      - run: terraform show -json tfplan &gt; tfplan.json
+      - uses: bridgecrewio/checkov-action@v12
+        with: { file: infra/envs/prod/tfplan.json, framework: terraform_plan, soft_fail: false }
+      - uses: actions/upload-artifact@v4
+        with: { name: tfplan, path: infra/envs/prod/tfplan }
+      - if: github.event_name == &#x27;pull_request&#x27;
+        run: |
+          terraform show -no-color tfplan &gt; plan.txt
+          gh pr comment ${{ github.event.pull_request.number }} --body &quot;$(printf &#x27;```\n%s\n```&#x27; &quot;$(head -c 60000 plan.txt)&quot;)&quot;
+        env: { GH_TOKEN: ${{ github.token }} }
+
+  apply:
+    if: github.ref == &#x27;refs/heads/main&#x27;
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: prod                       # required reviewers gate this job
+    defaults: { run: { working-directory: infra/envs/prod } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform init -backend-config=backend.hcl
+      - uses: actions/download-artifact@v4
+        with: { name: tfplan, path: infra/envs/prod }
+      - run: terraform apply -input=false tfplan     # exactly the reviewed plan</code></pre><pre data-lang="bash" hidden><code># Local pre-commit equivalents (fast feedback before the PR)
+pre-commit install
+# .pre-commit-config.yaml hooks: terraform_fmt, terraform_validate, terraform_tflint, terraform_docs, checkov
+# For Bicep: az bicep lint, PSRule for Azure (Invoke-PSRule -InputPath infra/ -Module PSRule.Rules.Azure)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why the apply uses the saved plan artifact; how you prevent two pipelines applying concurrently (state lock, concurrency groups); policy-as-code before review; OIDC auth; what you do when apply fails halfway (state is consistent per resource — rerun).</p></div></section>
+<section id="testing"><h2 id="testing">Testing, policy and drift</h2><p>Layers: <strong>lint</strong> (bicep lint / tflint), <strong>static policy</strong> (PSRule for Azure, Checkov, tfsec, Azure Policy in the what-if), <strong>plan review</strong>, <strong>deployment test</strong> (deploy to an ephemeral RG, run smoke tests, destroy — Terratest or a script), and <strong>drift detection</strong> (scheduled plan/what-if that opens an issue on changes). Azure Policy at the subscription remains the last line.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># PSRule for Azure: 300+ Well-Architected rules against Bicep/ARM before deployment
+pwsh -c &quot;Install-Module PSRule.Rules.Azure -Scope CurrentUser -Force; Invoke-PSRule -InputPath infra/ -Module PSRule.Rules.Azure -Format File -Outcome Fail,Error&quot;
+
+# Checkov on Terraform source or plan
+checkov -d infra/ --framework terraform --check CKV_AZURE_* --skip-check CKV_AZURE_109
+checkov -f tfplan.json --framework terraform_plan
+
+# Ephemeral deployment test for Bicep — deploy, smoke, destroy
+RG=rg-shop-test-$RANDOM
+az group create -n $RG -l westeurope --tags ephemeral=true
+az deployment group create -g $RG --template-file infra/main.bicep --parameters env=test sqlAdminPassword=&quot;$(openssl rand -base64 24)&quot; -o none
+URL=$(az deployment group show -g $RG -n main --query properties.outputs.webUrl.value -o tsv)
+curl -fsS &quot;$URL/health/ready&quot; &amp;&amp; echo &quot;smoke OK&quot;
+az group delete -n $RG --yes --no-wait
+
+# Scheduled drift check (nightly)
+terraform plan -detailed-exitcode -input=false &gt;/dev/null; case $? in 0) echo &quot;no drift&quot;;; 2) echo &quot;DRIFT&quot; &amp;&amp; exit 2;; *) exit 1;; esac</code></pre><pre data-lang="python" hidden><code># Terraform-plan assertions in pytest — cheap guardrails your team owns
+import json, subprocess, pytest
+
+@pytest.fixture(scope=&quot;session&quot;)
+def plan():
+    subprocess.run([&quot;terraform&quot;, &quot;-chdir=infra/envs/prod&quot;, &quot;plan&quot;, &quot;-out=tfplan&quot;, &quot;-input=false&quot;], check=True)
+    out = subprocess.check_output([&quot;terraform&quot;, &quot;-chdir=infra/envs/prod&quot;, &quot;show&quot;, &quot;-json&quot;, &quot;tfplan&quot;])
+    return json.loads(out)
+
+def resources(plan, rtype):
+    return [r for r in plan[&quot;planned_values&quot;][&quot;root_module&quot;].get(&quot;resources&quot;, []) if r[&quot;type&quot;] == rtype] +            [r for m in plan[&quot;planned_values&quot;][&quot;root_module&quot;].get(&quot;child_modules&quot;, []) for r in m.get(&quot;resources&quot;, []) if r[&quot;type&quot;] == rtype]
+
+def test_no_public_storage(plan):
+    for r in resources(plan, &quot;azurerm_storage_account&quot;):
+        assert r[&quot;values&quot;][&quot;public_network_access_enabled&quot;] is False, r[&quot;address&quot;]
+
+def test_nothing_destroyed_in_prod(plan):
+    destroyed = [c[&quot;address&quot;] for c in plan[&quot;resource_changes&quot;] if &quot;delete&quot; in c[&quot;change&quot;][&quot;actions&quot;]]
+    assert not destroyed, f&quot;plan would destroy: {destroyed}&quot;</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Test pyramid for infrastructure; what static analysis can and cannot catch; ephemeral environments and their cost; drift sources (portal edits, auto-generated resources) and response; when a rule should be a pipeline check vs an Azure Policy deny.</p></div></section>
+<section id="choosing"><h2 id="choosing">Bicep vs Terraform vs Pulumi</h2><p>Pick one per organisation and stick with it. <strong>Bicep</strong>: Azure-only, no state to manage, day-zero resource support, best with deployment stacks and Azure Verified Modules. <strong>Terraform</strong>: multi-cloud and SaaS providers (Entra, GitHub, Datadog…), rich ecosystem, explicit plan, state to protect. <strong>Pulumi</strong>: real languages (C#, Python) with tests and abstractions, Terraform-provider bridge, state in Pulumi Cloud or your own backend.</p><div class="table-wrap"><table><thead><tr><th></th><th>Bicep</th><th>Terraform</th><th>Pulumi</th></tr></thead><tbody><tr><td>Scope</td><td>Azure only</td><td>Any provider</td><td>Any provider (bridged)</td></tr><tr><td>State</td><td>None (ARM is the source of truth; stacks add tracking)</td><td>Remote state file, locking</td><td>State file (Pulumi Cloud or self-managed)</td></tr><tr><td>Preview</td><td>what-if</td><td>plan (saved, applied exactly)</td><td>preview</td></tr><tr><td>New Azure features</td><td>Day zero</td><td>azurerm lag; azapi for gaps</td><td>azure-native is auto-generated (fast)</td></tr><tr><td>Deletions</td><td>Only with stacks / complete mode</td><td>Natural (plan shows destroy)</td><td>Natural</td></tr><tr><td>Language</td><td>DSL</td><td>HCL</td><td>C#, Python, TS, Go</td></tr><tr><td>Best fit</td><td>Azure-centric teams, landing zones (ALZ Bicep)</td><td>Multi-cloud, platform teams, wide SaaS automation</td><td>Developer-heavy teams who want unit tests and abstractions</td></tr></tbody></table></div><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button></div><pre data-lang="csharp"><code>// Pulumi in C# — the same web tier, with a unit test
+class ShopStack : Stack
+{
+    public ShopStack()
+    {
+        var cfg = new Config(); var env = cfg.Require(&quot;env&quot;);
+        var rg = new ResourceGroup(&quot;rg&quot;, new() { ResourceGroupName = $&quot;rg-shop-{env}&quot;, Location = &quot;westeurope&quot; });
+        var plan = new AppServicePlan(&quot;plan&quot;, new() { ResourceGroupName = rg.Name, Kind = &quot;linux&quot;, Reserved = true,
+            Sku = new SkuDescriptionArgs { Name = env == &quot;prod&quot; ? &quot;P1v3&quot; : &quot;B1&quot;, Capacity = env == &quot;prod&quot; ? 3 : 1 } });
+        var app = new WebApp(&quot;api&quot;, new() { ResourceGroupName = rg.Name, ServerFarmId = plan.Id, HttpsOnly = true,
+            Identity = new ManagedServiceIdentityArgs { Type = ManagedServiceIdentityType.SystemAssigned },
+            SiteConfig = new SiteConfigArgs { LinuxFxVersion = &quot;DOTNETCORE|9.0&quot;, MinTlsVersion = &quot;1.2&quot;, FtpsState = &quot;Disabled&quot; } });
+        Url = app.DefaultHostName.Apply(h =&gt; $&quot;https://{h}&quot;);
+    }
+    [Output] public Output&lt;string&gt; Url { get; set; }
+}
+// Test with Pulumi.Testing mocks:  var resources = await Deployment.TestAsync&lt;ShopStack&gt;(new Mocks());  Assert all WebApps have HttpsOnly == true</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Defend a choice for a given org (Azure-only startup vs multi-cloud enterprise); migration cost between tools; how each handles secrets, deletions and drift; team skills as a deciding factor.</p></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/azure/azure-resource-manager/bicep/" target="_blank" rel="noopener">Bicep documentation</a></li><li><a href="https://aka.ms/avm" target="_blank" rel="noopener">Azure Verified Modules</a> — Bicep and Terraform modules with a support policy</li><li><a href="https://learn.microsoft.com/azure/azure-resource-manager/bicep/deployment-stacks" target="_blank" rel="noopener">Deployment stacks</a></li><li><a href="https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs" target="_blank" rel="noopener">Terraform azurerm provider</a></li><li><a href="https://learn.microsoft.com/azure/developer/terraform/" target="_blank" rel="noopener">Terraform on Azure — best practices</a></li><li><a href="https://azure.github.io/PSRule.Rules.Azure/" target="_blank" rel="noopener">PSRule for Azure</a></li><li><a href="https://www.pulumi.com/registry/packages/azure-native/" target="_blank" rel="noopener">Pulumi Azure Native</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

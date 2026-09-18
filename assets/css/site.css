@@ -183,6 +183,28 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 2rem 0; }
 }
 .nav-group ul { list-style: none; margin: 0; padding: 0; }
 .nav-group li { margin: 0; }
+
+/* collapsible group menus (C# & .NET / Azure / DevOps) */
+.nav-group-menu { margin-top: .6rem; }
+.nav-group-toggle {
+  display: flex; align-items: center; gap: .45rem; width: 100%;
+  margin: 0; padding: .4rem 1.1rem .35rem; border: 0; background: none; cursor: pointer; text-align: left;
+  font: inherit; font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint);
+}
+.nav-group-toggle:hover { color: var(--text); }
+.nav-group-caret { display: inline-block; width: .8em; transition: transform .15s ease; font-size: .85em; }
+.nav-group-menu.open .nav-group-caret { transform: rotate(90deg); }
+.nav-group-label { flex: 1; }
+.nav-group-count { font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: 0; text-transform: none; color: var(--text-faint); }
+.nav-group-menu > ul { display: none; }
+.nav-group-menu.open > ul { display: block; }
+.nav-group-menu.open > ul .nav-item { padding-left: 1.2rem; }
+
+/* dashboard group headings */
+.group-head { display: flex; align-items: baseline; gap: .75rem; margin: 2rem 0 .25rem; }
+.group-head h3 { margin: 0; font-size: 1.12rem; }
+.group-head .group-count { font-size: .78rem; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.group-blurb { margin: 0 0 .25rem; font-size: .9rem; color: var(--text-muted); }
 .nav-item {
   display: flex; align-items: center; gap: .55rem;
   padding: .42rem 1.1rem .42rem .9rem;

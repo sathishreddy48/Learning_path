@@ -1,5 +1,5 @@
 /* ==========================================================================
-   nav.js — builds the sidebar from CURRICULUM.topics
+   nav.js — builds the sidebar from CURRICULUM.groups (one menu per group)
    --------------------------------------------------------------------------
    Every page carries <body data-root=""> (root) or data-root="../" (topics/).
    The sidebar is generated from a plain JS object rather than fetched, so
@@ -15,12 +15,28 @@
 
   var root = document.body.getAttribute('data-root') || '';
   var currentTopic = document.body.getAttribute('data-topic') || '';
+  var currentGroup = '';
+  C.groups.forEach(function (g) {
+    g.topics.forEach(function (t) { if (t.id === currentTopic) currentGroup = g.id; });
+  });
 
   function esc(s) {
     return String(s).replace(/[&<>"]/g, function (c) {
       return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
     });
   }
+
+  /* Collapsed groups are remembered per browser; the group holding the current
+     topic is always expanded so the active item is visible. */
+  var COLLAPSE_KEY = 'learningPath.v1.collapsedGroups';
+  function loadCollapsed() {
+    try { return JSON.parse(window.localStorage.getItem(COLLAPSE_KEY) || '{}') || {}; } catch (e) { return {}; }
+  }
+  function saveCollapsed(state) {
+    try { window.localStorage.setItem(COLLAPSE_KEY, JSON.stringify(state)); } catch (e) { /* Safari file:// */ }
+  }
+  var collapsed = loadCollapsed();
+
 
   function itemHtml(t, i) {
     var visited = V.isVisited(t.id);
@@ -40,6 +56,19 @@
       '<button type="button" class="btn btn-sm btn-danger" data-reset-visited>Reset visited topics</button>';
   }
 
+  function groupHtml(g) {
+    var visitedHere = g.topics.filter(function (t) { return V.isVisited(t.id); }).length;
+    var isOpen = !collapsed[g.id] || g.id === currentGroup;
+    return '<div class="nav-group nav-group-menu' + (isOpen ? ' open' : '') + '" data-group="' + esc(g.id) + '">' +
+      '<button type="button" class="nav-group-toggle" aria-expanded="' + (isOpen ? 'true' : 'false') + '" data-toggle-group="' + esc(g.id) + '">' +
+        '<span class="nav-group-caret" aria-hidden="true">▸</span>' +
+        '<span class="nav-group-label">' + esc(g.label) + '</span>' +
+        '<span class="nav-group-count" title="Visited in this group">' + visitedHere + '/' + g.topics.length + '</span>' +
+      '</button>' +
+      '<ul>' + g.topics.map(function (t) { return itemHtml(t, C.topics.indexOf(t)); }).join('') + '</ul>' +
+      '</div>';
+  }
+
   function build() {
     var isHome = !currentTopic;
     var html = '' +
@@ -52,9 +81,7 @@
       '</div>' +
       '<div class="nav-group"><ul><li><a class="nav-item' + (isHome ? ' active' : '') + '" href="' + root + 'index.html">' +
         '<span class="nav-num"><span>⌂</span></span><span class="nav-label">Dashboard</span></a></li></ul></div>' +
-      '<div class="nav-group"><h4>Topics</h4><ul>' +
-      C.topics.map(itemHtml).join('') +
-      '</ul></div>' +
+      C.groups.map(groupHtml).join('') +
       '<div class="nav-foot">' + footHtml() + '</div>';
     return html;
   }
@@ -94,6 +121,16 @@
     if (el.closest('.nav-close')) { setDrawer(false); return; }
     if (el === scrim) { setDrawer(false); return; }
     if (el.closest('.sidebar a')) { setDrawer(false); }
+    var tg = el.closest('[data-toggle-group]');
+    if (tg) {
+      var gid = tg.getAttribute('data-toggle-group');
+      var box = tg.closest('.nav-group-menu');
+      var open = !box.classList.contains('open');
+      box.classList.toggle('open', open);
+      tg.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) delete collapsed[gid]; else collapsed[gid] = true;
+      saveCollapsed(collapsed);
+    }
   });
   document.addEventListener('keydown', function (e) {
     if (e.key === 'Escape') setDrawer(false);
@@ -116,6 +153,10 @@
   document.addEventListener('visited:change', function () {
     Array.prototype.forEach.call(sb.querySelectorAll('.nav-item[data-topic-id]'), function (a) {
       a.classList.toggle('visited', V.isVisited(a.getAttribute('data-topic-id')));
+    });
+    C.groups.forEach(function (g) {
+      var el = sb.querySelector('.nav-group-menu[data-group="' + g.id + '"] .nav-group-count');
+      if (el) el.textContent = g.topics.filter(function (t) { return V.isVisited(t.id); }).length + '/' + g.topics.length;
     });
     var foot = sb.querySelector('.nav-foot');
     if (foot) foot.innerHTML = footHtml();

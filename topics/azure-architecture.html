@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure Architecture &amp; Governance — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="azure-architecture">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Azure › Topic 17 of 23</div>
+  <h1>Azure Architecture &amp; Governance</h1>
+  <p class="lede">Senior interviews move from "which service" to "how would you run this for a company". This page is the vocabulary and the numbers: how resources are organised, what guardrails exist, how you reason about availability and disaster recovery, where the money goes, and a reference architecture you can draw on a whiteboard and defend.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#hierarchy">Management groups, subscriptions, resource groups, tags</a></li><li><a href="#policy">RBAC, Azure Policy and resource locks</a></li><li><a href="#well-architected">The Well-Architected Framework</a></li><li><a href="#resiliency">Regions, availability zones and composite SLAs</a></li><li><a href="#dr">Backup, disaster recovery, RTO and RPO</a></li><li><a href="#cost">Cost management and FinOps</a></li><li><a href="#landing-zones">Landing zones and the Cloud Adoption Framework</a></li><li><a href="#reference-arch">Reference architecture: a .NET web workload on Azure</a></li></ol>
+  </div>
+
+<section id="hierarchy"><h2 id="hierarchy">Management groups, subscriptions, resource groups, tags</h2><p>Scope flows down: <strong>tenant → management groups → subscriptions → resource groups → resources</strong>. Policy and RBAC assigned at a level apply to everything beneath it. Subscriptions are billing and quota boundaries (typical split: per environment or per workload); resource groups hold things with the same lifecycle. <strong>Tags</strong> (owner, cost-centre, environment, data-classification) drive cost reports and automation — enforce them with policy.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="bicep">Bicep</button></div><pre data-lang="bash"><code># Management group tree
+az account management-group create --name mg-contoso --display-name Contoso
+az account management-group create --name mg-platform  --parent mg-contoso
+az account management-group create --name mg-workloads --parent mg-contoso
+az account management-group subscription add --name mg-workloads --subscription &quot;sub-shop-prod&quot;
+
+# Resource groups per lifecycle, tagged
+az group create -n rg-shop-prod-weu -l westeurope --tags env=prod owner=shop-team costcenter=CC123 dataclass=confidential
+az tag update --resource-id /subscriptions/&lt;sub&gt;/resourceGroups/rg-shop-prod-weu --operation Merge --tags reviewed=2026-09
+
+# Naming: &lt;type&gt;-&lt;workload&gt;-&lt;env&gt;-&lt;region&gt;-&lt;instance&gt;   e.g. app-shop-prod-weu-01, sql-shop-prod-weu, kv-shop-prod-weu
+# Query everything with Resource Graph
+az graph query -q &quot;Resources | where tags.env == &#x27;prod&#x27; and type =~ &#x27;microsoft.web/sites&#x27; | project name, resourceGroup, location, sku=properties.sku&quot;</code></pre><pre data-lang="bicep" hidden><code>// Subscription-scoped deployment that creates the RG and then deploys the workload module into it
+targetScope = &#x27;subscription&#x27;
+param location string = &#x27;westeurope&#x27;
+param env string
+var tags = { env: env, owner: &#x27;shop-team&#x27;, costcenter: &#x27;CC123&#x27; }
+
+resource rg &#x27;Microsoft.Resources/resourceGroups@2024-03-01&#x27; = {
+  name: &#x27;rg-shop-${env}-weu&#x27;
+  location: location
+  tags: tags
+}
+
+module shop &#x27;modules/shop.bicep&#x27; = {
+  scope: rg
+  name: &#x27;shop-${env}&#x27;
+  params: { location: location, env: env, tags: tags }
+}</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why management groups exist; subscription as a blast-radius/quota/billing boundary and how many you would use; resource group as lifecycle unit; tag strategy and enforcement; naming conventions and why they matter for automation.</p></div></section>
+<section id="policy"><h2 id="policy">RBAC, Azure Policy and resource locks</h2><p>RBAC answers <em>who can do what</em>; <strong>Azure Policy</strong> answers <em>what is allowed to exist</em> (deny public storage, require tags, allowed regions/SKUs, audit missing diagnostics, <code>DeployIfNotExists</code> to auto-remediate). <strong>Initiatives</strong> bundle policies (e.g. the Microsoft cloud security benchmark). <strong>Locks</strong> (CanNotDelete / ReadOnly) protect production resources from accidents, including by Owners.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="json">Policy definition</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="json"><code>{
+  &quot;properties&quot;: {
+    &quot;displayName&quot;: &quot;Storage accounts must disable public network access&quot;,
+    &quot;mode&quot;: &quot;Indexed&quot;,
+    &quot;policyRule&quot;: {
+      &quot;if&quot;: { &quot;allOf&quot;: [
+        { &quot;field&quot;: &quot;type&quot;, &quot;equals&quot;: &quot;Microsoft.Storage/storageAccounts&quot; },
+        { &quot;field&quot;: &quot;Microsoft.Storage/storageAccounts/publicNetworkAccess&quot;, &quot;notEquals&quot;: &quot;Disabled&quot; } ] },
+      &quot;then&quot;: { &quot;effect&quot;: &quot;[parameters(&#x27;effect&#x27;)]&quot; }
+    },
+    &quot;parameters&quot;: { &quot;effect&quot;: { &quot;type&quot;: &quot;String&quot;, &quot;allowedValues&quot;: [&quot;Audit&quot;, &quot;Deny&quot;, &quot;Disabled&quot;], &quot;defaultValue&quot;: &quot;Deny&quot; } }
+  }
+}</code></pre><pre data-lang="bash" hidden><code># Assign built-ins at the management group: allowed locations, required tag, no public IPs on NICs
+az policy assignment create --name allowed-locations --scope /providers/Microsoft.Management/managementGroups/mg-workloads   --policy e56962a6-4747-49cd-b67b-bf8b01975c4c --params &#x27;{&quot;listOfAllowedLocations&quot;:{&quot;value&quot;:[&quot;westeurope&quot;,&quot;northeurope&quot;]}}&#x27;
+az policy assignment create --name require-env-tag --scope /providers/Microsoft.Management/managementGroups/mg-workloads   --policy 871b6d14-10aa-478d-b590-94f262ecfa99 --params &#x27;{&quot;tagName&quot;:{&quot;value&quot;:&quot;env&quot;}}&#x27;
+
+# DeployIfNotExists needs a managed identity to remediate; then create a remediation task for existing resources
+az policy assignment create --name diag-to-law --scope /subscriptions/&lt;sub&gt; --policy-set-definition &lt;initiative-id&gt;   --mi-system-assigned --location westeurope --role Contributor
+az policy remediation create --name fix-diag --policy-assignment diag-to-law --resource-discovery-mode ReEvaluateCompliance
+
+# Compliance state
+az policy state summarize --management-group mg-workloads --query &quot;results.{nonCompliant:nonCompliantResources}&quot;
+
+# Locks
+az lock create --name no-delete --lock-type CanNotDelete --resource-group rg-shop-prod-weu</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>RBAC vs Policy (who vs what); effects (Audit, Deny, Modify, DeployIfNotExists) and evaluation order; how policy interacts with IaC pipelines (fail early with what-if / PSRule); locks vs RBAC deny; exemptions and their expiry.</p></div></section>
+<section id="well-architected"><h2 id="well-architected">The Well-Architected Framework</h2><p>Five pillars you will be asked to apply to your own design: <strong>Reliability</strong> (define SLOs, remove single points of failure, test failover), <strong>Security</strong> (identity first, least privilege, private networking, secrets in Key Vault), <strong>Cost Optimisation</strong> (right-size, scale to zero, reservations), <strong>Operational Excellence</strong> (IaC, CI/CD, observability, runbooks), <strong>Performance Efficiency</strong> (scale out, cache, async, measure). Use the Azure Well-Architected Review as a checklist.</p><div class="table-wrap"><table><thead><tr><th>Pillar</th><th>Questions an interviewer asks</th><th>Concrete Azure answers</th></tr></thead><tbody><tr><td>Reliability</td><td>What is your SLO? What happens if this zone/region goes down?</td><td>Zone-redundant SKUs, health probes, retries with jitter, Service Bus for decoupling, geo-replication, tested failover</td></tr><tr><td>Security</td><td>Where are the secrets? Who can reach the database?</td><td>Managed identity, Key Vault, private endpoints, WAF, Defender for Cloud, policy guardrails</td></tr><tr><td>Cost</td><td>What does it cost idle? At 10× load?</td><td>Consumption tiers, autoscale rules, reservations/savings plans, budgets and alerts, tagging</td></tr><tr><td>Operational excellence</td><td>How do you deploy? How do you know it is broken?</td><td>Bicep/Terraform, pipelines with gates, App Insights + alerts, runbooks, game days</td></tr><tr><td>Performance</td><td>Where is the bottleneck? How do you find out?</td><td>Load tests, App Insights profiler, caching (Redis/CDN), async messaging, partitioning</td></tr></tbody></table></div><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button></div><pre data-lang="csharp"><code>// Reliability in code: the pieces the framework expects to see in a .NET service
+builder.Services.AddHttpClient(&quot;inventory&quot;, c =&gt; c.BaseAddress = new Uri(cfg[&quot;Inventory:Url&quot;]!))
+    .AddStandardResilienceHandler(o =&gt;                       // Microsoft.Extensions.Http.Resilience (Polly v8)
+    {
+        o.Retry.MaxRetryAttempts = 3; o.Retry.UseJitter = true;
+        o.CircuitBreaker.FailureRatio = 0.5; o.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(30);
+        o.AttemptTimeout.Timeout = TimeSpan.FromSeconds(3); o.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(10);
+    });
+
+builder.Services.AddHealthChecks()
+    .AddSqlServer(cfg.GetConnectionString(&quot;Shop&quot;)!, tags: new[] { &quot;ready&quot; })
+    .AddAzureServiceBusQueue(cfg[&quot;ServiceBus:Namespace&quot;]!, &quot;orders&quot;, new DefaultAzureCredential(), tags: new[] { &quot;ready&quot; });
+app.MapHealthChecks(&quot;/health/live&quot;);                                           // process is up
+app.MapHealthChecks(&quot;/health/ready&quot;, new() { Predicate = r =&gt; r.Tags.Contains(&quot;ready&quot;) });   // dependencies are up
+
+// Graceful shutdown so scale-in and deploys don&#x27;t drop requests
+builder.Host.ConfigureHostOptions(o =&gt; o.ShutdownTimeout = TimeSpan.FromSeconds(30));</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Walk through your last system pillar by pillar; trade-offs between pillars (cost vs reliability); how you would measure each; what a Well-Architected review produced for you.</p></div></section>
+<section id="resiliency"><h2 id="resiliency">Regions, availability zones and composite SLAs</h2><p>A <strong>region</strong> is a set of datacentres; most have three <strong>availability zones</strong> with independent power/network. Zone-redundant SKUs (App Service P-tier, SQL Business Critical/Premium, zone-redundant storage, Service Bus Premium) survive a zone loss with no action from you. A second <strong>region</strong> is for regional disasters and needs data replication plus a failover plan. <strong>Composite SLA</strong> = product of dependent SLAs; parallel redundancy raises it: <code>1 − (1−A)(1−B)</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="python"><code># Composite SLA calculator — bring numbers to the design discussion
+def series(*slas):      # everything must be up
+    p = 1.0
+    for s in slas: p *= s
+    return p
+def parallel(*slas):    # any one being up is enough (independent failures)
+    q = 1.0
+    for s in slas: q *= (1 - s)
+    return 1 - q
+
+app_service, sql, redis, service_bus = 0.9995, 0.9995, 0.999, 0.999
+single_region = series(app_service, sql, redis, service_bus)
+print(f&quot;single region: {single_region:.4%}  ≈ {(1-single_region)*365*24*60:.0f} min/yr&quot;)        # ~99.75% → ~22h/yr
+
+two_regions = parallel(single_region, single_region) * 0.9999                                   # × Front Door SLA
+print(f&quot;active/active 2 regions: {two_regions:.4%} ≈ {(1-two_regions)*365*24*60:.0f} min/yr&quot;)
+
+# Takeaways: every synchronous dependency multiplies risk; move optional ones behind a queue or a cache; a second region
+# helps only if failover is automatic and tested.</code></pre><pre data-lang="bash" hidden><code># Zone-redundant choices (a few examples)
+az appservice plan create -g rg-shop -n asp-shop --sku P1v3 --zone-redundant --number-of-workers 3
+az sql db create -g rg-shop -s sql-shop -n shopdb --edition GeneralPurpose --family Gen5 --capacity 4 --zone-redundant true
+az storage account create -g rg-shop -n stshop --sku Standard_ZRS
+az servicebus namespace create -g rg-shop -n sb-shop --sku Premium --zone-redundant true
+az containerapp env create -g rg-shop -n cae-shop --zone-redundant --infrastructure-subnet-resource-id &lt;subnet-id&gt;
+
+# Which regions have zones, and paired regions
+az account list-locations --query &quot;[?metadata.regionType==&#x27;Physical&#x27;].{name:name, zones:length(availabilityZoneMappings || \`[]\`), pair:metadata.pairedRegion[0].name}&quot; -o table</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Zone vs region failure modes; what "zone-redundant" actually does per service; composite SLA maths and how a queue changes it; active/passive vs active/active; data consistency across regions (Cosmos multi-write, SQL failover group RPO).</p></div></section>
+<section id="dr"><h2 id="dr">Backup, disaster recovery, RTO and RPO</h2><p><strong>RPO</strong>: how much data you can lose; <strong>RTO</strong>: how long you can be down. Cheaper as they grow. Options ladder: backup/restore (hours) → pilot light (IaC ready, data replicated) → warm standby (scaled-down copy) → active/active. Azure pieces: Azure Backup, SQL geo-replication and failover groups, Cosmos multi-region, GRS/RA-GZRS storage, Site Recovery for VMs, and a <em>runbook you have actually executed</em>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button></div><pre data-lang="bash"><code># Azure SQL failover group: async replica in the paired region, single listener endpoint for the app
+az sql failover-group create -g rg-shop -s sql-shop-weu --partner-server sql-shop-neu -n fog-shop --add-db shopdb   --failover-policy Automatic --grace-period 1
+# App connects to fog-shop.database.windows.net (RW) or fog-shop.secondary.database.windows.net (RO)
+
+# Planned failover (no data loss) vs forced (accept RPO)
+az sql failover-group set-primary -g rg-shop -s sql-shop-neu -n fog-shop
+az sql failover-group set-primary -g rg-shop -s sql-shop-neu -n fog-shop --allow-data-loss
+
+# Cosmos DB: add a region, enable automatic failover; multi-write if the app handles conflicts
+az cosmosdb update -g rg-shop -n cosmos-shop --locations regionName=westeurope failoverPriority=0 --locations regionName=northeurope failoverPriority=1 --enable-automatic-failover true
+
+# Storage: geo-redundant with read access; app can read from the -secondary endpoint during an outage
+az storage account update -g rg-shop -n stshop --sku Standard_RAGZRS
+# Backup vault for Blob / SQL / disks with immutable (WORM) retention against ransomware
+az dataprotection backup-vault create -g rg-shop --vault-name bv-shop -l westeurope --storage-setting &#x27;[{&quot;type&quot;:&quot;LocallyRedundant&quot;,&quot;datastore-type&quot;:&quot;VaultStore&quot;}]&#x27; --immutability-state Locked</code></pre><pre data-lang="csharp" hidden><code>// The app side of DR: connect via the listener, tolerate the flip, prefer read replicas for reads
+builder.Services.AddDbContext&lt;ShopDb&gt;(o =&gt; o.UseSqlServer(cfg.GetConnectionString(&quot;Shop&quot;),   // Server=fog-shop.database.windows.net
+    sql =&gt; sql.EnableRetryOnFailure(maxRetryCount: 6, maxRetryDelay: TimeSpan.FromSeconds(10), errorNumbersToAdd: null)));
+builder.Services.AddDbContext&lt;ShopReadDb&gt;(o =&gt; o.UseSqlServer(cfg.GetConnectionString(&quot;ShopRead&quot;)));   // ...;ApplicationIntent=ReadOnly
+
+// Cosmos: preferred regions, so failover is client-side automatic
+var cosmos = new CosmosClient(endpoint, new DefaultAzureCredential(), new CosmosClientOptions
+{
+    ApplicationPreferredRegions = new[] { Regions.WestEurope, Regions.NorthEurope }
+});
+
+// DR checklist (put it in the runbook, rehearse quarterly):
+//  1. Decide (who declares?)  2. Fail over data  3. Repoint traffic (Front Door origin priority / DNS)
+//  4. Scale up standby  5. Validate with synthetic transactions  6. Communicate  7. Fail back &amp; post-mortem</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Define RTO/RPO for a given system and price the options; failover group vs geo-replication; what breaks on failover (cached connections, identity, secrets in the other region, queues in flight); why you rehearse; ransomware and immutable backups.</p></div></section>
+<section id="cost"><h2 id="cost">Cost management and FinOps</h2><p>Cost is an architecture property. Levers: pick consumption tiers where load is spiky (Functions, Container Apps, serverless SQL), autoscale with sensible minimums, buy <strong>reservations</strong> / <strong>savings plans</strong> for the steady baseline, turn off non-prod at night, and stop paying for data egress and logs you never read. Make cost visible: tags → cost analysis → budgets with alerts → Advisor recommendations in the sprint.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="kql">KQL</button></div><pre data-lang="bash"><code># Budget with alerts at 80% and 100% (and a forecast alert)
+az consumption budget create-with-rg -g rg-shop-prod-weu --budget-name shop-prod-monthly --amount 5000 --category cost --time-grain monthly   --start-date 2026-09-01 --end-date 2027-08-31   --notifications &#x27;{&quot;Actual80&quot;:{&quot;enabled&quot;:true,&quot;operator&quot;:&quot;GreaterThan&quot;,&quot;threshold&quot;:80,&quot;contactEmails&quot;:[&quot;shop-team@contoso.com&quot;]},
+                    &quot;Forecast100&quot;:{&quot;enabled&quot;:true,&quot;operator&quot;:&quot;GreaterThan&quot;,&quot;threshold&quot;:100,&quot;thresholdType&quot;:&quot;Forecasted&quot;,&quot;contactEmails&quot;:[&quot;shop-team@contoso.com&quot;]}}&#x27;
+
+# Where does the money go? (Cost Management query API via CLI)
+az costmanagement query --type ActualCost --timeframe MonthToDate --scope /subscriptions/&lt;sub&gt;   --dataset-aggregation &#x27;{&quot;totalCost&quot;:{&quot;name&quot;:&quot;Cost&quot;,&quot;function&quot;:&quot;Sum&quot;}}&#x27; --dataset-grouping name=ServiceName type=Dimension -o table
+
+# Advisor: right-sizing and idle resources
+az advisor recommendation list --category Cost -o table
+
+# Stop non-prod at night (pipeline or Automation schedule)
+az webapp stop -g rg-shop-dev -n shop-api-dev ; az sql db update -g rg-shop-dev -s sql-shop-dev -n shopdb --auto-pause-delay 60</code></pre><pre data-lang="kql" hidden><code>// Log Analytics is a frequent surprise cost — find the noisy tables and sample/route them
+Usage
+| where TimeGenerated &gt; ago(30d) and IsBillable
+| summarize GB = sum(Quantity) / 1024 by DataType
+| order by GB desc
+| take 10
+// Typical fixes: App Insights sampling, drop verbose categories in diagnostic settings,
+// Basic Logs tier for high-volume/low-query tables, shorter interactive retention + archive.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Biggest cost drivers in a typical web workload (compute, SQL, logs, egress); reservations vs savings plans vs spot; how you would cut a bill 30% without hurting SLOs; showback/chargeback via tags; how cost shows up in design reviews.</p></div></section>
+<section id="landing-zones"><h2 id="landing-zones">Landing zones and the Cloud Adoption Framework</h2><p>An <strong>Azure landing zone</strong> is the pre-built environment a workload lands in: management group hierarchy, policies, hub network with firewall/DNS, identity, logging, and a subscription vending process. The <strong>Cloud Adoption Framework</strong> describes it; the ALZ Bicep/Terraform accelerators build it. As an application team you consume it: you get a subscription with guardrails, a spoke VNet, private DNS zones already linked, and diagnostics routed to the central workspace.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="hcl">Terraform</button></div><pre data-lang="bash"><code># What a &quot;vended&quot; subscription typically gives you — check before you design
+az account show --query &quot;{sub:name,id:id}&quot;                                   # your own subscription
+az network vnet list --query &quot;[].{name:name,rg:resourceGroup,space:addressSpace.addressPrefixes}&quot; -o table     # spoke VNet pre-created
+az network vnet peering list -g rg-network --vnet-name vnet-shop -o table    # peered to the hub
+az policy assignment list --disable-scope-strict-match --query &quot;[].{name:displayName,scope:scope}&quot; -o table   # inherited guardrails
+az monitor diagnostic-settings subscription list                               # activity log → central workspace
+
+# Things you usually cannot do in a landing zone (by design): public IPs, storage with public access, non-approved regions,
+# VNets with your own address space, direct internet egress. Ask the platform team; do not fight policy in the pipeline.</code></pre><pre data-lang="hcl" hidden><code># Consuming platform outputs in your workload&#x27;s Terraform: look them up, don&#x27;t hard-code
+data &quot;azurerm_virtual_network&quot; &quot;spoke&quot; {
+  name                = &quot;vnet-shop-prod-weu&quot;
+  resource_group_name = &quot;rg-network-shop-prod&quot;
+}
+data &quot;azurerm_subnet&quot; &quot;app&quot; {
+  name                 = &quot;snet-app&quot;
+  virtual_network_name = data.azurerm_virtual_network.spoke.name
+  resource_group_name  = data.azurerm_virtual_network.spoke.resource_group_name
+}
+data &quot;azurerm_private_dns_zone&quot; &quot;sql&quot; {
+  name                = &quot;privatelink.database.windows.net&quot;
+  resource_group_name = &quot;rg-dns-hub&quot;
+  provider            = azurerm.hub          # aliased provider with read access to the hub subscription
+}
+
+resource &quot;azurerm_private_endpoint&quot; &quot;sql&quot; {
+  name                = &quot;pe-sql-shop&quot;
+  location            = var.location
+  resource_group_name = azurerm_resource_group.shop.name
+  subnet_id           = data.azurerm_subnet.app.id
+  private_service_connection {
+    name                           = &quot;sql&quot;
+    private_connection_resource_id = azurerm_mssql_server.shop.id
+    subresource_names              = [&quot;sqlServer&quot;]
+    is_manual_connection           = false
+  }
+  private_dns_zone_group { name = &quot;default&quot;; private_dns_zone_ids = [data.azurerm_private_dns_zone.sql.id] }
+}</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>What a landing zone provides and why application teams should not build their own; platform vs workload team responsibilities; subscription vending; how policy-as-code and IaC interact; the shared services you depend on (DNS, firewall, logging).</p></div></section>
+<section id="reference-arch"><h2 id="reference-arch">Reference architecture: a .NET web workload on Azure</h2><p>Draw this and be able to justify every box. Traffic: <strong>Front Door (WAF)</strong> → <strong>App Service</strong> (zone-redundant, VNet-integrated, private endpoint) or <strong>Container Apps</strong>. Data: <strong>Azure SQL</strong> (zone-redundant, failover group) + <strong>Redis</strong> + <strong>Blob</strong>, all via private endpoints. Async: <strong>Service Bus</strong> → worker; <strong>Event Grid</strong> for fan-out. Cross-cutting: <strong>Key Vault</strong>, <strong>App Configuration</strong>, managed identities, <strong>App Insights</strong> → Log Analytics, Bicep in a pipeline with staging slot + approval.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bicep">Bicep</button><button role="tab" aria-selected="false" data-lang="yaml">Text diagram</button></div><pre data-lang="bicep"><code>// modules/shop.bicep — the core of the reference architecture (abridged)
+param location string
+param env string
+param tags object
+
+resource plan &#x27;Microsoft.Web/serverfarms@2023-12-01&#x27; = {
+  name: &#x27;asp-shop-${env}&#x27;, location: location, tags: tags
+  sku: { name: &#x27;P1v3&#x27;, capacity: 3 }
+  properties: { zoneRedundant: true, reserved: true }
+}
+resource api &#x27;Microsoft.Web/sites@2023-12-01&#x27; = {
+  name: &#x27;app-shop-api-${env}&#x27;, location: location, tags: tags, kind: &#x27;app,linux&#x27;
+  identity: { type: &#x27;SystemAssigned&#x27; }
+  properties: {
+    serverFarmId: plan.id
+    httpsOnly: true
+    publicNetworkAccess: &#x27;Disabled&#x27;
+    virtualNetworkSubnetId: appSubnetId
+    siteConfig: {
+      linuxFxVersion: &#x27;DOTNETCORE|9.0&#x27;, vnetRouteAllEnabled: true, healthCheckPath: &#x27;/health/ready&#x27;, minTlsVersion: &#x27;1.2&#x27;, ftpsState: &#x27;Disabled&#x27;
+      appSettings: [
+        { name: &#x27;APPLICATIONINSIGHTS_CONNECTION_STRING&#x27;, value: appInsights.properties.ConnectionString }
+        { name: &#x27;AppConfig__Endpoint&#x27;, value: appConfig.properties.endpoint }
+        { name: &#x27;ConnectionStrings__Shop&#x27;, value: &#x27;Server=tcp:${sql.properties.fullyQualifiedDomainName};Database=shopdb;Authentication=Active Directory Default;&#x27; }
+      ]
+    }
+  }
+}
+resource staging &#x27;Microsoft.Web/sites/slots@2023-12-01&#x27; = { parent: api, name: &#x27;staging&#x27;, location: location, identity: { type: &#x27;SystemAssigned&#x27; }, properties: { serverFarmId: plan.id } }
+
+resource sql &#x27;Microsoft.Sql/servers@2023-08-01-preview&#x27; = {
+  name: &#x27;sql-shop-${env}&#x27;, location: location, tags: tags
+  properties: { administrators: { administratorType: &#x27;ActiveDirectory&#x27;, azureADOnlyAuthentication: true, login: &#x27;sql-admins&#x27;, sid: sqlAdminsGroupId, tenantId: tenant().tenantId }, publicNetworkAccess: &#x27;Disabled&#x27; }
+}
+resource db &#x27;Microsoft.Sql/servers/databases@2023-08-01-preview&#x27; = { parent: sql, name: &#x27;shopdb&#x27;, location: location, sku: { name: &#x27;GP_Gen5_4&#x27; }, properties: { zoneRedundant: true } }
+
+// RBAC: the API&#x27;s identity reads secrets, writes blobs, sends to Service Bus — no keys anywhere
+resource kvRole &#x27;Microsoft.Authorization/roleAssignments@2022-04-01&#x27; = {
+  scope: kv, name: guid(kv.id, api.id, &#x27;kv-secrets-user&#x27;)
+  properties: { principalId: api.identity.principalId, principalType: &#x27;ServicePrincipal&#x27;, roleDefinitionId: subscriptionResourceId(&#x27;Microsoft.Authorization/roleDefinitions&#x27;, &#x27;4633458b-17de-408a-b874-0445c86b69e6&#x27;) }
+}
+// + private endpoints for sql/kv/blob/redis, Service Bus namespace + queue, Redis, App Insights, Front Door with the app as a Private Link origin.</code></pre><pre data-lang="yaml" hidden><code>Internet ──▶ Front Door (WAF, TLS, cache) ──Private Link──▶ App Service (P1v3 ×3, zones 1-3)  ──▶ Service Bus ──▶ Worker (Container Apps, KEDA)
+                                                              │  managed identity                     │
+                                                              ├─▶ Azure SQL (ZR, failover group → NEU)  ├─▶ Event Grid ──▶ Functions (email, search index)
+                                                              ├─▶ Redis (Standard, PE)                 └─▶ Blob (RA-GZRS, PE)
+                                                              ├─▶ Key Vault (PE)  ── App Configuration (feature flags)
+                                                              └─▶ App Insights ──▶ Log Analytics ──▶ Alerts / Workbooks
+Pipeline: PR build → Bicep what-if → deploy to staging slot → smoke tests → approval → swap → post-deploy checks
+Guardrails: landing-zone policies (regions, tags, no public access), locks on prod, budget alerts</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Justify each component and its SKU; what changes at 10× traffic; what changes for multi-region; where you would cut cost for a dev environment; how a request is traced end to end; the deployment path and rollback.</p></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/azure/well-architected/" target="_blank" rel="noopener">Azure Well-Architected Framework</a></li><li><a href="https://learn.microsoft.com/azure/cloud-adoption-framework/ready/landing-zone/" target="_blank" rel="noopener">Cloud Adoption Framework — landing zones</a></li><li><a href="https://learn.microsoft.com/azure/governance/policy/" target="_blank" rel="noopener">Azure Policy documentation</a></li><li><a href="https://learn.microsoft.com/azure/reliability/" target="_blank" rel="noopener">Azure reliability documentation (zones, regions, SLAs)</a></li><li><a href="https://learn.microsoft.com/azure/architecture/browse/" target="_blank" rel="noopener">Azure Architecture Center — reference architectures</a></li><li><a href="https://learn.microsoft.com/azure/cost-management-billing/" target="_blank" rel="noopener">Cost Management + Billing</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

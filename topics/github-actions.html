@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitHub Actions &amp; CI/CD Patterns — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="github-actions">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › DevOps › Topic 19 of 23</div>
+  <h1>GitHub Actions &amp; CI/CD Patterns</h1>
+  <p class="lede">Azure DevOps gave you the pipeline concepts; GitHub Actions is the other engine you will meet, and the one Microsoft now invests in first. This page builds the same .NET/Python pipeline in Actions, shows the idioms that differ (OIDC, environments, reusable workflows), and ends with a side-by-side so you can translate between the two in an interview.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#anatomy">Workflow anatomy: triggers, jobs, steps, runners</a></li><li><a href="#dotnet-python">Build and test .NET and Python with caching and a matrix</a></li><li><a href="#oidc">OIDC login to Azure: no secrets in GitHub</a></li><li><a href="#reuse">Reusable workflows and composite actions</a></li><li><a href="#environments">Environments, protection rules and secrets</a></li><li><a href="#deploy-targets">Deploying to App Service, Container Apps and AKS</a></li><li><a href="#supply-chain">Supply-chain hygiene: pinning, Dependabot, CodeQL, secrets</a></li><li><a href="#vs-azure-pipelines">GitHub Actions vs Azure Pipelines: translation table</a></li></ol>
+  </div>
+
+<section id="anatomy"><h2 id="anatomy">Workflow anatomy: triggers, jobs, steps, runners</h2><p>A workflow is a YAML file in <code>.github/workflows/</code> with <code>on:</code> triggers (push, pull_request, schedule, workflow_dispatch, workflow_call), <strong>jobs</strong> that run in parallel unless they <code>needs:</code> each other, and <strong>steps</strong> that are either <code>run:</code> shell or <code>uses:</code> an action. <strong>Runners</strong> are GitHub-hosted (ubuntu/windows/macos, larger runners) or self-hosted. Contexts (<code>github</code>, <code>env</code>, <code>secrets</code>, <code>vars</code>, <code>needs</code>) feed expressions <code>${{ }}</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="yaml"><code>name: ci
+on:
+  push:
+    branches: [main]
+    paths-ignore: [&quot;docs/**&quot;, &quot;*.md&quot;]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment: { description: Target, type: choice, options: [staging, production], default: staging }
+  schedule:
+    - cron: &quot;0 3 * * 1&quot;          # weekly Monday 03:00 UTC (dependency audit)
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true       # a new push cancels the running PR build
+
+permissions:                     # least privilege for GITHUB_TOKEN; add per job as needed
+  contents: read
+
+defaults: { run: { shell: bash } }
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }                       # full history for versioning tools
+      - id: ver
+        run: echo &quot;version=1.4.${{ github.run_number }}&quot; &gt;&gt; &quot;$GITHUB_OUTPUT&quot;
+      - run: echo &quot;Building ${{ steps.ver.outputs.version }} on ${{ runner.os }} for ${{ github.event_name }}&quot;
+
+  lint:
+    runs-on: ubuntu-latest
+    steps: [ { uses: actions/checkout@v4 }, { run: echo lint } ]
+
+  package:
+    needs: [build, lint]                               # fan-in
+    if: github.event_name != &#x27;pull_request&#x27;
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo &quot;packaging ${{ needs.build.outputs.version }}&quot;</code></pre><pre data-lang="bash" hidden><code># Local iteration
+gh workflow list ; gh workflow run ci.yml -f environment=staging
+gh run list --workflow ci.yml --limit 5 ; gh run watch ; gh run view --log-failed
+act -j build                                   # run jobs locally with nektos/act (approximation)
+
+# Step-level API you will use in scripts
+echo &quot;name=value&quot; &gt;&gt; &quot;$GITHUB_OUTPUT&quot;         # step output
+echo &quot;MY_VAR=value&quot; &gt;&gt; &quot;$GITHUB_ENV&quot;          # env for later steps
+echo &quot;$HOME/.dotnet/tools&quot; &gt;&gt; &quot;$GITHUB_PATH&quot;  # PATH
+echo &quot;::error file=src/a.cs,line=10::Bad thing&quot;  ;  echo &quot;::warning::Heads up&quot;  ;  echo &quot;::group::Details&quot; ; echo ... ; echo &quot;::endgroup::&quot;
+echo &quot;## Summary&quot; &gt;&gt; &quot;$GITHUB_STEP_SUMMARY&quot;    # markdown on the run page</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Jobs vs steps and where state is shared (not across jobs — use artifacts/outputs); triggers and the <code>pull_request</code> vs <code>pull_request_target</code> security difference; concurrency groups; GITHUB_TOKEN permissions; hosted vs self-hosted runners and when you need the latter (VNet access).</p></div></section>
+<section id="dotnet-python"><h2 id="dotnet-python">Build and test .NET and Python with caching and a matrix</h2><p>Setup actions install toolchains and cache package restores. Publish test results and coverage as artifacts (or with a reporter action) so PRs show failures inline. A <strong>matrix</strong> runs the same job across versions/OSes; use <code>fail-fast: false</code> when you want the whole picture.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">.NET</button><button role="tab" aria-selected="false" data-lang="yaml">Python</button></div><pre data-lang="yaml"><code>jobs:
+  dotnet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+          cache: true
+          cache-dependency-path: &quot;**/packages.lock.json&quot;     # enable lock files: &lt;RestorePackagesWithLockFile&gt;true&lt;/RestorePackagesWithLockFile&gt;
+      - run: dotnet restore --locked-mode
+      - run: dotnet build --no-restore -c Release -warnaserror
+      - run: dotnet format --verify-no-changes --no-restore
+      - run: dotnet test --no-build -c Release --logger &quot;trx;LogFileName=test.trx&quot; --collect:&quot;XPlat Code Coverage&quot; --results-directory TestResults
+      - uses: dorny/test-reporter@v1
+        if: always()
+        with: { name: .NET tests, path: TestResults/*.trx, reporter: dotnet-trx }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: coverage, path: TestResults/**/coverage.cobertura.xml }
+      - run: dotnet publish src/Shop.Api -c Release -o publish --no-build
+      - uses: actions/upload-artifact@v4
+        with: { name: shop-api, path: publish, retention-days: 7 }</code></pre><pre data-lang="yaml" hidden><code>jobs:
+  python:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: [&quot;3.11&quot;, &quot;3.12&quot;, &quot;3.13&quot;]
+        exclude: [{ os: windows-latest, python: &quot;3.11&quot; }]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true, cache-dependency-glob: uv.lock }
+      - uses: actions/setup-python@v5
+        with: { python-version: &quot;${{ matrix.python }}&quot; }
+      - run: uv sync --frozen --all-extras
+      - run: uv run ruff check . &amp;&amp; uv run ruff format --check .
+      - run: uv run mypy src
+      - run: uv run pytest -q --junitxml=junit.xml --cov=src --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: test-results-${{ matrix.os }}-${{ matrix.python }}, path: junit.xml }
+
+  # Integration tests against real dependencies with service containers
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      redis: { image: redis:7-alpine, ports: [&quot;6379:6379&quot;], options: --health-cmd &quot;redis-cli ping&quot; --health-interval 5s }
+      sql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env: { ACCEPT_EULA: &quot;Y&quot;, MSSQL_SA_PASSWORD: &quot;Your_password123&quot; }
+        ports: [&quot;1433:1433&quot;]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: 9.0.x }
+      - run: dotnet test tests/Shop.IntegrationTests -c Release
+        env: { ConnectionStrings__Shop: &quot;Server=localhost;Database=shop;User Id=sa;Password=Your_password123;TrustServerCertificate=true&quot;, Redis: &quot;localhost:6379&quot; }</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>What to cache and what not to (package caches yes, build outputs rarely); lock files for reproducibility; matrix design and cost; service containers vs Testcontainers; test result reporting on PRs; keeping PR builds under ten minutes.</p></div></section>
+<section id="oidc"><h2 id="oidc">OIDC login to Azure: no secrets in GitHub</h2><p>Give the job <code>id-token: write</code>, register a <strong>federated credential</strong> on the app registration or a user-assigned managed identity whose <code>subject</code> matches the workflow (branch, environment, tag or PR), and <code>azure/login</code> exchanges GitHub's OIDC token for an Azure token. Nothing sensitive is stored; the trust is scoped to exactly that repo + branch/environment.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="yaml">YAML</button></div><pre data-lang="bash"><code># One identity per environment, each trusting a specific subject
+az identity create -g rg-shop -n id-gh-shop-prod
+az identity federated-credential create -g rg-shop --identity-name id-gh-shop-prod -n gh-prod-env   --issuer https://token.actions.githubusercontent.com --subject repo:contoso/shop:environment:production --audiences api://AzureADTokenExchange
+az identity federated-credential create -g rg-shop --identity-name id-gh-shop-prod -n gh-main-branch   --issuer https://token.actions.githubusercontent.com --subject repo:contoso/shop:ref:refs/heads/main --audiences api://AzureADTokenExchange
+az role assignment create --assignee $(az identity show -g rg-shop -n id-gh-shop-prod --query principalId -o tsv) --role Contributor --scope /subscriptions/&lt;sub&gt;/resourceGroups/rg-shop-prod
+
+# Store non-secret IDs as repository/environment *variables*
+gh variable set AZURE_CLIENT_ID --env production --body $(az identity show -g rg-shop -n id-gh-shop-prod --query clientId -o tsv)
+gh variable set AZURE_TENANT_ID --body $(az account show --query tenantId -o tsv)
+gh variable set AZURE_SUBSCRIPTION_ID --body $(az account show --query id -o tsv)</code></pre><pre data-lang="yaml" hidden><code>jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write            # request the OIDC token
+      contents: read
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - run: az account show --query &quot;{sub:name, identity:user.name}&quot;
+      # Subsequent steps: az cli, azure/webapps-deploy, azure/container-apps-deploy-action, azure/aks-set-context all reuse the login.
+
+      # Terraform / SDKs pick up the same token via env:
+      - run: terraform apply -auto-approve
+        env: { ARM_USE_OIDC: &quot;true&quot;, ARM_CLIENT_ID: &quot;${{ vars.AZURE_CLIENT_ID }}&quot;, ARM_TENANT_ID: &quot;${{ vars.AZURE_TENANT_ID }}&quot;, ARM_SUBSCRIPTION_ID: &quot;${{ vars.AZURE_SUBSCRIPTION_ID }}&quot; }</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Explain the OIDC exchange and what the <code>subject</code> claim protects against (a fork or another branch using prod credentials); why environment-scoped subjects; secrets vs variables; rotating nothing; the equivalent in Azure Pipelines (workload identity federation service connection).</p></div></section>
+<section id="reuse"><h2 id="reuse">Reusable workflows and composite actions</h2><p>Stop copy-pasting. A <strong>composite action</strong> bundles steps (setup + restore + build) and is called with <code>uses: ./.github/actions/dotnet-build</code>. A <strong>reusable workflow</strong> (<code>on: workflow_call</code>) bundles whole jobs with inputs, secrets and outputs, callable across repos from a central <code>.github</code> repository — the equivalent of Azure Pipelines templates. Pin versions by tag or SHA.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">Reusable workflow</button><button role="tab" aria-selected="false" data-lang="yaml">Composite action</button></div><pre data-lang="yaml"><code># contoso/.github/.github/workflows/dotnet-service.yml
+name: dotnet-service
+on:
+  workflow_call:
+    inputs:
+      project:      { type: string, required: true }
+      dotnet:       { type: string, default: 9.0.x }
+      image-name:   { type: string, required: true }
+    secrets:
+      SONAR_TOKEN:  { required: false }
+    outputs:
+      image-digest: { value: ${{ jobs.build.outputs.digest }} }
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write, id-token: write }
+    outputs: { digest: ${{ steps.push.outputs.digest }} }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/dotnet-build            # composite (below)
+        with: { project: ${{ inputs.project }}, dotnet: ${{ inputs.dotnet }} }
+      - uses: azure/login@v2
+        with: { client-id: ${{ vars.AZURE_CLIENT_ID }}, tenant-id: ${{ vars.AZURE_TENANT_ID }}, subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }} }
+      - id: push
+        run: |
+          az acr build -r acrshop -t ${{ inputs.image-name }}:${{ github.sha }} -f Dockerfile .
+          echo &quot;digest=$(az acr manifest show-metadata -r acrshop -n ${{ inputs.image-name }}:${{ github.sha }} --query digest -o tsv)&quot; &gt;&gt; &quot;$GITHUB_OUTPUT&quot;
+
+# Caller — in contoso/shop/.github/workflows/ci.yml
+# jobs:
+#   service:
+#     uses: contoso/.github/.github/workflows/dotnet-service.yml@v3
+#     with: { project: src/Shop.Api/Shop.Api.csproj, image-name: shop-api }
+#     secrets: inherit</code></pre><pre data-lang="yaml" hidden><code># .github/actions/dotnet-build/action.yml
+name: dotnet-build
+description: Restore, build and test a .NET project with caching
+inputs:
+  project: { required: true }
+  dotnet:  { default: 9.0.x }
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-dotnet@v4
+      with: { dotnet-version: ${{ inputs.dotnet }}, cache: true, cache-dependency-path: &quot;**/packages.lock.json&quot; }
+    - run: dotnet restore ${{ inputs.project }} --locked-mode
+      shell: bash
+    - run: dotnet build ${{ inputs.project }} --no-restore -c Release -warnaserror
+      shell: bash
+    - run: dotnet test ${{ inputs.project }} --no-build -c Release
+      shell: bash</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Composite action vs reusable workflow (steps vs jobs; secrets handling; nesting limits); versioning shared workflows and rolling out changes safely; how this maps to Azure Pipelines <code>template</code>/<code>extends</code>; governance of allowed actions in an org.</p></div></section>
+<section id="environments"><h2 id="environments">Environments, protection rules and secrets</h2><p>An <strong>environment</strong> (staging, production) carries its own secrets and variables plus <strong>protection rules</strong>: required reviewers, wait timers, branch restrictions, and custom rules via deployment-protection apps (e.g. a health check). A job with <code>environment:</code> pauses until rules pass and records a deployment with history and URL. This is the Azure DevOps "environment + approvals" equivalent.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="yaml"><code>jobs:
+  staging:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: { name: staging, url: https://shop-api-staging.azurewebsites.net }
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: azure/login@v2
+        with: { client-id: ${{ vars.AZURE_CLIENT_ID }}, tenant-id: ${{ vars.AZURE_TENANT_ID }}, subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }} }
+      - uses: actions/download-artifact@v4
+        with: { name: shop-api, path: publish }
+      - uses: azure/webapps-deploy@v3
+        with: { app-name: shop-api, slot-name: staging, package: publish }
+      - run: curl -fsS --retry 10 --retry-delay 6 --retry-all-errors https://shop-api-staging.azurewebsites.net/health/ready
+
+  production:
+    needs: staging
+    runs-on: ubuntu-latest
+    environment: { name: production, url: https://shop-api.azurewebsites.net }     # required reviewers + main-only branch rule
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: azure/login@v2
+        with: { client-id: ${{ vars.AZURE_CLIENT_ID }}, tenant-id: ${{ vars.AZURE_TENANT_ID }}, subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }} }
+      - run: az webapp deployment slot swap -g rg-shop -n shop-api --slot staging --target-slot production
+      - run: curl -fsS https://shop-api.azurewebsites.net/health/ready</code></pre><pre data-lang="bash" hidden><code># Configure environments and rules from the CLI / API
+gh api -X PUT repos/contoso/shop/environments/production   -f &#x27;deployment_branch_policy[protected_branches]=true&#x27; -f &#x27;deployment_branch_policy[custom_branch_policies]=false&#x27;   --input - &lt;&lt;&#x27;JSON&#x27;
+{ &quot;wait_timer&quot;: 5, &quot;reviewers&quot;: [ { &quot;type&quot;: &quot;Team&quot;, &quot;id&quot;: 123456 } ], &quot;prevent_self_review&quot;: true }
+JSON
+gh secret set SONAR_TOKEN --env production &lt; token.txt
+gh variable set APP_NAME --env production --body shop-api
+gh api repos/contoso/shop/deployments --jq &#x27;.[] | {env: .environment, ref: .ref, created: .created_at}&#x27; | head -5</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Environment vs repository secrets; protection rules and who can bypass them; deployment history as an audit trail; custom deployment protection rules (e.g. gate on error rate); branch restrictions preventing a feature branch from deploying to prod.</p></div></section>
+<section id="deploy-targets"><h2 id="deploy-targets">Deploying to App Service, Container Apps and AKS</h2><p>Three first-party actions cover most targets: <code>azure/webapps-deploy</code> (zip/package or container), <code>azure/container-apps-deploy-action</code> (build + deploy, or just point at an image), and <code>azure/aks-set-context</code> + <code>azure/k8s-deploy</code> (or plain kubectl/helm). Always deploy an immutable artifact by digest, run a smoke test, and make the rollback path a one-liner.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">Container Apps</button><button role="tab" aria-selected="false" data-lang="yaml">AKS</button><button role="tab" aria-selected="false" data-lang="yaml">App Service + EF migration</button></div><pre data-lang="yaml"><code>      - uses: azure/login@v2
+        with: { client-id: ${{ vars.AZURE_CLIENT_ID }}, tenant-id: ${{ vars.AZURE_TENANT_ID }}, subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }} }
+      - name: Deploy new revision with 10% traffic
+        run: |
+          az containerapp update -g rg-shop -n orders-api --image acrshop.azurecr.io/shop-api@${{ needs.build.outputs.digest }} --revision-suffix ${{ github.run_number }}
+          az containerapp ingress traffic set -g rg-shop -n orders-api --revision-weight latest=10
+      - name: Bake and check error rate
+        run: |
+          sleep 300
+          ERR=$(az monitor metrics list --resource $(az containerapp show -g rg-shop -n orders-api --query id -o tsv) --metric Requests --filter &quot;statusCodeCategory eq &#x27;5xx&#x27;&quot; --interval PT5M --query &quot;value[0].timeseries[0].data[-1].total&quot; -o tsv)
+          [ &quot;${ERR:-0}&quot; -lt 5 ] || { echo &quot;::error::error rate too high&quot;; exit 1; }
+      - name: Promote
+        run: az containerapp ingress traffic set -g rg-shop -n orders-api --revision-weight latest=100
+      - name: Roll back
+        if: failure()
+        run: |
+          PREV=$(az containerapp revision list -g rg-shop -n orders-api --query &quot;[?properties.trafficWeight==\`90\`].name | [0]&quot; -o tsv)
+          az containerapp ingress traffic set -g rg-shop -n orders-api --revision-weight $PREV=100</code></pre><pre data-lang="yaml" hidden><code>      - uses: azure/login@v2
+        with: { client-id: ${{ vars.AZURE_CLIENT_ID }}, tenant-id: ${{ vars.AZURE_TENANT_ID }}, subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }} }
+      - uses: azure/use-kubelogin@v1
+        with: { kubelogin-version: v0.1.4 }
+      - uses: azure/aks-set-context@v4
+        with: { resource-group: rg-shop, cluster-name: aks-shop, admin: false, use-kubelogin: true }
+      - uses: azure/setup-helm@v4
+      - run: |
+          helm upgrade --install orders-api charts/orders-api -n shop -f charts/orders-api/values.prod.yaml             --set image.digest=${{ needs.build.outputs.digest }} --atomic --timeout 10m
+          kubectl rollout status deploy/orders-api -n shop --timeout=300s</code></pre><pre data-lang="yaml" hidden><code>      - uses: actions/download-artifact@v4
+        with: { name: shop-api, path: publish }
+      - uses: actions/download-artifact@v4
+        with: { name: migrations, path: migrations }          # produced in build: dotnet ef migrations script --idempotent -o migrations/migrate.sql
+      - uses: azure/login@v2
+        with: { client-id: ${{ vars.AZURE_CLIENT_ID }}, tenant-id: ${{ vars.AZURE_TENANT_ID }}, subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }} }
+      - uses: azure/sql-action@v2.3
+        with: { connection-string: &quot;Server=tcp:sql-shop.database.windows.net;Database=shopdb;Authentication=Active Directory Default;&quot;, path: migrations/migrate.sql }
+      - uses: azure/webapps-deploy@v3
+        with: { app-name: shop-api, slot-name: staging, package: publish }
+      - run: az webapp deployment slot swap -g rg-shop -n shop-api --slot staging --target-slot production</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Slot swap vs revision traffic split vs rolling update — rollback for each; where database migrations run relative to the deploy (expand/contract); smoke tests and automated rollback; deploying by digest; keeping the deploy job short-lived and idempotent.</p></div></section>
+<section id="supply-chain"><h2 id="supply-chain">Supply-chain hygiene: pinning, Dependabot, CodeQL, secrets</h2><p>Actions run third-party code with your token. Pin actions to a commit SHA (Dependabot keeps them fresh), restrict allowed actions at the org, keep <code>GITHUB_TOKEN</code> read-only by default, never use <code>pull_request_target</code> with checkout of the PR head, and turn on <strong>CodeQL</strong>, <strong>secret scanning</strong> with push protection and <strong>Dependabot</strong> alerts/updates. Sign releases and build provenance with <code>attest-build-provenance</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="yaml">dependabot.yml</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="yaml"><code># Pinned actions with a version comment (Dependabot updates both)
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+- uses: actions/setup-dotnet@3e891b0cb619bf60e2c25674b222b8940e2c1c25 # v4.1.0
+
+# CodeQL
+name: codeql
+on: { push: { branches: [main] }, pull_request: { branches: [main] }, schedule: [{ cron: &quot;0 4 * * 2&quot; }] }
+permissions: { security-events: write, contents: read, actions: read }
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    strategy: { matrix: { language: [csharp, python] } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with: { languages: ${{ matrix.language }}, queries: security-extended }
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+
+# Build provenance (SLSA) for the published artifact
+- uses: actions/attest-build-provenance@v2
+  with: { subject-path: publish/**/*.dll }</code></pre><pre data-lang="yaml" hidden><code>version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: nuget
+    directory: /
+    schedule: { interval: weekly }
+    groups: { minor-and-patch: { update-types: [minor, patch] } }
+    open-pull-requests-limit: 5
+  - package-ecosystem: pip          # uv.lock is supported via the pip ecosystem
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly }</code></pre><pre data-lang="bash" hidden><code># Org/repo policy checks
+gh api repos/contoso/shop/actions/permissions            # allowed actions
+gh api repos/contoso/shop/actions/permissions/workflow   # default GITHUB_TOKEN permissions (should be &quot;read&quot;)
+gh api repos/contoso/shop --jq &#x27;.security_and_analysis&#x27;  # secret scanning / push protection status
+gh secret list ; gh secret list --env production</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why SHA-pin actions; the <code>pull_request_target</code> injection class; least-privilege GITHUB_TOKEN; secret scanning push protection; SBOM/provenance and what consumers do with them; how you would respond to a compromised popular action.</p></div></section>
+<section id="vs-azure-pipelines"><h2 id="vs-azure-pipelines">GitHub Actions vs Azure Pipelines: translation table</h2><p>Both are YAML, both have stages/jobs/steps, approvals, templates and marketplace tasks. The differences that matter in practice are below. Many organisations run both: Azure DevOps for Boards and legacy pipelines, GitHub for code, Actions and security features.</p><div class="table-wrap"><table><thead><tr><th>Concept</th><th>Azure Pipelines</th><th>GitHub Actions</th></tr></thead><tbody><tr><td>Grouping</td><td>stages → jobs → steps</td><td>jobs → steps (stages implied via <code>needs</code>)</td></tr><tr><td>Reuse</td><td><code>template</code>, <code>extends</code></td><td>reusable workflows (<code>workflow_call</code>), composite actions</td></tr><tr><td>Approvals</td><td>Environments with checks</td><td>Environments with protection rules</td></tr><tr><td>Cloud auth</td><td>Service connection (workload identity federation)</td><td><code>azure/login</code> with OIDC federated credential</td></tr><tr><td>Secrets/config</td><td>Variable groups, Key Vault-linked groups</td><td>Repo/env secrets and variables; Key Vault via <code>az</code></td></tr><tr><td>Artifacts</td><td>Pipeline artifacts, Azure Artifacts feeds</td><td><code>upload-artifact</code>, GitHub Packages</td></tr><tr><td>Tasks</td><td>Tasks (<code>DotNetCoreCLI@2</code>)</td><td>Actions (<code>setup-dotnet</code>) + plain <code>run:</code></td></tr><tr><td>Runners</td><td>Microsoft-hosted, self-hosted agents, scale sets</td><td>GitHub-hosted, larger runners, self-hosted, ARC on AKS</td></tr><tr><td>Triggers</td><td><code>trigger</code>/<code>pr</code>/<code>schedules</code>, resources</td><td><code>on:</code> with 30+ event types</td></tr><tr><td>Security scanning</td><td>Marketplace / GitHub Advanced Security for ADO</td><td>CodeQL, Dependabot, secret scanning built in</td></tr></tbody></table></div><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button></div><pre data-lang="yaml"><code># The same deploy step, side by side
+# --- Azure Pipelines ---
+# - task: AzureWebApp@1
+#   inputs: { azureSubscription: sc-shop-prod, appName: shop-api, deployToSlotOrASE: true, slotName: staging, package: $(Pipeline.Workspace)/drop/*.zip }
+# --- GitHub Actions ---
+- uses: azure/login@v2
+  with: { client-id: ${{ vars.AZURE_CLIENT_ID }}, tenant-id: ${{ vars.AZURE_TENANT_ID }}, subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }} }
+- uses: azure/webapps-deploy@v3
+  with: { app-name: shop-api, slot-name: staging, package: publish }</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Given a pipeline in one system, sketch it in the other; when you would keep Azure DevOps (Boards, on-prem agents, existing governance) vs move to GitHub; migration tools (GitHub Actions Importer); running self-hosted runners inside a VNet for private endpoints.</p></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://docs.github.com/actions" target="_blank" rel="noopener">GitHub Actions documentation</a></li><li><a href="https://docs.github.com/actions/writing-workflows/workflow-syntax-for-github-actions" target="_blank" rel="noopener">Workflow syntax reference</a></li><li><a href="https://learn.microsoft.com/azure/developer/github/connect-from-azure-openid-connect" target="_blank" rel="noopener">Use GitHub Actions to connect to Azure (OIDC)</a></li><li><a href="https://docs.github.com/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions" target="_blank" rel="noopener">Security hardening for GitHub Actions</a></li><li><a href="https://docs.github.com/actions/sharing-automations/reusing-workflows" target="_blank" rel="noopener">Reusable workflows</a></li><li><a href="https://docs.github.com/actions/migrating-to-github-actions/using-github-actions-importer-to-automate-migrations" target="_blank" rel="noopener">GitHub Actions Importer (from Azure Pipelines)</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

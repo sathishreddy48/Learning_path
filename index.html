@@ -12,9 +12,11 @@
 
   <h1>C# Learning Path</h1>
   <p class="lede">A self-paced study site for <strong>C# / .NET preparation</strong> — from the language core through
-  threading, Web API, security, data access, patterns, and the Azure platform. Every topic page pairs C# with the
-  equivalent <strong>Python</strong> so you can practise the same idea in both languages. Pick a topic from the sidebar;
-  pages you have opened turn <span class="badge badge-visited">✓ visited</span>.</p>
+  threading, Web API, security, data access and patterns, then the <strong>Azure</strong> platform and the
+  <strong>DevOps</strong> practice that gets it to production. Every topic page pairs C# with the equivalent
+  <strong>Python</strong> (or the YAML / CLI the topic really uses) so you can practise the same idea in both.
+  The sidebar has three menus — <em>C# &amp; .NET</em>, <em>Azure</em> and <em>DevOps</em>; pages you have opened turn
+  <span class="badge badge-visited">✓ visited</span>.</p>
 
   <div class="storage-banner"></div>
 
@@ -30,7 +32,7 @@
   <div class="callout callout-note">
     <span class="callout-title">How to use this site</span>
     <ul>
-      <li><strong>Start with Core Concepts</strong> and go in order — later pages assume the earlier ones.</li>
+      <li><strong>Start with Core Concepts</strong> and go in order within a menu — later pages assume the earlier ones. The Azure and DevOps menus can be studied in parallel once you are past Web API.</li>
       <li>Every code sample has a <strong>C# | Python</strong> tab bar. Switch tabs to see the same concept in the other language; <strong>Copy</strong> grabs whatever tab is showing.</li>
       <li>Each section ends with a <strong>Practice</strong> box. Do the exercise in both languages before moving on.</li>
       <li><strong>Interview angle</strong> boxes call out what a senior-level interviewer will probe on that topic.</li>
@@ -39,12 +41,14 @@
   </div>
 
   <h2 id="topics">Topics</h2>
-  <div class="cards" data-topic-cards></div>
+  <div data-topic-groups></div>
 
   <h2 id="order">Suggested order</h2>
-  <p>The sidebar is already in study order. Roughly: <strong>language</strong> (1–2) → <strong>building services</strong> (3–7)
-  → <strong>algorithms &amp; runtime</strong> (8–9) → <strong>architecture</strong> (10–11) → <strong>platform &amp; delivery</strong> (12–13).
-  If you are short on time, the highest-yield pages for a senior C# interview are Core Concepts, Threading, Web API, Security and Performance.</p>
+  <p>Each sidebar menu is already in study order. Roughly: <strong>language</strong> (1–2) → <strong>building services</strong> (3–7)
+  → <strong>algorithms &amp; runtime</strong> (8–9) → <strong>architecture</strong> (10–11) → <strong>Azure platform</strong> (12–17)
+  → <strong>DevOps &amp; operations</strong> (18–23). If you are short on time, the highest-yield pages for a senior C# interview are
+  Core Concepts, Threading, Web API, Security and Performance; for a cloud-leaning role add Azure Services, Entra ID, Azure Architecture,
+  Azure DevOps and Observability.</p>
 
   <div class="table-wrap">
   <table>
@@ -54,7 +58,8 @@
       <tr><td>Services</td><td>Web API · Security · EF Core · Patterns · Testing</td><td>Build a secured, validated, versioned API with EF Core behind it, structured with SOLID and a couple of patterns, and covered by unit + one integration test.</td></tr>
       <tr><td>Algorithms &amp; runtime</td><td>DSA · Performance</td><td>Solve the standard pattern problems in 45 minutes and diagnose a GC / allocation problem with the right tool.</td></tr>
       <tr><td>Architecture</td><td>Microservices · Service Fabric</td><td>Argue boundaries, pick sync vs async communication, apply resilience and outbox patterns, and explain stateful services and partitioning.</td></tr>
-      <tr><td>Platform &amp; delivery</td><td>Azure Services · Azure DevOps</td><td>Choose the right Azure service and talk to it with managed identity; take a change from PR to production through a YAML pipeline with approvals.</td></tr>
+      <tr><td>Azure platform</td><td>Azure Services · Entra ID · Networking · Integration · Data, Search &amp; AI · Architecture &amp; Governance</td><td>Choose the right Azure service and talk to it with managed identity; protect and call APIs with Entra; make a workload private and load-balanced; pick the right messaging service; add search and an AI assistant; defend a reference architecture on cost, resilience and governance.</td></tr>
+      <tr><td>DevOps &amp; operations</td><td>Azure DevOps · GitHub Actions · Docker · Kubernetes &amp; AKS · Infrastructure as Code · Observability &amp; SRE</td><td>Take a change from PR to production through a pipeline with approvals in either engine; ship a small secure image; deploy and scale it on AKS; declare every environment in Bicep or Terraform; define an SLO, alert on it and run the incident.</td></tr>
     </tbody>
   </table>
   </div>
@@ -80,17 +85,26 @@
     });
   }
 
+  function cardHtml(t) {
+    var i = C.topics.indexOf(t);
+    var visited = V.isVisited(t.id);
+    return '<div class="card' + (visited ? ' visited' : '') + '">' +
+      '<h3><span class="card-num">' + (visited ? '✓' : (i + 1)) + '</span><a href="' + t.href + '">' + esc(t.label) + '</a></h3>' +
+      '<p>' + esc(t.blurb) + '</p>' +
+      '<div class="card-foot"><span>' + t.sections.length + ' sections</span>' +
+      (visited ? '<span class="badge badge-visited">Visited</span>' : (i === 0 ? '<span class="badge badge-start">Start here</span>' : '')) +
+      '</div></div>';
+  }
+
   function render() {
-    var host = document.querySelector('[data-topic-cards]');
+    var host = document.querySelector('[data-topic-groups]');
     if (host) {
-      host.innerHTML = C.topics.map(function (t, i) {
-        var visited = V.isVisited(t.id);
-        return '<div class="card' + (visited ? ' visited' : '') + '">' +
-          '<h3><span class="card-num">' + (visited ? '✓' : (i + 1)) + '</span><a href="' + t.href + '">' + esc(t.label) + '</a></h3>' +
-          '<p>' + esc(t.blurb) + '</p>' +
-          '<div class="card-foot"><span>' + t.sections.length + ' sections</span>' +
-          (visited ? '<span class="badge badge-visited">Visited</span>' : (i === 0 ? '<span class="badge badge-start">Start here</span>' : '')) +
-          '</div></div>';
+      host.innerHTML = C.groups.map(function (g) {
+        var done = g.topics.filter(function (t) { return V.isVisited(t.id); }).length;
+        return '<div class="group-head" id="group-' + esc(g.id) + '"><h3>' + esc(g.label) + '</h3>' +
+          '<span class="group-count">' + done + ' / ' + g.topics.length + ' visited</span></div>' +
+          '<p class="group-blurb">' + esc(g.blurb) + '</p>' +
+          '<div class="cards">' + g.topics.map(cardHtml).join('') + '</div>';
       }).join('');
     }
     var n = V.count(), total = C.topics.length;

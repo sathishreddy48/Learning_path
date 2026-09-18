@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker &amp; Containers — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="docker-containers">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › DevOps › Topic 20 of 23</div>
+  <h1>Docker &amp; Containers</h1>
+  <p class="lede">Every DevOps topic after this one assumes you can produce a small, secure image and run it locally with its dependencies. This page is the Dockerfile you should be shipping for a .NET API and a Python service, the compose file that spins up the API with SQL and Redis, and the ACR workflow that gets the image into Azure.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#images">Images, layers, containers and registries</a></li><li><a href="#dockerfile">Production Dockerfiles for .NET and Python</a></li><li><a href="#compose">docker compose for local development</a></li><li><a href="#acr">Azure Container Registry: push, build, scan</a></li><li><a href="#config-secrets">Configuration and secrets in containers</a></li><li><a href="#debugging">Debugging and resource limits</a></li><li><a href="#supply-chain">Image security and supply chain</a></li></ol>
+  </div>
+
+<section id="images"><h2 id="images">Images, layers, containers and registries</h2><p>An <strong>image</strong> is an immutable stack of read-only <strong>layers</strong> (each Dockerfile instruction adds one); a <strong>container</strong> is a process started from an image with a thin writable layer on top. Layers are content-addressed and cached — order instructions from least to most frequently changing. A <strong>registry</strong> (Docker Hub, ACR, GHCR) stores images by <code>name:tag</code>; the immutable identity is the <strong>digest</strong> (<code>sha256:…</code>).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code>docker build -t shop-api:dev .                                # build from ./Dockerfile
+docker run --rm -p 8080:8080 -e ASPNETCORE_ENVIRONMENT=Development shop-api:dev
+docker ps ; docker logs -f &lt;id&gt; ; docker exec -it &lt;id&gt; sh     # look inside
+docker image history shop-api:dev                             # layer sizes — find what bloats the image
+docker image inspect shop-api:dev --format &#x27;{{.RepoDigests}} {{.Size}}&#x27;
+docker system df ; docker system prune -f                     # reclaim disk
+
+# Tag by immutable identity in deployments
+docker pull shop-api@sha256:3f1a…                             # digest never changes; tags do
+docker tag shop-api:dev acrshop.azurecr.io/shop-api:1.4.2 &amp;&amp; docker push acrshop.azurecr.io/shop-api:1.4.2
+
+# Multi-platform (Apple Silicon → Azure amd64)
+docker buildx build --platform linux/amd64,linux/arm64 -t acrshop.azurecr.io/shop-api:1.4.2 --push .</code></pre><pre data-lang="python" hidden><code># A container is &quot;just&quot; a process with namespaces + cgroups — you can see it from the host
+import subprocess, json
+info = json.loads(subprocess.check_output([&quot;docker&quot;, &quot;inspect&quot;, &quot;shop-api&quot;]))[0]
+print(info[&quot;State&quot;][&quot;Pid&quot;], info[&quot;HostConfig&quot;][&quot;Memory&quot;], info[&quot;Config&quot;][&quot;User&quot;])
+# ps -p &lt;pid&gt; on the host shows the same process; /proc/&lt;pid&gt;/cgroup shows its cgroup limits.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Image vs container; layer caching and why COPY order matters; tags vs digests and why prod deploys pin a digest; what a registry stores; how a container differs from a VM (shared kernel, namespaces, cgroups).</p></div></section>
+<section id="dockerfile"><h2 id="dockerfile">Production Dockerfiles for .NET and Python</h2><p><strong>Multi-stage</strong>: build with the SDK image, run on a runtime image. Restore dependencies before copying source so the cache survives code changes. Run as <strong>non-root</strong>, listen on a high port, set a <code>HEALTHCHECK</code>, and pin base image versions. For .NET use the <em>chiseled</em> Ubuntu images (no shell, no package manager); for Python use <code>slim</code> with a locked requirements file or <code>uv</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="dockerfile">.NET</button><button role="tab" aria-selected="false" data-lang="dockerfile">Python</button><button role="tab" aria-selected="false" data-lang="bash">.dockerignore</button></div><pre data-lang="dockerfile"><code># syntax=docker/dockerfile:1.7
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+WORKDIR /src
+# restore first — this layer is cached until a .csproj changes
+COPY Directory.Packages.props Directory.Build.props nuget.config ./
+COPY src/Shop.Api/Shop.Api.csproj src/Shop.Api/
+COPY src/Shop.Domain/Shop.Domain.csproj src/Shop.Domain/
+RUN --mount=type=cache,target=/root/.nuget/packages dotnet restore src/Shop.Api/Shop.Api.csproj
+COPY src/ src/
+RUN --mount=type=cache,target=/root/.nuget/packages \
+    dotnet publish src/Shop.Api/Shop.Api.csproj -c Release -o /app --no-restore /p:UseAppHost=false
+
+# chiseled: no shell, no apt, non-root user &quot;app&quot; (uid 1654) already configured
+FROM mcr.microsoft.com/dotnet/aspnet:9.0-noble-chiseled AS final
+WORKDIR /app
+COPY --from=build /app .
+ENV ASPNETCORE_HTTP_PORTS=8080 DOTNET_gcServer=1 DOTNET_EnableDiagnostics=0
+EXPOSE 8080
+USER app
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s CMD [&quot;dotnet&quot;, &quot;Shop.Api.dll&quot;, &quot;--healthcheck&quot;]  # or curl on a non-chiseled base
+ENTRYPOINT [&quot;dotnet&quot;, &quot;Shop.Api.dll&quot;]</code></pre><pre data-lang="dockerfile" hidden><code># syntax=docker/dockerfile:1.7
+FROM python:3.12-slim AS build
+COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /bin/uv
+WORKDIR /app
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+# deps first (cached), then the code
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-install-project
+COPY src/ src/
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
+
+FROM python:3.12-slim AS final
+RUN useradd --uid 1000 --create-home app
+WORKDIR /app
+COPY --from=build --chown=app:app /app /app
+ENV PATH=&quot;/app/.venv/bin:$PATH&quot; PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+USER app
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s CMD python -c &quot;import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(&#x27;http://127.0.0.1:8080/health&#x27;).status==200 else 1)&quot;
+CMD [&quot;uvicorn&quot;, &quot;shop.main:app&quot;, &quot;--host&quot;, &quot;0.0.0.0&quot;, &quot;--port&quot;, &quot;8080&quot;, &quot;--workers&quot;, &quot;2&quot;, &quot;--proxy-headers&quot;, &quot;--forwarded-allow-ips=*&quot;]</code></pre><pre data-lang="bash" hidden><code># .dockerignore — keep the build context small and secrets out of the image
+**/bin
+**/obj
+**/.git
+**/node_modules
+**/.venv
+**/__pycache__
+**/*.user
+.env
+*.md
+tests/</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why multi-stage; layer ordering for cache hits; running as non-root and what breaks (ports < 1024, file permissions); chiseled/distroless trade-offs (no shell to debug — use ephemeral debug containers); reproducible builds (lock files, pinned bases); image size targets.</p></div></section>
+<section id="compose"><h2 id="compose">docker compose for local development</h2><p>Compose declares the whole local stack: the API, SQL Server (or Postgres), Redis, Azurite for storage, maybe the Service Bus emulator, with health-checked start order and named volumes so data survives restarts. Developers run one command; CI can run the same file for integration tests. Keep secrets in an untracked <code>.env</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">compose.yaml</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button></div><pre data-lang="yaml"><code>services:
+  api:
+    build: { context: ., target: final }
+    ports: [&quot;8080:8080&quot;]
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Shop: &quot;Server=sql;Database=shop;User Id=sa;Password=${SA_PASSWORD};TrustServerCertificate=true&quot;
+      Redis: &quot;redis:6379&quot;
+      AzureWebJobsStorage: &quot;UseDevelopmentStorage=true;DevelopmentStorageProxyUri=http://azurite&quot;
+    depends_on:
+      sql:   { condition: service_healthy }
+      redis: { condition: service_started }
+    develop:
+      watch:                                  # docker compose watch → rebuild/sync on change
+        - { action: rebuild, path: ./src }
+
+  sql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment: { ACCEPT_EULA: &quot;Y&quot;, MSSQL_SA_PASSWORD: &quot;${SA_PASSWORD}&quot; }
+    ports: [&quot;1433:1433&quot;]
+    volumes: [ &quot;sqldata:/var/opt/mssql&quot; ]
+    healthcheck:
+      test: [&quot;CMD-SHELL&quot;, &quot;/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \&quot;$$MSSQL_SA_PASSWORD\&quot; -C -Q &#x27;SELECT 1&#x27; || exit 1&quot;]
+      interval: 10s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: [&quot;6379:6379&quot;]
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    command: azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0 --skipApiVersionCheck
+    ports: [&quot;10000:10000&quot;, &quot;10001:10001&quot;, &quot;10002:10002&quot;]
+
+volumes:
+  sqldata:</code></pre><pre data-lang="bash" hidden><code>echo &quot;SA_PASSWORD=Your_password123&quot; &gt; .env          # untracked
+docker compose up -d --build
+docker compose logs -f api
+docker compose exec sql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P &quot;$SA_PASSWORD&quot; -C -Q &quot;SELECT name FROM sys.databases&quot;
+docker compose watch                                # live rebuild loop
+docker compose down -v                              # tear down including volumes
+
+# Integration tests in CI against the same stack
+docker compose -f compose.yaml -f compose.ci.yaml up -d --wait &amp;&amp; dotnet test tests/Shop.IntegrationTests</code></pre><pre data-lang="csharp" hidden><code>// Alternative for tests: Testcontainers spins the same dependencies from code, no compose needed
+public sealed class SqlFixture : IAsyncLifetime
+{
+    public MsSqlContainer Sql { get; } = new MsSqlBuilder().WithImage(&quot;mcr.microsoft.com/mssql/server:2022-latest&quot;).Build();
+    public RedisContainer Redis { get; } = new RedisBuilder().Build();
+    public async Task InitializeAsync() { await Task.WhenAll(Sql.StartAsync(), Redis.StartAsync()); }
+    public async Task DisposeAsync()    { await Task.WhenAll(Sql.DisposeAsync().AsTask(), Redis.DisposeAsync().AsTask()); }
+}
+// tests get Sql.GetConnectionString() / Redis.GetConnectionString() — identical engine to production.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Compose vs Kubernetes locally (Kind/minikube) — when compose is enough; health-checked dependencies; volumes and data reset; how the same file serves CI; Testcontainers vs compose for integration tests.</p></div></section>
+<section id="acr"><h2 id="acr">Azure Container Registry: push, build, scan</h2><p><strong>ACR</strong> is the private registry your App Service, Container Apps, Functions and AKS pull from with managed identity (<code>AcrPull</code>). <strong>ACR Tasks</strong> build in the cloud (no Docker on the agent), <strong>Defender for Containers</strong> scans images, retention policies and <strong>content trust / notation signing</strong> keep it clean. Premium adds private endpoints, geo-replication and zone redundancy.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="yaml">Pipeline</button></div><pre data-lang="bash"><code>az acr create -g rg-shop -n acrshop --sku Premium --admin-enabled false --zone-redundancy Enabled
+az acr login -n acrshop                                                  # token via your Entra login
+
+# Cloud build (also runs the Dockerfile&#x27;s multi-stage build) and push
+az acr build -r acrshop -t shop-api:{{.Run.ID}} -t shop-api:1.4.2 -f Dockerfile .
+
+# Let the runtime pull without secrets
+az role assignment create --assignee $(az webapp identity show -g rg-shop -n shop-api --query principalId -o tsv) --role AcrPull --scope $(az acr show -n acrshop --query id -o tsv)
+az webapp config container set -g rg-shop -n shop-api --container-image-name acrshop.azurecr.io/shop-api:1.4.2 --container-registry-url https://acrshop.azurecr.io
+az webapp config set -g rg-shop -n shop-api --generic-configurations &#x27;{&quot;acrUseManagedIdentityCreds&quot;: true}&#x27;
+az aks update -g rg-shop -n aks-shop --attach-acr acrshop                # AKS: kubelet identity gets AcrPull
+
+# Housekeeping and hygiene
+az acr repository show-tags -n acrshop --repository shop-api --orderby time_desc --top 5
+az acr manifest list-metadata -r acrshop -n shop-api --query &quot;[?tags==null].digest&quot; -o tsv | xargs -I{} az acr repository delete -n acrshop --image shop-api@{} -y   # untagged
+az acr config retention update -r acrshop --status enabled --days 7 --type UntaggedManifests
+az acr import -n acrshop --source docker.io/library/redis:7-alpine -t base/redis:7-alpine   # mirror public bases you depend on
+az acr task create -r acrshop -n rebuild-on-base --image shop-api:latest --context https://github.com/contoso/shop.git#main -f Dockerfile --git-access-token $PAT   # rebuild when the base image updates</code></pre><pre data-lang="yaml" hidden><code># Azure Pipelines: build with Docker@2 or ACR Tasks, then scan and push by digest
+steps:
+  - task: AzureCLI@2
+    displayName: Build &amp; push (ACR Tasks)
+    inputs:
+      azureSubscription: sc-shop
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        az acr build -r acrshop -t shop-api:$(Build.BuildNumber) -f Dockerfile .
+        DIGEST=$(az acr manifest show-metadata -r acrshop -n shop-api:$(Build.BuildNumber) --query digest -o tsv)
+        echo &quot;##vso[task.setvariable variable=imageDigest;isOutput=true]$DIGEST&quot;
+    name: build
+  - script: |
+      trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed acrshop.azurecr.io/shop-api@$(build.imageDigest)
+    displayName: Vulnerability scan (fail on HIGH/CRITICAL)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why pull with managed identity rather than the admin user; tags vs digests in deployments; scanning at build vs continuous scanning in the registry; base-image drift and automated rebuilds; geo-replication for multi-region AKS; retention and cost.</p></div></section>
+<section id="config-secrets"><h2 id="config-secrets">Configuration and secrets in containers</h2><p>Twelve-factor: config comes from the <strong>environment</strong>, the image is identical across environments. Never bake secrets into layers (they remain in history). In Azure the runtime injects secrets from Key Vault (App Service Key Vault references, Container Apps secrets, AKS CSI driver) or the app reads them with managed identity. Locally, an untracked <code>.env</code> or <code>dotnet user-secrets</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="csharp"><code>// ASP.NET Core reads env vars with &quot;__&quot; as the section separator: ConnectionStrings__Shop, Redis__Host
+var cs = builder.Configuration.GetConnectionString(&quot;Shop&quot;);
+
+// Layered config in containers: appsettings.json (defaults) → env vars (per environment) → Key Vault (secrets)
+if (!builder.Environment.IsDevelopment())
+    builder.Configuration.AddAzureKeyVault(new Uri(builder.Configuration[&quot;KeyVault:Uri&quot;]!), new DefaultAzureCredential());
+
+// Strongly typed + validated at startup so a missing env var fails fast, not on the first request
+builder.Services.AddOptions&lt;ShopOptions&gt;().BindConfiguration(&quot;Shop&quot;).ValidateDataAnnotations().ValidateOnStart();
+
+// Read secrets mounted as files (AKS CSI / Container Apps volume) — works with reloadOnChange
+builder.Configuration.AddKeyPerFile(&quot;/mnt/secrets&quot;, optional: true, reloadOnChange: true);</code></pre><pre data-lang="python" hidden><code># pydantic-settings: env vars with a nested delimiter, .env for local, Key Vault when running in Azure
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Db(BaseModel):
+    host: str
+    password: str = Field(repr=False)          # never print it
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_nested_delimiter=&quot;__&quot;, env_file=&quot;.env&quot;, secrets_dir=&quot;/mnt/secrets&quot;, extra=&quot;ignore&quot;)
+    env: str = &quot;dev&quot;
+    db: Db
+    redis_host: str = &quot;localhost&quot;
+
+settings = Settings()      # fails loudly at import time if DB__HOST / DB__PASSWORD are missing
+# In Azure: Container Apps secrets → env or mounted files; App Service → @Microsoft.KeyVault(SecretUri=...) references.</code></pre><pre data-lang="bash" hidden><code># Build-time secrets without leaking them into layers (private NuGet/PyPI feed token)
+docker build --secret id=nuget,env=NUGET_TOKEN .
+#   RUN --mount=type=secret,id=nuget dotnet restore --configfile &lt;(sed &quot;s/%TOKEN%/$(cat /run/secrets/nuget)/&quot; nuget.config)
+
+# Runtime: env file locally, never committed
+docker run --env-file .env shop-api:dev
+
+# Container Apps: secret from Key Vault via managed identity, surfaced as an env var
+az containerapp secret set -g rg-shop -n shop-api --secrets db-password=keyvaultref:https://kv-shop.vault.azure.net/secrets/DbPassword,identityref:system
+az containerapp update -g rg-shop -n shop-api --set-env-vars &quot;ConnectionStrings__Shop=secretref:db-password&quot;
+
+# Check nothing sensitive is in the image
+docker history --no-trunc shop-api:dev | grep -i -E &quot;token|password|secret&quot; || echo clean</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why env vars over config files in images; how ARG/ENV leak into history and the BuildKit secret mount; Key Vault reference vs SDK; validating configuration at startup; rotating a secret without redeploying.</p></div></section>
+<section id="debugging"><h2 id="debugging">Debugging and resource limits</h2><p>Containers die for three reasons: the process exited (check logs and exit code), the health check failed, or the <strong>OOM killer</strong> hit the memory limit. Set CPU/memory limits explicitly, tell .NET about them (it reads cgroups automatically; tune <code>DOTNET_GCHeapHardLimit</code> if needed) and size Python worker counts to the CPU limit. Use <code>docker stats</code>, <code>exec</code>, and <code>dotnet-counters</code>/<code>py-spy</code> inside the container.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button></div><pre data-lang="bash"><code>docker run --rm --memory=512m --cpus=1 -p 8080:8080 shop-api:dev
+docker stats --no-stream                                     # CPU/mem per container
+docker inspect --format &#x27;{{.State.ExitCode}} {{.State.OOMKilled}}&#x27; &lt;id&gt;    # 137 + OOMKilled=true → raise limit or fix the leak
+docker logs --since 10m --timestamps &lt;id&gt;
+
+# Chiseled image has no shell: attach a debug sidecar sharing the PID namespace
+docker run --rm -it --pid=container:&lt;id&gt; --net=container:&lt;id&gt; mcr.microsoft.com/dotnet/sdk:9.0 bash
+  # inside: dotnet tool install -g dotnet-counters dotnet-dump; dotnet-counters monitor -p 1; dotnet-dump collect -p 1
+# Python: py-spy dump --pid 1   (needs SYS_PTRACE: docker run --cap-add SYS_PTRACE)
+
+# Networking inside: curl the peer service by compose name
+docker compose exec api sh -c &quot;getent hosts sql &amp;&amp; wget -qO- http://redis:6379 || true&quot;</code></pre><pre data-lang="csharp" hidden><code>// .NET is container-aware: Environment.ProcessorCount and GC heap limits come from cgroups.
+// Log what the runtime sees at startup — it prevents a class of &quot;works on my machine&quot; tickets.
+app.Logger.LogInformation(&quot;CPU={Cpu} GC={Gc} Limit={Limit}MB&quot;,
+    Environment.ProcessorCount, GCSettings.IsServerGC ? &quot;server&quot; : &quot;workstation&quot;,
+    GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / 1024 / 1024);
+
+// Small containers (&lt; 2 cores): workstation GC usually wins;  DOTNET_gcServer=0 or &lt;ServerGarbageCollection&gt;false&lt;/ServerGarbageCollection&gt;
+// Memory-limited: DOTNET_GCHeapHardLimitPercent=75 leaves headroom for native memory so the OOM killer doesn&#x27;t fire first.
+// Thread pool under limits: ThreadPool.SetMinThreads if you see starvation when ProcessorCount is 1.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Exit code 137 and OOM diagnosis; CPU limits vs requests and throttling; how .NET/Python detect container limits; debugging a distroless image; log to stdout/stderr, not files; graceful shutdown and SIGTERM handling.</p></div></section>
+<section id="supply-chain"><h2 id="supply-chain">Image security and supply chain</h2><p>Minimise the attack surface (chiseled/slim, non-root, read-only filesystem, drop capabilities), scan continuously (Defender, Trivy, Grype), produce an <strong>SBOM</strong>, and <strong>sign</strong> images (Notation/cosign) so the cluster admits only what your pipeline built. Pin base images by digest and rebuild on base updates; the vulnerability is usually in the base, not your code.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="yaml">Pipeline</button></div><pre data-lang="bash"><code># Scan + SBOM + sign in the pipeline
+trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed acrshop.azurecr.io/shop-api:1.4.2
+syft acrshop.azurecr.io/shop-api:1.4.2 -o spdx-json &gt; sbom.spdx.json
+grype sbom:sbom.spdx.json --fail-on high
+
+# Sign with Notation using a Key Vault certificate; verify before deploy (or with an AKS admission policy)
+notation key add --plugin azure-kv --id https://kv-shop.vault.azure.net/keys/signing-cert/&lt;version&gt; shop-signer
+notation sign --key shop-signer acrshop.azurecr.io/shop-api@sha256:3f1a…
+notation verify acrshop.azurecr.io/shop-api@sha256:3f1a…
+
+# Runtime hardening flags (also expressible in Kubernetes securityContext / Container Apps)
+docker run --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges -u 1654 shop-api:1.4.2</code></pre><pre data-lang="yaml" hidden><code># Pin the base image by digest and let Dependabot / Renovate bump it
+# Dockerfile:  FROM mcr.microsoft.com/dotnet/aspnet:9.0-noble-chiseled@sha256:5b2e…
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: nuget
+    directory: /
+    schedule: { interval: weekly }
+    groups: { minor-and-patch: { update-types: [minor, patch] } }</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>What an SBOM is for; scanning in CI vs registry vs runtime; image signing and admission control; why base image updates matter more than your code for CVEs; read-only root filesystem and what your app must change (temp paths).</p></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://docs.docker.com/reference/dockerfile/" target="_blank" rel="noopener">Dockerfile reference</a></li><li><a href="https://learn.microsoft.com/dotnet/core/docker/introduction" target="_blank" rel="noopener">.NET container images</a> — chiseled images, environment variables</li><li><a href="https://docs.docker.com/compose/" target="_blank" rel="noopener">Docker Compose</a></li><li><a href="https://learn.microsoft.com/azure/container-registry/" target="_blank" rel="noopener">Azure Container Registry</a></li><li><a href="https://dotnet.testcontainers.org/" target="_blank" rel="noopener">Testcontainers for .NET</a></li><li><a href="https://learn.microsoft.com/azure/container-registry/container-registry-tutorial-sign-build-push" target="_blank" rel="noopener">Notation image signing with ACR</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

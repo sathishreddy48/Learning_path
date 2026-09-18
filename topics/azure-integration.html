@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure Integration Services — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="azure-integration">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Azure › Topic 15 of 23</div>
+  <h1>Azure Integration Services</h1>
+  <p class="lede">Azure Services covered the building blocks a single service uses. This page is about the pieces that sit <em>between</em> services: an API gateway in front, events fanning out behind, a cache to the side, configuration pushed from the centre. Each section gives the C# and Python code that talks to the service and the one design question an interviewer will ask.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#apim">API Management: gateway, products and subscriptions</a></li><li><a href="#apim-policies">Policies: the part you will actually write</a></li><li><a href="#event-grid">Event Grid: push-based eventing</a></li><li><a href="#logic-apps">Logic Apps and Durable Functions: which workflow engine?</a></li><li><a href="#app-configuration">App Configuration: central settings and feature flags</a></li><li><a href="#redis">Azure Cache for Redis / Azure Managed Redis</a></li><li><a href="#signalr">Real-time: Azure SignalR Service and Web PubSub</a></li><li><a href="#choosing">Which messaging service?</a></li></ol>
+  </div>
+
+<section id="apim"><h2 id="apim">API Management: gateway, products and subscriptions</h2><p><strong>API Management</strong> is a managed gateway: import an OpenAPI spec, group operations into <strong>products</strong>, hand out <strong>subscription keys</strong> or validate JWTs, and apply <strong>policies</strong> (rate limits, caching, rewriting) without touching the backend. Tiers: Consumption (serverless, per-call), Basic v2/Standard v2 (fast provisioning), Developer/Premium (VNet, multi-region, self-hosted gateway).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button></div><pre data-lang="bash"><code># Create an instance (v2 tiers provision in minutes; classic Developer/Premium take ~45 min)
+az apim create -g rg-shop -n apim-shop --publisher-email api@contoso.com --publisher-name Contoso --sku-name StandardV2
+
+# Import the API from the running service&#x27;s OpenAPI document
+az apim api import -g rg-shop --service-name apim-shop --api-id orders --path orders   --specification-format OpenApiJson --specification-url https://shop-api.azurewebsites.net/swagger/v1/swagger.json   --service-url https://shop-api.azurewebsites.net
+
+# Product = a bundle of APIs with its own access rules and quota
+az apim product create -g rg-shop --service-name apim-shop --product-id partners --product-name &quot;Partner APIs&quot;   --subscription-required true --approval-required true --state published
+az apim product api add -g rg-shop --service-name apim-shop --product-id partners --api-id orders
+
+# Backend, named values (secrets from Key Vault) and the developer portal
+az apim nv create -g rg-shop --service-name apim-shop --named-value-id backend-key --display-name backend-key --secret true --value &quot;&lt;key&gt;&quot;</code></pre><pre data-lang="csharp" hidden><code>// The backend should verify the call came through the gateway, not trust the network
+app.Use(async (ctx, next) =&gt;
+{
+    // APIM policy sets this header from a named value: &lt;set-header name=&quot;X-Gateway-Key&quot;&gt;&lt;value&gt;{{backend-key}}&lt;/value&gt;&lt;/set-header&gt;
+    if (ctx.Request.Headers[&quot;X-Gateway-Key&quot;] != cfg[&quot;Gateway:Key&quot;]) { ctx.Response.StatusCode = 401; return; }
+    await next();
+});
+
+// Expose a clean OpenAPI document — APIM imports it, and the developer portal renders it
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(o =&gt;
+{
+    o.SwaggerDoc(&quot;v1&quot;, new() { Title = &quot;Orders API&quot;, Version = &quot;v1&quot; });
+    o.AddSecurityDefinition(&quot;bearer&quot;, new() { Type = SecuritySchemeType.Http, Scheme = &quot;bearer&quot;, BearerFormat = &quot;JWT&quot; });
+});
+app.MapGet(&quot;/orders/{id:int}&quot;, (int id) =&gt; ...).WithName(&quot;GetOrder&quot;).WithOpenApi(op =&gt; { op.Summary = &quot;Get an order&quot;; return op; });</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why put a gateway in front of a microservice mesh (auth, throttling, versioning, observability in one place); products vs APIs vs subscriptions; how you would version an API in APIM (path/header/query); when a self-hosted gateway makes sense.</p></div></section>
+<section id="apim-policies"><h2 id="apim-policies">Policies: the part you will actually write</h2><p>Policies are XML applied at global, product, API or operation scope with <code>&lt;base /&gt;</code> chaining them. The ones you will use weekly: <code>validate-jwt</code>, <code>rate-limit-by-key</code>, <code>cache-lookup</code>/<code>cache-store</code>, <code>set-backend-service</code>, <code>rewrite-uri</code>, <code>cors</code>, <code>mock-response</code>, and <code>send-request</code> for a side call. Expressions are C# snippets in <code>@(…)</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="xml">Policy XML</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="xml"><code>&lt;policies&gt;
+  &lt;inbound&gt;
+    &lt;base /&gt;
+    &lt;cors allow-credentials=&quot;true&quot;&gt;&lt;allowed-origins&gt;&lt;origin&gt;https://shop.contoso.com&lt;/origin&gt;&lt;/allowed-origins&gt;
+      &lt;allowed-methods&gt;&lt;method&gt;*&lt;/method&gt;&lt;/allowed-methods&gt;&lt;allowed-headers&gt;&lt;header&gt;*&lt;/header&gt;&lt;/allowed-headers&gt;&lt;/cors&gt;
+
+    &lt;!-- Validate Entra tokens; the backend still validates too --&gt;
+    &lt;validate-azure-ad-token tenant-id=&quot;{{tenant-id}}&quot; failed-validation-httpcode=&quot;401&quot;&gt;
+      &lt;audiences&gt;&lt;audience&gt;api://shop-api&lt;/audience&gt;&lt;/audiences&gt;
+      &lt;required-claims&gt;&lt;claim name=&quot;scp&quot; match=&quot;any&quot; separator=&quot; &quot;&gt;&lt;value&gt;Orders.Read&lt;/value&gt;&lt;value&gt;Orders.ReadWrite&lt;/value&gt;&lt;/claim&gt;&lt;/required-claims&gt;
+    &lt;/validate-azure-ad-token&gt;
+
+    &lt;!-- Rate limit per caller (oid claim), plus a hard quota per subscription --&gt;
+    &lt;rate-limit-by-key calls=&quot;100&quot; renewal-period=&quot;60&quot; increment-condition=&quot;@(context.Response.StatusCode &lt; 400)&quot;
+      counter-key=&quot;@(context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;,&quot;&quot;).AsJwt()?.Claims.GetValueOrDefault(&quot;oid&quot;,&quot;anon&quot;))&quot; /&gt;
+    &lt;quota calls=&quot;100000&quot; renewal-period=&quot;2592000&quot; /&gt;
+
+    &lt;!-- Cache GETs for 30 s, vary by the id in the URL --&gt;
+    &lt;cache-lookup vary-by-developer=&quot;false&quot; vary-by-developer-groups=&quot;false&quot; downstream-caching-type=&quot;none&quot; /&gt;
+
+    &lt;set-header name=&quot;X-Gateway-Key&quot; exists-action=&quot;override&quot;&gt;&lt;value&gt;{{backend-key}}&lt;/value&gt;&lt;/set-header&gt;
+    &lt;set-header name=&quot;X-Correlation-Id&quot; exists-action=&quot;skip&quot;&gt;&lt;value&gt;@(context.RequestId.ToString())&lt;/value&gt;&lt;/set-header&gt;
+    &lt;set-backend-service base-url=&quot;https://shop-api.azurewebsites.net&quot; /&gt;
+  &lt;/inbound&gt;
+  &lt;backend&gt;&lt;base /&gt;&lt;/backend&gt;
+  &lt;outbound&gt;
+    &lt;base /&gt;
+    &lt;cache-store duration=&quot;30&quot; /&gt;
+    &lt;set-header name=&quot;Server&quot; exists-action=&quot;delete&quot; /&gt;
+  &lt;/outbound&gt;
+  &lt;on-error&gt;
+    &lt;base /&gt;
+    &lt;set-header name=&quot;X-Error&quot; exists-action=&quot;override&quot;&gt;&lt;value&gt;@(context.LastError.Message)&lt;/value&gt;&lt;/set-header&gt;
+  &lt;/on-error&gt;
+&lt;/policies&gt;</code></pre><pre data-lang="python" hidden><code># Call an APIM-fronted API: subscription key header + bearer token; respect 429 with Retry-After
+import time, httpx
+from azure.identity import DefaultAzureCredential
+
+tok = DefaultAzureCredential().get_token(&quot;api://shop-api/.default&quot;).token
+client = httpx.Client(base_url=&quot;https://apim-shop.azure-api.net/orders&quot;,
+                      headers={&quot;Ocp-Apim-Subscription-Key&quot;: SUB_KEY, &quot;Authorization&quot;: f&quot;Bearer {tok}&quot;})
+
+def get(path):
+    for attempt in range(5):
+        r = client.get(path)
+        if r.status_code != 429:
+            r.raise_for_status(); return r.json()
+        time.sleep(int(r.headers.get(&quot;Retry-After&quot;, 2 ** attempt)))
+    raise RuntimeError(&quot;rate limited&quot;)
+
+# Test policies locally against the trace: send Ocp-Apim-Trace: true (with the allow-tracing subscription) and read the trace URL header.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Where in the pipeline (inbound/backend/outbound/on-error) a policy runs; rate-limit vs quota; the cost of <code>validate-jwt</code> at the gateway and why the backend still validates; caching pitfalls (auth-varying responses); how you test and version policies (APIOps).</p></div></section>
+<section id="event-grid"><h2 id="event-grid">Event Grid: push-based eventing</h2><p><strong>Event Grid</strong> delivers discrete events (a blob was created, an order was placed) to subscribers over HTTPS (webhooks, Functions, Service Bus, Event Hubs, Storage Queues) with retry and dead-lettering. Publish your own on a <strong>custom topic</strong> or an <strong>Event Grid namespace</strong> (MQTT + pull delivery). It complements Service Bus (commands, ordering) and Event Hubs (streams): use Event Grid for "something happened" fan-out with many subscribers.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="csharp"><code>// Publish CloudEvents to a custom topic
+var publisher = new EventGridPublisherClient(new Uri(&quot;https://eg-shop.westeurope-1.eventgrid.azure.net/api/events&quot;), new DefaultAzureCredential());
+await publisher.SendEventAsync(new CloudEvent(&quot;/shop/orders&quot;, &quot;Shop.OrderPlaced&quot;, new { OrderId = 42, Total = 99.5m }) { Subject = &quot;orders/42&quot; });
+
+// Receive via webhook: handle the validation handshake, then the events
+app.MapPost(&quot;/events&quot;, async (HttpRequest req) =&gt;
+{
+    var events = CloudEvent.ParseMany(await BinaryData.FromStreamAsync(req.Body));
+    foreach (var ev in events)
+    {
+        switch (ev.Type)
+        {
+            case &quot;Microsoft.Storage.BlobCreated&quot;:
+                var data = ev.Data!.ToObjectFromJson&lt;StorageBlobCreatedEventData&gt;();
+                await invoices.ProcessAsync(data.Url); break;
+            case &quot;Shop.OrderPlaced&quot;:
+                await mailer.SendConfirmationAsync(ev.Data!.ToObjectFromJson&lt;OrderPlaced&gt;()); break;
+        }
+    }
+    return Results.Ok();
+}).AllowAnonymous();   // secure with a shared query-string token or, better, Entra auth on the subscription
+// CloudEvents v1.0 handshake is an OPTIONS request with WebHook-Request-Origin — ASP.NET Core needs to answer it:
+app.MapMethods(&quot;/events&quot;, new[] { &quot;OPTIONS&quot; }, (HttpResponse res) =&gt; { res.Headers[&quot;WebHook-Allowed-Origin&quot;] = &quot;*&quot;; return Results.Ok(); });</code></pre><pre data-lang="python" hidden><code>from azure.eventgrid import EventGridPublisherClient
+from azure.core.messaging import CloudEvent
+from azure.identity import DefaultAzureCredential
+
+pub = EventGridPublisherClient(&quot;https://eg-shop.westeurope-1.eventgrid.azure.net/api/events&quot;, DefaultAzureCredential())
+pub.send([CloudEvent(source=&quot;/shop/orders&quot;, type=&quot;Shop.OrderPlaced&quot;, data={&quot;orderId&quot;: 42, &quot;total&quot;: 99.5}, subject=&quot;orders/42&quot;)])
+
+# Azure Function trigger (Python v2 model) — no webhook plumbing needed
+import azure.functions as func
+app = func.FunctionApp()
+
+@app.event_grid_trigger(arg_name=&quot;event&quot;)
+def on_blob_created(event: func.EventGridEvent):
+    data = event.get_json()
+    if event.event_type == &quot;Microsoft.Storage.BlobCreated&quot;:
+        process_invoice(data[&quot;url&quot;])</code></pre><pre data-lang="bash" hidden><code># Subscribe a Function to blob-created events for one container, with a dead-letter destination and filters
+az eventgrid event-subscription create --name invoices-created   --source-resource-id $(az storage account show -g rg-shop -n stshop --query id -o tsv)   --endpoint-type azurefunction --endpoint $(az functionapp function show -g rg-shop -n func-shop --function-name OnBlobCreated --query id -o tsv)   --included-event-types Microsoft.Storage.BlobCreated --subject-begins-with /blobServices/default/containers/invoices/   --event-delivery-schema cloudeventschemav1_0 --max-delivery-attempts 10 --event-ttl 1440   --deadletter-endpoint $(az storage account show -g rg-shop -n stshop --query id -o tsv)/blobServices/default/containers/deadletter</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Event Grid vs Service Bus vs Event Hubs (see the table below); at-least-once delivery and idempotent handlers; webhook validation; filtering at the subscription vs in code; dead-lettering and retry schedule.</p></div></section>
+<section id="logic-apps"><h2 id="logic-apps">Logic Apps and Durable Functions: which workflow engine?</h2><p><strong>Logic Apps</strong> are low-code workflows with 1,000+ connectors (SAP, Salesforce, Office 365, SQL, FTP) — ideal for integration and approvals that business analysts can read. <strong>Durable Functions</strong> are code-first orchestrations (fan-out/fan-in, human interaction, eternal orchestrations) with replay semantics. Rule of thumb: connectors and visual flow → Logic Apps; complex logic, tests, and versioning in git → Durable Functions.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="json">Logic App</button></div><pre data-lang="csharp"><code>// Durable Functions (isolated worker): order fulfilment with a timeout and compensation
+[Function(nameof(FulfilOrder))]
+public static async Task&lt;string&gt; FulfilOrder([OrchestrationTrigger] TaskOrchestrationContext ctx)
+{
+    var order = ctx.GetInput&lt;Order&gt;()!;
+    var retry = new TaskOptions(new TaskRetryOptions(new RetryPolicy(3, TimeSpan.FromSeconds(5), backoffCoefficient: 2)));
+
+    await ctx.CallActivityAsync(nameof(ReserveStock), order, retry);
+    try
+    {
+        // Wait for payment webhook, max 30 minutes
+        using var cts = new CancellationTokenSource();
+        var paid = ctx.WaitForExternalEvent&lt;bool&gt;(&quot;PaymentConfirmed&quot;);
+        var timeout = ctx.CreateTimer(ctx.CurrentUtcDateTime.AddMinutes(30), cts.Token);
+        if (await Task.WhenAny(paid, timeout) == timeout || !paid.Result)
+            throw new InvalidOperationException(&quot;payment not received&quot;);
+        cts.Cancel();
+        await ctx.CallActivityAsync(nameof(Ship), order, retry);
+        return &quot;shipped&quot;;
+    }
+    catch
+    {
+        await ctx.CallActivityAsync(nameof(ReleaseStock), order, retry);    // compensate
+        return &quot;cancelled&quot;;
+    }
+}
+// Orchestrator rules: deterministic only — no DateTime.Now, Guid.NewGuid(), I/O or Task.Delay; use ctx.* equivalents.</code></pre><pre data-lang="json" hidden><code>{
+  &quot;definition&quot;: {
+    &quot;$schema&quot;: &quot;https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#&quot;,
+    &quot;triggers&quot;: {
+      &quot;When_a_message_arrives&quot;: { &quot;type&quot;: &quot;ApiConnection&quot;, &quot;recurrence&quot;: { &quot;frequency&quot;: &quot;Minute&quot;, &quot;interval&quot;: 1 },
+        &quot;inputs&quot;: { &quot;host&quot;: { &quot;connection&quot;: { &quot;name&quot;: &quot;@parameters(&#x27;$connections&#x27;)[&#x27;servicebus&#x27;][&#x27;connectionId&#x27;]&quot; } },
+                    &quot;method&quot;: &quot;get&quot;, &quot;path&quot;: &quot;/@{encodeURIComponent(&#x27;orders&#x27;)}/messages/head&quot;, &quot;queries&quot;: { &quot;queueType&quot;: &quot;Main&quot; } } }
+    },
+    &quot;actions&quot;: {
+      &quot;Parse_order&quot;: { &quot;type&quot;: &quot;ParseJson&quot;, &quot;inputs&quot;: { &quot;content&quot;: &quot;@base64ToString(triggerBody()?[&#x27;ContentData&#x27;])&quot;, &quot;schema&quot;: { &quot;type&quot;: &quot;object&quot; } } },
+      &quot;Approval_email&quot;: { &quot;type&quot;: &quot;ApiConnectionWebhook&quot;, &quot;runAfter&quot;: { &quot;Parse_order&quot;: [&quot;Succeeded&quot;] },
+        &quot;inputs&quot;: { &quot;host&quot;: { &quot;connection&quot;: { &quot;name&quot;: &quot;@parameters(&#x27;$connections&#x27;)[&#x27;office365&#x27;][&#x27;connectionId&#x27;]&quot; } },
+                    &quot;body&quot;: { &quot;NotificationUrl&quot;: &quot;@{listCallbackUrl()}&quot;, &quot;Message&quot;: { &quot;To&quot;: &quot;finance@contoso.com&quot;, &quot;Options&quot;: &quot;Approve, Reject&quot;,
+                              &quot;Subject&quot;: &quot;Order @{body(&#x27;Parse_order&#x27;)?[&#x27;id&#x27;]} needs approval&quot; } }, &quot;path&quot;: &quot;/approvalmail/$subscriptions&quot; } },
+      &quot;Condition&quot;: { &quot;type&quot;: &quot;If&quot;, &quot;runAfter&quot;: { &quot;Approval_email&quot;: [&quot;Succeeded&quot;] },
+        &quot;expression&quot;: { &quot;equals&quot;: [&quot;@body(&#x27;Approval_email&#x27;)?[&#x27;SelectedOption&#x27;]&quot;, &quot;Approve&quot;] },
+        &quot;actions&quot;: { &quot;Call_API&quot;: { &quot;type&quot;: &quot;Http&quot;, &quot;inputs&quot;: { &quot;method&quot;: &quot;POST&quot;, &quot;uri&quot;: &quot;https://shop-api.contoso.com/orders/@{body(&#x27;Parse_order&#x27;)?[&#x27;id&#x27;]}/approve&quot;,
+                     &quot;authentication&quot;: { &quot;type&quot;: &quot;ManagedServiceIdentity&quot;, &quot;audience&quot;: &quot;api://shop-api&quot; } } } },
+        &quot;else&quot;: { &quot;actions&quot;: { &quot;Reject&quot;: { &quot;type&quot;: &quot;Http&quot;, &quot;inputs&quot;: { &quot;method&quot;: &quot;POST&quot;, &quot;uri&quot;: &quot;https://shop-api.contoso.com/orders/@{body(&#x27;Parse_order&#x27;)?[&#x27;id&#x27;]}/reject&quot; } } } } }
+    }
+  }
+}</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Durable orchestrator constraints and why (replay); Standard vs Consumption Logic Apps (single-tenant, VNet, local dev in VS Code); how you test a Logic App; the human-interaction pattern in both engines; idempotency when a step is retried.</p></div></section>
+<section id="app-configuration"><h2 id="app-configuration">App Configuration: central settings and feature flags</h2><p><strong>Azure App Configuration</strong> stores key-values with labels (environment/version), references Key Vault secrets, and hosts feature flags with targeting and percentage filters. Apps load it at startup and refresh on a sentinel key change — no redeploy to flip a flag or turn down a timeout. Combine with managed identity; never put the connection string in the app.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="csharp"><code>builder.Configuration.AddAzureAppConfiguration(o =&gt;
+{
+    o.Connect(new Uri(&quot;https://appcs-shop.azconfig.io&quot;), new DefaultAzureCredential())
+     .Select(&quot;Shop:*&quot;, labelFilter: builder.Environment.EnvironmentName)     // Shop:* with label &quot;Production&quot;
+     .Select(&quot;Shop:*&quot;, LabelFilter.Null)                                       // fall back to unlabelled defaults
+     .ConfigureKeyVault(kv =&gt; kv.SetCredential(new DefaultAzureCredential())) // resolve Key Vault references
+     .ConfigureRefresh(r =&gt; r.Register(&quot;Shop:Sentinel&quot;, refreshAll: true).SetRefreshInterval(TimeSpan.FromSeconds(30)))
+     .UseFeatureFlags(f =&gt; f.SetRefreshInterval(TimeSpan.FromSeconds(30)));
+});
+builder.Services.AddAzureAppConfiguration().AddFeatureManagement().AddFeatureFilter&lt;TargetingFilter&gt;();
+builder.Services.Configure&lt;CheckoutOptions&gt;(builder.Configuration.GetSection(&quot;Shop:Checkout&quot;));   // IOptionsSnapshot/Monitor see refreshes
+
+var app = builder.Build();
+app.UseAzureAppConfiguration();      // triggers refresh on incoming requests
+
+app.MapGet(&quot;/checkout/preview&quot;, async (IFeatureManager fm, IOptionsSnapshot&lt;CheckoutOptions&gt; opt) =&gt;
+    await fm.IsEnabledAsync(&quot;NewCheckout&quot;) ? Results.Ok(new { opt.Value.MaxItems, ui = &quot;v2&quot; }) : Results.Ok(new { opt.Value.MaxItems, ui = &quot;v1&quot; }));</code></pre><pre data-lang="python" hidden><code>from azure.appconfiguration.provider import load, SettingSelector, WatchKey
+from azure.identity import DefaultAzureCredential
+from featuremanagement import FeatureManager
+
+cred = DefaultAzureCredential()
+config = load(endpoint=&quot;https://appcs-shop.azconfig.io&quot;, credential=cred,
+              selects=[SettingSelector(key_filter=&quot;Shop:*&quot;, label_filter=&quot;Production&quot;)],
+              trim_prefixes=[&quot;Shop:&quot;],
+              keyvault_credential=cred,                                   # resolve Key Vault references
+              refresh_on=[WatchKey(&quot;Shop:Sentinel&quot;)], refresh_interval=30,
+              feature_flag_enabled=True, feature_flag_refresh_enabled=True)
+
+fm = FeatureManager(config)
+max_items = int(config[&quot;Checkout:MaxItems&quot;])
+if fm.is_enabled(&quot;NewCheckout&quot;, user=&quot;ada@contoso.com&quot;):    # targeting filter
+    ...
+# call config.refresh() periodically (e.g., a FastAPI middleware) to pick up changes</code></pre><pre data-lang="bash" hidden><code>az appconfig kv set -n appcs-shop --key Shop:Checkout:MaxItems --value 50 --label Production -y
+az appconfig kv set-keyvault -n appcs-shop --key Shop:Db:Password --secret-identifier https://kv-shop.vault.azure.net/secrets/DbPassword -y
+az appconfig feature set -n appcs-shop --feature NewCheckout --label Production -y
+az appconfig feature filter add -n appcs-shop --feature NewCheckout --filter-name Microsoft.Targeting   --filter-parameters Audience=&#x27;{&quot;Users&quot;:[&quot;ada@contoso.com&quot;],&quot;Groups&quot;:[{&quot;Name&quot;:&quot;beta&quot;,&quot;RolloutPercentage&quot;:25}],&quot;DefaultRolloutPercentage&quot;:5}&#x27; -y
+az appconfig kv set -n appcs-shop --key Shop:Sentinel --value $(date +%s) --label Production -y     # bump → clients refresh everything</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Labels for environments vs separate stores; the sentinel-key refresh pattern and why (one read instead of N); Key Vault references; feature flag lifecycle and cleanup; snapshots for immutable config releases.</p></div></section>
+<section id="redis"><h2 id="redis">Azure Cache for Redis / Azure Managed Redis</h2><p>A managed Redis for <strong>cache-aside</strong>, session state, distributed locks, rate limiting and pub/sub. Use <code>IDistributedCache</code> for simple cases and StackExchange.Redis directly when you need data structures, Lua or pub/sub. Watch the timeouts: cache misses must be cheap, and the cache going away must not take the app with it. Azure Managed Redis (Redis 7.4+ Enterprise) is the newer tier with active geo-replication and vector search modules.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Registration (Entra auth, no access keys)
+builder.Services.AddSingleton&lt;IConnectionMultiplexer&gt;(sp =&gt;
+{
+    var opts = ConfigurationOptions.Parse(&quot;redis-shop.redis.cache.windows.net:6380,ssl=true,abortConnect=false&quot;);
+    opts.ConfigureForAzureWithTokenCredentialAsync(new DefaultAzureCredential()).GetAwaiter().GetResult();   // Microsoft.Azure.StackExchangeRedis
+    return ConnectionMultiplexer.Connect(opts);
+});
+builder.Services.AddStackExchangeRedisCache(o =&gt; o.ConnectionMultiplexerFactory = () =&gt; Task.FromResult(sp.GetRequiredService&lt;IConnectionMultiplexer&gt;()));
+builder.Services.AddHybridCache();   // .NET 9: L1 in-memory + L2 distributed, stampede protection built in
+
+// Cache-aside with HybridCache
+public class ProductService(HybridCache cache, ShopDb db)
+{
+    public Task&lt;Product?&gt; Get(int id, CancellationToken ct) =&gt;
+        cache.GetOrCreateAsync($&quot;product:{id}&quot;, async token =&gt; await db.Products.FindAsync(new object[] { id }, token),
+            new HybridCacheEntryOptions { Expiration = TimeSpan.FromMinutes(10), LocalCacheExpiration = TimeSpan.FromMinutes(1) }, cancellationToken: ct);
+    public Task Invalidate(int id) =&gt; cache.RemoveAsync($&quot;product:{id}&quot;);
+}
+
+// Distributed lock (single instance, correct release) and a sliding-window rate limit
+var db = mux.GetDatabase();
+var token = Guid.NewGuid().ToString();
+if (await db.LockTakeAsync(&quot;lock:reindex&quot;, token, TimeSpan.FromSeconds(30)))
+    try { await Reindex(); } finally { await db.LockReleaseAsync(&quot;lock:reindex&quot;, token); }
+var hits = await db.StringIncrementAsync($&quot;rl:{userId}:{DateTime.UtcNow:yyyyMMddHHmm}&quot;);
+if (hits == 1) await db.KeyExpireAsync($&quot;rl:{userId}:{DateTime.UtcNow:yyyyMMddHHmm}&quot;, TimeSpan.FromMinutes(1));
+if (hits &gt; 100) return Results.StatusCode(429);</code></pre><pre data-lang="python" hidden><code>import json, redis
+from azure.identity import DefaultAzureCredential
+
+cred = DefaultAzureCredential()
+def token_provider():
+    t = cred.get_token(&quot;https://redis.azure.com/.default&quot;)
+    return &quot;&lt;user-or-object-id&gt;&quot;, t.token           # Entra auth: username = principal id, password = token
+
+r = redis.Redis(host=&quot;redis-shop.redis.cache.windows.net&quot;, port=6380, ssl=True,
+                credential_provider=redis.UsernamePasswordCredentialProvider(*token_provider()),
+                socket_timeout=2, socket_connect_timeout=2, retry_on_timeout=True)
+
+def get_product(pid: int) -&gt; dict:                  # cache-aside with a stampede guard
+    key = f&quot;product:{pid}&quot;
+    if (hit := r.get(key)):
+        return json.loads(hit)
+    with r.lock(f&quot;lock:{key}&quot;, timeout=5, blocking_timeout=2):
+        if (hit := r.get(key)):
+            return json.loads(hit)
+        product = db.fetch_product(pid)
+        r.set(key, json.dumps(product), ex=600)
+        return product
+
+# Rate limit with a Lua script (atomic)
+RL = r.register_script(&quot;local c=redis.call(&#x27;INCR&#x27;,KEYS[1]) if c==1 then redis.call(&#x27;EXPIRE&#x27;,KEYS[1],ARGV[1]) end return c&quot;)
+if RL(keys=[f&quot;rl:{user}&quot;], args=[60]) &gt; 100:
+    raise TooManyRequests()</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Cache-aside vs write-through; stampede (dog-pile) protection; TTL choice and invalidation strategy; why the app must survive Redis being down (fail open with short timeouts); Redis as a lock — what Redlock does and does not guarantee; Basic vs Standard vs Premium (clustering, persistence, VNet) and Managed Redis.</p></div></section>
+<section id="signalr"><h2 id="signalr">Real-time: Azure SignalR Service and Web PubSub</h2><p>SignalR works in-process, but scaled-out App Service needs sticky sessions and a backplane. <strong>Azure SignalR Service</strong> takes over the connections (hundreds of thousands per unit) and your app just calls hub methods; in <em>serverless</em> mode Functions push messages via REST. <strong>Web PubSub</strong> is the protocol-agnostic sibling (raw WebSocket, MQTT) with Python and JS server SDKs.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Default mode: your ASP.NET Core hub, connections held by the service
+builder.Services.AddSignalR().AddAzureSignalR(o =&gt; o.ConnectionString = null)   // uses Azure:SignalR:ConnectionString / identity-based
+    .AddMessagePackProtocol();
+app.MapHub&lt;OrdersHub&gt;(&quot;/hubs/orders&quot;);
+
+[Authorize]
+public class OrdersHub : Hub
+{
+    public override Task OnConnectedAsync() =&gt; Groups.AddToGroupAsync(Context.ConnectionId, $&quot;user:{Context.UserIdentifier}&quot;);
+    public Task Watch(int orderId) =&gt; Groups.AddToGroupAsync(Context.ConnectionId, $&quot;order:{orderId}&quot;);
+}
+
+// Push from anywhere in the app (a Service Bus consumer, for example)
+public class OrderStatusProjector(IHubContext&lt;OrdersHub&gt; hub)
+{
+    public Task OnShipped(OrderShipped e) =&gt; hub.Clients.Group($&quot;order:{e.OrderId}&quot;).SendAsync(&quot;statusChanged&quot;, new { e.OrderId, Status = &quot;Shipped&quot; });
+}
+
+// Identity-based connection string (no keys):  &quot;Endpoint=https://sigr-shop.service.signalr.net;AuthType=azure.msi;Version=1.0;&quot;</code></pre><pre data-lang="python" hidden><code># Serverless push with Web PubSub (Python server SDK) — clients connect with a negotiated client access URL
+from azure.messaging.webpubsubservice import WebPubSubServiceClient
+from azure.identity import DefaultAzureCredential
+
+svc = WebPubSubServiceClient(endpoint=&quot;https://wps-shop.webpubsub.azure.com&quot;, hub=&quot;orders&quot;, credential=DefaultAzureCredential())
+
+@app.post(&quot;/negotiate&quot;)
+def negotiate(user_id: str):
+    tok = svc.get_client_access_token(user_id=user_id, groups=[f&quot;user:{user_id}&quot;], minutes_to_expire=60)
+    return {&quot;url&quot;: tok[&quot;url&quot;]}
+
+def on_shipped(order_id: int, user_id: str):
+    svc.send_to_group(f&quot;order:{order_id}&quot;, {&quot;orderId&quot;: order_id, &quot;status&quot;: &quot;Shipped&quot;}, content_type=&quot;application/json&quot;)
+    svc.send_to_user(user_id, {&quot;type&quot;: &quot;toast&quot;, &quot;text&quot;: f&quot;Order {order_id} shipped&quot;})</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why scale-out breaks in-process SignalR (connection affinity, backplane); default vs serverless mode; groups vs users; auth on the hub and on negotiate; message ordering and delivery guarantees (none — design for it).</p></div></section>
+<section id="choosing"><h2 id="choosing">Which messaging service?</h2><p>The question you will be asked in every Azure design interview. The answer is about <em>semantics</em>, not throughput numbers.</p><div class="table-wrap"><table><thead><tr><th>Need</th><th>Service</th><th>Why</th></tr></thead><tbody><tr><td>Simple work queue, huge volume, cheap</td><td>Storage Queue</td><td>64 KB messages, at-least-once, 7-day TTL, no ordering or sessions</td></tr><tr><td>Commands with ordering, transactions, dead-letter, duplicate detection</td><td>Service Bus queue / topic</td><td>Peek-lock, sessions (FIFO per key), scheduled and deferred messages, pub/sub via topics + filters</td></tr><tr><td>Discrete events fanned out to many reactive subscribers</td><td>Event Grid</td><td>Push over HTTPS to any endpoint, per-subscription filtering, 24h retry, pennies per million</td></tr><tr><td>High-throughput telemetry / stream processed in order with replay</td><td>Event Hubs</td><td>Partitioned log with offsets, consumer groups, Kafka protocol, capture to storage</td></tr><tr><td>Long-running workflow with connectors / human steps</td><td>Logic Apps / Durable Functions</td><td>State and retries handled by the engine</td></tr><tr><td>Real-time push to browsers / devices</td><td>SignalR Service / Web PubSub</td><td>WebSocket fan-out managed for you</td></tr></tbody></table></div><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button></div><pre data-lang="csharp"><code>// A common composition in one order flow:
+//   API  --(command: PlaceOrder)--&gt;  Service Bus queue  --&gt;  Order worker (transactional outbox)
+//   Order worker --(event: OrderPlaced)--&gt;  Event Grid topic  --&gt;  Email func, Analytics func, Search indexer
+//   Devices/telemetry  --&gt;  Event Hubs  --&gt;  Stream Analytics / Functions  --&gt;  Cosmos / ADX
+//   Browser  &lt;--  SignalR Service  &lt;-- Order worker (status changes)
+
+// Idempotency is the common thread — every consumer must tolerate redelivery:
+public async Task Handle(OrderPlaced e, CancellationToken ct)
+{
+    if (await db.ProcessedEvents.AnyAsync(p =&gt; p.EventId == e.Id, ct)) return;      // dedupe table
+    await mailer.SendAsync(e.CustomerEmail, ct);
+    db.ProcessedEvents.Add(new ProcessedEvent(e.Id, DateTime.UtcNow));
+    await db.SaveChangesAsync(ct);
+}</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Given a scenario (order processing, IoT telemetry, cross-team notifications, chat), pick the service and defend it on delivery semantics, ordering, fan-out, retention and cost; explain at-least-once and the outbox pattern; where you would put a dead-letter monitor.</p></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/azure/api-management/" target="_blank" rel="noopener">API Management documentation</a></li><li><a href="https://learn.microsoft.com/azure/api-management/api-management-policies" target="_blank" rel="noopener">APIM policy reference</a></li><li><a href="https://learn.microsoft.com/azure/event-grid/" target="_blank" rel="noopener">Event Grid documentation</a></li><li><a href="https://learn.microsoft.com/azure/service-bus-messaging/compare-messaging-services" target="_blank" rel="noopener">Choose between Azure messaging services</a></li><li><a href="https://learn.microsoft.com/azure/azure-functions/durable/" target="_blank" rel="noopener">Durable Functions</a></li><li><a href="https://learn.microsoft.com/azure/azure-app-configuration/" target="_blank" rel="noopener">Azure App Configuration</a></li><li><a href="https://learn.microsoft.com/azure/azure-cache-for-redis/cache-best-practices-development" target="_blank" rel="noopener">Azure Cache for Redis best practices</a></li><li><a href="https://learn.microsoft.com/azure/azure-signalr/" target="_blank" rel="noopener">Azure SignalR Service</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

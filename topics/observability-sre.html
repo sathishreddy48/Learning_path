@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Observability &amp; SRE — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="observability-sre">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › DevOps › Topic 23 of 23</div>
+  <h1>Observability &amp; SRE</h1>
+  <p class="lede">Deploying is half the job; knowing it works — and knowing first when it does not — is the other half. This page turns the Application Insights section from Azure Services into a practice: what to emit, how to query it, what to alert on, how to define "good enough" with an SLO, and how to run and learn from incidents.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#pillars">Logs, metrics, traces — and structured logging</a></li><li><a href="#otel">OpenTelemetry → Azure Monitor</a></li><li><a href="#kql">KQL you will actually run</a></li><li><a href="#alerts">Alerts, action groups and avoiding fatigue</a></li><li><a href="#slo">SLIs, SLOs and error budgets</a></li><li><a href="#dashboards">Dashboards, workbooks and Grafana</a></li><li><a href="#incidents">Incident response, runbooks and postmortems</a></li><li><a href="#testing-resilience">Load testing and chaos engineering</a></li></ol>
+  </div>
+
+<section id="pillars"><h2 id="pillars">Logs, metrics, traces — and structured logging</h2><p><strong>Logs</strong> are events with context; <strong>metrics</strong> are cheap numeric time series for dashboards and alerts; <strong>traces</strong> tie a request together across services via a propagated <code>traceparent</code>. Emit logs as structured properties (not string concatenation), always with a correlation/trace ID, never with secrets or PII, and at a level you can afford to store. Metrics for anything you alert on; logs for the "why".</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Structured logging with message templates — properties become queryable columns, not text
+public partial class OrderService(ILogger&lt;OrderService&gt; log)
+{
+    [LoggerMessage(Level = LogLevel.Information, Message = &quot;Order {OrderId} placed for {CustomerId} with {ItemCount} items totalling {Total:C}&quot;)]
+    partial void LogPlaced(int orderId, string customerId, int itemCount, decimal total);       // source-generated, zero-alloc when disabled
+
+    public async Task PlaceAsync(Order o)
+    {
+        using var scope = log.BeginScope(new Dictionary&lt;string, object&gt; { [&quot;OrderId&quot;] = o.Id, [&quot;Tenant&quot;] = o.Tenant });   // attached to every log line inside
+        LogPlaced(o.Id, o.CustomerId, o.Items.Count, o.Total);
+        ...
+    }
+}
+
+// Custom metrics with System.Diagnostics.Metrics — picked up by OpenTelemetry and Azure Monitor
+public class ShopMetrics
+{
+    private readonly Counter&lt;long&gt; _orders;  private readonly Histogram&lt;double&gt; _checkout;
+    public ShopMetrics(IMeterFactory f)
+    {
+        var m = f.Create(&quot;Shop.Orders&quot;);
+        _orders = m.CreateCounter&lt;long&gt;(&quot;shop.orders.placed&quot;, unit: &quot;{order}&quot;);
+        _checkout = m.CreateHistogram&lt;double&gt;(&quot;shop.checkout.duration&quot;, unit: &quot;ms&quot;);
+    }
+    public void OrderPlaced(string channel) =&gt; _orders.Add(1, new KeyValuePair&lt;string, object?&gt;(&quot;channel&quot;, channel));
+    public void Checkout(double ms) =&gt; _checkout.Record(ms);
+}
+// Never:  log.LogInformation(&quot;Order &quot; + id + &quot; for &quot; + email)   — unqueryable, and email is PII.</code></pre><pre data-lang="python" hidden><code>import logging, structlog
+from opentelemetry import metrics, trace
+
+structlog.configure(processors=[
+    structlog.contextvars.merge_contextvars,                # request-scoped context (order_id, tenant)
+    structlog.processors.add_log_level, structlog.processors.TimeStamper(fmt=&quot;iso&quot;),
+    structlog.processors.JSONRenderer()])                   # JSON lines to stdout → collected by the platform
+log = structlog.get_logger()
+
+meter = metrics.get_meter(&quot;shop.orders&quot;)
+orders_placed = meter.create_counter(&quot;shop.orders.placed&quot;, unit=&quot;{order}&quot;)
+checkout_ms = meter.create_histogram(&quot;shop.checkout.duration&quot;, unit=&quot;ms&quot;)
+
+async def place_order(order):
+    structlog.contextvars.bind_contextvars(order_id=order.id, tenant=order.tenant)
+    with trace.get_tracer(&quot;shop&quot;).start_as_current_span(&quot;place_order&quot;) as span:
+        span.set_attribute(&quot;order.items&quot;, len(order.items))
+        log.info(&quot;order_placed&quot;, customer_id=order.customer_id, item_count=len(order.items), total=float(order.total))
+        orders_placed.add(1, {&quot;channel&quot;: order.channel})</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Which signal for which question; cardinality and why user IDs do not belong in metric labels; structured logging vs text; log levels and cost; PII in logs and how you prevent it; correlation across services.</p></div></section>
+<section id="otel"><h2 id="otel">OpenTelemetry → Azure Monitor</h2><p><strong>OpenTelemetry</strong> is the vendor-neutral standard for traces, metrics and logs; the <strong>Azure Monitor OpenTelemetry distro</strong> configures exporters, auto-instrumentation (HTTP, SQL, Redis, Service Bus) and live metrics in one call. Sampling keeps cost sane: keep 100% of errors and slow requests, sample the rest. Set the cloud role name so the application map shows real services.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Azure.Monitor.OpenTelemetry.AspNetCore — one line, then customise
+builder.Services.AddOpenTelemetry()
+    .UseAzureMonitor(o =&gt;
+    {
+        o.ConnectionString = builder.Configuration[&quot;APPLICATIONINSIGHTS_CONNECTION_STRING&quot;];
+        o.SamplingRatio = 0.2f;                                         // 20% of traces (errors/dependencies inside them kept consistently)
+        o.Credential = new DefaultAzureCredential();                    // Entra auth for ingestion (disable local auth on the resource)
+    })
+    .ConfigureResource(r =&gt; r.AddService(&quot;orders-api&quot;, serviceVersion: typeof(Program).Assembly.GetName().Version?.ToString())
+                              .AddAttributes(new Dictionary&lt;string, object&gt; { [&quot;deployment.environment&quot;] = builder.Environment.EnvironmentName }))
+    .WithMetrics(m =&gt; m.AddMeter(&quot;Shop.Orders&quot;))                         // your custom meter
+    .WithTracing(t =&gt; t.AddSource(&quot;Shop.Orders&quot;)                          // your ActivitySource
+                       .AddProcessor(new PiiScrubbingProcessor()));      // drop/mask attributes before export
+
+// Manual spans for business steps
+private static readonly ActivitySource Source = new(&quot;Shop.Orders&quot;);
+using var act = Source.StartActivity(&quot;checkout.pricing&quot;);
+act?.SetTag(&quot;order.id&quot;, order.Id);
+act?.AddEvent(new ActivityEvent(&quot;coupon.applied&quot;));
+
+// Propagation across Service Bus: the SDK stamps Diagnostic-Id on messages; the consumer links to it automatically.
+// Console/Docker/Kubernetes: stdout stays JSON via Microsoft.Extensions.Logging.Console JsonFormatter for the platform collector too.</code></pre><pre data-lang="python" hidden><code># azure-monitor-opentelemetry distro: auto-instruments FastAPI/Flask/Django, requests/httpx, psycopg, redis, azure SDKs
+from azure.monitor.opentelemetry import configure_azure_monitor
+from azure.identity import DefaultAzureCredential
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+
+configure_azure_monitor(
+    connection_string=os.environ[&quot;APPLICATIONINSIGHTS_CONNECTION_STRING&quot;],
+    credential=DefaultAzureCredential(),
+    resource=Resource.create({&quot;service.name&quot;: &quot;orders-worker&quot;, &quot;service.version&quot;: VERSION, &quot;deployment.environment&quot;: ENV}),
+    sampler=ParentBased(TraceIdRatioBased(0.2)),
+    logger_name=&quot;shop&quot;,                       # only loggers under &quot;shop&quot; are exported as traces/logs
+    enable_live_metrics=True)
+
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+FastAPIInstrumentor.instrument_app(app, excluded_urls=&quot;health/.*&quot;)     # keep probes out of your data
+
+tracer = trace.get_tracer(&quot;shop.orders&quot;)
+with tracer.start_as_current_span(&quot;checkout.pricing&quot;, attributes={&quot;order.id&quot;: order.id}):
+    ...</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why OTel over the classic SDK; head vs tail sampling; resource attributes and the application map; excluding health probes; the cost model (GB ingested) and what sampling does to counts; exporting to Prometheus/Grafana alongside.</p></div></section>
+<section id="kql"><h2 id="kql">KQL you will actually run</h2><p>Application Insights (workspace-based) lands in Log Analytics tables: <code>AppRequests</code>, <code>AppDependencies</code>, <code>AppExceptions</code>, <code>AppTraces</code>, <code>AppMetrics</code>, joined by <code>OperationId</code>. Learn a dozen shapes — filter, summarize by bin, percentiles, join on operation, render — and you can answer most production questions in minutes. Save the good ones as functions.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="kql">KQL</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="kql"><code>// 1) Golden signals per endpoint, last hour
+AppRequests
+| where TimeGenerated &gt; ago(1h) and AppRoleName == &quot;orders-api&quot;
+| summarize count(), errors = countif(Success == false), p50 = percentile(DurationMs, 50), p95 = percentile(DurationMs, 95), p99 = percentile(DurationMs, 99) by Name
+| extend errorRate = round(100.0 * errors / count_, 2)
+| order by p95 desc
+
+// 2) Requests per minute and error rate over time (chart)
+AppRequests
+| where TimeGenerated &gt; ago(6h)
+| summarize rpm = count(), errRate = 100.0 * countif(Success == false) / count() by bin(TimeGenerated, 1m)
+| render timechart
+
+// 3) Everything about one failed request: request, dependencies, exceptions, traces
+let op = &quot;a1b2c3d4e5f6...&quot;;
+union AppRequests, AppDependencies, AppExceptions, AppTraces
+| where OperationId == op
+| project TimeGenerated, Type, Name, DurationMs, Success, ResultCode, Message = coalesce(Message, OuterMessage, Name), Properties
+| order by TimeGenerated asc
+
+// 4) Slowest dependencies (SQL, HTTP, Redis) and who calls them
+AppDependencies
+| where TimeGenerated &gt; ago(1h)
+| summarize calls = count(), p95 = percentile(DurationMs, 95), fails = countif(Success == false) by DependencyType, Target, Name
+| top 15 by p95
+
+// 5) New exceptions after the last deploy
+AppExceptions
+| where TimeGenerated &gt; ago(24h)
+| summarize n = count(), first = min(TimeGenerated), sample = any(OuterMessage) by ProblemId, AppVersion = tostring(Properties[&quot;service.version&quot;])
+| order by first desc
+
+// 6) Custom metric and structured log properties
+AppMetrics | where Name == &quot;shop.checkout.duration&quot; | summarize percentile(Sum / ItemCount, 95) by bin(TimeGenerated, 5m) | render timechart
+AppTraces  | where Message has &quot;Order&quot; | extend OrderId = toint(Properties[&quot;OrderId&quot;]), Tenant = tostring(Properties[&quot;Tenant&quot;]) | summarize count() by Tenant
+
+// 7) Availability from the outside (standard tests)
+AppAvailabilityResults | where TimeGenerated &gt; ago(7d) | summarize availability = 100.0 * countif(Success) / count() by Name, bin(TimeGenerated, 1d)</code></pre><pre data-lang="bash" hidden><code># Run KQL from the CLI / a script (handy in runbooks and pipelines)
+WS=$(az monitor log-analytics workspace show -g rg-platform-logs -n law-platform --query customerId -o tsv)
+az monitor log-analytics query -w $WS --analytics-query &#x27;AppRequests | where TimeGenerated &gt; ago(15m) | summarize errRate = 100.0*countif(Success==false)/count()&#x27; -o tsv
+
+# App Insights REST for the classic resource id
+az monitor app-insights query --app ai-shop -g rg-shop --analytics-query &#x27;requests | where timestamp &gt; ago(15m) | count&#x27; --offset 15m</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Explain a query shape on the spot (error rate per endpoint, p95 over time, trace a request); <code>summarize</code>/<code>bin</code>/<code>percentile</code>/<code>join</code>; sampling and <code>ItemCount</code>; workspace-based vs classic tables; cost-aware querying (time filter first).</p></div></section>
+<section id="alerts"><h2 id="alerts">Alerts, action groups and avoiding fatigue</h2><p>Alert on <strong>symptoms users feel</strong> (error rate, latency, availability, queue age) rather than causes (CPU), with thresholds tied to your SLO and a duration window that filters blips. <strong>Action groups</strong> route to on-call (PagerDuty/Opsgenie/Teams/email/webhook/Function). Use severity consistently (Sev0–1 pages, Sev2–3 tickets), add <strong>alert processing rules</strong> for maintenance windows, and review noisy alerts weekly.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="bicep">Bicep</button></div><pre data-lang="bash"><code># Action group: page on-call via webhook + email the team
+az monitor action-group create -g rg-shop -n ag-shop-oncall --short-name shop-oncall   --action email team shop-team@contoso.com --action webhook pagerduty https://events.pagerduty.com/integration/&lt;key&gt;/enqueue
+
+# Log alert: error rate &gt; 2% for 10 minutes, evaluated every 5 (Sev1 → pages)
+az monitor scheduled-query create -g rg-shop -n &quot;orders-api error rate&quot; --severity 1 --action-groups ag-shop-oncall   --scopes $(az monitor log-analytics workspace show -g rg-platform-logs -n law-platform --query id -o tsv)   --evaluation-frequency 5m --window-size 10m --auto-mitigate true   --condition &quot;count &#x27;Placeholder&#x27; &gt; 0&quot; --condition-query &#x27;Placeholder=AppRequests | where AppRoleName == &quot;orders-api&quot; | summarize err = 100.0*countif(Success==false)/count() | where err &gt; 2&#x27;
+
+# Metric alert: p95 latency (dynamic threshold learns the daily pattern)
+az monitor metrics alert create -g rg-shop -n &quot;orders-api p95 latency&quot; --severity 2 --action ag-shop-oncall   --scopes $(az monitor app-insights component show -g rg-shop -a ai-shop --query id -o tsv)   --condition &quot;avg requests/duration &gt; dynamic medium 2 of 4 since 2026-09-01&quot; --window-size 15m --evaluation-frequency 5m
+
+# Availability test + alert (external synthetic probe from 5 regions)
+az monitor app-insights web-test create -g rg-shop -n ready-probe --defined-web-test-name ready-probe --location westeurope --kind standard   --request-url https://api.contoso.com/health/ready --frequency 300 --timeout 30 --retry-enabled true --enabled true   --locations Id=emea-nl-ams-azr Id=us-va-ash-azr Id=apac-sg-sin-azr Id=emea-gb-db3-azr Id=us-ca-sjc-azr --tags &quot;hidden-link:$(az monitor app-insights component show -g rg-shop -a ai-shop --query id -o tsv)=Resource&quot;
+
+# Service Bus: oldest message age (backlog users will notice) and dead-letter growth
+az monitor metrics alert create -g rg-shop -n &quot;orders queue backlog&quot; --severity 2 --action ag-shop-oncall   --scopes $(az servicebus namespace show -g rg-shop -n sb-shop --query id -o tsv) --condition &quot;max ActiveMessages &gt; 1000 where EntityName includes orders&quot; --window-size 15m
+
+# Maintenance window: suppress everything in the RG during the deploy
+az monitor alert-processing-rule create -g rg-shop -n suppress-deploy --rule-type RemoveAllActionGroups --scopes /subscriptions/&lt;sub&gt;/resourceGroups/rg-shop-prod   --schedule-recurrence-type Weekly --schedule-recurrence Tuesday --schedule-start-time 02:00 --schedule-end-time 03:00</code></pre><pre data-lang="bicep" hidden><code>// Alerts belong in IaC next to the service they protect
+resource errRate &#x27;Microsoft.Insights/scheduledQueryRules@2023-03-15-preview&#x27; = {
+  name: &#x27;orders-api-error-rate&#x27;, location: location
+  properties: {
+    severity: 1, enabled: true, evaluationFrequency: &#x27;PT5M&#x27;, windowSize: &#x27;PT10M&#x27;, autoMitigate: true
+    scopes: [ logAnalyticsId ]
+    criteria: { allOf: [ {
+      query: &#x27;AppRequests | where AppRoleName == &quot;orders-api&quot; | summarize err = 100.0*countif(Success==false)/count()&#x27;
+      timeAggregation: &#x27;Average&#x27;, metricMeasureColumn: &#x27;err&#x27;, operator: &#x27;GreaterThan&#x27;, threshold: 2, failingPeriods: { numberOfEvaluationPeriods: 2, minFailingPeriodsToAlert: 2 } } ] }
+    actions: { actionGroups: [ actionGroupId ], customProperties: { runbook: &#x27;https://wiki.contoso.com/runbooks/orders-api-errors&#x27; } }
+  }
+}</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Symptom vs cause alerts; how you pick thresholds (SLO burn rate); static vs dynamic thresholds; severity policy and paging rules; alert fatigue and how you fix it; where alert definitions live (IaC) and how you test them.</p></div></section>
+<section id="slo"><h2 id="slo">SLIs, SLOs and error budgets</h2><p>An <strong>SLI</strong> is a measurement of user-visible behaviour (fraction of successful requests, fraction under 500 ms). An <strong>SLO</strong> is the target over a window (99.9% of requests succeed over 30 days). The <strong>error budget</strong> is what is left (0.1% ≈ 43 min/month of full outage); burning it fast pages, burning it steadily triggers a reliability conversation. SLOs make "is it reliable enough" a number rather than an argument.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="kql">KQL</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="kql"><code>// Availability SLI over 30 days, plus remaining error budget for a 99.9% SLO
+let slo = 0.999;
+AppRequests
+| where TimeGenerated &gt; ago(30d) and AppRoleName == &quot;orders-api&quot; and Name !has &quot;health&quot;
+| summarize total = count(), good = countif(Success == true and DurationMs &lt; 500)          // &quot;good&quot; = succeeded AND fast enough
+| extend sli = 1.0 * good / total, budget = (1 - slo) * total, burned = total - good
+| extend budgetRemainingPct = round(100.0 * (budget - burned) / budget, 1)
+
+// Multi-window burn-rate alert (Google SRE style): page when both 1h and 5m burn &gt; 14.4× (2% of monthly budget in 1 hour)
+let slo = 0.999;
+let burn = (w: timespan) {
+    AppRequests
+    | where TimeGenerated &gt; ago(w) and AppRoleName == &quot;orders-api&quot; and Name !has &quot;health&quot;
+    | summarize errRate = 1.0 * countif(Success == false or DurationMs &gt;= 500) / count()
+    | extend burnRate = errRate / (1 - slo)
+};
+burn(1h) | extend win = &quot;1h&quot; | union (burn(5m) | extend win = &quot;5m&quot;)
+| summarize minBurn = min(burnRate)
+| where minBurn &gt; 14.4</code></pre><pre data-lang="python" hidden><code># Error budget maths you should be able to do in your head
+def budget_minutes(slo: float, days: int = 30) -&gt; float:
+    return (1 - slo) * days * 24 * 60
+
+for slo in (0.99, 0.995, 0.999, 0.9999):
+    print(f&quot;{slo:.2%}: {budget_minutes(slo):7.1f} min/month of total outage&quot;)
+# 99.00%:   432.0 min   99.50%: 216.0 min   99.90%: 43.2 min   99.99%: 4.3 min
+
+# Burn rate: how fast are we consuming the budget relative to &quot;exactly on target&quot;?
+def burn_rate(error_rate: float, slo: float) -&gt; float:
+    return error_rate / (1 - slo)
+print(burn_rate(0.0144, 0.999))   # 14.4 → at this rate the whole monthly budget goes in ~2 days</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Define an SLI/SLO for a given service and defend the number; why 100% is wrong; error budget policy (what happens when it is exhausted — feature freeze?); burn-rate alerting vs threshold alerting; SLOs for async work (queue age, freshness).</p></div></section>
+<section id="dashboards"><h2 id="dashboards">Dashboards, workbooks and Grafana</h2><p>Dashboards answer "is it healthy now" in five seconds: the golden signals per service, SLO status, deploy markers, dependency health. <strong>Azure Workbooks</strong> are parameterised, KQL-backed and versionable as JSON; <strong>Azure Managed Grafana</strong> is the choice when teams already speak Grafana or need multi-source panels (Prometheus from AKS + Log Analytics). Keep dashboards in IaC and delete the ones nobody opens.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="json">Workbook (excerpt)</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="json"><code>{
+  &quot;version&quot;: &quot;Notebook/1.0&quot;,
+  &quot;items&quot;: [
+    { &quot;type&quot;: 9, &quot;content&quot;: { &quot;version&quot;: &quot;KqlParameterItem/1.0&quot;, &quot;parameters&quot;: [
+        { &quot;name&quot;: &quot;TimeRange&quot;, &quot;type&quot;: 4, &quot;value&quot;: { &quot;durationMs&quot;: 3600000 } },
+        { &quot;name&quot;: &quot;Service&quot;, &quot;type&quot;: 2, &quot;query&quot;: &quot;AppRequests | distinct AppRoleName&quot;, &quot;value&quot;: &quot;orders-api&quot;, &quot;queryType&quot;: 0 } ] } },
+    { &quot;type&quot;: 3, &quot;content&quot;: { &quot;version&quot;: &quot;KqlItem/1.0&quot;, &quot;title&quot;: &quot;Requests &amp; error rate&quot;,
+        &quot;query&quot;: &quot;AppRequests | where AppRoleName == &#x27;{Service}&#x27; | summarize rpm = count(), errRate = 100.0*countif(Success==false)/count() by bin(TimeGenerated, 1m)&quot;,
+        &quot;visualization&quot;: &quot;timechart&quot;, &quot;queryType&quot;: 0, &quot;resourceType&quot;: &quot;microsoft.operationalinsights/workspaces&quot; } },
+    { &quot;type&quot;: 3, &quot;content&quot;: { &quot;version&quot;: &quot;KqlItem/1.0&quot;, &quot;title&quot;: &quot;p95 latency by endpoint&quot;,
+        &quot;query&quot;: &quot;AppRequests | where AppRoleName == &#x27;{Service}&#x27; | summarize p95 = percentile(DurationMs, 95) by Name, bin(TimeGenerated, 5m)&quot;,
+        &quot;visualization&quot;: &quot;linechart&quot;, &quot;queryType&quot;: 0, &quot;resourceType&quot;: &quot;microsoft.operationalinsights/workspaces&quot; } },
+    { &quot;type&quot;: 1, &quot;content&quot;: { &quot;json&quot;: &quot;### Runbook\n[orders-api](https://wiki.contoso.com/runbooks/orders-api) · [On-call](https://contoso.pagerduty.com)&quot; } }
+  ]
+}</code></pre><pre data-lang="bash" hidden><code># Deploy the workbook as a resource (versioned in git)
+az monitor app-insights workbook create -g rg-shop -n $(uuidgen) --display-name &quot;Orders API&quot; --category workbook   --source-id $(az monitor log-analytics workspace show -g rg-platform-logs -n law-platform --query id -o tsv)   --serialized-data @workbooks/orders-api.json
+
+# Azure Managed Grafana wired to Azure Monitor + Prometheus from AKS
+az grafana create -g rg-platform -n grafana-contoso --sku Standard --zone-redundancy Enabled
+az grafana data-source create -n grafana-contoso --definition &#x27;{&quot;name&quot;:&quot;Azure Monitor&quot;,&quot;type&quot;:&quot;grafana-azure-monitor-datasource&quot;,&quot;jsonData&quot;:{&quot;azureAuthType&quot;:&quot;msi&quot;}}&#x27;
+az aks update -g rg-shop -n aks-shop --enable-azure-monitor-metrics --grafana-resource-id $(az grafana show -g rg-platform -n grafana-contoso --query id -o tsv)
+az grafana dashboard import -n grafana-contoso --definition @dashboards/orders-api.json --overwrite true
+
+# Deploy markers: annotate releases so graphs show what changed
+az monitor app-insights component create-annotation ... # or POST to the Annotations API from the pipeline with the version and commit</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>What goes on the on-call dashboard vs the deep-dive; workbooks vs Grafana vs Azure dashboards; parameterisation; deploy annotations; dashboards as code; how you know a dashboard is actually used.</p></div></section>
+<section id="incidents"><h2 id="incidents">Incident response, runbooks and postmortems</h2><p>Roles: <strong>incident commander</strong> (decides, communicates), <strong>ops lead</strong> (hands on keyboard), <strong>comms</strong> (status page, stakeholders). Process: detect → triage severity → mitigate first (roll back, scale, fail over, feature-flag off) → diagnose later → resolve → <strong>blameless postmortem</strong> with action items that actually get scheduled. <strong>Runbooks</strong> live next to the alert that fires and start with the mitigation, not the theory.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">Runbook template</button><button role="tab" aria-selected="false" data-lang="yaml">Postmortem template</button></div><pre data-lang="yaml"><code># runbooks/orders-api-error-rate.md
+title: orders-api — elevated error rate (Sev1)
+alert: &quot;orders-api error rate&quot;  (fires when 5xx &gt; 2% for 10 min)
+impact: customers cannot place orders; checkout shows a generic error
+
+first 5 minutes:
+  - Acknowledge in PagerDuty; open the incident channel #inc-&lt;date&gt;; post &quot;investigating&quot; on the status page
+  - Dashboard: Orders API workbook → error rate, p95, dependencies panel
+  - Did we deploy in the last 60 min?  →  az webapp deployment slot swap --slot staging --target-slot production  (swap back)  OR  containerapp traffic set to previous revision
+  - Is a dependency failing? AppDependencies | where Success == false | summarize count() by Target
+      • SQL: check failover group state, DTU/CPU; consider read-only degradation flag  Shop:Checkout:ReadOnly=true (App Configuration)
+      • Service Bus: dead-letter growth → pause consumer, drain DLQ later
+      • Redis: fail open — flag Shop:Cache:Enabled=false
+  - Traffic spike? scale out: az appservice plan update --number-of-workers 6; enable WAF rate-limit rule
+escalation: DB on-call (#db-oncall), platform on-call (#platform-oncall); Sev1 → engineering manager after 30 min
+comms cadence: status page every 30 min until resolved
+after: schedule postmortem within 48 h using the template; link the timeline export from the incident channel</code></pre><pre data-lang="yaml" hidden><code># postmortems/2026-09-17-orders-api-outage.md
+summary: 41 minutes of failed checkouts for ~12% of users after a deploy introduced a connection-pool leak
+severity: Sev1        detected by: alert (orders-api error rate) at 14:02, 7 min after deploy
+customer impact: ~1,900 failed orders; ~600 retried successfully later; 0 data loss
+timeline:
+  - 13:55 deploy 1.4.2 swapped to production
+  - 14:02 alert fires; on-call acknowledges (2 min)
+  - 14:09 dashboard shows SQL dependency failures climbing; hypothesis: deploy
+  - 14:14 rollback (slot swap) — errors stop by 14:16
+  - 14:36 all queued retries processed; status page resolved
+root cause (5 whys): DbContext created outside DI in a new background job → pool exhaustion → timeouts → 5xx
+what went well: alert fired in 7 min; rollback took 2 min; runbook was followed
+what went badly: no integration test covered the job; canary would have caught it with 10% traffic; error budget: 41 min of 43 burned
+action items:
+  - [ ] Add analyzer rule banning `new ShopDb(` outside tests (owner: A, due: 2026-09-24)
+  - [ ] Container Apps canary with automated promotion (owner: B, due: 2026-10-08)
+  - [ ] Pool-exhaustion alert on SQL connection count (owner: C, due: 2026-09-24)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Walk through an incident you ran: detection time, mitigation vs fix, comms; what "blameless" means in practice and why it matters for reporting; how action items are tracked; game days and on-call health (paging load, handoffs).</p></div></section>
+<section id="testing-resilience"><h2 id="testing-resilience">Load testing and chaos engineering</h2><p>Prove capacity and resilience before customers do. <strong>Azure Load Testing</strong> runs JMeter/Locust scripts at scale with server-side metrics and pass/fail criteria in the pipeline. <strong>Azure Chaos Studio</strong> injects faults (CPU pressure, network latency, kill AKS pods, Cosmos failover, Key Vault deny) under an experiment you can gate and abort. Start small: one hypothesis, one fault, steady-state metrics before and after.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Locust</button><button role="tab" aria-selected="false" data-lang="yaml">Load test config</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="python"><code># loadtest/locustfile.py — runs locally or in Azure Load Testing
+from locust import HttpUser, task, between
+
+class Shopper(HttpUser):
+    wait_time = between(0.5, 2)
+    host = &quot;https://api-staging.contoso.com&quot;
+
+    def on_start(self):
+        self.client.headers[&quot;Authorization&quot;] = f&quot;Bearer {TOKEN}&quot;
+
+    @task(5)
+    def browse(self):
+        with self.client.get(&quot;/products?page=1&quot;, name=&quot;/products&quot;, catch_response=True) as r:
+            if r.elapsed.total_seconds() &gt; 0.5: r.failure(&quot;slow&quot;)
+
+    @task(1)
+    def checkout(self):
+        self.client.post(&quot;/orders&quot;, json={&quot;items&quot;: [{&quot;sku&quot;: &quot;JKT-001&quot;, &quot;qty&quot;: 1}]}, name=&quot;/orders&quot;)</code></pre><pre data-lang="yaml" hidden><code># loadtest/config.yaml  (Azure Load Testing)
+version: v0.1
+testId: orders-api-baseline
+displayName: orders-api baseline
+testPlan: locustfile.py
+testType: Locust
+engineInstances: 3
+env: [{ name: LOCUST_USERS, value: &quot;300&quot; }, { name: LOCUST_SPAWN_RATE, value: &quot;20&quot; }, { name: LOCUST_RUN_TIME, value: &quot;10m&quot; }]
+secrets: [{ name: TOKEN, value: https://kv-shop.vault.azure.net/secrets/loadtest-token }]
+failureCriteria:
+  - avg(response_time_ms) &gt; 400
+  - percentage(error) &gt; 1
+  - p95(response_time_ms) &gt; 800
+appComponents:                                        # server-side metrics captured alongside
+  - resourceId: /subscriptions/&lt;sub&gt;/resourceGroups/rg-shop-staging/providers/Microsoft.Web/sites/shop-api-staging
+  - resourceId: /subscriptions/&lt;sub&gt;/resourceGroups/rg-shop-staging/providers/Microsoft.Sql/servers/sql-shop/databases/shopdb</code></pre><pre data-lang="bash" hidden><code># Load test in the pipeline (fails the stage on criteria)
+az load test create  -g rg-shop --load-test-resource lt-shop --test-id orders-api-baseline --load-test-config-file loadtest/config.yaml
+az load test-run create -g rg-shop --load-test-resource lt-shop --test-id orders-api-baseline --test-run-id run-$(date +%s) --wait
+
+# Chaos Studio: kill 50% of orders-api pods for 5 minutes; hypothesis: error rate stays &lt; 1%, HPA restores capacity
+az rest --method PUT --uri &quot;https://management.azure.com/subscriptions/&lt;sub&gt;/resourceGroups/rg-shop-staging/providers/Microsoft.Chaos/experiments/pod-kill?api-version=2024-01-01&quot; --body &#x27;{
+  &quot;location&quot;: &quot;westeurope&quot;, &quot;identity&quot;: { &quot;type&quot;: &quot;SystemAssigned&quot; },
+  &quot;properties&quot;: {
+    &quot;selectors&quot;: [{ &quot;type&quot;: &quot;List&quot;, &quot;id&quot;: &quot;aks&quot;, &quot;targets&quot;: [{ &quot;type&quot;: &quot;ChaosTarget&quot;, &quot;id&quot;: &quot;/subscriptions/&lt;sub&gt;/resourceGroups/rg-shop-staging/providers/Microsoft.ContainerService/managedClusters/aks-shop-staging/providers/Microsoft.Chaos/targets/Microsoft-AzureKubernetesServiceChaosMesh&quot; }] }],
+    &quot;steps&quot;: [{ &quot;name&quot;: &quot;step1&quot;, &quot;branches&quot;: [{ &quot;name&quot;: &quot;b1&quot;, &quot;actions&quot;: [{
+      &quot;type&quot;: &quot;continuous&quot;, &quot;name&quot;: &quot;urn:csci:microsoft:azureKubernetesServiceChaosMesh:podChaos/2.2&quot;, &quot;duration&quot;: &quot;PT5M&quot;, &quot;selectorId&quot;: &quot;aks&quot;,
+      &quot;parameters&quot;: [{ &quot;key&quot;: &quot;jsonSpec&quot;, &quot;value&quot;: &quot;{\&quot;action\&quot;:\&quot;pod-kill\&quot;,\&quot;mode\&quot;:\&quot;fixed-percent\&quot;,\&quot;value\&quot;:\&quot;50\&quot;,\&quot;selector\&quot;:{\&quot;namespaces\&quot;:[\&quot;shop\&quot;],\&quot;labelSelectors\&quot;:{\&quot;app\&quot;:\&quot;orders-api\&quot;}}}&quot; }] }] }] }] } }&#x27;
+az rest --method POST --uri &quot;https://management.azure.com/subscriptions/&lt;sub&gt;/resourceGroups/rg-shop-staging/providers/Microsoft.Chaos/experiments/pod-kill/start?api-version=2024-01-01&quot;
+# Watch the SLO query during the experiment; abort with .../cancel if the hypothesis fails badly.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>What you load-test (realistic mix, think time, data volume) and what you measure server-side; pass/fail criteria in CI; chaos hypothesis design and blast radius; game days; what your last resilience finding was and what you changed.</p></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/azure/azure-monitor/app/opentelemetry-enable" target="_blank" rel="noopener">Azure Monitor OpenTelemetry (.NET, Python)</a></li><li><a href="https://learn.microsoft.com/azure/data-explorer/kql-quick-reference" target="_blank" rel="noopener">KQL quick reference</a></li><li><a href="https://learn.microsoft.com/azure/azure-monitor/alerts/alerts-overview" target="_blank" rel="noopener">Azure Monitor alerts overview</a></li><li><a href="https://sre.google/workbook/alerting-on-slos/" target="_blank" rel="noopener">Google SRE book — SLOs and alerting on SLOs</a></li><li><a href="https://learn.microsoft.com/azure/azure-monitor/visualize/workbooks-overview" target="_blank" rel="noopener">Azure Workbooks</a></li><li><a href="https://learn.microsoft.com/azure/load-testing/" target="_blank" rel="noopener">Azure Load Testing</a></li><li><a href="https://learn.microsoft.com/azure/chaos-studio/" target="_blank" rel="noopener">Azure Chaos Studio</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

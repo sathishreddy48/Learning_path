@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure Data, Search &amp; AI — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="azure-data-ai">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Azure › Topic 16 of 23</div>
+  <h1>Azure Data, Search &amp; AI</h1>
+  <p class="lede">Interviews increasingly include "and how would you add search / analytics / an AI assistant to this?". This page covers the Azure pieces that answer that: where analytical data lives, how it moves, how you index and search it (including vectors), and how you call Azure OpenAI from .NET and Python without shipping a demo that falls over in production.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#data-lake">Data Lake Storage Gen2 and Parquet</a></li><li><a href="#pipelines">Data Factory, Synapse and Microsoft Fabric</a></li><li><a href="#ai-search">Azure AI Search: indexes, indexers and vector search</a></li><li><a href="#azure-openai">Azure OpenAI: chat, embeddings and structured output</a></li><li><a href="#rag">The RAG pattern end to end</a></li><li><a href="#document-intelligence">Azure AI services: Document Intelligence, Language, Vision</a></li></ol>
+  </div>
+
+<section id="data-lake"><h2 id="data-lake">Data Lake Storage Gen2 and Parquet</h2><p><strong>ADLS Gen2</strong> is Blob Storage with a hierarchical namespace (real directories, POSIX ACLs) — the landing zone for analytics. Store columnar <strong>Parquet</strong> (or Delta) partitioned by date; every engine (Synapse, Databricks, Fabric, DuckDB, pandas) reads it. Layout convention: <code>bronze/</code> raw, <code>silver/</code> cleaned, <code>gold/</code> aggregated.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Write events to the lake as Parquet, one file per hour (Parquet.Net + Azure.Storage.Files.DataLake)
+var lake = new DataLakeServiceClient(new Uri(&quot;https://dlsshop.dfs.core.windows.net&quot;), new DefaultAzureCredential());
+var fs = lake.GetFileSystemClient(&quot;bronze&quot;);
+var path = $&quot;orders/year={now:yyyy}/month={now:MM}/day={now:dd}/orders-{now:HH}.parquet&quot;;
+
+await using var ms = new MemoryStream();
+await ParquetSerializer.SerializeAsync(orders, ms);          // orders: IEnumerable&lt;OrderRow&gt; (plain POCO)
+ms.Position = 0;
+var file = fs.GetFileClient(path);
+await file.UploadAsync(ms, overwrite: true);
+
+// ACLs are per directory/file (in addition to RBAC) — grant the analytics SP read on silver/
+var dir = fs.GetDirectoryClient(&quot;silver&quot;);
+await dir.SetAccessControlRecursiveAsync(new[] { new PathAccessControlItem(AccessControlType.User, RolePermissions.Read | RolePermissions.Execute, entityId: analyticsSpObjectId) });</code></pre><pre data-lang="python" hidden><code># pandas / pyarrow straight against the lake with identity auth
+import pandas as pd
+from azure.identity import DefaultAzureCredential
+
+storage_options = {&quot;account_name&quot;: &quot;dlsshop&quot;, &quot;credential&quot;: DefaultAzureCredential()}   # via adlfs
+df = pd.read_parquet(&quot;abfs://bronze/orders/year=2026/month=09/&quot;, storage_options=storage_options)
+daily = df.groupby(df.created.dt.date).agg(orders=(&quot;id&quot;, &quot;count&quot;), revenue=(&quot;total&quot;, &quot;sum&quot;)).reset_index()
+daily.to_parquet(&quot;abfs://gold/daily_sales/2026-09.parquet&quot;, storage_options=storage_options, index=False)
+
+# DuckDB for ad-hoc analysis without a cluster
+import duckdb
+duckdb.sql(&quot;SELECT country, sum(total) FROM read_parquet(&#x27;bronze/orders/**/*.parquet&#x27;, hive_partitioning=true) GROUP BY 1 ORDER BY 2 DESC&quot;)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why columnar formats for analytics; partition pruning; hierarchical namespace vs flat blobs (rename cost, ACLs); medallion layout; small-files problem and compaction; lifecycle policies to cool/archive old partitions.</p></div></section>
+<section id="pipelines"><h2 id="pipelines">Data Factory, Synapse and Microsoft Fabric</h2><p><strong>Data Factory</strong> orchestrates copy and transform activities (100+ connectors, mapping data flows, triggers). <strong>Synapse</strong> bundled pipelines with serverless SQL and Spark pools. <strong>Microsoft Fabric</strong> is the current SaaS umbrella (OneLake, Lakehouse, Warehouse, pipelines, Power BI) and where new investment goes. Application teams mostly need to: land data reliably, expose a change feed, and avoid hammering the OLTP database.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="json">ADF pipeline</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="json"><code>{
+  &quot;name&quot;: &quot;CopyOrdersToLake&quot;,
+  &quot;properties&quot;: {
+    &quot;activities&quot;: [{
+      &quot;name&quot;: &quot;CopyIncremental&quot;, &quot;type&quot;: &quot;Copy&quot;,
+      &quot;inputs&quot;:  [{ &quot;referenceName&quot;: &quot;AzureSqlOrders&quot;, &quot;type&quot;: &quot;DatasetReference&quot; }],
+      &quot;outputs&quot;: [{ &quot;referenceName&quot;: &quot;LakeOrdersParquet&quot;, &quot;type&quot;: &quot;DatasetReference&quot;,
+                    &quot;parameters&quot;: { &quot;path&quot;: &quot;bronze/orders/@{formatDateTime(pipeline().TriggerTime,&#x27;yyyy/MM/dd&#x27;)}&quot; } }],
+      &quot;typeProperties&quot;: {
+        &quot;source&quot;: { &quot;type&quot;: &quot;AzureSqlSource&quot;,
+          &quot;sqlReaderQuery&quot;: &quot;SELECT * FROM dbo.Orders WHERE ModifiedAt &gt; &#x27;@{pipeline().parameters.watermark}&#x27;&quot; },
+        &quot;sink&quot;: { &quot;type&quot;: &quot;ParquetSink&quot; },
+        &quot;enableStaging&quot;: false
+      },
+      &quot;policy&quot;: { &quot;retry&quot;: 2, &quot;timeout&quot;: &quot;0.01:00:00&quot; }
+    }, {
+      &quot;name&quot;: &quot;UpdateWatermark&quot;, &quot;type&quot;: &quot;SqlServerStoredProcedure&quot;, &quot;dependsOn&quot;: [{ &quot;activity&quot;: &quot;CopyIncremental&quot;, &quot;dependencyConditions&quot;: [&quot;Succeeded&quot;] }],
+      &quot;typeProperties&quot;: { &quot;storedProcedureName&quot;: &quot;etl.SetWatermark&quot;, &quot;storedProcedureParameters&quot;: { &quot;table&quot;: { &quot;value&quot;: &quot;Orders&quot; }, &quot;value&quot;: { &quot;value&quot;: &quot;@{pipeline().TriggerTime}&quot; } } }
+    }],
+    &quot;parameters&quot;: { &quot;watermark&quot;: { &quot;type&quot;: &quot;string&quot; } }
+  }
+}</code></pre><pre data-lang="python" hidden><code># Trigger and monitor a pipeline from code (azure-mgmt-datafactory)
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.datafactory import DataFactoryManagementClient
+import time
+
+adf = DataFactoryManagementClient(DefaultAzureCredential(), SUBSCRIPTION_ID)
+run = adf.pipelines.create_run(&quot;rg-data&quot;, &quot;adf-shop&quot;, &quot;CopyOrdersToLake&quot;, parameters={&quot;watermark&quot;: &quot;2026-09-17T00:00:00Z&quot;})
+while (status := adf.pipeline_runs.get(&quot;rg-data&quot;, &quot;adf-shop&quot;, run.run_id)).status in (&quot;Queued&quot;, &quot;InProgress&quot;):
+    time.sleep(15)
+print(status.status, status.message)
+
+# Alternative for the app side: expose a change feed instead of letting ETL query the OLTP tables
+#   • SQL: temporal tables / change tracking       • Cosmos: change feed → Function → lake
+#   • Fabric mirroring: near-real-time replica of Azure SQL / Cosmos into OneLake with no pipeline at all</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Incremental load with watermarks vs CDC; why analytics should not query production tables (read replica, mirroring, change feed); ADF vs Fabric vs Databricks positioning; idempotent reruns of a failed pipeline.</p></div></section>
+<section id="ai-search"><h2 id="ai-search">Azure AI Search: indexes, indexers and vector search</h2><p><strong>Azure AI Search</strong> is a managed search engine: define an <strong>index</strong> (fields, analyzers, vector profiles), push documents from code or pull them with an <strong>indexer</strong> (Blob, SQL, Cosmos) plus a skillset (OCR, chunking, embedding). Query with full-text (BM25), vectors (HNSW) or <strong>hybrid</strong> + semantic ranker. It is the retrieval layer of most Azure RAG systems.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Index definition with a vector field
+var indexClient = new SearchIndexClient(new Uri(&quot;https://srch-shop.search.windows.net&quot;), new DefaultAzureCredential());
+var index = new SearchIndex(&quot;products&quot;)
+{
+    Fields =
+    {
+        new SimpleField(&quot;id&quot;, SearchFieldDataType.String) { IsKey = true },
+        new SearchableField(&quot;name&quot;) { AnalyzerName = LexicalAnalyzerName.EnLucene },
+        new SearchableField(&quot;description&quot;),
+        new SimpleField(&quot;category&quot;, SearchFieldDataType.String) { IsFilterable = true, IsFacetable = true },
+        new SimpleField(&quot;price&quot;, SearchFieldDataType.Double) { IsFilterable = true, IsSortable = true },
+        new VectorSearchField(&quot;embedding&quot;, vectorSearchDimensions: 1536, vectorSearchProfileName: &quot;hnsw&quot;)
+    },
+    VectorSearch = new() { Profiles = { new VectorSearchProfile(&quot;hnsw&quot;, &quot;hnsw-cfg&quot;) }, Algorithms = { new HnswAlgorithmConfiguration(&quot;hnsw-cfg&quot;) } },
+    SemanticSearch = new() { Configurations = { new SemanticConfiguration(&quot;default&quot;, new() { TitleField = new(&quot;name&quot;), ContentFields = { new(&quot;description&quot;) } }) } }
+};
+await indexClient.CreateOrUpdateIndexAsync(index);
+
+// Upload + hybrid query
+var search = indexClient.GetSearchClient(&quot;products&quot;);
+await search.MergeOrUploadDocumentsAsync(docs);
+var results = await search.SearchAsync&lt;ProductDoc&gt;(&quot;waterproof hiking jacket&quot;, new SearchOptions
+{
+    VectorSearch = new() { Queries = { new VectorizedQuery(queryEmbedding) { KNearestNeighborsCount = 20, Fields = { &quot;embedding&quot; } } } },
+    Filter = &quot;category eq &#x27;outdoor&#x27; and price lt 300&quot;, Facets = { &quot;category&quot; }, Size = 10,
+    QueryType = SearchQueryType.Semantic, SemanticSearch = new() { SemanticConfigurationName = &quot;default&quot; }
+});
+await foreach (var r in results.Value.GetResultsAsync()) Console.WriteLine($&quot;{r.Score:F2} {r.Document.Name}&quot;);</code></pre><pre data-lang="python" hidden><code>from azure.identity import DefaultAzureCredential
+from azure.search.documents import SearchClient
+from azure.search.documents.models import VectorizedQuery
+
+client = SearchClient(&quot;https://srch-shop.search.windows.net&quot;, &quot;products&quot;, DefaultAzureCredential())
+client.merge_or_upload_documents(docs)     # list of dicts with id, name, description, category, price, embedding
+
+results = client.search(
+    search_text=&quot;waterproof hiking jacket&quot;,                       # BM25 part
+    vector_queries=[VectorizedQuery(vector=query_embedding, k_nearest_neighbors=20, fields=&quot;embedding&quot;)],
+    filter=&quot;category eq &#x27;outdoor&#x27; and price lt 300&quot;,
+    query_type=&quot;semantic&quot;, semantic_configuration_name=&quot;default&quot;,
+    facets=[&quot;category&quot;], top=10)
+for r in results:
+    print(round(r[&quot;@search.score&quot;], 2), r.get(&quot;@search.reranker_score&quot;), r[&quot;name&quot;])
+
+# Indexer route: blob container → skillset (split + embed with an Azure OpenAI skill) → index, on a schedule.
+# Use it for documents; push from code for data you already own in a database.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>BM25 vs vector vs hybrid and why hybrid usually wins; chunking strategy for documents; index size and replicas/partitions; filters as security trimming (per-user ACL fields); push vs pull indexing; keeping the index in sync with the source of truth.</p></div></section>
+<section id="azure-openai"><h2 id="azure-openai">Azure OpenAI: chat, embeddings and structured output</h2><p>Deploy a model (e.g. <code>gpt-4.1</code>, <code>o4-mini</code>, <code>text-embedding-3-large</code>) in an Azure OpenAI / AI Foundry resource and call it with the OpenAI-compatible SDK using Entra auth. Production concerns: TPM quotas and 429s, prompt caching, content filters, structured output for anything you parse, and logging prompts/completions with correlation IDs (minus PII).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Azure.AI.OpenAI 2.x — same client shapes as the OpenAI SDK
+var client = new AzureOpenAIClient(new Uri(&quot;https://aoai-shop.openai.azure.com&quot;), new DefaultAzureCredential());
+var chat = client.GetChatClient(&quot;gpt-4.1&quot;);            // deployment name
+
+// Structured output: parse into a type, never regex the answer
+var schema = BinaryData.FromString(&quot;&quot;&quot;
+{ &quot;type&quot;:&quot;object&quot;,&quot;properties&quot;:{ &quot;sentiment&quot;:{&quot;type&quot;:&quot;string&quot;,&quot;enum&quot;:[&quot;positive&quot;,&quot;neutral&quot;,&quot;negative&quot;]},
+  &quot;issues&quot;:{&quot;type&quot;:&quot;array&quot;,&quot;items&quot;:{&quot;type&quot;:&quot;string&quot;}} }, &quot;required&quot;:[&quot;sentiment&quot;,&quot;issues&quot;], &quot;additionalProperties&quot;:false }
+&quot;&quot;&quot;);
+var options = new ChatCompletionOptions
+{
+    Temperature = 0,
+    ResponseFormat = ChatResponseFormat.CreateJsonSchemaFormat(&quot;review&quot;, schema, jsonSchemaIsStrict: true)
+};
+var completion = await chat.CompleteChatAsync(
+[
+    new SystemChatMessage(&quot;Classify customer reviews. Answer only with the schema.&quot;),
+    new UserChatMessage(review)
+], options);
+var parsed = JsonSerializer.Deserialize&lt;ReviewAnalysis&gt;(completion.Value.Content[0].Text);
+Console.WriteLine($&quot;{parsed!.Sentiment} — tokens: {completion.Value.Usage.TotalTokenCount}&quot;);
+
+// Embeddings
+var emb = client.GetEmbeddingClient(&quot;text-embedding-3-large&quot;);
+float[] vector = (await emb.GenerateEmbeddingAsync(text)).Value.ToFloats().ToArray();
+
+// Retries: the SDK retries 429 with Retry-After; set a per-call timeout and a circuit breaker for the rest.</code></pre><pre data-lang="python" hidden><code>from openai import AzureOpenAI
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from pydantic import BaseModel
+from typing import Literal
+
+token_provider = get_bearer_token_provider(DefaultAzureCredential(), &quot;https://cognitiveservices.azure.com/.default&quot;)
+client = AzureOpenAI(azure_endpoint=&quot;https://aoai-shop.openai.azure.com&quot;, azure_ad_token_provider=token_provider, api_version=&quot;2024-10-21&quot;)
+
+class ReviewAnalysis(BaseModel):
+    sentiment: Literal[&quot;positive&quot;, &quot;neutral&quot;, &quot;negative&quot;]
+    issues: list[str]
+
+resp = client.beta.chat.completions.parse(
+    model=&quot;gpt-4.1&quot;,                                   # deployment name
+    temperature=0,
+    messages=[{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;Classify customer reviews.&quot;}, {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: review}],
+    response_format=ReviewAnalysis)
+analysis: ReviewAnalysis = resp.choices[0].message.parsed
+print(analysis.sentiment, resp.usage.total_tokens)
+
+vec = client.embeddings.create(model=&quot;text-embedding-3-large&quot;, input=text).data[0].embedding</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Deployments vs models, TPM/RPM quotas and how you handle 429 (backoff, PTU, multiple deployments behind APIM); temperature and determinism; structured output vs "please answer in JSON"; content filtering and its failure modes; cost control (prompt caching, max tokens, model routing).</p></div></section>
+<section id="rag"><h2 id="rag">The RAG pattern end to end</h2><p><strong>Retrieval-Augmented Generation</strong>: chunk and embed your documents into AI Search, at question time retrieve the top chunks (hybrid), build a prompt with citations, call the model, and return the answer with the sources. The quality levers are chunking, hybrid + reranking, prompt discipline (answer only from context) and evaluation — not the model. Keep security trimming in the search filter so users only retrieve what they may see.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class RagService(SearchClient search, EmbeddingClient embed, ChatClient chat)
+{
+    public async Task&lt;Answer&gt; AskAsync(string question, string userId, CancellationToken ct)
+    {
+        // 1) retrieve — hybrid + semantic, security-trimmed
+        var qv = (await embed.GenerateEmbeddingAsync(question, cancellationToken: ct)).Value.ToFloats();
+        var hits = await search.SearchAsync&lt;Chunk&gt;(question, new SearchOptions
+        {
+            VectorSearch = new() { Queries = { new VectorizedQuery(qv) { KNearestNeighborsCount = 30, Fields = { &quot;embedding&quot; } } } },
+            Filter = $&quot;allowedUsers/any(u: u eq &#x27;{userId}&#x27;) or isPublic eq true&quot;,
+            QueryType = SearchQueryType.Semantic, SemanticSearch = new() { SemanticConfigurationName = &quot;default&quot; }, Size = 6
+        }, ct);
+        var chunks = new List&lt;Chunk&gt;();
+        await foreach (var h in hits.Value.GetResultsAsync()) chunks.Add(h.Document);
+
+        // 2) prompt with numbered sources
+        var context = string.Join(&quot;\n\n&quot;, chunks.Select((c, i) =&gt; $&quot;[{i + 1}] ({c.Title}) {c.Text}&quot;));
+        var messages = new ChatMessage[]
+        {
+            new SystemChatMessage(&quot;Answer using ONLY the sources. Cite as [n]. If the sources do not contain the answer, say you don&#x27;t know.&quot;),
+            new UserChatMessage($&quot;Sources:\n{context}\n\nQuestion: {question}&quot;)
+        };
+
+        // 3) generate
+        var result = await chat.CompleteChatAsync(messages, new ChatCompletionOptions { Temperature = 0, MaxOutputTokenCount = 600 }, ct);
+        return new Answer(result.Value.Content[0].Text, chunks.Select(c =&gt; new Source(c.Title, c.Url)).ToList());
+    }
+}
+// Evaluate: a golden set of (question, expected facts) → groundedness / relevance scores per release. Log retrieval hits with the answer.</code></pre><pre data-lang="python" hidden><code>def ask(question: str, user_id: str) -&gt; dict:
+    qv = client.embeddings.create(model=&quot;text-embedding-3-large&quot;, input=question).data[0].embedding
+    hits = list(search.search(
+        search_text=question,
+        vector_queries=[VectorizedQuery(vector=qv, k_nearest_neighbors=30, fields=&quot;embedding&quot;)],
+        filter=f&quot;allowedUsers/any(u: u eq &#x27;{user_id}&#x27;) or isPublic eq true&quot;,
+        query_type=&quot;semantic&quot;, semantic_configuration_name=&quot;default&quot;, top=6))
+    context = &quot;\n\n&quot;.join(f&quot;[{i+1}] ({h[&#x27;title&#x27;]}) {h[&#x27;text&#x27;]}&quot; for i, h in enumerate(hits))
+    resp = client.chat.completions.create(model=&quot;gpt-4.1&quot;, temperature=0, max_tokens=600, messages=[
+        {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;Answer using ONLY the sources. Cite as [n]. If the sources do not contain the answer, say you don&#x27;t know.&quot;},
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: f&quot;Sources:\n{context}\n\nQuestion: {question}&quot;}])
+    return {&quot;answer&quot;: resp.choices[0].message.content, &quot;sources&quot;: [{&quot;title&quot;: h[&quot;title&quot;], &quot;url&quot;: h[&quot;url&quot;]} for h in hits]}
+
+# Ingestion: split with overlap (e.g. 500 tokens / 50 overlap), embed in batches of 16–100, upload with a stable chunk id = f&quot;{doc_id}-{n}&quot;
+# so re-indexing a changed document overwrites its chunks and a deleted document&#x27;s chunks can be removed.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why RAG over fine-tuning for private, changing data; chunk size and overlap; hybrid retrieval and reranking; hallucination controls (grounding instruction, citations, refusal); security trimming; evaluation (groundedness, relevance, golden set) and monitoring in production; caching and cost.</p></div></section>
+<section id="document-intelligence"><h2 id="document-intelligence">Azure AI services: Document Intelligence, Language, Vision</h2><p>Prebuilt models extract structured data from invoices, receipts, IDs and forms (<strong>Document Intelligence</strong>); <strong>Language</strong> does PII detection, sentiment, summarisation and entity extraction; <strong>Vision</strong> does OCR and image analysis; <strong>Speech</strong> transcribes. They are REST/SDK calls with the same identity story as everything else and frequently feed the ingestion side of a RAG or automation pipeline.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Extract invoice fields from an uploaded PDF (Azure.AI.DocumentIntelligence)
+var di = new DocumentIntelligenceClient(new Uri(&quot;https://di-shop.cognitiveservices.azure.com&quot;), new DefaultAzureCredential());
+var op = await di.AnalyzeDocumentAsync(WaitUntil.Completed, &quot;prebuilt-invoice&quot;, BinaryData.FromStream(pdfStream));
+var doc = op.Value.Documents[0];
+
+string? Str(string f) =&gt; doc.Fields.TryGetValue(f, out var v) &amp;&amp; v.Confidence &gt; 0.8 ? v.Content : null;
+var invoice = new InvoiceDraft(
+    Number: Str(&quot;InvoiceId&quot;), Vendor: Str(&quot;VendorName&quot;), Total: Str(&quot;InvoiceTotal&quot;), Due: Str(&quot;DueDate&quot;),
+    Lines: doc.Fields[&quot;Items&quot;].ValueList.Select(i =&gt; i.ValueDictionary).Select(d =&gt; new Line(d[&quot;Description&quot;].Content, d[&quot;Amount&quot;].Content)).ToList());
+// Route low-confidence fields to a human review queue instead of guessing.
+
+// PII redaction before logging or indexing (Azure.AI.TextAnalytics)
+var ta = new TextAnalyticsClient(new Uri(&quot;https://lang-shop.cognitiveservices.azure.com&quot;), new DefaultAzureCredential());
+var pii = await ta.RecognizePiiEntitiesAsync(text);
+string redacted = pii.Value.RedactedText;</code></pre><pre data-lang="python" hidden><code>from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.textanalytics import TextAnalyticsClient
+from azure.identity import DefaultAzureCredential
+
+cred = DefaultAzureCredential()
+di = DocumentIntelligenceClient(&quot;https://di-shop.cognitiveservices.azure.com&quot;, cred)
+with open(&quot;invoice.pdf&quot;, &quot;rb&quot;) as f:
+    result = di.begin_analyze_document(&quot;prebuilt-invoice&quot;, f, content_type=&quot;application/octet-stream&quot;).result()
+doc = result.documents[0]
+def field(name, min_conf=0.8):
+    v = doc.fields.get(name)
+    return v.content if v and (v.confidence or 0) &gt;= min_conf else None
+print(field(&quot;InvoiceId&quot;), field(&quot;VendorName&quot;), field(&quot;InvoiceTotal&quot;), field(&quot;DueDate&quot;))
+
+ta = TextAnalyticsClient(&quot;https://lang-shop.cognitiveservices.azure.com&quot;, cred)
+redacted = ta.recognize_pii_entities([text])[0].redacted_text</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Prebuilt vs custom models and when to train one; confidence thresholds and human-in-the-loop; data residency and whether inputs are used for training (they are not); combining Document Intelligence → chunk → AI Search for document RAG.</p></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/azure/storage/blobs/data-lake-storage-introduction" target="_blank" rel="noopener">Azure Data Lake Storage Gen2</a></li><li><a href="https://learn.microsoft.com/fabric/" target="_blank" rel="noopener">Microsoft Fabric documentation</a></li><li><a href="https://learn.microsoft.com/azure/search/" target="_blank" rel="noopener">Azure AI Search documentation</a> — vector search and hybrid ranking</li><li><a href="https://learn.microsoft.com/azure/ai-services/openai/" target="_blank" rel="noopener">Azure OpenAI documentation</a></li><li><a href="https://learn.microsoft.com/azure/search/retrieval-augmented-generation-overview" target="_blank" rel="noopener">RAG in Azure AI Search</a></li><li><a href="https://learn.microsoft.com/azure/ai-services/document-intelligence/" target="_blank" rel="noopener">Azure AI Document Intelligence</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

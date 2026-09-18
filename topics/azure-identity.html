@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Microsoft Entra ID &amp; App Identity — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="azure-identity">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Azure › Topic 13 of 23</div>
+  <h1>Microsoft Entra ID &amp; App Identity</h1>
+  <p class="lede">Almost every Azure conversation ends up at identity: who is calling, what are they allowed to do, and how did they prove it without a password in a config file. This page walks the model from tenant to token, then shows the .NET and Python code for the three flows a backend engineer needs, and finishes with the no-secrets options (managed identity and workload identity federation).</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#entra-basics">Tenants, app registrations, service principals and tokens</a></li><li><a href="#app-registrations">Scopes, app roles and consent</a></li><li><a href="#oauth-flows">The three OAuth 2.0 flows you need</a></li><li><a href="#calling-apis">Token caching, Microsoft Graph and downstream APIs</a></li><li><a href="#rbac">Azure RBAC vs app roles vs groups</a></li><li><a href="#workload-identity">No secrets: managed identity and workload identity federation</a></li><li><a href="#external-id">External ID (B2C) for customer-facing apps</a></li><li><a href="#zero-trust">Conditional Access, MFA and PIM</a></li></ol>
+  </div>
+
+<section id="entra-basics"><h2 id="entra-basics">Tenants, app registrations, service principals and tokens</h2><p>A <strong>tenant</strong> is a directory (users, groups, apps). An <strong>app registration</strong> is the global definition of an application (its ID, redirect URIs, exposed scopes, app roles). A <strong>service principal</strong> is that app's identity inside one tenant — the thing you assign roles to. Clients get <strong>ID tokens</strong> (who the user is, for sign-in) and <strong>access tokens</strong> (what the caller may do, sent to an API). Access tokens are JWTs whose <code>aud</code> is the API, <code>scp</code> lists delegated scopes and <code>roles</code> lists app roles.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="json">Access token</button></div><pre data-lang="bash"><code># Create an API app registration that exposes a scope, and a client app that requests it
+API_ID=$(az ad app create --display-name shop-api --identifier-uris api://shop-api --query appId -o tsv)
+az ad sp create --id $API_ID                                    # service principal in this tenant
+
+# Expose a delegated scope (Orders.Read) and an app role (Orders.Admin) — usually done in the portal blade
+# &quot;Expose an API&quot; / &quot;App roles&quot;; from the CLI you patch the manifest:
+az ad app update --id $API_ID --set api.oauth2PermissionScopes=&#x27;[{&quot;id&quot;:&quot;&#x27;$(uuidgen)&#x27;&quot;,&quot;adminConsentDescription&quot;:&quot;Read orders&quot;,&quot;adminConsentDisplayName&quot;:&quot;Read orders&quot;,&quot;isEnabled&quot;:true,&quot;type&quot;:&quot;User&quot;,&quot;value&quot;:&quot;Orders.Read&quot;}]&#x27;
+
+CLIENT_ID=$(az ad app create --display-name shop-web --web-redirect-uris https://localhost:5001/signin-oidc --query appId -o tsv)
+az ad app permission add --id $CLIENT_ID --api $API_ID --api-permissions &lt;scope-id&gt;=Scope
+az ad app permission admin-consent --id $CLIENT_ID
+
+# Decode a token you got (never paste real tokens into web tools): 
+python3 -c &quot;import sys,base64,json;p=sys.argv[1].split(&#x27;.&#x27;)[1];print(json.dumps(json.loads(base64.urlsafe_b64decode(p+&#x27;=&#x27;*(-len(p)%4))),indent=1))&quot; &quot;$TOKEN&quot;</code></pre><pre data-lang="json" hidden><code>{
+  &quot;aud&quot;: &quot;api://shop-api&quot;,                       // this token is for the Shop API
+  &quot;iss&quot;: &quot;https://login.microsoftonline.com/&lt;tenant-id&gt;/v2.0&quot;,
+  &quot;iat&quot;: 1758200000, &quot;nbf&quot;: 1758200000, &quot;exp&quot;: 1758203600,
+  &quot;azp&quot;: &quot;&lt;client app id&gt;&quot;,                      // who asked for it
+  &quot;oid&quot;: &quot;&lt;user object id&gt;&quot;,                     // stable user identifier — key your data on this, not email
+  &quot;preferred_username&quot;: &quot;ada@contoso.com&quot;,
+  &quot;scp&quot;: &quot;Orders.Read Orders.Write&quot;,             // delegated permissions (user + app)
+  &quot;roles&quot;: [&quot;Orders.Admin&quot;],                     // app roles (assigned to user or, for daemons, to the SP)
+  &quot;tid&quot;: &quot;&lt;tenant-id&gt;&quot;, &quot;ver&quot;: &quot;2.0&quot;
+}</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Difference between an app registration and a service principal (and an enterprise app); ID token vs access token vs refresh token; why you validate <code>aud</code> and <code>iss</code>; v1 vs v2 endpoints; why <code>oid</code>, not email, is the user key.</p></div></section>
+<section id="app-registrations"><h2 id="app-registrations">Scopes, app roles and consent</h2><p>Delegated permissions (<strong>scopes</strong>) are used when a user is present — the effective permission is the intersection of what the user can do and what the app was granted. Application permissions (<strong>app roles</strong> with <code>allowedMemberTypes: Application</code>) are for daemons with no user. Users or admins must <strong>consent</strong>; tenant admins can grant consent for everyone. Design your API's permissions as coarse verbs (<code>Orders.Read</code>, <code>Orders.ReadWrite</code>) and keep authorization decisions inside the API.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Enforce scopes / roles in ASP.NET Core with Microsoft.Identity.Web
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddMicrosoftIdentityWebApi(builder.Configuration.GetSection(&quot;AzureAd&quot;));   // reads TenantId, ClientId, Audience
+
+builder.Services.AddAuthorization(o =&gt;
+{
+    o.AddPolicy(&quot;Orders.Read&quot;, p =&gt; p.RequireScopeOrAppPermission(new[] { &quot;Orders.Read&quot;, &quot;Orders.ReadWrite&quot; }, new[] { &quot;Orders.Admin&quot; }));
+    o.AddPolicy(&quot;Orders.Admin&quot;, p =&gt; p.RequireRole(&quot;Orders.Admin&quot;));            // app role → role claim
+});
+
+app.MapGet(&quot;/orders&quot;, (HttpContext ctx) =&gt; ...).RequireAuthorization(&quot;Orders.Read&quot;);
+app.MapDelete(&quot;/orders/{id}&quot;, ...).RequireAuthorization(&quot;Orders.Admin&quot;);
+
+// Inside a handler you can also assert:  ctx.VerifyUserHasAnyAcceptedScope(&quot;Orders.Read&quot;);
+// appsettings.json
+// &quot;AzureAd&quot;: { &quot;Instance&quot;: &quot;https://login.microsoftonline.com/&quot;, &quot;TenantId&quot;: &quot;&lt;tenant&gt;&quot;, &quot;ClientId&quot;: &quot;&lt;api app id&gt;&quot;, &quot;Audience&quot;: &quot;api://shop-api&quot; }</code></pre><pre data-lang="python" hidden><code># FastAPI: validate the JWT against the tenant&#x27;s JWKS and check scopes / roles
+import httpx, jwt
+from fastapi import Depends, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+TENANT, AUDIENCE = &quot;&lt;tenant-id&gt;&quot;, &quot;api://shop-api&quot;
+ISSUER = f&quot;https://login.microsoftonline.com/{TENANT}/v2.0&quot;
+jwks = jwt.PyJWKClient(f&quot;https://login.microsoftonline.com/{TENANT}/discovery/v2.0/keys&quot;)
+bearer = HTTPBearer()
+
+def current_claims(cred: HTTPAuthorizationCredentials = Security(bearer)) -&gt; dict:
+    try:
+        key = jwks.get_signing_key_from_jwt(cred.credentials).key
+        return jwt.decode(cred.credentials, key, algorithms=[&quot;RS256&quot;], audience=AUDIENCE, issuer=ISSUER)
+    except jwt.PyJWTError as ex:
+        raise HTTPException(401, str(ex))
+
+def require(scopes=(), roles=()):
+    def dep(claims: dict = Depends(current_claims)):
+        have_scope = set(claims.get(&quot;scp&quot;, &quot;&quot;).split()) &amp; set(scopes)
+        have_role = set(claims.get(&quot;roles&quot;, [])) &amp; set(roles)
+        if not (have_scope or have_role):
+            raise HTTPException(403, &quot;insufficient permissions&quot;)
+        return claims
+    return dep
+
+@app.get(&quot;/orders&quot;, dependencies=[Depends(require(scopes={&quot;Orders.Read&quot;, &quot;Orders.ReadWrite&quot;}, roles={&quot;Orders.Admin&quot;}))])
+async def list_orders(): ...</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Delegated vs application permissions; what admin consent is and when it is required; why scopes are not a substitute for authorization logic in the API; how you would version or split a scope safely.</p></div></section>
+<section id="oauth-flows"><h2 id="oauth-flows">The three OAuth 2.0 flows you need</h2><p><strong>Authorization code + PKCE</strong> for anything with a user (web apps, SPAs, mobile). <strong>Client credentials</strong> for daemons and service-to-service calls (prefer managed identity or federated credentials over a client secret). <strong>On-behalf-of</strong> when an API must call another API as the signed-in user. Implicit and resource-owner-password flows are legacy — do not use them.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button><span class="code-note">Scope &quot;&lt;app-id-uri&gt;/.default&quot; means &quot;everything statically granted to this app&quot;</span></div><pre data-lang="csharp"><code>// 1) Auth code + PKCE — a Razor/Blazor/MVC app signs the user in and gets tokens for the API
+builder.Services.AddAuthentication(OpenIdConnectDefaults.AuthenticationScheme)
+    .AddMicrosoftIdentityWebApp(builder.Configuration.GetSection(&quot;AzureAd&quot;))
+    .EnableTokenAcquisitionToCallDownstreamApi(new[] { &quot;api://shop-api/Orders.Read&quot; })
+    .AddInMemoryTokenCaches();                               // distributed cache (Redis/SQL) in production
+
+// 2) Client credentials — a worker with no user
+var app = ConfidentialClientApplicationBuilder.Create(clientId)
+    .WithAuthority($&quot;https://login.microsoftonline.com/{tenantId}&quot;)
+    .WithClientSecret(secret)                                // or .WithCertificate(cert) / .WithClientAssertion(...)
+    .Build();
+var result = await app.AcquireTokenForClient(new[] { &quot;api://shop-api/.default&quot; }).ExecuteAsync();
+http.DefaultRequestHeaders.Authorization = new(&quot;Bearer&quot;, result.AccessToken);
+
+// 3) On-behalf-of — the API exchanges the incoming user token for a Graph token
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddMicrosoftIdentityWebApi(builder.Configuration.GetSection(&quot;AzureAd&quot;))
+    .EnableTokenAcquisitionToCallDownstreamApi()
+    .AddMicrosoftGraph(builder.Configuration.GetSection(&quot;Graph&quot;))     // GraphServiceClient with OBO baked in
+    .AddDistributedTokenCaches();
+
+app.MapGet(&quot;/me&quot;, async (GraphServiceClient graph) =&gt; (await graph.Me.GetAsync())!.DisplayName)
+   .RequireAuthorization();</code></pre><pre data-lang="python" hidden><code>import msal
+
+AUTHORITY = f&quot;https://login.microsoftonline.com/{TENANT}&quot;
+
+# 1) Auth code + PKCE (web app) — msal handles PKCE for you
+cca = msal.ConfidentialClientApplication(CLIENT_ID, authority=AUTHORITY, client_credential=SECRET)
+flow = cca.initiate_auth_code_flow(scopes=[&quot;api://shop-api/Orders.Read&quot;], redirect_uri=&quot;https://localhost:8000/callback&quot;)
+# redirect user to flow[&quot;auth_uri&quot;]; keep `flow` in the session; on callback:
+tokens = cca.acquire_token_by_auth_code_flow(flow, request.query_params)   # includes access_token, id_token_claims
+
+# 2) Client credentials (daemon)
+daemon = msal.ConfidentialClientApplication(CLIENT_ID, authority=AUTHORITY, client_credential=SECRET)
+tok = daemon.acquire_token_for_client(scopes=[&quot;api://shop-api/.default&quot;])   # cached + refreshed by msal
+headers = {&quot;Authorization&quot;: f&quot;Bearer {tok[&#x27;access_token&#x27;]}&quot;}
+
+# 3) On-behalf-of (API → Graph as the user)
+obo = cca.acquire_token_on_behalf_of(user_assertion=incoming_bearer_token, scopes=[&quot;https://graph.microsoft.com/User.Read&quot;])
+
+# In Azure, prefer azure-identity (managed identity / workload identity) for 2):
+#   from azure.identity import DefaultAzureCredential
+#   token = DefaultAzureCredential().get_token(&quot;api://shop-api/.default&quot;).token</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why PKCE replaced implicit flow for SPAs; what a refresh token is and where it may be stored; the OBO flow and why it needs the API to be a confidential client; when client secrets are acceptable and how you rotate them.</p></div></section>
+<section id="calling-apis"><h2 id="calling-apis">Token caching, Microsoft Graph and downstream APIs</h2><p>Acquire tokens through a library (MSAL / Microsoft.Identity.Web / azure-identity) and never cache them yourself in a static field. Libraries handle refresh, the cache and retries. Use the <strong>downstream API</strong> abstraction so handlers ask for a typed client, not a token. For Graph, request the minimum permission (<code>User.Read</code>, not <code>Directory.Read.All</code>).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Typed downstream API client — token acquisition is invisible to the handler
+builder.Services.AddAuthentication(...)
+    .AddMicrosoftIdentityWebApi(builder.Configuration.GetSection(&quot;AzureAd&quot;))
+    .EnableTokenAcquisitionToCallDownstreamApi()
+    .AddDownstreamApi(&quot;Inventory&quot;, builder.Configuration.GetSection(&quot;InventoryApi&quot;))   // BaseUrl + Scopes
+    .AddDistributedTokenCaches();
+builder.Services.AddStackExchangeRedisCache(o =&gt; o.Configuration = builder.Configuration[&quot;Redis&quot;]);   // token cache store
+
+app.MapGet(&quot;/orders/{id}/stock&quot;, async (int id, IDownstreamApi api) =&gt;
+    await api.GetForUserAsync&lt;StockDto&gt;(&quot;Inventory&quot;, options =&gt; options.RelativePath = $&quot;stock/{id}&quot;));
+
+// Daemon calling it as the app itself:
+//   await api.GetForAppAsync&lt;StockDto&gt;(&quot;Inventory&quot;, o =&gt; o.RelativePath = &quot;stock/1&quot;);
+
+// Handling the classic errors
+//   MsalUiRequiredException  → the user must re-consent / re-sign in (send a 401 with a challenge)
+//   401 from downstream       → token for the wrong audience; check the scope you requested</code></pre><pre data-lang="python" hidden><code># Microsoft Graph SDK with azure-identity (works with MI in Azure, az login locally)
+from azure.identity import DefaultAzureCredential
+from msgraph import GraphServiceClient
+
+graph = GraphServiceClient(DefaultAzureCredential(), scopes=[&quot;https://graph.microsoft.com/.default&quot;])
+me_or_app = await graph.users.by_user_id(&quot;ada@contoso.com&quot;).get()          # needs User.Read.All app permission
+
+# Calling your own API as the app, with a cached token (msal keeps it in memory; persist with SerializableTokenCache)
+cache = msal.SerializableTokenCache()
+cca = msal.ConfidentialClientApplication(CLIENT_ID, authority=AUTHORITY, client_credential=SECRET, token_cache=cache)
+def bearer():
+    r = cca.acquire_token_silent([&quot;api://inventory/.default&quot;], account=None) or cca.acquire_token_for_client([&quot;api://inventory/.default&quot;])
+    if &quot;access_token&quot; not in r:
+        raise RuntimeError(r.get(&quot;error_description&quot;))
+    return {&quot;Authorization&quot;: f&quot;Bearer {r[&#x27;access_token&#x27;]}&quot;}
+
+async with httpx.AsyncClient(base_url=&quot;https://inventory.contoso.com&quot;) as c:
+    stock = (await c.get(&quot;/stock/1&quot;, headers=bearer())).json()</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Where token caches live in a scaled-out API and why in-memory is wrong; what happens when a token expires mid-request; least-privilege Graph permissions; how you'd handle <code>MsalUiRequiredException</code> in an API vs a web app.</p></div></section>
+<section id="rbac"><h2 id="rbac">Azure RBAC vs app roles vs groups</h2><p><strong>Azure RBAC</strong> controls who can manage or access <em>Azure resources</em> (control plane and data plane: "Storage Blob Data Reader" on a container). <strong>App roles</strong> control what a user or service can do <em>inside your application</em>. <strong>Groups</strong> are how you assign either at scale; group claims can be emitted in the token (watch the 200-group overage limit — use app roles or the Graph <code>checkMemberGroups</code> call instead).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button></div><pre data-lang="bash"><code># Azure RBAC — resource permissions. Scope: management group / subscription / resource group / resource.
+az role assignment create --assignee &lt;object-id-or-upn&gt; --role &quot;Storage Blob Data Contributor&quot;   --scope /subscriptions/&lt;sub&gt;/resourceGroups/rg-shop/providers/Microsoft.Storage/storageAccounts/stshop
+
+# Who can do what here?
+az role assignment list --scope /subscriptions/&lt;sub&gt;/resourceGroups/rg-shop --include-inherited -o table
+
+# Custom role with just what a deploy pipeline needs
+az role definition create --role-definition &#x27;{
+  &quot;Name&quot;: &quot;Shop Deployer&quot;, &quot;IsCustom&quot;: true,
+  &quot;Actions&quot;: [&quot;Microsoft.Web/sites/*&quot;, &quot;Microsoft.Web/serverfarms/read&quot;, &quot;Microsoft.Resources/deployments/*&quot;],
+  &quot;NotActions&quot;: [&quot;Microsoft.Web/sites/config/list/action&quot;],
+  &quot;AssignableScopes&quot;: [&quot;/subscriptions/&lt;sub&gt;/resourceGroups/rg-shop&quot;] }&#x27;
+
+# App roles — application permissions. Assign a user/group/SP to a role on the API&#x27;s service principal.
+az rest --method POST --uri &quot;https://graph.microsoft.com/v1.0/servicePrincipals/&lt;api-sp-id&gt;/appRoleAssignedTo&quot;   --body &#x27;{&quot;principalId&quot;:&quot;&lt;group-id&gt;&quot;,&quot;resourceId&quot;:&quot;&lt;api-sp-id&gt;&quot;,&quot;appRoleId&quot;:&quot;&lt;role-id&gt;&quot;}&#x27;</code></pre><pre data-lang="csharp" hidden><code>// Group-based authorization without token bloat: map groups to app roles at the tenant, or check membership via Graph
+builder.Services.AddAuthorization(o =&gt;
+{
+    o.AddPolicy(&quot;Finance&quot;, p =&gt; p.RequireClaim(&quot;groups&quot;, &quot;d0f1…finance-group-id&quot;));   // only if groups claim is emitted
+});
+
+// Resource-based authorization: the rule depends on the data (owner of the order), not just a role
+public class OrderOwnerHandler : AuthorizationHandler&lt;OperationAuthorizationRequirement, Order&gt;
+{
+    protected override Task HandleRequirementAsync(AuthorizationHandlerContext ctx, OperationAuthorizationRequirement req, Order order)
+    {
+        var oid = ctx.User.FindFirstValue(&quot;http://schemas.microsoft.com/identity/claims/objectidentifier&quot;);
+        if (order.CustomerOid == oid || ctx.User.IsInRole(&quot;Orders.Admin&quot;)) ctx.Succeed(req);
+        return Task.CompletedTask;
+    }
+}
+// usage: var ok = await authz.AuthorizeAsync(User, order, Operations.Read); if (!ok.Succeeded) return Results.Forbid();</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Control plane vs data plane roles (Owner of a storage account cannot read blobs without a data role); deny assignments; PIM and just-in-time elevation; why the groups claim overage matters and what to do about it.</p></div></section>
+<section id="workload-identity"><h2 id="workload-identity">No secrets: managed identity and workload identity federation</h2><p>Inside Azure use <strong>managed identity</strong> (see <a href="azure-services.html#managed-identity">Azure Services</a>). Outside Azure — GitHub Actions, AKS pods, another cloud — use <strong>workload identity federation</strong>: the external identity provider issues a token, Entra trusts it via a <em>federated credential</em> on the app registration, and exchanges it for an Entra token. No client secret exists to leak or expire.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="yaml">GitHub Actions</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># Federated credential for GitHub Actions on the main branch of contoso/shop
+az ad app federated-credential create --id $APP_ID --parameters &#x27;{
+  &quot;name&quot;: &quot;github-main&quot;,
+  &quot;issuer&quot;: &quot;https://token.actions.githubusercontent.com&quot;,
+  &quot;subject&quot;: &quot;repo:contoso/shop:ref:refs/heads/main&quot;,
+  &quot;audiences&quot;: [&quot;api://AzureADTokenExchange&quot;] }&#x27;
+# For a GitHub environment:  &quot;subject&quot;: &quot;repo:contoso/shop:environment:production&quot;
+
+# Federated credential for an AKS workload identity (service account in a namespace)
+ISSUER=$(az aks show -g rg-shop -n aks-shop --query oidcIssuerProfile.issuerUrl -o tsv)
+az identity federated-credential create --name orders-api -g rg-shop --identity-name id-orders-api   --issuer $ISSUER --subject system:serviceaccount:shop:orders-api --audiences api://AzureADTokenExchange</code></pre><pre data-lang="yaml" hidden><code>permissions:
+  id-token: write        # allow the job to request an OIDC token
+  contents: read
+
+steps:
+  - uses: azure/login@v2
+    with:
+      client-id: ${{ vars.AZURE_CLIENT_ID }}          # not secrets — nothing here is sensitive
+      tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  - run: az webapp deploy -g rg-shop -n shop-api --src-path app.zip</code></pre><pre data-lang="python" hidden><code># In an AKS pod with workload identity, the projected token + env vars are all you need:
+from azure.identity import DefaultAzureCredential          # picks WorkloadIdentityCredential automatically
+from azure.keyvault.secrets import SecretClient
+client = SecretClient(&quot;https://kv-shop.vault.azure.net&quot;, DefaultAzureCredential())
+print(client.get_secret(&quot;DbPassword&quot;).value)
+
+# Env vars set by the webhook: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE, AZURE_AUTHORITY_HOST
+# Pod spec needs:  serviceAccountName: orders-api   and label  azure.workload.identity/use: &quot;true&quot;</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Explain the token exchange in workload identity federation; why the <code>subject</code> must be specific (branch/environment, not the whole repo); managed identity vs federated credential — when each applies; how you'd migrate a pipeline off a client secret.</p></div></section>
+<section id="external-id"><h2 id="external-id">External ID (B2C) for customer-facing apps</h2><p>Employee identities live in your workforce tenant; customers should not. <strong>Microsoft Entra External ID</strong> (successor to Azure AD B2C) gives you a separate tenant with sign-up/sign-in user flows, social identity providers, custom branding and custom attributes. Your API code is the same JWT-bearer validation — only the authority and claims differ.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// appsettings.json for an External ID (CIAM) tenant
+// &quot;AzureAd&quot;: {
+//   &quot;Instance&quot;: &quot;https://contosocustomers.ciamlogin.com/&quot;,
+//   &quot;TenantId&quot;: &quot;&lt;tenant-id&gt;&quot;, &quot;ClientId&quot;: &quot;&lt;client-id&gt;&quot;,
+//   &quot;CallbackPath&quot;: &quot;/signin-oidc&quot;, &quot;SignedOutCallbackPath&quot;: &quot;/signout-callback-oidc&quot; }
+builder.Services.AddAuthentication(OpenIdConnectDefaults.AuthenticationScheme)
+    .AddMicrosoftIdentityWebApp(builder.Configuration.GetSection(&quot;AzureAd&quot;));
+
+// Custom attributes come through as extension claims:
+var tier = User.FindFirst(&quot;extension_LoyaltyTier&quot;)?.Value;
+
+// Legacy B2C with user flows adds the policy name to the authority:
+// &quot;Instance&quot;: &quot;https://contoso.b2clogin.com&quot;, &quot;Domain&quot;: &quot;contoso.onmicrosoft.com&quot;, &quot;SignUpSignInPolicyId&quot;: &quot;B2C_1_susi&quot;</code></pre><pre data-lang="python" hidden><code># Streamlit/Flask/FastAPI web app against External ID with msal — only the authority changes
+AUTHORITY = &quot;https://contosocustomers.ciamlogin.com/&lt;tenant-id&gt;&quot;
+cca = msal.ConfidentialClientApplication(CLIENT_ID, authority=AUTHORITY, client_credential=SECRET)
+flow = cca.initiate_auth_code_flow(scopes=[], redirect_uri=&quot;https://shop.contoso.com/callback&quot;)   # openid/profile implied
+# ... on callback:
+result = cca.acquire_token_by_auth_code_flow(flow, request.args)
+claims = result[&quot;id_token_claims&quot;]         # sub/oid, email, extension_LoyaltyTier, ...</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why customers and employees belong in different tenants; what a user flow is; social IdPs and account linking; how you protect the same API for both audiences (multiple authentication schemes / issuers).</p></div></section>
+<section id="zero-trust"><h2 id="zero-trust">Conditional Access, MFA and PIM</h2><p>Identity is the perimeter. <strong>Conditional Access</strong> policies evaluate signals (user, device, location, risk) and require MFA, a compliant device or block. <strong>PIM</strong> makes privileged roles just-in-time with approval and audit. Developers feel this as <code>claims</code> challenges (<code>acrs</code>) and as "why did my daemon get blocked" — service principals are governed by separate workload-identity policies.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="csharp"><code>// Continuous Access Evaluation / claims challenge: Graph says &quot;step up&quot;, your API relays it to the client
+try
+{
+    return await graph.Me.Messages.GetAsync();
+}
+catch (ServiceException ex) when (ex.ResponseHeaders.WwwAuthenticate.Any())
+{
+    var claims = WwwAuthenticateParameters.GetClaimChallengeFromResponseHeaders(ex.ResponseHeaders);
+    if (claims is not null)
+    {
+        Response.Headers.WWWAuthenticate = $&quot;Bearer realm=\&quot;\&quot;, error=\&quot;insufficient_claims\&quot;, claims=\&quot;{claims}\&quot;&quot;;
+        return Results.Unauthorized();       // client re-authenticates with the claims parameter
+    }
+    throw;
+}</code></pre><pre data-lang="bash" hidden><code># Read-only look at Conditional Access policies (needs Policy.Read.All)
+az rest --method GET --uri &quot;https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies&quot; --query &quot;value[].{name:displayName,state:state}&quot; -o table
+
+# PIM: activate an eligible role for 2 hours with a justification (Graph beta / portal)
+az rest --method POST --uri &quot;https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests&quot; --body &#x27;{
+  &quot;action&quot;: &quot;selfActivate&quot;, &quot;principalId&quot;: &quot;&lt;me&gt;&quot;, &quot;roleDefinitionId&quot;: &quot;&lt;role&gt;&quot;, &quot;directoryScopeId&quot;: &quot;/&quot;,
+  &quot;justification&quot;: &quot;Rotate prod cert&quot;, &quot;scheduleInfo&quot;: { &quot;expiration&quot;: { &quot;type&quot;: &quot;afterDuration&quot;, &quot;duration&quot;: &quot;PT2H&quot; } } }&#x27;</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>What signals Conditional Access uses; MFA vs passwordless (FIDO2, passkeys); how PIM changes the on-call story; how an API should react to a claims challenge; sign-in logs and risk detections as observability.</p></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/entra/identity-platform/" target="_blank" rel="noopener">Microsoft identity platform documentation</a> — start with the &quot;Scenarios&quot; section</li><li><a href="https://github.com/AzureAD/microsoft-identity-web/wiki" target="_blank" rel="noopener">Microsoft.Identity.Web wiki</a></li><li><a href="https://learn.microsoft.com/entra/msal/python/" target="_blank" rel="noopener">MSAL for Python</a></li><li><a href="https://learn.microsoft.com/entra/workload-id/workload-identity-federation" target="_blank" rel="noopener">Workload identity federation</a></li><li><a href="https://learn.microsoft.com/azure/role-based-access-control/" target="_blank" rel="noopener">Azure RBAC documentation</a></li><li><a href="https://learn.microsoft.com/entra/external-id/" target="_blank" rel="noopener">Microsoft Entra External ID</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

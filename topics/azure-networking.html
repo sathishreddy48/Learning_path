@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure Networking for App Developers — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="azure-networking">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Azure › Topic 14 of 23</div>
+  <h1>Azure Networking for App Developers</h1>
+  <p class="lede">You will not design the corporate network, but you will be asked why the API cannot reach the database, why the private endpoint resolves to a public IP, or which load balancer sits in front of the app. This page gives you the model and the CLI/Bicep to build a private, zone-redundant web tier — with the .NET and Python bits where the app has to cooperate.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#vnet">VNets, subnets and Network Security Groups</a></li><li><a href="#private-endpoints">Private Link and Private Endpoints</a></li><li><a href="#vnet-integration">VNet integration for App Service, Functions and Container Apps</a></li><li><a href="#load-balancing">Choosing a load balancer</a></li><li><a href="#app-gateway-waf">Application Gateway and the Web Application Firewall</a></li><li><a href="#dns">Azure DNS, private DNS zones and custom domains</a></li><li><a href="#hub-spoke">Hub-spoke, Azure Firewall and hybrid connectivity</a></li></ol>
+  </div>
+
+<section id="vnet"><h2 id="vnet">VNets, subnets and Network Security Groups</h2><p>A <strong>VNet</strong> is a private address space in a region; <strong>subnets</strong> carve it up and are where resources get NICs. <strong>NSGs</strong> are stateful allow/deny rules attached to a subnet or NIC, evaluated by priority; <strong>service tags</strong> (<code>AzureCloud</code>, <code>Storage</code>) and <strong>ASGs</strong> save you from IP lists. Many PaaS services need a <em>delegated</em> subnet of their own.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="bicep">Bicep</button></div><pre data-lang="bash"><code>az network vnet create -g rg-shop -n vnet-shop --address-prefixes 10.10.0.0/16   --subnet-name snet-app --subnet-prefixes 10.10.1.0/24
+az network vnet subnet create -g rg-shop --vnet-name vnet-shop -n snet-pe   --address-prefixes 10.10.2.0/24
+az network vnet subnet create -g rg-shop --vnet-name vnet-shop -n snet-appsvc --address-prefixes 10.10.3.0/24   --delegations Microsoft.Web/serverFarms                 # required for App Service VNet integration
+
+# NSG: allow HTTPS from the Application Gateway subnet only, deny everything else inbound
+az network nsg create -g rg-shop -n nsg-app
+az network nsg rule create -g rg-shop --nsg-name nsg-app -n AllowAppGw --priority 100 --direction Inbound   --source-address-prefixes 10.10.0.0/24 --destination-port-ranges 443 --protocol Tcp --access Allow
+az network nsg rule create -g rg-shop --nsg-name nsg-app -n DenyAllIn --priority 4096 --direction Inbound --access Deny --protocol &#x27;*&#x27;
+az network vnet subnet update -g rg-shop --vnet-name vnet-shop -n snet-app --network-security-group nsg-app
+
+# Debug &quot;why can&#x27;t A reach B&quot;: effective rules and Network Watcher
+az network nic list-effective-nsg --ids &lt;nic-id&gt;
+az network watcher test-ip-flow --vm vm-app --direction Outbound --protocol TCP --local 10.10.1.4:5000 --remote 10.10.2.5:1433</code></pre><pre data-lang="bicep" hidden><code>resource vnet &#x27;Microsoft.Network/virtualNetworks@2023-11-01&#x27; = {
+  name: &#x27;vnet-shop&#x27;
+  location: location
+  properties: {
+    addressSpace: { addressPrefixes: [ &#x27;10.10.0.0/16&#x27; ] }
+    subnets: [
+      { name: &#x27;snet-app&#x27;,    properties: { addressPrefix: &#x27;10.10.1.0/24&#x27;, networkSecurityGroup: { id: nsg.id } } }
+      { name: &#x27;snet-pe&#x27;,     properties: { addressPrefix: &#x27;10.10.2.0/24&#x27;, privateEndpointNetworkPolicies: &#x27;Enabled&#x27; } }
+      { name: &#x27;snet-appsvc&#x27;, properties: { addressPrefix: &#x27;10.10.3.0/24&#x27;, delegations: [ { name: &#x27;web&#x27;, properties: { serviceName: &#x27;Microsoft.Web/serverFarms&#x27; } } ] } }
+    ]
+  }
+}</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Stateful NSG semantics and default rules; NSG vs Azure Firewall vs WAF (layer 4 vs 7); why some services need delegated subnets; how you would find out which rule is blocking traffic.</p></div></section>
+<section id="private-endpoints"><h2 id="private-endpoints">Private Link and Private Endpoints</h2><p>A <strong>private endpoint</strong> puts a NIC in your subnet with a private IP that fronts a PaaS resource (SQL, Storage, Key Vault, Cosmos…). Combined with disabling public network access, the service is only reachable from your VNet. The catch is <strong>DNS</strong>: <code>stshop.blob.core.windows.net</code> must resolve to the private IP, which is what the <code>privatelink.*</code> private DNS zone does. Most "private endpoint doesn't work" tickets are DNS.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button></div><pre data-lang="bash"><code># 1) Private endpoint for a storage account&#x27;s blob sub-resource
+az network private-endpoint create -g rg-shop -n pe-stshop-blob --vnet-name vnet-shop --subnet snet-pe   --private-connection-resource-id $(az storage account show -g rg-shop -n stshop --query id -o tsv)   --group-id blob --connection-name stshop-blob
+
+# 2) Private DNS zone + link to the VNet + auto-registered A record
+az network private-dns zone create -g rg-shop -n privatelink.blob.core.windows.net
+az network private-dns link vnet create -g rg-shop -z privatelink.blob.core.windows.net -n link-vnet-shop -v vnet-shop -e false
+az network private-endpoint dns-zone-group create -g rg-shop --endpoint-name pe-stshop-blob -n default   --private-dns-zone privatelink.blob.core.windows.net --zone-name blob
+
+# 3) Close the front door
+az storage account update -g rg-shop -n stshop --public-network-access Disabled
+
+# Verify from inside the VNet — should print 10.10.2.x
+nslookup stshop.blob.core.windows.net
+# Common sub-resource names: sqlServer, vault, blob/queue/table, Sql (Cosmos), sites (App Service), namespace (Service Bus)</code></pre><pre data-lang="csharp" hidden><code>// Nothing changes in app code — the SDK still uses the public hostname, DNS does the rest.
+var blob = new BlobServiceClient(new Uri(&quot;https://stshop.blob.core.windows.net&quot;), new DefaultAzureCredential());
+
+// But local development can no longer reach the resource. Options:
+//  • VPN / Bastion into the VNet     • a dev storage account with public access + IP rule
+//  • Azurite / SQL in Docker locally  (see Docker &amp; Containers)
+if (builder.Environment.IsDevelopment())
+    builder.Services.AddSingleton(new BlobServiceClient(&quot;UseDevelopmentStorage=true&quot;));   // Azurite</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Service endpoints vs private endpoints (source NAT vs private IP; who can use them); the DNS resolution chain with a custom DNS server / on-prem; why you keep one private DNS zone per service in the hub; cost per endpoint.</p></div></section>
+<section id="vnet-integration"><h2 id="vnet-integration">VNet integration for App Service, Functions and Container Apps</h2><p>Inbound privacy is a private endpoint <em>on</em> the app; outbound privacy is <strong>VNet integration</strong> — the app's outbound traffic exits through a delegated subnet so it can reach private endpoints and on-prem. Container Apps environments and AKS live inside a VNet natively. Set <code>WEBSITE_VNET_ROUTE_ALL=1</code> (now "Route All") so all outbound traffic, not just RFC1918, goes via the VNet.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># App Service: outbound via VNet
+az webapp vnet-integration add -g rg-shop -n shop-api --vnet vnet-shop --subnet snet-appsvc
+az webapp config set -g rg-shop -n shop-api --vnet-route-all-enabled true
+
+# App Service: inbound only via private endpoint (Premium v2/v3)
+az network private-endpoint create -g rg-shop -n pe-shop-api --vnet-name vnet-shop --subnet snet-pe   --private-connection-resource-id $(az webapp show -g rg-shop -n shop-api --query id -o tsv) --group-id sites --connection-name shop-api
+az webapp update -g rg-shop -n shop-api --set publicNetworkAccess=Disabled
+
+# Container Apps: environment inside your VNet with an internal-only ingress
+az containerapp env create -g rg-shop -n cae-shop --location westeurope   --infrastructure-subnet-resource-id $(az network vnet subnet show -g rg-shop --vnet-name vnet-shop -n snet-aca --query id -o tsv)   --internal-only true</code></pre><pre data-lang="python" hidden><code># Sanity-check what the app can reach from inside the platform (run in Kudu / a debug console / a startup probe)
+import socket, ssl, sys
+def check(host, port=443):
+    try:
+        ip = socket.gethostbyname(host)
+        with socket.create_connection((ip, port), timeout=3) as s:
+            if port == 443:
+                ssl.create_default_context().wrap_socket(s, server_hostname=host).close()
+        print(f&quot;OK   {host} -&gt; {ip}:{port}&quot;)
+    except Exception as ex:
+        print(f&quot;FAIL {host}: {ex}&quot;)
+for h in [&quot;stshop.blob.core.windows.net&quot;, &quot;sql-shop.database.windows.net&quot;, &quot;kv-shop.vault.azure.net&quot;]:
+    check(h, 1433 if &quot;database&quot; in h else 443)
+# Private IPs (10.x) mean DNS + integration are working; public IPs mean the private DNS zone is not linked.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Inbound vs outbound privacy and which feature covers each; the delegated subnet sizing rule (/26 minimum for scale-out); Route All and what breaks when NAT gateway is not attached (SNAT port exhaustion).</p></div></section>
+<section id="load-balancing"><h2 id="load-balancing">Choosing a load balancer</h2><p>Four services, two axes: <strong>global vs regional</strong> and <strong>HTTP(S) vs any TCP/UDP</strong>. <strong>Front Door</strong> — global, layer 7, CDN + WAF + TLS at the edge. <strong>Application Gateway</strong> — regional, layer 7, WAF, in your VNet. <strong>Load Balancer</strong> — regional, layer 4, fastest, used inside AKS and for VMs. <strong>Traffic Manager</strong> — global DNS-based routing for anything. Typical web stack: Front Door → App Gateway (or directly to App Service / Container Apps via Private Link origin).</p><div class="table-wrap"><table><thead><tr><th>Service</th><th>Scope</th><th>Layer</th><th>Use when</th></tr></thead><tbody><tr><td>Azure Front Door</td><td>Global (edge PoPs)</td><td>7 (HTTP/S)</td><td>Multi-region web apps, caching, WAF at the edge, Private Link to origins</td></tr><tr><td>Application Gateway</td><td>Regional, in VNet</td><td>7 (HTTP/S)</td><td>Path/host routing inside a VNet, WAF, mTLS, AKS ingress (AGIC / App Gateway for Containers)</td></tr><tr><td>Load Balancer</td><td>Regional (Standard also cross-region)</td><td>4 (TCP/UDP)</td><td>VMs, AKS Services of type LoadBalancer, non-HTTP protocols, lowest latency</td></tr><tr><td>Traffic Manager</td><td>Global (DNS)</td><td>DNS</td><td>Routing by geography/performance/priority for any endpoint type; no data path</td></tr></tbody></table></div><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button></div><pre data-lang="bash"><code># Front Door Standard with a WAF policy, routing to an App Service origin, health-probed on /health
+az afd profile create -g rg-shop --profile-name fd-shop --sku Standard_AzureFrontDoor
+az afd endpoint create -g rg-shop --profile-name fd-shop --endpoint-name shop --enabled-state Enabled
+az afd origin-group create -g rg-shop --profile-name fd-shop --origin-group-name og-api   --probe-path /health --probe-protocol Https --probe-interval-in-seconds 30 --sample-size 4 --successful-samples-required 3 --additional-latency-in-milliseconds 50
+az afd origin create -g rg-shop --profile-name fd-shop --origin-group-name og-api --origin-name api-weu   --host-name shop-api.azurewebsites.net --origin-host-header shop-api.azurewebsites.net --priority 1 --weight 1000 --enabled-state Enabled
+az afd route create -g rg-shop --profile-name fd-shop --endpoint-name shop --route-name api --origin-group og-api   --supported-protocols Https --https-redirect Enabled --forwarding-protocol HttpsOnly --patterns-to-match &quot;/api/*&quot;
+
+# Lock the origin so only Front Door can reach it (App Service access restriction on the AFD service tag + X-Azure-FDID header)
+az webapp config access-restriction add -g rg-shop -n shop-api --rule-name afd --priority 100 --service-tag AzureFrontDoor.Backend   --http-header x-azure-fdid=$(az afd profile show -g rg-shop --profile-name fd-shop --query frontDoorId -o tsv)</code></pre><pre data-lang="csharp" hidden><code>// Behind any layer-7 proxy the app must trust forwarded headers to see the real scheme/host/client IP
+builder.Services.Configure&lt;ForwardedHeadersOptions&gt;(o =&gt;
+{
+    o.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto | ForwardedHeaders.XForwardedHost;
+    o.KnownNetworks.Clear(); o.KnownProxies.Clear();     // App Service/AGW front the app; tighten in self-hosted scenarios
+});
+var app = builder.Build();
+app.UseForwardedHeaders();      // before UseHttpsRedirection / auth — otherwise redirects loop and cookies fail
+app.UseHttpsRedirection();
+
+// Health endpoint the probes hit: cheap, no auth, checks dependencies you can actually recover from
+app.MapHealthChecks(&quot;/health&quot;, new() { Predicate = r =&gt; r.Tags.Contains(&quot;ready&quot;) }).AllowAnonymous();
+// Reject traffic not from Front Door as defence in depth
+app.Use(async (ctx, next) =&gt;
+{
+    if (ctx.Request.Headers[&quot;X-Azure-FDID&quot;] != builder.Configuration[&quot;FrontDoorId&quot;]) { ctx.Response.StatusCode = 403; return; }
+    await next();
+});</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Front Door vs Application Gateway (global/edge vs regional/VNet) and when you would use both; layer 4 vs 7; how you prevent origin bypass; health probe design; session affinity and why you'd rather not need it.</p></div></section>
+<section id="app-gateway-waf"><h2 id="app-gateway-waf">Application Gateway and the Web Application Firewall</h2><p>Application Gateway v2 is a regional reverse proxy: listeners (host + port + cert), rules (path-based routing), backend pools (App Service, VMs, AKS, IPs) and HTTP settings (probe, cookie affinity, connection draining). The <strong>WAF</strong> applies the OWASP Core Rule Set in Detection or Prevention mode; tune false positives with exclusions and custom rules rather than disabling rule groups.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="kql">KQL</button></div><pre data-lang="bash"><code>az network application-gateway create -g rg-shop -n agw-shop --sku WAF_v2 --capacity 2 --zones 1 2 3   --vnet-name vnet-shop --subnet snet-agw --public-ip-address pip-agw --priority 100   --frontend-port 443 --http-settings-port 443 --http-settings-protocol Https   --servers shop-api.azurewebsites.net --key-vault-secret-id https://kv-shop.vault.azure.net/secrets/cert-shop
+
+# Path-based routing: /api/* → API pool, everything else → SPA pool
+az network application-gateway address-pool create -g rg-shop --gateway-name agw-shop -n pool-spa --servers shop-web.azurewebsites.net
+az network application-gateway url-path-map create -g rg-shop --gateway-name agw-shop -n paths --rule-name api --paths &quot;/api/*&quot;   --address-pool appGatewayBackendPool --http-settings appGatewayBackendHttpSettings --default-address-pool pool-spa --default-http-settings appGatewayBackendHttpSettings
+
+# WAF policy: Prevention mode, CRS 3.2, exclude a noisy rule for one header
+az network application-gateway waf-policy create -g rg-shop -n waf-shop
+az network application-gateway waf-policy policy-setting update -g rg-shop --policy-name waf-shop --mode Prevention --state Enabled --request-body-check true
+az network application-gateway waf-policy managed-rule rule-set add -g rg-shop --policy-name waf-shop --type OWASP --version 3.2
+az network application-gateway waf-policy managed-rule exclusion add -g rg-shop --policy-name waf-shop   --match-variable RequestHeaderNames --selector-match-operator Equals --selector &quot;x-custom-json&quot;</code></pre><pre data-lang="kql" hidden><code>// What is the WAF blocking?  (diagnostic setting → Log Analytics)
+AzureDiagnostics
+| where Category == &quot;ApplicationGatewayFirewallLog&quot; and action_s == &quot;Blocked&quot;
+| summarize hits = count() by ruleId_s, Message, requestUri_s
+| order by hits desc
+| take 20</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Listeners vs rules vs HTTP settings; end-to-end TLS vs TLS termination; WAF Detection → Prevention rollout and how you tune false positives; App Gateway for Containers as the AKS ingress; zone redundancy and autoscaling of v2.</p></div></section>
+<section id="dns"><h2 id="dns">Azure DNS, private DNS zones and custom domains</h2><p>Public <strong>Azure DNS</strong> hosts your zones (A/AAAA/CNAME/TXT, alias records to Azure resources). <strong>Private DNS zones</strong> resolve names inside VNets (and are how private endpoints work). With on-prem DNS in the mix, <strong>DNS Private Resolver</strong> forwards queries between the two. Custom domains on App Service / Front Door need a TXT (verification) and CNAME/A, plus a managed or Key Vault certificate.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># Public zone and records
+az network dns zone create -g rg-dns -n contoso.com
+az network dns record-set cname set-record -g rg-dns -z contoso.com -n www --cname shop.z01.azurefd.net
+az network dns record-set txt add-record -g rg-dns -z contoso.com -n _dnsauth.www --value &quot;&lt;afd-validation-token&gt;&quot;
+az network dns record-set a create -g rg-dns -z contoso.com -n apex --target-resource $(az network public-ip show -g rg-shop -n pip-agw --query id -o tsv)   # alias record
+
+# Custom domain + managed cert on Front Door
+az afd custom-domain create -g rg-shop --profile-name fd-shop --custom-domain-name www --host-name www.contoso.com   --certificate-type ManagedCertificate --minimum-tls-version TLS12
+az afd route update -g rg-shop --profile-name fd-shop --endpoint-name shop --route-name api --custom-domains www
+
+# Private DNS: one zone per service, linked to every spoke VNet
+for z in privatelink.database.windows.net privatelink.vaultcore.azure.net privatelink.blob.core.windows.net; do
+  az network private-dns zone create -g rg-hub -n $z
+  az network private-dns link vnet create -g rg-hub -z $z -n link-shop -v $(az network vnet show -g rg-shop -n vnet-shop --query id -o tsv) -e false
+done</code></pre><pre data-lang="python" hidden><code># Automate DNS from a pipeline / script with the management SDK
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.dns import DnsManagementClient
+
+dns = DnsManagementClient(DefaultAzureCredential(), SUBSCRIPTION_ID)
+dns.record_sets.create_or_update(&quot;rg-dns&quot;, &quot;contoso.com&quot;, &quot;api&quot;, &quot;CNAME&quot;,
+    {&quot;ttl&quot;: 300, &quot;cname_record&quot;: {&quot;cname&quot;: &quot;shop.z01.azurefd.net&quot;}})
+for rs in dns.record_sets.list_by_dns_zone(&quot;rg-dns&quot;, &quot;contoso.com&quot;):
+    print(rs.name, rs.type.split(&quot;/&quot;)[-1], rs.ttl)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Alias records vs CNAME at the apex; TTL and cutover planning; how private endpoint DNS works end to end including on-prem resolvers; certificate renewal (managed vs Key Vault) and where it breaks.</p></div></section>
+<section id="hub-spoke"><h2 id="hub-spoke">Hub-spoke, Azure Firewall and hybrid connectivity</h2><p>Enterprises put shared services (firewall, VPN/ExpressRoute gateway, DNS, Bastion) in a <strong>hub</strong> VNet and each workload in a <strong>spoke</strong> peered to it. User-defined routes send spoke egress through <strong>Azure Firewall</strong> for inspection and FQDN filtering. <strong>VPN Gateway</strong> (encrypted over internet) or <strong>ExpressRoute</strong> (private circuit) connect on-prem. As a developer you mostly need to know: egress may be filtered by FQDN, and NAT gateway solves SNAT exhaustion.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button></div><pre data-lang="bash"><code># Peer spoke ↔ hub (both directions), let the spoke use the hub&#x27;s gateway
+az network vnet peering create -g rg-hub  -n hub-to-shop --vnet-name vnet-hub  --remote-vnet $(az network vnet show -g rg-shop -n vnet-shop --query id -o tsv) --allow-vnet-access --allow-gateway-transit
+az network vnet peering create -g rg-shop -n shop-to-hub --vnet-name vnet-shop --remote-vnet $(az network vnet show -g rg-hub -n vnet-hub --query id -o tsv) --allow-vnet-access --use-remote-gateways
+
+# Force spoke egress through the firewall (UDR on the app subnet)
+FW_IP=$(az network firewall show -g rg-hub -n fw-hub --query &quot;ipConfigurations[0].privateIPAddress&quot; -o tsv)
+az network route-table create -g rg-shop -n rt-shop
+az network route-table route create -g rg-shop --route-table-name rt-shop -n default --address-prefix 0.0.0.0/0 --next-hop-type VirtualAppliance --next-hop-ip-address $FW_IP
+az network vnet subnet update -g rg-shop --vnet-name vnet-shop -n snet-app --route-table rt-shop
+
+# Allow the app to reach NuGet/PyPI and Microsoft endpoints by FQDN
+az network firewall policy rule-collection-group collection add-filter-collection -g rg-hub --policy-name fwpol-hub --rcg-name apps   --name allow-package-feeds --collection-priority 200 --action Allow --rule-type ApplicationRule --rule-name feeds   --protocols Https=443 --source-addresses 10.10.0.0/16 --target-fqdns api.nuget.org pypi.org files.pythonhosted.org &quot;*.blob.core.windows.net&quot;
+
+# NAT gateway for predictable outbound IPs and 64k SNAT ports per IP
+az network nat gateway create -g rg-shop -n nat-shop --public-ip-addresses pip-nat --idle-timeout 4
+az network vnet subnet update -g rg-shop --vnet-name vnet-shop -n snet-appsvc --nat-gateway nat-shop</code></pre><pre data-lang="csharp" hidden><code>// SNAT exhaustion shows up as random timeouts under load. The fix is in the app, not just the network:
+//   1. One HttpClient per destination via IHttpClientFactory (connection pooling) — never new HttpClient() per call
+builder.Services.AddHttpClient(&quot;inventory&quot;, c =&gt; c.BaseAddress = new Uri(&quot;https://inventory.contoso.com&quot;))
+    .SetHandlerLifetime(TimeSpan.FromMinutes(5))
+    .ConfigurePrimaryHttpMessageHandler(() =&gt; new SocketsHttpHandler { PooledConnectionLifetime = TimeSpan.FromMinutes(2), MaxConnectionsPerServer = 100 });
+//   2. Private endpoints for Azure services (traffic never SNATs to the internet)
+//   3. NAT gateway on the integration subnet for whatever is left</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Hub-spoke rationale; peering is non-transitive (why spoke-to-spoke goes via the hub/firewall); UDR + firewall for egress control; VPN vs ExpressRoute; SNAT exhaustion symptoms and the three fixes.</p></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/azure/networking/" target="_blank" rel="noopener">Azure networking documentation</a></li><li><a href="https://learn.microsoft.com/azure/private-link/private-endpoint-dns" target="_blank" rel="noopener">Private Link and DNS integration</a> — the table of privatelink zones</li><li><a href="https://learn.microsoft.com/azure/architecture/guide/technology-choices/load-balancing-overview" target="_blank" rel="noopener">Load-balancing options decision tree</a></li><li><a href="https://learn.microsoft.com/azure/frontdoor/" target="_blank" rel="noopener">Azure Front Door documentation</a></li><li><a href="https://learn.microsoft.com/azure/architecture/networking/architecture/hub-spoke" target="_blank" rel="noopener">Hub-spoke network topology</a></li><li><a href="https://learn.microsoft.com/azure/app-service/networking-features" target="_blank" rel="noopener">App Service networking features</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

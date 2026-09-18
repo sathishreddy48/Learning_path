@@ -23,8 +23,16 @@
     python: 'False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield self print len range str int float list dict set tuple bool',
     yaml: 'true false null',
     json: 'true false null',
-    bash: 'if then else fi for do done in echo export'
+    bash: 'if then else fi for do done in echo export case esac while local exit',
+    bicep: 'resource module param var output targetScope existing for in if else true false null using',
+    hcl: 'resource variable output module provider terraform locals data backend required_providers for_each count true false null each var local',
+    dockerfile: 'FROM RUN COPY ADD WORKDIR ENV ARG EXPOSE CMD ENTRYPOINT USER HEALTHCHECK LABEL VOLUME AS',
+    kql: 'let where summarize project extend order by take top join union render count countif sum avg min max percentile bin ago distinct asc desc and or not has contains startswith in between',
+    xml: '',
+    sql: 'SELECT FROM WHERE AND OR NOT IN GROUP BY ORDER BY LIMIT JOIN ON AS INSERT UPDATE DELETE CREATE TABLE'
   };
+  /* line-comment marker per language; languages absent here use '//' */
+  var LINE_COMMENT = { python: '#', yaml: '#', bash: '#', hcl: '#', dockerfile: '#', xml: null, json: '//' };
   var TYPES = {
     csharp: /\b([A-Z][A-Za-z0-9_]*)(?=\s*[<(\.\s\[]|\b)/g,
     python: /\b([A-Z][A-Za-z0-9_]*)\b/g
@@ -40,7 +48,7 @@
     var kw = (KW[lang] || '').split(' ');
     var isKw = {};
     kw.forEach(function (k) { isKw[k] = true; });
-    var lineComment = lang === 'python' || lang === 'yaml' || lang === 'bash' ? '#' : '//';
+    var lineComment = LINE_COMMENT.hasOwnProperty(lang) ? LINE_COMMENT[lang] : '//';
     var typeRe = TYPES[lang];
 
     function flushIdent(word) {
@@ -53,9 +61,13 @@
     while (i < n) {
       var ch = src[i];
       // comments
-      if (src.substr(i, lineComment.length) === lineComment && !(lang === 'csharp' && src[i + 2] === '/' && false)) {
+      if (lineComment && src.substr(i, lineComment.length) === lineComment) {
         var e = src.indexOf('\n', i); if (e === -1) e = n;
         out += '<span class="c">' + esc(src.slice(i, e)) + '</span>'; i = e; continue;
+      }
+      if (lang === 'xml' && src.substr(i, 4) === '<!--') {
+        var ex = src.indexOf('-->', i + 4); ex = ex === -1 ? n : ex + 3;
+        out += '<span class="c">' + esc(src.slice(i, ex)) + '</span>'; i = ex; continue;
       }
       if (lang === 'csharp' && ch === '/' && src[i + 1] === '*') {
         var e2 = src.indexOf('*/', i + 2); e2 = e2 === -1 ? n : e2 + 2;

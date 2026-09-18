@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kubernetes &amp; AKS — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="kubernetes-aks">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › DevOps › Topic 21 of 23</div>
+  <h1>Kubernetes &amp; AKS</h1>
+  <p class="lede">Container Apps hides Kubernetes; AKS does not. This page is the working vocabulary — enough YAML to deploy the .NET API with config, secrets, scaling and TLS — plus the AKS-specific features that replace the "Kubernetes way" with the "Azure way" (identity, secrets, registry). Every snippet is something you would actually run.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#core-objects">Pods, Deployments, Services and namespaces</a></li><li><a href="#config">ConfigMaps, Secrets, probes and resources</a></li><li><a href="#ingress">Ingress, Gateway API and TLS</a></li><li><a href="#scaling">HPA, KEDA and the cluster autoscaler</a></li><li><a href="#helm">Helm and Kustomize</a></li><li><a href="#aks">AKS specifics: node pools, identity, secrets, registry</a></li><li><a href="#deploy">Deploying from a pipeline: rollouts and rollbacks</a></li><li><a href="#troubleshooting">The kubectl troubleshooting loop</a></li></ol>
+  </div>
+
+<section id="core-objects"><h2 id="core-objects">Pods, Deployments, Services and namespaces</h2><p>A <strong>Pod</strong> is one or more containers sharing a network namespace — the unit of scheduling. You never create Pods directly; a <strong>Deployment</strong> manages a ReplicaSet that keeps N Pods running and performs rolling updates. A <strong>Service</strong> gives a stable virtual IP/DNS name (<code>orders-api.shop.svc.cluster.local</code>) in front of the Pods selected by labels. <strong>Namespaces</strong> partition the cluster (per team/environment) for RBAC, quotas and naming.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="yaml"><code>apiVersion: apps/v1
+kind: Deployment
+metadata: { name: orders-api, namespace: shop, labels: { app: orders-api } }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: orders-api } }
+  strategy: { type: RollingUpdate, rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }   # zero-downtime
+  template:
+    metadata:
+      labels: { app: orders-api, azure.workload.identity/use: &quot;true&quot; }
+    spec:
+      serviceAccountName: orders-api
+      topologySpreadConstraints:                                  # spread across zones
+        - { maxSkew: 1, topologyKey: topology.kubernetes.io/zone, whenUnsatisfiable: ScheduleAnyway, labelSelector: { matchLabels: { app: orders-api } } }
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: api
+          image: acrshop.azurecr.io/shop-api@sha256:3f1a…            # digest-pinned by the pipeline
+          ports: [{ containerPort: 8080, name: http }]
+          envFrom: [{ configMapRef: { name: orders-api-config } }]
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits:   { memory: 512Mi }                              # CPU limit omitted on purpose (throttling); memory limit kept
+          readinessProbe: { httpGet: { path: /health/ready, port: http }, periodSeconds: 5, failureThreshold: 3 }
+          livenessProbe:  { httpGet: { path: /health/live,  port: http }, periodSeconds: 15, initialDelaySeconds: 10 }
+          lifecycle: { preStop: { exec: { command: [&quot;sleep&quot;, &quot;5&quot;] } } }   # let the endpoint drain before SIGTERM
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes: [{ name: tmp, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: orders-api, namespace: shop }
+spec:
+  selector: { app: orders-api }
+  ports: [{ port: 80, targetPort: http }]
+  type: ClusterIP</code></pre><pre data-lang="bash" hidden><code>kubectl create namespace shop
+kubectl apply -f deploy/ -n shop
+kubectl get deploy,rs,pods,svc -n shop -o wide
+kubectl rollout status deploy/orders-api -n shop
+kubectl describe pod -l app=orders-api -n shop | sed -n &#x27;/Events/,$p&#x27;
+kubectl port-forward svc/orders-api 8080:80 -n shop      # hit it from your laptop
+kubectl scale deploy/orders-api --replicas=5 -n shop</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Pod vs container vs Deployment vs ReplicaSet; how a Service finds Pods (labels, Endpoints/EndpointSlices); ClusterIP vs NodePort vs LoadBalancer; what happens during a rolling update; readiness vs liveness and how a bad liveness probe causes restart storms.</p></div></section>
+<section id="config"><h2 id="config">ConfigMaps, Secrets, probes and resources</h2><p><strong>ConfigMaps</strong> hold non-secret config as env vars or mounted files; <strong>Secrets</strong> are base64 (not encrypted by default — use Key Vault + CSI driver on AKS, see below). <strong>Requests</strong> drive scheduling and the autoscaler; <strong>limits</strong> cap usage (memory limit → OOMKill; CPU limit → throttling). Set requests always; set memory limits; think twice about CPU limits for latency-sensitive services.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="yaml"><code>apiVersion: v1
+kind: ConfigMap
+metadata: { name: orders-api-config, namespace: shop }
+data:
+  ASPNETCORE_ENVIRONMENT: Production
+  ASPNETCORE_HTTP_PORTS: &quot;8080&quot;
+  Shop__Inventory__Url: http://inventory-api.shop.svc.cluster.local
+  Logging__LogLevel__Default: Information
+---
+# Mounted file config (reloadOnChange works with the projected volume symlink swap)
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: orders-api-appsettings, namespace: shop }
+data:
+  appsettings.Production.json: |
+    { &quot;Shop&quot;: { &quot;Checkout&quot;: { &quot;MaxItems&quot;: 50 } } }
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata: { name: shop-quota, namespace: shop }
+spec: { hard: { requests.cpu: &quot;8&quot;, requests.memory: 16Gi, limits.memory: 32Gi, pods: &quot;50&quot; } }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget                    # keep 2 up during node upgrades / drains
+metadata: { name: orders-api-pdb, namespace: shop }
+spec: { minAvailable: 2, selector: { matchLabels: { app: orders-api } } }</code></pre><pre data-lang="csharp" hidden><code>// Health endpoints Kubernetes will probe — keep liveness trivial, readiness honest
+builder.Services.AddHealthChecks()
+    .AddCheck(&quot;self&quot;, () =&gt; HealthCheckResult.Healthy(), tags: new[] { &quot;live&quot; })
+    .AddSqlServer(cs, tags: new[] { &quot;ready&quot; })
+    .AddRedis(redisCs, tags: new[] { &quot;ready&quot; });
+app.MapHealthChecks(&quot;/health/live&quot;,  new() { Predicate = r =&gt; r.Tags.Contains(&quot;live&quot;) });
+app.MapHealthChecks(&quot;/health/ready&quot;, new() { Predicate = r =&gt; r.Tags.Contains(&quot;ready&quot;) });
+
+// Graceful shutdown: SIGTERM → stop accepting → finish in-flight (must be &lt; terminationGracePeriodSeconds, default 30)
+builder.Host.ConfigureHostOptions(o =&gt; o.ShutdownTimeout = TimeSpan.FromSeconds(20));
+
+// Mounted appsettings from the ConfigMap
+builder.Configuration.AddJsonFile(&quot;/app/config/appsettings.Production.json&quot;, optional: true, reloadOnChange: true);</code></pre><pre data-lang="python" hidden><code># FastAPI equivalents
+@app.get(&quot;/health/live&quot;)
+def live(): return {&quot;status&quot;: &quot;ok&quot;}
+
+@app.get(&quot;/health/ready&quot;)
+async def ready():
+    await db.execute(&quot;SELECT 1&quot;); await redis.ping()
+    return {&quot;status&quot;: &quot;ready&quot;}
+
+# uvicorn handles SIGTERM: stops accepting, waits for in-flight requests (--timeout-graceful-shutdown 20)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Requests vs limits and QoS classes (Guaranteed/Burstable/BestEffort); why CPU limits can hurt p99; PDBs and node upgrades; Secrets are base64, so what do you actually do; how config changes reach running Pods (env needs restart, files reload).</p></div></section>
+<section id="ingress"><h2 id="ingress">Ingress, Gateway API and TLS</h2><p>An <strong>Ingress</strong> routes HTTP by host/path to Services through an ingress controller (NGINX, Application Gateway for Containers, Traefik). The newer <strong>Gateway API</strong> (GatewayClass → Gateway → HTTPRoute) is the successor with clearer role separation. TLS certificates come from <strong>cert-manager</strong> (Let's Encrypt) or Key Vault; on AKS the managed "application routing" add-on gives you NGINX + Key Vault certs + Azure DNS in one step.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="yaml"><code># AKS application routing add-on (managed NGINX) with a Key Vault certificate and Azure DNS
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  namespace: shop
+  annotations:
+    kubernetes.azure.com/tls-cert-keyvault-uri: https://kv-shop.vault.azure.net/certificates/shop-tls
+    nginx.ingress.kubernetes.io/proxy-body-size: 10m
+    nginx.ingress.kubernetes.io/limit-rps: &quot;50&quot;
+spec:
+  ingressClassName: webapprouting.kubernetes.azure.com
+  tls: [{ hosts: [api.contoso.com], secretName: keyvault-shop }]
+  rules:
+    - host: api.contoso.com
+      http:
+        paths:
+          - { path: /orders,    pathType: Prefix, backend: { service: { name: orders-api,    port: { number: 80 } } } }
+          - { path: /inventory, pathType: Prefix, backend: { service: { name: inventory-api, port: { number: 80 } } } }
+---
+# Gateway API flavour (Application Gateway for Containers / any conformant controller)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: orders, namespace: shop }
+spec:
+  parentRefs: [{ name: shop-gateway, namespace: infra }]
+  hostnames: [api.contoso.com]
+  rules:
+    - matches: [{ path: { type: PathPrefix, value: /orders } }]
+      backendRefs:
+        - { name: orders-api, port: 80, weight: 90 }
+        - { name: orders-api-canary, port: 80, weight: 10 }        # weighted canary in the route</code></pre><pre data-lang="bash" hidden><code>az aks approuting enable -g rg-shop -n aks-shop
+az aks approuting update -g rg-shop -n aks-shop --enable-kv --attach-kv $(az keyvault show -n kv-shop --query id -o tsv)
+az aks approuting zone add -g rg-shop -n aks-shop --ids $(az network dns zone show -g rg-dns -n contoso.com --query id -o tsv) --attach-zones
+kubectl get ingress -n shop                        # ADDRESS column = public IP; DNS record is created for you
+kubectl logs -n app-routing-system -l app.kubernetes.io/name=nginx --tail=100    # controller logs for 502s</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Ingress vs Service type LoadBalancer; where TLS terminates and mTLS to Pods; Ingress vs Gateway API; how you do canary/blue-green at the routing layer; WAF placement (App Gateway for Containers / Front Door in front).</p></div></section>
+<section id="scaling"><h2 id="scaling">HPA, KEDA and the cluster autoscaler</h2><p>Three layers: the <strong>HPA</strong> scales Pods on CPU/memory/custom metrics; <strong>KEDA</strong> scales on event sources (Service Bus queue length, Event Hubs lag, HTTP, cron) including to zero; the <strong>cluster autoscaler</strong> (or Node Autoprovisioning / Karpenter) adds nodes when Pods are unschedulable. Requests must be accurate or every layer misbehaves. VPA can recommend requests.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="yaml"><code>apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: orders-api, namespace: shop }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: orders-api }
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+  behavior:
+    scaleUp:   { stabilizationWindowSeconds: 0,   policies: [{ type: Percent, value: 100, periodSeconds: 30 }] }
+    scaleDown: { stabilizationWindowSeconds: 300, policies: [{ type: Pods, value: 2, periodSeconds: 60 }] }
+---
+# KEDA: the order worker scales on Service Bus queue depth, to zero when idle, authenticating with workload identity
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata: { name: sb-auth, namespace: shop }
+spec: { podIdentity: { provider: azure-workload, identityId: &lt;client-id-of-user-assigned-mi&gt; } }
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: { name: order-worker, namespace: shop }
+spec:
+  scaleTargetRef: { name: order-worker }
+  minReplicaCount: 0
+  maxReplicaCount: 50
+  cooldownPeriod: 120
+  triggers:
+    - type: azure-servicebus
+      metadata: { queueName: orders, namespace: sb-shop, messageCount: &quot;20&quot; }     # 1 replica per 20 messages
+      authenticationRef: { name: sb-auth }</code></pre><pre data-lang="bash" hidden><code>az aks update -g rg-shop -n aks-shop --enable-keda                                   # managed KEDA add-on
+az aks nodepool update -g rg-shop --cluster-name aks-shop -n userpool --enable-cluster-autoscaler --min-count 2 --max-count 20
+az aks update -g rg-shop -n aks-shop --cluster-autoscaler-profile scale-down-delay-after-add=5m scan-interval=20s
+
+kubectl get hpa,scaledobject -n shop
+kubectl describe hpa orders-api -n shop | sed -n &#x27;/Conditions/,$p&#x27;
+kubectl get events -n shop --field-selector reason=TriggeredScaleUp
+kubectl top pods -n shop --sort-by=cpu</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Why HPA needs requests; scale-up vs scale-down stabilisation; KEDA vs HPA on custom metrics; scaling to zero and cold starts; the cluster autoscaler's signal (pending Pods) and node provisioning time; over-provisioning with pause Pods.</p></div></section>
+<section id="helm"><h2 id="helm">Helm and Kustomize</h2><p><strong>Helm</strong> packages templated manifests into a <strong>chart</strong> with per-environment <code>values.yaml</code>, tracked as releases with history and rollback; use it for third-party software (ingress, KEDA, Prometheus) and your own services when you want one artefact. <strong>Kustomize</strong> patches plain YAML per overlay without templating and is built into kubectl. Many teams do both: Helm for vendor charts, Kustomize for their own manifests.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">Helm</button><button role="tab" aria-selected="false" data-lang="yaml">Kustomize</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="yaml"><code># charts/orders-api/values.yaml
+image: { repository: acrshop.azurecr.io/shop-api, tag: &quot;&quot; }       # tag/digest injected by the pipeline
+replicaCount: 3
+resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { memory: 512Mi } }
+ingress: { host: api.contoso.com, path: /orders }
+config:
+  Shop__Inventory__Url: http://inventory-api.shop.svc.cluster.local
+
+# charts/orders-api/templates/deployment.yaml (excerpt)
+# spec:
+#   replicas: {{ .Values.replicaCount }}
+#   template:
+#     metadata:
+#       annotations: { checksum/config: {{ include (print $.Template.BasePath &quot;/configmap.yaml&quot;) . | sha256sum }} }  # restart on config change
+#     spec:
+#       containers:
+#         - image: &quot;{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}&quot;
+#           envFrom: [{ configMapRef: { name: {{ include &quot;orders-api.fullname&quot; . }} } }]
+
+# values.prod.yaml
+replicaCount: 6
+resources: { requests: { cpu: 500m, memory: 512Mi }, limits: { memory: 1Gi } }</code></pre><pre data-lang="yaml" hidden><code># k8s/base/kustomization.yaml
+resources: [deployment.yaml, service.yaml, configmap.yaml, hpa.yaml]
+commonLabels: { app.kubernetes.io/part-of: shop }
+
+# k8s/overlays/prod/kustomization.yaml
+resources: [../../base]
+namespace: shop
+images:
+  - { name: acrshop.azurecr.io/shop-api, digest: sha256:3f1a… }
+patches:
+  - target: { kind: Deployment, name: orders-api }
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 6
+configMapGenerator:
+  - name: orders-api-config
+    behavior: merge
+    literals: [Logging__LogLevel__Default=Warning]</code></pre><pre data-lang="bash" hidden><code># Helm
+helm repo add kedacore https://kedacore.github.io/charts &amp;&amp; helm repo update
+helm upgrade --install keda kedacore/keda -n keda --create-namespace --version 2.16.0 --wait
+helm upgrade --install orders-api charts/orders-api -n shop -f charts/orders-api/values.prod.yaml   --set image.tag=1.4.2 --atomic --timeout 5m          # --atomic rolls back automatically if the release fails
+helm history orders-api -n shop ; helm rollback orders-api 3 -n shop
+helm template orders-api charts/orders-api -f values.prod.yaml | kubectl apply --dry-run=server -f -   # validate against the API server
+
+# Kustomize
+kubectl kustomize k8s/overlays/prod | kubectl diff -f - ; kubectl apply -k k8s/overlays/prod</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Helm vs Kustomize trade-offs; release history and rollback; the config-checksum annotation trick; chart versioning vs app versioning; where you store charts (ACR supports OCI charts); GitOps (Flux/Argo CD) as the next step.</p></div></section>
+<section id="aks"><h2 id="aks">AKS specifics: node pools, identity, secrets, registry</h2><p>AKS replaces several DIY pieces: <strong>system/user node pools</strong> (spot pools for batch), <strong>workload identity</strong> instead of secrets in Pods, the <strong>Key Vault CSI driver</strong> to mount secrets/certs, <strong>ACR attach</strong> for pulls, Azure CNI (Overlay) networking, <strong>Azure Policy for AKS</strong> (Gatekeeper) and <strong>Container Insights</strong>. AKS Automatic bundles most of the recommended setup.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="yaml">YAML</button></div><pre data-lang="bash"><code># Cluster with the pieces you want from day one
+az aks create -g rg-shop -n aks-shop --location westeurope --tier standard --zones 1 2 3   --node-count 3 --node-vm-size Standard_D4ds_v5 --nodepool-name system --nodepool-labels mode=system   --network-plugin azure --network-plugin-mode overlay --network-policy cilium --network-dataplane cilium   --enable-oidc-issuer --enable-workload-identity --enable-managed-identity   --enable-addons monitoring,azure-keyvault-secrets-provider --enable-secret-rotation   --attach-acr acrshop --enable-cluster-autoscaler --min-count 3 --max-count 6 --enable-azure-rbac --enable-aad
+az aks nodepool add -g rg-shop --cluster-name aks-shop -n userpool --mode User --node-count 2 --node-vm-size Standard_D8ds_v5 --zones 1 2 3 --enable-cluster-autoscaler --min-count 2 --max-count 20
+az aks nodepool add -g rg-shop --cluster-name aks-shop -n spotpool --priority Spot --eviction-policy Delete --spot-max-price -1 --node-count 0 --enable-cluster-autoscaler --min-count 0 --max-count 10   --node-taints kubernetes.azure.com/scalesetpriority=spot:NoSchedule
+
+# Workload identity: MI + federated credential ↔ service account
+az identity create -g rg-shop -n id-orders-api
+ISSUER=$(az aks show -g rg-shop -n aks-shop --query oidcIssuerProfile.issuerUrl -o tsv)
+az identity federated-credential create -g rg-shop --identity-name id-orders-api -n orders-api --issuer $ISSUER --subject system:serviceaccount:shop:orders-api --audiences api://AzureADTokenExchange
+az role assignment create --assignee $(az identity show -g rg-shop -n id-orders-api --query principalId -o tsv) --role &quot;Key Vault Secrets User&quot; --scope $(az keyvault show -n kv-shop --query id -o tsv)
+
+az aks get-credentials -g rg-shop -n aks-shop ; kubelogin convert-kubeconfig -l azurecli</code></pre><pre data-lang="yaml" hidden><code>apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orders-api
+  namespace: shop
+  annotations: { azure.workload.identity/client-id: &lt;client-id-of-id-orders-api&gt; }
+---
+# Key Vault secrets mounted as files (and optionally synced to a k8s Secret for env vars)
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata: { name: kv-shop, namespace: shop }
+spec:
+  provider: azure
+  parameters:
+    clientID: &lt;client-id-of-id-orders-api&gt;       # workload identity
+    keyvaultName: kv-shop
+    tenantId: &lt;tenant-id&gt;
+    objects: |
+      array:
+        - { objectName: DbPassword, objectType: secret }
+        - { objectName: shop-tls,   objectType: secret }
+  secretObjects:
+    - secretName: orders-api-secrets
+      type: Opaque
+      data: [{ objectName: DbPassword, key: DB_PASSWORD }]
+---
+# In the Pod spec:
+#   volumes: [{ name: secrets, csi: { driver: secrets-store.csi.k8s.io, readOnly: true, volumeAttributes: { secretProviderClass: kv-shop } } }]
+#   volumeMounts: [{ name: secrets, mountPath: /mnt/secrets, readOnly: true }]
+#   env: [{ name: DB_PASSWORD, valueFrom: { secretKeyRef: { name: orders-api-secrets, key: DB_PASSWORD } } }]</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>System vs user node pools and taints; workload identity end to end (OIDC issuer, federated credential, projected token); CSI driver vs reading Key Vault from code; Azure CNI overlay vs kubenet; upgrades (node image vs Kubernetes version, surge, PDBs); AKS Automatic.</p></div></section>
+<section id="deploy"><h2 id="deploy">Deploying from a pipeline: rollouts and rollbacks</h2><p>The pipeline builds the image, pins the digest, renders manifests (Helm/Kustomize), applies them and waits for the rollout. Rolling updates are the default; for canary or blue-green use weighted routes (Gateway API / Argo Rollouts / Flagger). Rollback is <code>kubectl rollout undo</code> or redeploying the previous digest. GitOps (Flux is an AKS extension) inverts the flow: the cluster pulls the desired state from git.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">Azure Pipelines</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button></div><pre data-lang="yaml"><code>- stage: DeployProd
+  dependsOn: Build
+  jobs:
+    - deployment: aks
+      environment: shop-prod.shop          # AKS environment resource → approvals + Kubernetes view
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: AzureCLI@2
+                inputs:
+                  azureSubscription: sc-shop-prod
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    az aks get-credentials -g rg-shop -n aks-shop --overwrite-existing
+                    kubelogin convert-kubeconfig -l azurecli
+                    DIGEST=&quot;$(Build.imageDigest)&quot;
+                    helm upgrade --install orders-api charts/orders-api -n shop -f charts/orders-api/values.prod.yaml                       --set image.digest=&quot;$DIGEST&quot; --atomic --timeout 10m
+                    kubectl rollout status deploy/orders-api -n shop --timeout=300s
+              - script: curl -fsS https://api.contoso.com/orders/health/ready
+                displayName: Smoke test</code></pre><pre data-lang="bash" hidden><code># Manual rollout control
+kubectl set image deploy/orders-api api=acrshop.azurecr.io/shop-api@sha256:9c2b… -n shop
+kubectl rollout status deploy/orders-api -n shop
+kubectl rollout history deploy/orders-api -n shop
+kubectl rollout undo deploy/orders-api -n shop --to-revision=4
+kubectl rollout pause deploy/orders-api -n shop   # investigate mid-rollout; resume later
+
+# GitOps with the Flux extension: cluster reconciles k8s/overlays/prod from git every minute
+az k8s-configuration flux create -g rg-shop -c aks-shop -n shop-config -t managedClusters --scope cluster   -u https://github.com/contoso/shop-deploy --branch main --kustomization name=prod path=./k8s/overlays/prod prune=true</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Rolling vs canary vs blue-green on Kubernetes and the tooling for each; what "rollout status" waits for; digest pinning; GitOps pros/cons (drift, audit, pull vs push); database migrations relative to the rollout.</p></div></section>
+<section id="troubleshooting"><h2 id="troubleshooting">The kubectl troubleshooting loop</h2><p>Pending → scheduling problem (resources, taints, PVC). CrashLoopBackOff → the process exits; read logs of the previous container. ImagePullBackOff → registry auth or wrong tag. Ready 0/1 → readiness probe failing. 502/503 from ingress → no ready endpoints. Learn the five commands and the order: <code>get</code> → <code>describe</code> → <code>logs</code> → <code>exec</code>/<code>debug</code> → <code>events</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="kql">Container Insights</button></div><pre data-lang="bash"><code>kubectl get pods -n shop -o wide                              # STATUS / RESTARTS / node
+kubectl describe pod &lt;pod&gt; -n shop                            # Events at the bottom: FailedScheduling, Unhealthy, BackOff, Failed to pull
+kubectl logs &lt;pod&gt; -n shop --previous --tail=200              # why did the last container die
+kubectl get events -n shop --sort-by=.lastTimestamp | tail -30
+kubectl get endpoints orders-api -n shop                      # empty → no ready Pods → ingress 503
+
+kubectl exec -it &lt;pod&gt; -n shop -- sh                          # if the image has a shell
+kubectl debug -it &lt;pod&gt; -n shop --image=mcr.microsoft.com/dotnet/sdk:9.0 --target=api --share-processes   # ephemeral container for chiseled images
+kubectl debug node/&lt;node&gt; -it --image=ubuntu                  # node-level shell
+
+kubectl top pods -n shop ; kubectl top nodes
+kubectl get pod &lt;pod&gt; -n shop -o jsonpath=&#x27;{.status.containerStatuses[0].lastState.terminated.reason}&#x27;   # OOMKilled?
+kubectl auth can-i create deployments -n shop --as system:serviceaccount:shop:ci     # RBAC checks
+
+# Networking from inside the cluster
+kubectl run -it --rm netshoot --image=nicolaka/netshoot -n shop -- bash
+  # nslookup inventory-api.shop.svc.cluster.local ; curl -sv http://inventory-api/health/ready</code></pre><pre data-lang="kql" hidden><code>// Container Insights (Log Analytics): restarts and OOM kills in the last hour
+KubePodInventory
+| where TimeGenerated &gt; ago(1h) and Namespace == &quot;shop&quot;
+| summarize restarts = max(ContainerRestartCount) by Name, ContainerStatusReason
+| where restarts &gt; 0
+| order by restarts desc
+
+// Application stdout logs
+ContainerLogV2
+| where TimeGenerated &gt; ago(30m) and PodNamespace == &quot;shop&quot; and PodName startswith &quot;orders-api&quot;
+| where LogMessage has &quot;error&quot;
+| project TimeGenerated, PodName, LogMessage</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Walk through diagnosing CrashLoopBackOff / Pending / ImagePullBackOff / 503; ephemeral debug containers; reading Events; where logs go on AKS and how you query them; the difference between the Pod being Running and the app being healthy.</p></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://kubernetes.io/docs/concepts/" target="_blank" rel="noopener">Kubernetes documentation — Concepts</a></li><li><a href="https://learn.microsoft.com/azure/aks/" target="_blank" rel="noopener">AKS documentation</a></li><li><a href="https://learn.microsoft.com/azure/aks/workload-identity-overview" target="_blank" rel="noopener">AKS workload identity</a></li><li><a href="https://keda.sh/docs/scalers/" target="_blank" rel="noopener">KEDA scalers</a></li><li><a href="https://helm.sh/docs/" target="_blank" rel="noopener">Helm documentation</a></li><li><a href="https://learn.microsoft.com/azure/architecture/reference-architectures/containers/aks/baseline-aks" target="_blank" rel="noopener">AKS baseline architecture</a></li><li><a href="https://kubernetes.io/docs/reference/kubectl/quick-reference/" target="_blank" rel="noopener">kubectl cheat sheet</a></li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>
