@@ -19,6 +19,7 @@ Major stock exchanges are **NYSE**, **NASDAQ**, among others.
 <p align="left">
     <img src="./images/world-stock-exchanges.png" alt="world-stock-exchanges" width="500" />
 </p>
+
 ---
 
 ## Step 1: Understand the Problem and Establish Design scope
@@ -108,21 +109,25 @@ L1 market data contains best bid/ask prices and quantities:
 <p align="left">
     <img src="./images/l1-price.png" alt="l1-price" width="500" />
 </p>
+
 L2 includes more price levels:
 
 <p align="left">
     <img src="./images/l2-price.png" alt="l2-price" width="500" />
 </p>
+
 L3 shows levels and queued quantity at each level:
 
 <p align="left">
     <img src="./images/l3-price.png" alt="l3-price" width="500" />
 </p>
+
 A candlestick shows the market open and close price, as well as the highest and lowest prices in the given interval:
 
 <p align="left">
     <img src="./images/candlestick.png" alt="candlestick" width="500" />
 </p>
+
 FIX is a protocol for exchanging securities transaction information, used by most vendors. Example securities transaction:
 ```
 8=FIX.4.2 | 9=176 | 35=8 | 49=PHLX | 56=PERS | 52=20071123-05:30:00.000 | 11=ATOMNOCCC9990900 | 20=3 | 150=E | 39=E | 55=MSFT | 167=CS | 54=1 | 38=15 | 40=2 | 44=15 | 58=PHLX EQUITY TESTING | 59=0 | 47=C | 32=0 | 31=0 | 151=15 | 14=0 | 6=0 | 10=128 |
@@ -133,6 +138,7 @@ FIX is a protocol for exchanging securities transaction information, used by mos
 <p align="left">
     <img src="./images/high-level-design.png" alt="high-level-design" width="500" />
 </p>
+
 Trade flow:
  * Client places order via trading interface
  * Broker sends the order to the exchange
@@ -167,6 +173,7 @@ Next is the sequencer - it is the key component making the matching engine deter
 <p align="left">
     <img src="./images/sequencer.png" alt="sequencer" width="500" />
 </p>
+
 We stamp inbound orders and outbound fills for several reasons:
  * timeliness and fairness
  * fast recovery/replay
@@ -189,6 +196,7 @@ Finally, the client gateway receives orders from users and sends them to the ord
 <p align="left">
     <img src="./images/client-gateway.png" alt="client-gateway" width="500" />
 </p>
+
 Since the client gateway is on the critical path, it should stay lightweight.
 
 There can be multiple client gateways for different clients. Eg a colo engine is a trading engine server, rented by the broker in the exchange's data center:
@@ -196,6 +204,7 @@ There can be multiple client gateways for different clients. Eg a colo engine is
 <p align="left">
     <img src="./images/client-gateways.png" alt="client-gateways" width="500" />
 </p>
+
 #### Market data flow
 The market data publisher receives executions from the matching engine and builds the order book/candlestick charts from the execution stream.
 
@@ -204,12 +213,14 @@ That data is sent to the data service, which is responsible for showing the aggr
 <p align="left">
     <img src="./images/market-data.png" alt="market-data" width="500" />
 </p>
+
 #### Reporting flow
 The reporter is not on the critical path, but it is an important component nevertheless.
 
 <p align="left">
     <img src="./images/reporting-flow.png" alt="reporting-flow" width="500" />
 </p>
+
 It is responsible for trading history, tax reporting, compliance reporting, settlements, etc.
 Latency is not a critical requirement for the reporting flow. Accuracy and compliance are more important.
 
@@ -310,6 +321,7 @@ Here's the data model:
 <p align="left">
     <img src="./images/product-order-execution-data-model.png" alt="product-order-execution-data-model" width="500" />
 </p>
+
 We encounter orders and executions in all of our three flows:
  * in the critical path, they are processed in-memory for high performance. They are stored and recovered from the sequencer.
  * The reporter writes orders and executions to the database for reporting use-cases
@@ -329,6 +341,7 @@ Example order book execution:
 <p align="left">
     <img src="./images/order-book-execution.png" alt="order-book-execution" width="500" />
 </p>
+
 After fulfilling this large order, the price increases as the bid/ask spread widens.
 
 Example order book implementation in pseudo code:
@@ -377,6 +390,7 @@ Everything on the hot path is constant time, which is what a microsecond budget 
 <p align="left">
     <img src="./images/order-book-impl.png" alt="order-book-impl" width="500" />
 </p>
+
 This data structure is also used in the market data services to reconstruct the order book.
 
 #### Candlestick chart
@@ -428,11 +442,13 @@ Hence, we'll put everything on one server and processes are going to communicate
 <p align="left">
     <img src="./images/mmap-bus.png" alt="mmap-bus" width="500" />
 </p>
+
 Another optimization is using an application loop (while loop executing mission-critical tasks), pinned to the same CPU to avoid context switching:
 
 <p align="left">
     <img src="./images/application-loop.png" alt="application-loop" width="500" />
 </p>
+
 Another side effect of using an application loop is that there is no lock contention - multiple threads fighting for the same resource.
 
 **Three distinct costs disappear with a single pinned thread, and it is worth separating them:**
@@ -463,6 +479,7 @@ In a nutshell, instead of storing current states, we store immutable state trans
 <p align="left">
     <img src="./images/event-sourcing.png" alt="event-sourcing" width="500" />
 </p>
+
  * On the left - traditional schema
  * On the right - event source schema
 
@@ -471,6 +488,7 @@ Here's how our design looks like thus far:
 <p align="left">
     <img src="./images/design-so-far.png" alt="design-so-far" width="500" />
 </p>
+
  * external domain interacts with our client gateway using the FIX protocol
  * Order manager receives the new order event, validates it and adds it to its internal state. Order is then sent to matching core
  * If order is matched, the `OrderFilledEvent` is generated and sent over mmap
@@ -483,6 +501,7 @@ The sequencer in this design, changes to not be an event store, but be a single 
 <p align="left">
     <img src="./images/sequencer-deep-dive.png" alt="sequencer-deep-dive" width="500" />
 </p>
+
 ### **High availability**
 We aim for 99.99% availability - only 8.64s of downtime per day.
 
@@ -497,6 +516,7 @@ For stateful components, we can process inbound events, but not publish outbound
 <p align="left">
     <img src="./images/leader-election.png" alt="leader-election" width="500" />
 </p>
+
 To detect the primary replica being down, we can send heartbeats to detect that its non-functional.
 
 This mechanism only works within the boundary of a single server. 
@@ -525,11 +545,13 @@ Example of how replication works across different servers:
 <p align="left">
     <img src="./images/replication-across-servers.png" alt="replication-across-servers" width="500" />
 </p>
+
 Example leader-election terms:
 
 <p align="left">
     <img src="./images/leader-election-terms.png" alt="leader-election-terms" width="500" />
 </p>
+
 For details on how Raft works, [check this out](https://thesecretlivesofdata.com/raft/)
 
 Finally, we need to also consider loss tolerance - how much data can we lose before things get critical?
@@ -602,6 +624,7 @@ The actual time when the event happens doesn't matter:
 <p align="left">
     <img src="./images/determinism.png" alt="determinism" width="500" />
 </p>
+
 **And functional determinism is doing more work here than audit.** Because the matching engine is a pure function of the sequenced event stream, any replica fed the same sequence reaches the same state — which is what makes hot-warm standbys possible at all, and what makes recovery a replay rather than a reconciliation. The sequencer is the thing that creates that stream, so it is simultaneously the ordering authority, the fairness authority (sequence number = arrival priority), and the foundation of fault tolerance.
 
 It is worth noting what that means for the sequencer itself: it is a **single point of failure and the system's throughput ceiling**, because every order must pass through it to be ordered. There is no sharding it without giving up the total order that everything else depends on — the same wall as the hot account in [Chapter 27](../27.%20%20Digital%20Wallet/) and the hot inventory row in [Chapter 22](../22.%20Hotel%20Reservation%20System/). An exchange accepts that ceiling and makes the single path as fast as possible, which is the whole of Step 3.
@@ -620,6 +643,7 @@ We only keep part of the candlesticks as we don't have infinite memory. Clients 
 <p align="left">
     <img src="./images/market-data-publisher.png" alt="market-data-publisher" width="500" />
 </p>
+
 A ring buffer (aka circular buffer) is a fixed-size queue with the head connected to the tail. The space is preallocated to avoid allocations. The data structure is also lock-free.
 
 Another technique to optimize the ring buffer is padding, which ensures the sequence number is never in a cache line with anything else.

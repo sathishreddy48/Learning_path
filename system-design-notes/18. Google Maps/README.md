@@ -57,6 +57,7 @@ World is a sphere, rotating on its axis. Positions are defined by latitude (how 
 <p align="left">
     <img src="./images/partitioning-system.png" alt="partitioning-system" width="500" />
 </p>
+
 #### Going from 3D to 2D
 
 The process of translating points from 3D to 2D plane is called "map projection".
@@ -77,6 +78,7 @@ Conformality is the one navigation genuinely needs, and the square world is what
 <p align="left">
     <img src="./images/map-projections.png" alt="map-projections" width="500" />
 </p>
+
 Google maps selected a modified version of Mercator projection called "Web Mercator".
 
 #### Geocoding
@@ -96,6 +98,7 @@ It depicts the world as a flattened surface and recursively sub-divides it into 
 <p align="left">
     <img src="./images/geohashing.png" alt="geohashing" width="500" />
 </p>
+
 #### Map rendering
 
 Map rendering happens via tiling. Instead of rendering entire map as one big custom image, world is broken up into smaller tiles.
@@ -143,6 +146,7 @@ In most routing algorithms, intersections are represented as nodes and roads are
 <p align="left">
     <img src="./images/road-representation.png" alt="road-representation" width="500" />
 </p>
+
 Most navigation algorithms use a modified version of Dijkstra's or A* algorithms.
 
 Pathfinding performance is sensitive to the size of the graph. To work at scale, we can't represent the whole world as a graph and run the algorithm on it.
@@ -160,6 +164,7 @@ Routing tiles hold references to neighboring tiles and algorithms can stitch tog
 <p align="left">
     <img src="./images/routing-tiles.png" alt="routing-tiles" width="500" />
 </p>
+
 This technique enables us to significantly reduce memory bandwidth and only load the tiles we need for the given source/destination pair.
 
 Note what the "references to neighboring tiles" are doing: they are the **stitching seams**. A road crossing a tile boundary must appear in both tiles, with each side carrying a pointer to the node in the adjacent tile, or the graph falls apart at every edge of every tile and no route would cross one. Boundary handling is not a detail here; it is what makes the subdivision legal.
@@ -181,6 +186,7 @@ The number of tiles loaded grows with the **logarithm** of the distance rather t
 <p align="left">
     <img src="./images/map-routing-hierarchical.png" alt="map-routing-hierarchical" width="500" />
 </p>
+
 ### **Back-of-the-envelope estimation**
 
 For storage, we need to store:
@@ -211,11 +217,13 @@ Assuming gps update requests are batched, we arrive at 200k QPS and 1mil QPS at 
 <p align="left">
     <img src="./images/high-level-design.png" alt="high-level-design" width="500" />
 </p>
+
 ### **Location service**
 
 <p align="left">
     <img src="./images/location-service.png" alt="location-service" width="500" />
 </p>
+
 It is responsible for recording a user's location updates:
  * location updates are sent every `t` seconds
  * location data streams can be used to improve the service over time, eg provide more accurate ETAs, monitor traffic data, detect closed roads, analyze user behavior, etc
@@ -225,6 +233,7 @@ Instead of sending location updates to the server all the time, we can batch the
 <p align="left">
     <img src="./images/location-update-batches.png" alt="location-update-batches" width="500" />
 </p>
+
 Despite this optimization, for a system of Google Maps scale, load will still be significant. Therefore, we can leverage a database, optimized for heavy writes such as Cassandra.
 
 We can also leverage Kafka for efficient stream processing of location updates, meant for further analysis.
@@ -292,11 +301,13 @@ How should the map tiles be served to the client?
 <p align="left">
     <img src="./images/static-map-tiles.png" alt="static-map-tiles" width="500" />
 </p>
+
 CDNs enable users to fetch map tiles from point-of-presence servers (POP) which are closest to users in order to minimize latency:
 
 <p align="left">
     <img src="./images/cdn-vs-no-cdn.png" alt="cdn-vs-no-cdn" width="500" />
 </p>
+
 Options to consider for determining map tiles:
  * geohash for map tile can be calculated on the client-side. If that's the case, we should be careful that we commit to this type of map tile calculation for the long-term as forcing clients to update is hard
  * alternatively, we can have simple API which calculates the map tile URLs on behalf of the clients at the cost of additional API call
@@ -304,6 +315,7 @@ Options to consider for determining map tiles:
 <p align="left">
     <img src="./images/map-tile-url-calculation.png" alt="map-tile-url-calculation" width="500" />
 </p>
+
 ---
 
 ## Step 3: Design Deep Dive
@@ -333,6 +345,7 @@ Example row:
 <p align="left">
     <img src="./images/user-location-data-torw.png" alt="user-location-data-row" width="500" />
 </p>
+
 #### Geocoding database
 
 This database stores a key-value pair of lat/long pairs and places.
@@ -346,6 +359,7 @@ As we discussed, we will precompute map tiling images and store them in CDN.
 <p align="left">
     <img src="./images/precomputed-map-tile-image.png" alt="precomputed-map-tile-image" width="500" />
 </p>
+
 ### **Services**
 
 #### Location service
@@ -355,6 +369,7 @@ Let's focus on the database design and how user location is stored in detail for
 <p align="left">
     <img src="./images/location-service-diagram.png" alt="location-service-diagram" width="500" />
 </p>
+
 We can use a NoSQL database to facilitate the heavy write load we have on location updates. We prioritize availability over consistency as user location data often changes and becomes stale as new updates arrive.
 
 We'll choose Cassandra as our database choice as it nicely fits all our requirements.
@@ -364,6 +379,7 @@ Example row we're going to store:
 <p align="left">
     <img src="./images/user-location-row-example.png" alt="user-location-row-example" width="500" />
 </p>
+
  * `user_id` is the partition key in order to quickly access all location updates for a particular user
  * `timestamp` is the clustering key in order to store the data sorted by the time a location update is received
 
@@ -372,6 +388,7 @@ We also leverage Kafka to stream location updates to various other service which
 <p align="left">
     <img src="./images/location-update-streaming.png" alt="location-update-streaming" width="500" />
 </p>
+
 #### Rendering map
 
 Map tiles are stored at various zoom levels. At the lowest zoom level, the entire world is represented by a single 256x256 tile.
@@ -381,6 +398,7 @@ As zoom levels increase, the number of map tiles quadruples:
 <p align="left">
     <img src="./images/zoom-level-increases.png" alt="zoom-level-increases" width="500" />
 </p>
+
 One optimization we can use is to not send the entire image information over the network, but instead represent tiles as vectors (paths & polygons) and let the client render the tiles dynamically.
 
 This will have substantial bandwidth savings.
@@ -392,6 +410,7 @@ This service is responsible for finding the fastest routes:
 <p align="left">
     <img src="./images/navigation-service.png" alt="navigation-service" width="500" />
 </p>
+
 Let's go through each component in this sub-system.
 
 First, we have the geocoding service which resolves an address to a location of lat/long pair.
@@ -447,6 +466,7 @@ The shortest-path service runs a variation of the A* algorithm against the routi
 <p align="left">
     <img src="./images/shortest-path-service.png" alt="shortest-path-service" width="500" />
 </p>
+
 The ETA service is called by the route planner to get estimated time based on machine learning algorithms, predicting ETA based on traffic data.
 
 **Why ETA needs a model rather than arithmetic, and why it is not simply "current traffic".** Summing each segment's current travel time would be wrong for any journey of length: by the time a driver reaches a motorway two hours into a trip, conditions there will have changed. The prediction must be of **conditions at the time of arrival at each segment**, which is a forecast, not a measurement — and that is what makes it a model rather than a sum. Historical patterns (this road is always slow at 17:30 on weekdays), live traffic, weather, incidents and road class all feed it.
@@ -484,6 +504,7 @@ user_1, r_1, super(r_1), super(super(r_1)), ...
 <p align="left">
     <img src="./images/adaptive-eta-data-storage.png" alt="adaptive-eta-data-storage" width="500" />
 </p>
+
 Using this, we only need to check if the final tile of a user includes the traffic accident tile to see if user is impacted.
 
 **This is a cheap over-approximation followed by an exact check, which is a pattern worth recognising.** Storing `super(super(...r_1))` reduces thousands of fine tiles per user to a handful of coarse ones, so the containment test is cheap — but a coarse tile covering the accident does **not** mean the user's actual path goes through it. The coarse test yields **false positives and no false negatives**, exactly like the Bloom filters in [Chapter 6](../06.%20Key-Value%20Store/) and [Chapter 8](../08.%20URL%20Shortener/): it narrows a huge candidate set cheaply, and the survivors get the expensive precise check against their real route.
@@ -604,4 +625,5 @@ This is our final design:
 <p align="left">
     <img src="./images/final-design.png" alt="final-design" width="500" />
 </p>
+
 One additional feature we could provide is multi-stop navigation which can be sold to enterprise customers such as Uber or Lyft in order to determine optimal path for visiting a set of locations.

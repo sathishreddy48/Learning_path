@@ -75,12 +75,14 @@ At a high-level, we have three actors, participating in money movement:
 <p align="left">
     <img src="./images/high-level-flow.png" alt="high-level-flow" width="500" />
 </p>
+
 ### **Pay-in flow**
 Here's the high-level overview of the pay-in flow:
 
 <p align="left">
     <img src="./images/payin-flow-high-level.png" alt="pay-in-flow-high-level" width="500" />
 </p>
+
  * Payment service - accepts payment events and coordinates the payment process. It typically also does a risk check using a third-party provider for AML violations or criminal activity.
  * Payment executor - executes a single payment order via the Payment Service Provider (PSP). Payment events may contain several payment orders.
  * Payment service provider (PSP) - moves money from one account to another, eg from buyer's credit card account to e-commerce site's bank account.
@@ -243,6 +245,7 @@ So the hosted page is not primarily a convenience: **it is a deliberate transfer
 <p align="left">
     <img src="./images/hosted-payment-page.png" alt="hosted-payment-page" width="500" />
 </p>
+
 ### **Pay-out flow**
 The components of the pay-out flow are very similar to the pay-in flow.
 
@@ -269,6 +272,7 @@ Here's how the hosted payment page workflow works:
 <p align="left">
     <img src="./images/hosted-payment-page-workflow.png" alt="hosted-payment-page-workflow" width="500" />
 </p>
+
  * User clicks "checkout" button in the browser
  * Client calls the payment service with the payment order information
  * After receiving payment order information, the payment service sends a payment registration request to the PSP.
@@ -296,6 +300,7 @@ Every night, the PSP sends a settlement file which our system uses to compare th
 <p align="left">
     <img src="./images/settlement-report.png" alt="settlement-report" width="500" />
 </p>
+
 This process can also be used to detect internal inconsistencies between eg the ledger and the wallet services.
 
 Mismatches are handled manually by the finance team. Mismatches are handled as:
@@ -348,11 +353,13 @@ Single receiver - multiple receivers subscribe to the same topic and messages ar
 <p align="left">
     <img src="./images/single-receiver.png" alt="single-receiver" width="500" />
 </p>
+
 Multiple receivers - multiple receivers subscribe to the same topic, but messages are forwarded to all of them:
 
 <p align="left">
     <img src="./images/multiple-receiver.png" alt="multiple-receiver" width="500" />
 </p>
+
 Latter model works well for our payment system as a payment can trigger multiple side effects, handled by different services.
 
 In a nutshell, synchronous communication is simpler but doesn't allow services to be autonomous. 
@@ -367,6 +374,7 @@ Every payment system needs to address failed payments. Here are some of the mech
 <p align="left">
     <img src="./images/failed-payments.png" alt="failed-payments" width="500" />
 </p>
+
 ### **Exactly-once delivery**
 We need to ensure a payment gets processed exactly-once to avoid double-charging a customer.
 
@@ -377,6 +385,7 @@ To achieve the at-least-once guarantee, we'll use a retry mechanism:
 <p align="left">
     <img src="./images/retry-mechanism.png" alt="retry-mechanism" width="500" />
 </p>
+
 Here are some common strategies on deciding the retry intervals:
  * immediate retry - client immediately sends another request after failure
  * fixed intervals - wait a fixed amount of time before retrying a payment
@@ -398,6 +407,7 @@ Idempotency is managed by a special header in the request (eg `idempotency-key`)
 <p align="left">
     <img src="./images/idempotency-example.png" alt="idempotency-example" width="500" />
 </p>
+
 Idempotency can be achieved using the database's mechanism of adding unique key constraints:
  * server attempts to insert a new row in the database
  * the insertion fails due to a unique key constraint violation

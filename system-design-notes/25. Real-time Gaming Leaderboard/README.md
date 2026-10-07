@@ -14,6 +14,7 @@ Two framing points worth carrying through:
 <p align="left">
     <img src="./images/leaderboard.png" alt="leaderboard" width="500" />
 </p>
+
 ---
 
 ## Step 1: Understand the Problem and Establish Design Scope
@@ -139,6 +140,7 @@ Example response:
 <p align="left">
     <img src="./images/high-level-architecture.png" alt="high-level-architecture" width="500" />
 </p>
+
 - When a player wins a game, client sends a request to the game service
 - Game service validates if win is valid and calls the leaderboard service to update the player's score
 - Leaderboard service updates the user's score in the leaderboard store
@@ -149,6 +151,7 @@ An alternative design which was considered is the client updating their score di
 <p align="left">
     <img src="./images/alternative-design.png" alt="alternative-design" width="500" />
 </p>
+
 This option is not secure as it's susceptible to man-in-the-middle attacks. Players can put a proxy and change their score as they please.
 
 One additional caveat is that for games, where the game logic is managed by the server, cliets don't need to call the server explicitly to record their win.
@@ -159,6 +162,7 @@ One additional consideration is whether we should put a message queue between th
 <p align="left">
     <img src="./images/message-queue-based-comm.png" alt="message-queue-based-comm" width="500" />
 </p>
+
 ### **Data models**
 
 Let's discuss the options we have for storing leaderboard data - relational DBs, Redis, NoSQL.
@@ -174,6 +178,7 @@ We can start from a simple leaderboard table, one for each month (personal note 
 <p align="left">
     <img src="./images/leaderboard-table.png" alt="leaderboard-table" width="500" />
 </p>
+
 There is additional data to include in there, but that is irrelevant to the queries we'd run, so it's omitted.
 
 What happens when a user wins a point?
@@ -181,6 +186,7 @@ What happens when a user wins a point?
 <p align="left">
     <img src="./images/user-wins-point.png" alt="user-wins-point" width="500" />
 </p>
+
 If a user doesn't exist in the table yet, we need to insert them first:
 
 ```
@@ -198,6 +204,7 @@ How do we find the top players of a leaderboard?
 <p align="left">
     <img src="./images/find-leaderboard-position.png" alt="find-leaderboard-position" width="500" />
 </p>
+
 We can run the following query:
 
 ```
@@ -252,6 +259,7 @@ Internally, it is implemented using a hash-map to maintain mapping between key (
 <p align="left">
     <img src="./images/sorted-set.png" alt="sorted-set" width="500" />
 </p>
+
 How does a skip list work?
 - It is a linked list which allows for fast search
 - It consists of a sorted linked list and multi-level indexes
@@ -259,6 +267,7 @@ How does a skip list work?
 <p align="left">
     <img src="./images/skip-list.png" alt="skip-list" width="500" />
 </p>
+
 This structure enables us to quickly search for specific values when the data set is large enough.
 In the example below (64 nodes), it requires traversing 62 nodes in a base linked list to find the given value and 11 nodes in the skip-list case:
 
@@ -289,6 +298,7 @@ This works, with a caveat worth knowing: sorted-set scores are IEEE-754 doubles 
 <p align="left">
     <img src="./images/skip-list-performance.png" alt="skip-list-performance" width="500" />
 </p>
+
 Sorted sets are more performant than relational databases as the data is kept sorted at all times at the price of O(logN) add and find operation.
 
 In contract, here's an example nested query we need to run to find the rank of a given user in a relational DB:
@@ -331,6 +341,7 @@ What about user fetching their leaderboard position?
 <p align="left">
     <img src="./images/leaderboard-position-of-user.png" alt="leaderboard-position-of-user" width="500" />
 </p>
+
 This can be easily achieved by the following query, given that we know a user's leaderboard position:
 
 ```
@@ -366,11 +377,13 @@ If we choose to manage the services ourselves, we'll use redis for leaderboard d
 <p align="left">
     <img src="./images/manage-services-ourselves.png" alt="manage-services-ourselves" width="500" />
 </p>
+
 Alternatively, we could use cloud offerings to manage a lot of the services for us. For example, we can use AWS API Gateway to route API calls to AWS Lambda functions:
 
 <p align="left">
     <img src="./images/api-gateway-mapping.png" alt="api-gateway-mapping" width="500" />
 </p>
+
 AWS Lambda enables us to run code without managing or provisioning servers ourselves. It runs only when needed and scales automatically.
 
 Example of a user scoring a point:
@@ -378,11 +391,13 @@ Example of a user scoring a point:
 <p align="left">
     <img src="./images/user-scoring-point-lambda.png" alt="user-scoring-point-lambda" width="500" />
 </p>
+
 Example user retrieving leaderboard:
 
 <p align="left">
     <img src="./images/user-retrieve-leaderboard.png" alt="user-retrieve-leaderboard" width="500" />
 </p>
+
 Lambdas are an implementation of a serverless architecture. We don't need to manage scaling and environment setup.
 
 Author recommends going with this approach if we build the game from the ground up.
@@ -400,6 +415,7 @@ One way to achieve it is by range-partitioning the data:
 <p align="left">
     <img src="./images/range-partition.png" alt="range-partition" width="500" />
 </p>
+
 **Before sharding, note what a leaderboard *is* in Redis terms: a single key.** The whole sorted set lives under one key, and Redis Cluster shards *by key* — so Redis Cluster cannot split one leaderboard across nodes at all. "Sharding the leaderboard" necessarily means **deciding to store it as several separate sorted sets** and reassembling answers in the application. That is why both options below are application-level schemes rather than a configuration change, and it is the detail that makes this section harder than it looks.
 
 In this example, we'll shard based on user's score. We'll maintain the mapping between user_id and shard in application code.
@@ -420,11 +436,13 @@ Alternatively, we can use hash partitioning via Redis Cluster. It is a proxy whi
 <p align="left">
     <img src="./images/hash-partition.png" alt="hash-partition" width="500" />
 </p>
+
 Calculating the top 10 players is challenging with this setup. We'll need to get the top 10 players of each shard and merge the results in the application:
 
 <p align="left">
     <img src="./images/top-10-players-calculation.png" alt="top-10-players-calculation" width="500" />
 </p>
+
 There are some limitations with the hash partitioning:
 - If we need to fetch top K users, where K is high, latency can increase as we'll need to fetch a lot of data from all the shards
 - Latency increases as the number of partitions grows
@@ -467,16 +485,19 @@ It also enables usage of global secondary indexes when we need to query fields n
 <p align="left">
     <img src="./images/dynamo-db.png" alt="dynamo-db" width="500" />
 </p>
+
 Let's start from a table for storing a leaderboard for a chess game:
 
 <p align="left">
     <img src="./images/chess-game-leaderboard-table-1.png" alt="chess-game-leaderboard-table-1" width="500" />
 </p>
+
 This works well, but doesn't scale well if we need to query anything by score. Hence, we can put the score as a sort key:
 
 <p align="left">
     <img src="./images/chess-game-leaderboard-table-2.png" alt="chess-game-leaderboard-table-2" width="500" />
 </p>
+
 Another problem with this design is that we're partitioning by month. This leads to a hotspot partition as the latest month will be unevenly accessed compared to the others.
 
 We could use a technique called write sharding, where we append a partition number for each key, calculated via `user_id % num_partitions`:
@@ -484,6 +505,7 @@ We could use a technique called write sharding, where we append a partition numb
 <p align="left">
     <img src="./images/chess-game-leaderboard-table-3.png" alt="chess-game-leaderboard-table-3" width="500" />
 </p>
+
 An important trade-off to consider is how many partitions we should use:
 - The more partitions there are, the higher the write scalability
 - However, read scalability suffers as we need to query more partitions to collect aggregate results
@@ -493,6 +515,7 @@ Using this approach requires that we use the "scatter-gather" technique we saw e
 <p align="left">
     <img src="./images/scatter-gather-2.png" alt="scatter-gather-2" width="500" />
 </p>
+
 To make a good evaluation on the number of partitions, we'd need to do some benchmarking.
 
 This NoSQL approach still has one major downside - it is hard to calculate the specific rank of a user.

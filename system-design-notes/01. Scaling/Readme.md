@@ -35,9 +35,9 @@ If you can tell that story in an interview, you have demonstrated far more than 
 ## Section 1: Single Server Setup
 Initially, all components (web app, database, cache) run on a single server. 
 
-<div style="margin-left:3rem">
+<p align="left">
    <img src="./images/single-server.png" width="400" />
-</div>
+</p>
 
 **What broke:** nothing yet. This is the correct starting point, and it is worth saying so out loud in an interview — a single modern server handles a surprising amount of traffic, often a few thousand requests per second for a simple application, which covers the first tens of thousands of users comfortably.
 
@@ -67,9 +67,9 @@ Note that DNS is typically a **third-party paid service**, not something you run
 ## Section 2: Database Separation
 As the user base grows, the database is moved to a dedicated server to allow independent scaling of web and database tiers.
 
-<div style="margin-left:3rem">
+<p align="left">
    <img src="./images/database.png" width="400" />
-</div>
+</p>
 
 **What broke:** the web app and the database compete for the same CPU, RAM, and disk. A traffic spike starves the database; a heavy query starves the app. You also cannot tune one without hurting the other — web servers want CPU, databases want RAM and fast disk.
 
@@ -142,9 +142,9 @@ Two corrections to common misconceptions worth knowing:
 
 ## Section 4: Load Balancer
 
-<div style="margin-left:3rem">
+<p align="left">
    <img src="./images/load-balancer.png" width="400" />
-</div>
+</p>
 
 **What broke:** a single web server is both a capacity limit and a single point of failure (SPOF). If it goes down, users see nothing; if it saturates, everyone's requests slow down together.
 
@@ -199,9 +199,9 @@ The load balancer continuously probes each server and removes unhealthy ones fro
 
 ## Section 5: Database Replication
 
-<div style="margin-left:3rem">
+<p align="left">
    <img src="./images/database-replication.png" width="400" />
-</div>
+</p>
 
 **What broke:** all web servers read from one database. Reads dominate most workloads, so the database saturates long before the app tier does — and it is still a single point of failure for the entire product.
 
@@ -271,9 +271,9 @@ recovery scripts (methods like multi-masters and circular replication could help
 ## Section 6: Caching
 A **cache** stores frequently accessed data in memory to reduce database load. The cache tier is a temporary data store layer, much faster than the database. 
 
-<div style="margin-left:3rem">
+<p align="left">
    <img src="./images/cache.png" width="500" />
-</div>
+</p>
 
 **What broke:** the same expensive queries run thousands of times per second for data that barely changes. Even with replicas, every read costs a network hop plus disk work. An in-memory cache hit is **orders of magnitude** cheaper than a database query — see the latency table in [Chapter 2](../02.%20Back%20Of%20the%20Envelope%20Estimation/) for why that gap is so large.
 
@@ -343,9 +343,9 @@ A practical approach is to set TTL from how stale the data is *allowed* to be by
 ## Section 7: Content Delivery Network (CDN)
 A **CDN** improves load times by caching static content (images, CSS, JavaScript) on geographically distributed servers.
 
-<div style="margin-left:3rem">
+<p align="left">
    <img src="./images/cdn.png" width="400" />
-</div>
+</p>
 
 **What broke:** caching helped your database, but it did nothing about **distance**. A user in Sydney hitting a server in Virginia pays well over 100 ms of round-trip latency *per request* that no amount of server-side optimization can remove — and a page pulling 50 assets pays it repeatedly. The only fix is to move the bytes physically closer.
 
@@ -394,15 +394,15 @@ By moving session data to a shared datastore, web servers become stateless. This
 
 Here is the stateful arrangement being replaced — session state living inside each server:
 
-<div style="margin-left:3rem">
+<p align="left">
    <img src="./images/statefull.png" width="400" />
-</div>
+</p>
 
 And the stateless version, with session state moved to a shared store that every server can reach:
 
-<div style="margin-left:3rem">
+<p align="left">
    <img src="./images/stateless.png" width="400" />
-</div>
+</p>
 
 The important shift is that **any server can now serve any request**. That single property is what makes auto-scaling, zero-downtime deploys, and instant failover possible — which is why "keep the web tier stateless" is the first item in this chapter's takeaways.
 
@@ -428,9 +428,9 @@ The important shift is that **any server can now serve any request**. That singl
 ## Section 9: Multi-Data Center Setup
 Deploying across multiple data centers improves availability and reduces latency. Strategies include:
 
-<div style="margin-left:3rem">
+<p align="left">
    <img src="./images/data-center.png" width="400" />
-</div>
+</p>
 
 **What broke:** one data center is one blast radius. A regional power, network, or provider failure takes the whole product offline no matter how many servers you run inside it — and users on the far side of the planet still pay the latency.
 
@@ -470,9 +470,9 @@ The deployment point deserves more weight than it usually gets: with multiple re
 A **message queue** is a durable component, stored in memory, that supports asynchronous
 communication. It serves as a buffer and distributes asynchronous requests.
 
-<div style="margin-left:3rem">
+<p align="left">
    <img src="./images/message-queue.png" width="500" />
-</div>
+</p>
 
 **What broke:** some work is simply too slow to do inside a request — encoding a video, applying filters to a photo, sending email, generating a report. Done synchronously it holds a web server thread for seconds or minutes, so a burst of uploads exhausts the web tier and users stare at a spinner or time out.
 
@@ -513,9 +513,9 @@ Covered in much more depth in [Chapter 19 – Distributed Message Queue](../19.%
 
 ## Section 11: Logging, Metrics, and Automation
 
-<div style="margin-left:3rem">
+<p align="left">
    <img src="./images/logging.png" width="400" />
-</div>
+</p>
 
 **What broke:** with a dozen components across multiple regions, "the site is slow" is no longer a question you can answer by reading one log file over SSH. You cannot operate what you cannot see.
 
@@ -557,9 +557,9 @@ Metrics are usefully grouped by level:
 
 ### Horizontal Scaling (Sharding)
 
-<div style="margin-left:3rem">
+<p align="left">
    <img src="./images/horizontal-scaling.png" width="400" />
-</div>
+</p>
 
 - Divides data across multiple shards using keys (e.g., `user_id`).
    - Sharding separates large databases into smaller, more easily managed parts called shards.

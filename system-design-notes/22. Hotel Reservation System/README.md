@@ -62,6 +62,7 @@ we can estimate that if there are 3 reservations, then there must be 30 views of
 <p align="left">
     <img src="./images/qps-estimation.png" alt="qps-estimation" width="500" />
 </p>
+
 ---
 
 ## Step 2: Propose High-Level Design and Get Buy-In
@@ -127,11 +128,13 @@ Here is our schema design:
 <p align="left">
     <img src="./images/schema-design.png" alt="schema-design" width="500" />
 </p>
+
 Most fields are self-explanatory. Only field worth mentioning is the `status` field which represents the state machine of a given room:
 
 <p align="left">
     <img src="./images/status-state-machine.png" alt="status-state-machine" width="500" />
 </p>
+
 This data model works well for a system like Airbnb, but not for hotels where users don't reserve a particular room but a room type.
 They reserve a type of room and a room number is chosen at the point of reservation.
 
@@ -143,6 +146,7 @@ We've chosen a microservice architecture for this design. It has gained great po
 <p align="left">
     <img src="./images/high-level-design.png" alt="high-level-design" width="500" />
 </p>
+
  - **Users**: book a hotel room on their phone or computer
  - **Admin**: perform administrative functions such as refunding/cancelling a payment, etc
  - **CDN**: caches static resources such as JS bundles, images, videos, etc
@@ -187,6 +191,7 @@ Here's the updated schema:
 <p align="left">
     <img src="./images/updated-schema.png" alt="updated-schema" width="500" />
 </p>
+
  - **room**: contains information about a room
  - **room_type_rate**: contains information about prices for a given room type
  - **reservation**: records guest reservation data
@@ -271,6 +276,7 @@ Here's a visualization of the first problem:
 <p align="left">
     <img src="./images/double-booking-single-user.png" alt="double-booking-single-user" width="500" />
 </p>
+
 There are two approaches to solving this problem:
  - Client-side handling - front-end can disable the book button once clicked. If a user disabled javascript, however, they won't see the button becoming grayed out.
  - Idempotent API - Add an idempotency key to the API, which enables a user to execute an action once, regardless of how many times the endpoint is invoked:
@@ -278,6 +284,7 @@ There are two approaches to solving this problem:
 <p align="left">
     <img src="./images/idempotency.png" alt="idempotency" width="500" />
 </p>
+
 Here's how this flow works:
  - A reservation order is generated once you're in the process of filling in your details and making a booking. The reservation order is generated using a globally unique identifier.
  - Submit reservation 1 using the `reservation_id` generated in the previous step.
@@ -293,11 +300,13 @@ It also solves a problem beyond double-clicks. A network timeout leaves the clie
 <p align="left">
     <img src="./images/unique-constraint-violation.png" alt="unique-constraint-violation" width="500" />
 </p>
+
 What if there are multiple users making the same reservation?
 
 <p align="left">
     <img src="./images/double-booking-multiple-users.png" alt="double-booking-multiple-users" width="500" />
 </p>
+
  - Let's assume the transaction isolation level is not serializable
  - User 1 and 2 attempt to book the same room at the same time.
  - Transaction 1 checks if there are enough rooms - there are
@@ -342,6 +351,7 @@ This can be done in MySQL by using the `SELECT... FOR UPDATE` query, which locks
 <p align="left">
     <img src="./images/pessimistic-locking.png" alt="pessimistic-locking" width="500" />
 </p>
+
 Pros:
  - Prevents applications from updating data that is being changed
  - Easy to implement and avoids conflict by serializing updates. Useful when there is heavy data contention.
@@ -361,6 +371,7 @@ There are two common ways to implement it - version numbers and timestamps. Vers
 <p align="left">
     <img src="./images/optimistic-locking.png" alt="optimistic-locking" width="500" />
 </p>
+
  - A new `version` column is added to the database table
  - Before a user modifies a database row, the version number is read
  - When the user updates the row, the version number is increased by 1 and written back to the database
@@ -389,6 +400,7 @@ CONSTRAINT `check_room_count` CHECK((`total_inventory - total_reserved` >= 0))
 <p align="left">
     <img src="./images/database-constraint.png" alt="database-constraint" width="500" />
 </p>
+
 Pros:
  - Easy to implement
  - Works well when data contention is small
@@ -482,11 +494,13 @@ Assuming, QPS is 30,000, after sharding the database in 16 shards, each shard ha
 <p align="left">
     <img src="./images/database-sharding.png" alt="database-sharding" width="500" />
 </p>
+
 We can also utilize caching for room inventory and reservations via Redis. We can set TTL so that old data can expire for days which are past.
 
 <p align="left">
     <img src="./images/inventory-cache.png" alt="inventory-cache" width="500" />
 </p>
+
 The way we store an inventory is based on the `hotel_id`, `room_type_id` and `date`:
 
 ```
@@ -523,16 +537,19 @@ However, the interviewer might challenge this approach as it's not a pure micros
 <p align="left">
     <img src="./images/microservices-vs-monolith.png" alt="microservices-vs-monolith" width="500" />
 </p>
+
 This can lead to consistency issues. In a monolithic server, we can leverage a relational DBs transaction capabilities to implement atomic operations:
 
 <p align="left">
     <img src="./images/atomicity-monolith.png" alt="atomicity-monolith" width="500" />
 </p>
+
 It's more challenging, however, to guarantee this atomicity when the operation spans across multiple services:
 
 <p align="left">
     <img src="./images/microservice-non-atomic-operation.png" alt="microservice-non-atomic-operation" width="500" />
 </p>
+
 There are some well-known techniques to handle these data inconsistencies:
  - **Two-phase commit**: a database protocol which guarantees atomic transaction commit across multiple nodes. 
    It's not performant, though, since a single node lag leads to all nodes blocking the operation.

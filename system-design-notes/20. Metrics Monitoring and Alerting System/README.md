@@ -90,6 +90,7 @@ There are five core components involved in a metrics monitoring and alerting sys
 <p align="left">
     <img src="./images/metrics-monitoring-core-components.png" alt="metrics-monitoring-core-components" width="500" />
 </p>
+
  - **Data collection**: collect metrics data from different sources
  - **Data transmission**: transfer data from sources to the metrics monitoring system
  - **Data storage**: organize and store incoming data
@@ -105,11 +106,13 @@ Example 1 - What is the CPU load on production server instance i631 at 20:00?
 <p align="left">
     <img src="./images/metrics-example-1.png" alt="metrics-example-1" width="500" />
 </p>
+
 The data can be identified by the following table:
 
 <p align="left">
     <img src="./images/metrics-example-1-data.png" alt="metrics-example-1-data" width="500" />
 </p>
+
 The time series is identified by the metric name, labels and a single point in at a specific time.
 
 Example 2 - What is the average CPU load across all web servers in the us-west region for the last 10min?
@@ -140,11 +143,13 @@ What every time series consists of:
 <p align="left">
     <img src="./images/time-series-data-example.png" alt="time-series-data-example" width="500" />
 </p>
+
 A good way to visualize how data looks like:
 
 <p align="left">
     <img src="./images/time-series-data-viz.png" alt="time-series-data-viz" width="500" />
 </p>
+
  - The x axis is the time
  - the y axis is the dimension you're querying - eg metric name, tag, etc.
 
@@ -165,6 +170,7 @@ Example scale of InfluxDB - more than 250k writes per second when provisioned wi
 <p align="left">
     <img src="./images/influxdb-scale.png" alt="influxdb-scale" width="500" />
 </p>
+
 It is not expected for you to understand the internals of a metrics database as it is niche knowledge. You might be asked only if you've mentioned it on your resume.
 
 For the purposes of the interview, it is sufficient to understand that metrics are time-series data and to be aware of popular time-series databases, like InfluxDB.
@@ -202,6 +208,7 @@ Worth noting too: this is a *write-time* decision that is expensive to undo. The
 <p align="left">
     <img src="./images/high-level-design.png" alt="high-level-design" width="500" />
 </p>
+
  - **Metrics source**: can be application servers, SQL databases, message queues, etc.
  - **Metrics collector**: Gathers metrics data and writes to time-series database
  - **Time-series database**: stores metrics as time-series. Provides a custom query interface for analyzing large amounts of metrics.
@@ -220,6 +227,7 @@ For metrics collection, occasional data loss is not critical. It's acceptable fo
 <p align="left">
     <img src="./images/metrics-collection.png" alt="metrics-collection" width="500" />
 </p>
+
 There are two ways to implement metrics collection - pull or push.
 
 Here's how the pull model might look like:
@@ -227,6 +235,7 @@ Here's how the pull model might look like:
 <p align="left">
     <img src="./images/pull-model-example.png" alt="pull-model-example" width="500" />
 </p>
+
 For this solution, the metrics collector needs to maintain an up-to-date list of services and metrics endpoints.
 We can use Zookeeper or etcd for that purpose - service discovery.
 
@@ -235,11 +244,13 @@ Service discovery contains configuration rules about when and where to collect m
 <p align="left">
     <img src="./images/service-discovery-example.png" alt="service-discovery-example" width="500" />
 </p>
+
 Here's a detailed explanation of the metrics collection flow:
 
 <p align="left">
     <img src="./images/metrics-collection-flow.png" alt="metrics-collection-flow" width="500" />
 </p>
+
  - Metrics collector fetches configuration metadata from service discovery. This includes pulling interval, IP addresses, timeout & retry params.
  - Metrics collector pulls metrics data via a pre-defined http endpoint (eg `/metrics`). This is typically done by a client library.
  - Alternatively, the metrics collector can register a change event notification with the service discovery to be notified once the service endpoint changes.
@@ -253,17 +264,20 @@ One solution for this is to position collectors and servers on a consistent hash
 <p align="left">
     <img src="./images/consistent-hash-ring.png" alt="consistent-hash-ring" width="500" />
 </p>
+
 With the push model, on the other hand, services push their metrics to the metrics collector proactively:
 
 <p align="left">
     <img src="./images/push-model-example.png" alt="push-model-example" width="500" />
 </p>
+
 In this approach, typically a collection agent is installed alongside service instances. 
 The agent collects metrics from the server and pushes them to the metrics collector.
 
 <p align="left">
     <img src="./images/metrics-collector-agent.png" alt="metrics-collector-agent" width="500" />
 </p>
+
 With this model, we can potentially aggregate metrics before sending them to the collector, which reduces the volume of data processed by the collector.
 
 On the flip side, metrics collector can reject push requests as it can't handle the load. 
@@ -300,6 +314,7 @@ The practical answer for a large organisation is pull as the default (because of
 <p align="left">
     <img src="./images/metrics-transmission-pipeline.png" alt="metrics-transmission-pipeline" width="500" />
 </p>
+
 The metrics collector is provisioned in an auto-scaling group, regardless if we use the push or pull model.
 
 There is a chance of data loss if the time-series DB is down, however. To mitigate this, we'll provision a queuing mechanism:
@@ -307,6 +322,7 @@ There is a chance of data loss if the time-series DB is down, however. To mitiga
 <p align="left">
     <img src="./images/queuing-mechanism.png" alt="queuing-mechanism" width="500" />
 </p>
+
  - Metrics collectors push metrics data into kafka
  - Consumers or stream processing services such as Apache Storm, Flink or Spark process the data and push it to the time-series DB
 
@@ -321,6 +337,7 @@ To scale this, we can further partition by tags/labels and categorize/prioritize
 <p align="left">
     <img src="./images/metrics-collection-kafka.png" alt="metrics-collection-kafka" width="500" />
 </p>
+
 The main downside of using Kafka for this problem is the maintenance/operation overhead.
 An alternative is to use a large-scale ingestion system like [Gorilla](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf).
 It can be argued that using that would be as scalable as using Kafka for queuing.
@@ -351,6 +368,7 @@ We can add a Cache layer here to reduce the load to the time-series database:
 <p align="left">
     <img src="./images/cache-layer-query-service.png" alt="cache-layer-query-service" width="500" />
 </p>
+
 We can also avoid adding a query service altogether as most visualization and alerting systems have powerful plugins to integrate with most time-series databases.
 With a well-chosen time-series DB, we might not need to introduce our own caching layer as well.
 
@@ -400,6 +418,7 @@ Data encoding and compression can significantly reduce the size of data. Those f
 <p align="left">
     <img src="./images/double-delta-encoding.png" alt="double-delta-encoding" width="500" />
 </p>
+
 In the above example, instead of storing full timestamps, we can store timestamp deltas.
 
 Another technique we can employ is down-sampling - converting high-resolution data to low-resolution in order to reduce disk usage.
@@ -436,6 +455,7 @@ Finally, we can also use cold storage for old data, which is no longer actively 
 <p align="left">
     <img src="./images/alerting-system.png" alt="alerting-system" width="500" />
 </p>
+
 Configuration is loaded to cache servers. Rules are typically defined in YAML format. Here's an example:
 
 ```
@@ -481,6 +501,7 @@ The visualization system shows metrics and alerts over a time period. Here's a d
 <p align="left">
     <img src="./images/grafana-dashboard.png" alt="grafana-dashboard" width="500" />
 </p>
+
 A high-quality visualization system is very hard to build. It is hard to justify not using an off-the-shelf solution like Grafana.
 
 ---

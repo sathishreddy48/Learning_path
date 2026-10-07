@@ -159,10 +159,10 @@ vector clocks are used to solve inconsistency problems.
 - **Versioning:** 
     - Use **vector clocks** to track data versions and resolve conflicts.
     - Versioning means treating each data modification as a new immutable version of data.
-        <div>
+        <p align="left">
         <img src="./images/consistent-server.png"   alt="Consistent server" width="400">
         <img src="./images/inconsistent-server.png"   alt="Inconsistent server" height="230">
-        </div>
+        </p>
     
     - Server 1 changes the name , and server 2 also changes the name. These two changes are performed simultaneously. Now, we have conflicting values, called versions v1 and v2.
 
@@ -223,9 +223,9 @@ Trimming has a real cost: dropping the oldest `[server, version]` entries can ma
 #### a. Failure Detection
 It is insufficient to believe that a server is down because another server says so.Usually, it requires at least two independent sources of information to mark a server down.
 - **Gossip Protocol:**
-    <div style="margin-left:3rem">
+    <p align="left">
         <img src="./images/gossip-protocol.png"  alt="Gossip protocol" width="600">
-    </div>
+    </p>
 
     - Each node maintains member IDs and heartbeat counters.
     - Each node periodically increments its heartbeat counter.
@@ -309,9 +309,9 @@ This background repair process is called **anti-entropy**, and it is what eventu
 ## Write and Read Paths
 ### 1. Write Path (Based on Cassandra architecture)
 
-<div style="margin-left:3rem">
+<p align="left">
     <img src="./images/write-path.png"   alt="Write path" width="500">
-</div>
+</p>
 
 - Persist the write in a **commit log**.
 - Save data to a **memory cache**.
@@ -329,10 +329,10 @@ The insight: **random disk writes are slow, sequential writes are fast** — the
 Note that a **delete is also a write** — a tombstone — because files are immutable. Space is only reclaimed at compaction, which is why deletions in these systems do not immediately free disk.
 
 ### 2. Read Path
-<div style="margin-left:3rem">
+<p align="left">
     <img src="./images/read-path.png"   alt="Read path" width="500">
     <img src="./images/read-path-without-cache.png"   alt="Read path without cache" width="500">
-</div>
+</p>
 
 - Check **memory cache** for the data.
 - If absent, use a **Bloom Filter** to locate the data in SSTables.

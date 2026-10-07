@@ -49,9 +49,9 @@ Following the framework from [Chapter 3](../03.%20System%20Design%20Framework/),
 
 ## Step 2: High-Level Design
 ### Placement Options
-<div style="margin-left:2rem">
+<p align="left">
     <img src="./images/rate_limiter_architecture.png"  alt="Rate Limiting Middleware Architecture" width="550">
-</div>
+</p>
 
 1. **Client-Side Implementation:** Unreliable due to potential misuse.
 2. **Server-Side Implementation:** Preferred for control and reliability.
@@ -83,9 +83,9 @@ The important property of this shape is that **rejected traffic never reaches yo
 All five answer the same question — "has this client exceeded its allowance?" — and differ in how precisely they measure the window and how much memory they spend doing it.
 
 ### 1. Token Bucket
-<div style="margin-left:2rem">
+<p align="left">
   <img src="./images/token-bucket.png"  alt="Token Bucket Algorithm" width="550">
-</div>
+</p>
 
 - **Description:** Tokens are added to a bucket at a fixed rate; each request consumes a token.
 - **Parameters:** Bucket size and refill rate.
@@ -103,9 +103,9 @@ Implementation is cheap because you don't store a token count ticking down in re
 This is the most widely used algorithm in practice (Stripe, Amazon API Gateway, and most API products behave this way), because allowing short bursts while capping sustained rate matches how real clients actually behave.
 
 ### 2. Leaking Bucket
-<div style="margin-left:2rem">
+<p align="left">
   <img src="./images/leaking-bucket.png"  alt="Leaking Bucket Algorithm" width="550">
-</div>
+</p>
 
 - **Description:** Processes requests at a fixed rate using a FIFO queue.
 - **Pros:** Memory-efficient, stable outflow rate.
@@ -119,9 +119,9 @@ This is the most widely used algorithm in practice (Stripe, Amazon API Gateway, 
 If the queue fills, requests are dropped — so the queue length is a latency budget, not a safety net.
 
 ### 3. Fixed Window Counter
-<div style="margin-left:2rem">
+<p align="left">
   <img src="./images/fixed-window-counter.png"  alt="Fixed Window Counter" width="550">
-</div>
+</p>
 
 - **Description:** Divides time into fixed intervals and uses counters to limit requests.
 - **Pros:** Simple, efficient for specific use cases.
@@ -137,9 +137,9 @@ could cause more requests than allowed quota to go through.
 It is nonetheless extremely common, because it is one Redis operation (`INCR` with a TTL) and the 2× worst case is often acceptable. It is a poor choice when the limit protects something with a hard ceiling.
 
 ### 4. Sliding Window Log
-<div style="margin-left:2rem">
+<p align="left">
   <img src="./images/sliding-window-log.png"  alt="Sliding Window Log" width="550">
-</div>
+</p>
 
 - **Description:** Tracks timestamps to allow a rolling time window.
 - **Pros:** Accurate rate limiting.
@@ -152,9 +152,9 @@ The cost is memory proportional to the *limit* multiplied by the *number of clie
 Use it when exactness is genuinely required and the client count is modest.
 
 ### 5. Sliding Window Counter
-<div style="margin-left:2rem">
+<p align="left">
   <img src="./images/sliding-window-counter.png"  alt="Fixed Window Counter" width="550">
-</div>
+</p>
 
 - **Description:** Combines fixed window and sliding log methods for smoothing spikes.
 - **Pros:** Memory-efficient, handles traffic bursts.
@@ -191,9 +191,9 @@ The approximation assumes requests were spread evenly across the previous window
 > **Interview angle:** do not just list all five. Pick one, justify it against the requirements you established, and name its weakness. "Token bucket, because API clients legitimately burst and I want to allow that — the tuning risk is that an over-large bucket lets a client dump its whole daily allowance in one second."
 
 ## High-Level Architecture
-<div style="margin-left:2rem">
+<p align="left">
   <img src="./images/architecture.png" style="margin-left: 40px; margin-top: 40px; margin-bottom: 20px;" alt="Architecture" width="550">
-</div>
+</p>
 
 - **Data Storage:** Use in-memory caching (e.g., Redis) for fast counter operations.
 - **Steps:**

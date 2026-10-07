@@ -10,6 +10,7 @@ Digital advertising has a process called **real-time bidding (RTB)**, where digi
 <p align="left">
     <img src="./images/digital-advertising-example.png" alt="digital-advertising-example" width="500" />
 </p>
+
 Speed of RTB is important as it usually occurs within a second.
 Data accuracy is also very important as it impacts how much money advertisers pay.
 
@@ -205,6 +206,7 @@ Here's how our system looks like:
 <p align="left">
     <img src="./images/high-level-design-1.png" alt="high-level-design-1" width="500" />
 </p>
+
 Data flows as an unbounded data stream on both inputs and outputs.
 
 In order to avoid having a synchronous sink, where a consumer crashing can cause the whole system to stall, 
@@ -213,6 +215,7 @@ we'll leverage asynchronous processing using message queues (Kafka) to decouple 
 <p align="left">
     <img src="./images/high-level-design-2.png" alt="high-level-design-2" width="500" />
 </p>
+
 The first message queue stores ad click event data:
 | ad_id | click_timestamp | user_id | ip | country |
 |-------|-----------------|---------|----|---------|
@@ -230,14 +233,17 @@ The second message queue is there in order to achieve end to end exactly-once at
 <p align="left">
     <img src="./images/atomic-commit.png" alt="atomic-commit" width="500" />
 </p>
+
 For the aggregation service, using the MapReduce framework is a good option:
 
 <p align="left">
     <img src="./images/ad-count-map-reduce.png" alt="ad-count-map-reduce" width="500" />
 </p>
+
 <p align="left">
     <img src="./images/top-100-map-reduce.png" alt="top-100-map-reduce" width="500" />
 </p>
+
 Each node is responsible for one single task and it sends the processing result to the downstream node.
 
 The map node is responsible for reading from the data source, then filtering and transforming the data.
@@ -247,6 +253,7 @@ For example, the map node can allocate data across different aggregation nodes b
 <p align="left">
     <img src="./images/map-node.png" alt="map-node" width="500" />
 </p>
+
 Alternatively, we can distribute ads across Kafka partitions and let the aggregation nodes subscribe directly within a consumer group.
 However, the mapping node enables us to sanitize or transform the data before subsequent processing.
 
@@ -260,6 +267,7 @@ The reduce node collects aggregated results from aggregate node and produces the
 <p align="left">
     <img src="./images/reduce-node.png" alt="reduce-node" width="500" />
 </p>
+
 This DAG model uses the MapReduce paradigm. It takes big data and leverages parallel distributed computing to turn it into regular-sized data.
 
 In the DAG model, intermediate data is stored in-memory and different nodes communicate with each other using TCP or shared memory.
@@ -271,6 +279,7 @@ Let's explore how this model can now help us to achieve our various use-cases.
 <p align="left">
     <img src="./images/use-case-1.png" alt="use-case-1" width="500" />
 </p>
+
  - Ads are partitioned using `ad_id % 3`
 
 **Use-case 2 - return top N most clicked ads**:
@@ -278,6 +287,7 @@ Let's explore how this model can now help us to achieve our various use-cases.
 <p align="left">
     <img src="./images/use-case-2.png" alt="use-case-2" width="500" />
 </p>
+
  - In this case, we're aggregating the top 3 ads, but this can be extended to top N ads easily
  - Each node maintains a heap data structure for fast retrieval of top N ads
 
@@ -334,11 +344,13 @@ Lambda architecture:
 <p align="left">
     <img src="./images/lambda-architecture.png" alt="lambda-architecture" width="500" />
 </p>
+
 Kappa architecture:
 
 <p align="left">
     <img src="./images/kappa-architecture.png" alt="kappa-architecture" width="500" />
 </p>
+
 Our high-level design uses Kappa architecture as reprocessing of historical data also goes through the aggregation service.
 
 Whenever we have to recalculate aggregated data due to eg a major bug in aggregation logic, we can recalculate the aggregation from the raw data we store.
@@ -349,6 +361,7 @@ Whenever we have to recalculate aggregated data due to eg a major bug in aggrega
 <p align="left">
     <img src="./images/recalculation-example.png" alt="recalculation-example" width="500" />
 </p>
+
 ### **Time**
 We need a timestamp to perform aggregation. It can be generated in two places:
  - event time - when ad click occurs
@@ -386,12 +399,14 @@ In the example below, event 2 misses the window where it needs to be aggregated:
 <p align="left">
     <img src="./images/watermark-technique.png" alt="watermark-technique" width="500" />
 </p>
+
 However, if we purposefully extend the aggregation window, we can reduce the likelihood of missed events.
 The extended part of a window is called a "watermark":
 
 <p align="left">
     <img src="./images/watermark-2.png" alt="watermark-2" width="500" />
 </p>
+
  - Short watermark increases likelihood of missed events, but reduces latency
  - Longer watermark reduces likelihood of missed events, but increases latency
 
@@ -431,11 +446,13 @@ In our design, we leverage a tumbling window for ad click aggregations:
 <p align="left">
     <img src="./images/tumbling-window.png" alt="tumbling-window" width="500" />
 </p>
+
 As well as a sliding window for the top N clicked ads in M minutes aggregation:
 
 <p align="left">
     <img src="./images/sliding-window.png" alt="sliding-window" width="500" />
 </p>
+
 ### **Delivery guarantees**
 Since the data we're aggregating is going to be used for billing, data accuracy is a priority.
 
@@ -461,6 +478,7 @@ Here's an example of data duplication occurring due to failure to acknowledge an
 <p align="left">
     <img src="./images/data-duplication-example.png" alt="data-duplication-example" width="500" />
 </p>
+
 In this example, offset 100 will be processed and sent downstream multiple times.
 
 One option to try and mitigate this is to store the last seen offset in HDFS/S3, but this risks the result never reaching downstream:
@@ -468,11 +486,13 @@ One option to try and mitigate this is to store the last seen offset in HDFS/S3,
 <p align="left">
     <img src="./images/data-duplication-example-2.png" alt="data-duplication-example-2" width="500" />
 </p>
+
 Finally, we can store the offset while interacting with downstream atomically. To achieve this, we need to implement a distributed transaction:
 
 <p align="left">
     <img src="./images/data-duplication-example-3.png" alt="data-duplication-example-3" width="500" />
 </p>
+
 **Personal side-note**: Alternatively, if the downstream system handles the aggregation result idempotently, there is no need for a distributed transaction.
 
 **That side-note is the better answer, and it is worth making central.** A distributed transaction spanning a message queue and a database is expensive, operationally fragile, and reduces throughput. An idempotent sink avoids the need for one entirely, and the trick is to make the write an **overwrite rather than an increment**:
@@ -505,11 +525,13 @@ How do we scale the message queue:
 <p align="left">
     <img src="./images/scale-consumers.png" alt="scale-consumers" width="500" />
 </p>
+
 How do we scale the aggregation service:
 
 <p align="left">
     <img src="./images/aggregation-service-scaling.png" alt="aggregation-service-scaling" width="500" />
 </p>
+
  - The map-reduce nodes can easily be scaled by adding more nodes
  - The throughput of the aggregation service can be scaled by utilising multi-threading
  - Alternatively, we can leverage resource providers such as Apache YARN to utilize multi-processing
@@ -519,6 +541,7 @@ How do we scale the aggregation service:
 <p align="left">
     <img src="./images/multi-threading-example.png" alt="multi-threading-example" width="500" />
 </p>
+
 How do we scale the database:
  - If we use Cassandra, it natively supports horizontal scaling utilizing consistent hashing
  - If a new node is added to the cluster, data automatically gets rebalanced across all (virtual) nodes
@@ -527,11 +550,13 @@ How do we scale the database:
 <p align="left">
     <img src="./images/cassandra-scalability.png" alt="cassandra-scalability" width="500" />
 </p>
+
 Another scalability issue to consider is the hotspot issue - what if an ad is more popular and gets more attention than others?
 
 <p align="left">
     <img src="./images/hotspot-issue.png" alt="hotspot-issue" width="500" />
 </p>
+
  - In the above example, aggregation service nodes can apply for extra resources via the resource manager
  - The resource manager allocates more resources, so the original node isn't overloaded
  - The original node splits the events into 3 groups and each of the aggregation nodes handles 100 events
@@ -572,11 +597,13 @@ We can make snapshots at a particular minute for the on-going aggregation:
 <p align="left">
     <img src="./images/fault-tolerance-example.png" alt="fault-tolerance-example" width="500" />
 </p>
+
 If a node goes down, the new node can read the latest committed consumer offset, as well as the latest snapshot to continue the job:
 
 <p align="left">
     <img src="./images/fault-tolerance-recovery-example.png" alt="fault-tolerance-recovery-example" width="500" />
 </p>
+
 ### **Data monitoring and correctness**
 As the data we're aggregating is critical as it's used for billing, it is very important to have rigorous monitoring in place in order to ensure correctness.
 
@@ -591,6 +618,7 @@ It calculates the aggregated results from the raw data and compares them against
 <p align="left">
     <img src="./images/reconciliation-flow.png" alt="reconciliation-flow" width="500" />
 </p>
+
 ### **Alternative design**
 In a generalist system design interview, you are not expected to know the internals of specialized software used in big data processing.
 
@@ -603,6 +631,7 @@ Aggregation is typically done in OLAP databases such as ClickHouse or Druid.
 <p align="left">
     <img src="./images/alternative-design.png" alt="alternative-design" width="500" />
 </p>
+
 ---
 
 ## Step 4: Wrap up

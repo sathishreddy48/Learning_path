@@ -29,6 +29,7 @@ It is relatively slow compared to other storage types. Most cloud providers have
 <p align="left">
     <img src="./images/storage-comparison.png" alt="storage-comparison" width="500" />
 </p>
+
 |                 | Block Storage                    | File Storage                            | Object Storage                 |
 |-----------------|----------------------------------|-----------------------------------------|--------------------------------|
 | Mutable Content | Y                                | Y                                       | N (has object versioning）     |
@@ -118,16 +119,19 @@ Object storage works similarly - metadata store is used for file information, bu
 <p align="left">
     <img src="./images/object-store-vs-unix.png" alt="object-store-vs-unix" width="500" />
 </p>
+
 By separating metadata from file contents, we can scale the different stores independently:
 
 <p align="left">
     <img src="./images/bucket-and-object.png" alt="bucket-and-object" width="500" />
 </p>
+
 ### **High-level design**
 
 <p align="left">
     <img src="./images/high-level-design.png" alt="high-level-design" width="500" />
 </p>
+
 - **Load balancer** - distributes API requests across service replicas
 - **API service** - Stateless server, orchestrating calls to metadata and object store, as well as IAM service.
 - **Identity and access management (IAM)** - central place for auth, authz, access control.
@@ -139,6 +143,7 @@ By separating metadata from file contents, we can scale the different stores ind
 <p align="left">
     <img src="./images/uploading-object.png" alt="uploading-object" width="500" />
 </p>
+
 - Create a bucket named "bucket-to-share" via HTTP PUT request
 - API service calls IAM to ensure user is authorized and has write permissions
 - API service calls metadata store to create a bucket entry. Once created, success response is returned.
@@ -177,6 +182,7 @@ Authorization: authorization string
 <p align="left">
     <img src="./images/download-object.png" alt="download-object" width="500" />
 </p>
+
 - Client sends an HTTP GET request to the load balancer, ie `GET /bucket-to-share/script.txt`
 - API service queries IAM to verify the user has correct permissions to read the bucket
 - Once validated, UUID of object is retrieved from metadata store
@@ -195,11 +201,13 @@ Here's how the API service interacts with the data store:
 <p align="left">
     <img src="./images/data-store-interactions.png" alt="data-store-interactions" width="500" />
 </p>
+
 The data store's main components:
 
 <p align="left">
     <img src="./images/data-store-main-components.png" alt="data-store-main-components" width="500" />
 </p>
+
 The data routing service provides a RESTful or gRPC API to access the data node cluster.
 It is a stateless service, which scales by adding more servers.
 
@@ -214,6 +222,7 @@ It maintains a virtual cluster map, which determines the physical topology of a 
 <p align="left">
     <img src="./images/virtual-cluster-map.png" alt="virtual-cluster-map" width="500" />
 </p>
+
 The service also sends heartbeats to all data nodes to determine if they should be removed from the virtual cluster.
 
 Since this is a critical service, it is recommended to maintain a cluster of 5 or 7 replicas, synchronized via Paxos or Raft consensus algorithms.
@@ -233,6 +242,7 @@ The heartbeat includes:
 <p align="left">
     <img src="./images/data-persistence-flow.png" alt="data-persistence-flow" width="500" />
 </p>
+
 - API service forwards the object data to data store
 - Data routing service sends the data to the primary data node
 - Primary data node saves the data locally and replicates it to two secondary data nodes. Response is sent after successful replication.
@@ -245,6 +255,7 @@ Caveats:
 <p align="left">
     <img src="./images/consistency-vs-latency.png" alt="consistency-vs-latency" width="500" />
 </p>
+
 #### How data is organized
 
 One simple approach to managing data is to store each object in a separate file.
@@ -258,6 +269,7 @@ These issues can be addressed by merging many small files into bigger ones via a
 <p align="left">
     <img src="./images/wal-optimization.png" alt="wal-optimization" width="500" />
 </p>
+
 The downside of this approach is that write access to the file needs to be serialized. Multiple cores accessing the same file must wait for each other.
 To fix this, we can confine files to specific cores to avoid lock contention.
 
@@ -299,6 +311,7 @@ Co-locating the index with the data it describes makes the lookup a local file r
 <p align="left">
     <img src="./images/updated-data-persistence-flow.png" alt="updated-data-persistence-flow" width="500" />
 </p>
+
 - API Service sends a request to save a new object
 - Data node service appends the new object at the end of a file, named "/data/c"
 - A new record for the object is inserted into the object mapping table
@@ -314,6 +327,7 @@ A critical event can cause multiple hardware failures within the same domain:
 <p align="left">
     <img src="./images/failure-domain-isolation.png" alt="failure-domain-isolation" width="500" />
 </p>
+
 Assuming annual failure rate of a typical HDD is 0.81%, making three copies gives us 6 nines of durability.
 
 **The arithmetic, since "nines" is easy to assert and worth being able to derive.** If a disk's annual failure rate is 0.81% and the three copies fail independently:
@@ -347,6 +361,7 @@ The cost saving at this scale is the headline number:
 <p align="left">
     <img src="./images/erasure-coding.png" alt="erasure-coding" width="500" />
 </p>
+
 Imagine those bits are data nodes. If two of them go down, they can be recovered using the remaining four ones.
 
 There are different erasure coding schemes. In our case, we could use 8+4 erasure coding, split across different failure domains to maximize reliability:
@@ -354,11 +369,13 @@ There are different erasure coding schemes. In our case, we could use 8+4 erasur
 <p align="left">
     <img src="./images/erasure-coding-across-failure-domains.png" alt="erasure-coding-across-failure-domains" width="500" />
 </p>
+
 Erasure coding enables us to achieve a much lower storage cost (50% improvement) at the expense of access speed due to the data routing service having to collect data from multiple locations:
 
 <p align="left">
     <img src="./images/erasure-coding-vs-replication.png" alt="erasure-coding-vs-replication" width="500" />
 </p>
+
 Other caveats:
 - Replication requires 200% storage overhead (in case of 3 replicas) vs. 50% via erasure coding
 - Erasure coding [gives us 11 nines of durability](https://github.com/Backblaze/erasure-coding-durability) vs 6 nines via replication
@@ -393,6 +410,7 @@ In our case, we'll store checksums for each file and each object:
 <p align="left">
     <img src="./images/checksums-for-correctness.png" alt="checksums-for-correctness" width="500" />
 </p>
+
 In the case of erasure coding (8+4), we'll need to fetch each of the 8 pieces of data separately and verify each of their checksums.
 
 **Checksums are what make the durability claim meaningful, and the failure they defend against is the nasty one.** A disk that dies is obvious — it stops answering, repair begins, the system heals. A disk that silently returns *wrong bytes* — bit rot, a firmware bug, a cosmic-ray flip, a misdirected write — is invisible. Without checksums you serve corruption as though it were data, and you cheerfully replicate it over your good copies.
@@ -408,6 +426,7 @@ Table schemas:
 <p align="left">
     <img src="./images/metadata-data-model.png" alt="metadata-data-model" width="500" />
 </p>
+
 Queries we need to support:
 - Find an object ID by name
 - Insert/delete object based on name
@@ -461,6 +480,7 @@ Each new version produces a new `object_id`:
 <p align="left">
     <img src="./images/object-versioning.png" alt="object-versioning" width="500" />
 </p>
+
 The versioning design is the clearest expression of immutability in the chapter: **a new version is a new object**, with its own `object_id` and its own bytes, and the old one is untouched. Nothing is ever overwritten; the "current" version is simply the newest row.
 
 Deleting an object creates a new version with a special `object_id` indicating that the object was deleted. Queries for it return 404:
@@ -484,6 +504,7 @@ Uploading large files can be optimized by using multipart uploads - splitting a 
 <p align="left">
     <img src="./images/multipart-upload.png" alt="multipart-upload" width="500" />
 </p>
+
 - Client calls service to initiate a multipart upload
 - Data store returns an upload ID which uniquely identifies the upload
 - Client splits the large file into several chunks, uploaded independently using the upload id
@@ -517,6 +538,7 @@ To facilitate the deletion, we'll use a process called compaction:
 <p align="left">
     <img src="./images/compaction.png" alt="compaction" width="500" />
 </p>
+
 ---
 
 ## Step 4: Wrap Up

@@ -109,6 +109,7 @@ Key components of a message queue:
 <p align="left">
     <img src="./images/message-queue-components.png" alt="message-queue-components" width="500" />
 </p>
+
  * Producer sends messages to a queue
  * Consumer subscribes to a queue and consumes the subscribed messages
  * Message queue is a service in the middle which decouples producers from consumers, letting them scale independently.
@@ -121,6 +122,7 @@ The first type of messaging model is point-to-point and it's commonly found in t
 <p align="left">
     <img src="./images/point-to-point-model.png" alt="point-to-point-model" width="500" />
 </p>
+
  * A message is sent to a queue and it's consumed by exactly one consumer.
  * There can be multiple consumers, but a message is consumed only once.
  * Once message is acknowledged as consumed, it is removed from the queue.
@@ -131,6 +133,7 @@ On the other hand, the publish-subscribe model is more common for event streamin
 <p align="left">
     <img src="./images/publish-subscribe-model.png" alt="publish-subscribe-model" width="500" />
 </p>
+
  * In this model, messages are associated to a topic.
  * Consumers are subscribed to a topic and they receive all messages sent to this topic.
 
@@ -141,6 +144,7 @@ What if the data volume for a topic is too large? One way to scale is by splitti
 <p align="left">
     <img src="./images/partitions.png" alt="partitions" width="500" />
 </p>
+
  * Messages sent to a topic are evenly distributed across partitions
  * The servers that host partitions are called brokers
  * Each topic operates like a queue using FIFO for message processing. Message order is preserved within a partition.
@@ -185,6 +189,7 @@ Consumer groups are a set of consumers working together to consume messages from
 <p align="left">
     <img src="./images/consumer-groups.png" alt="consumer-groups" width="500" />
 </p>
+
  * Messages are replicated per consumer group (not per consumer).
  * Each consumer group maintains its own offset.
  * Reading messages in parallel by a consumer group improves throughput but hampers the ordering guarantee.
@@ -196,6 +201,7 @@ Consumer groups are a set of consumers working together to consume messages from
 <p align="left">
     <img src="./images/high-level-architecture.png" alt="high-level-architecture" width="500" />
 </p>
+
 - **Clients**: producer and consumer. Producer pushes messages to a designated topic. Consumer group subscribes to messages from a topic.
 - **Brokers**: hold multiple partitions. A partition holds a subset of messages for a topic.
 - **Data storage**: stores messages in partitions.
@@ -228,6 +234,7 @@ What are our options:
 <p align="left">
     <img src="./images/wal-example.png" alt="wal-example" width="500" />
 </p>
+
 WAL files are extremely efficient when used with traditional HDDs. 
 
 There is a misconception that HDD access is slow, but that hugely depends on the access pattern.
@@ -243,6 +250,7 @@ Example message structure:
 <p align="left">
     <img src="./images/message-structure.png" alt="message-structure" width="500" />
 </p>
+
 The key of the message specifies which partition a message belongs to. An example mapping is `hash(key) % numPartitions`.
 For more flexibility, the producer can override default keys in order to control which partitions messages are distributed to.
 
@@ -285,6 +293,7 @@ One option is to introduce a routing layer, which route messages to the correct 
 <p align="left">
     <img src="./images/routing-layer.png" alt="routing-layer" width="500" />
 </p>
+
  * Routing layer reads the replication plan from the metadata store and caches it locally.
  * Producer sends a message to the routing layer.
  * Message is forwarded to broker 1 who is the leader of the given partition
@@ -301,6 +310,7 @@ To mitigate these issues, we can embed the routing layer into the producer:
 <p align="left">
     <img src="./images/routing-layer-producer.png" alt="routing-layer-producer" width="500" />
 </p>
+
  * Fewer network hops lead to lower latency
  * Producers can control which partition a message is routed to
  * The buffer allows us to batch messages in-memory and send out larger batches in a single request, which increases throughput.
@@ -310,6 +320,7 @@ The batch size choice is a classical trade-off between throughput and latency.
 <p align="left">
     <img src="./images/batch-size-throughput-vs-latency.png" alt="batch-size-throughput-vs-latency" width="500" />
 </p>
+
  * Larger batch size leads to longer wait time before batch is committed. 
  * Smaller batch size leads to request being sent sooner and having lower latency but lower throughput.
 
@@ -320,6 +331,7 @@ The consumer specifies its offset in a partition and receives a chunk of message
 <p align="left">
     <img src="./images/consumer-example.png" alt="consumer-example" width="500" />
 </p>
+
 One important consideration when designing the consumer is whether to use a push or a pull model:
 - **Push model**: leads to lower latency as broker pushes messages to consumer as it receives them.
   * However, if rate of consumption falls behind the rate of production, the consumer can be overwhelmed.
@@ -335,6 +347,7 @@ Hence, most message queues (and us) choose the pull model.
 <p align="left">
     <img src="./images/consumer-flow.png" alt="consumer-flow" width="500" />
 </p>
+
  * A new consumer subscribes to topic A and joins group 1.
  * The correct broker node is found by hashing the group name. This way, all consumers in a group connect to the same broker.
  * Note that this consumer group coordinator is different from the coordination service (ZooKeeper).
@@ -354,6 +367,7 @@ The broker, acting as a coordinator plays a huge role in orchestrating the rebal
 <p align="left">
     <img src="./images/consumer-rebalancing.png" alt="consumer-rebalancing" width="500" />
 </p>
+
  * All consumers from the same group are connected to the same coordinator. The coordinator is found by hashing the group name.
  * When the consumer list changes, the coordinator chooses a new leader of the group.
  * The leader of the group calculates a new partition dispatch plan and reports it back to the coordinator, which broadcasts it to the other consumers.
@@ -363,11 +377,13 @@ When the coordinator stops receiving heartbeats from the consumers in a group, a
 <p align="left">
     <img src="./images/consumer-rebalance-example.png" alt="consumer-rebalance-example" width="500" />
 </p>
+
 Let's explore what happens when a consumer joins a group:
 
 <p align="left">
     <img src="./images/consumer-join-group-usecase.png" alt="consumer-join-group-usecase" width="500" />
 </p>
+
  * Initially, only consumer A is in the group and it consumes all partitions.
  * Consumer B sends a request to join the group.
  * The coordinator notifies all group members that it's time to rebalance passively - as a response to the heartbeat.
@@ -380,6 +396,7 @@ Here's what happens when a consumer leaves the group:
 <p align="left">
     <img src="./images/consumer-leaves-group-usecase.png" alt="consumer-leaves-group-usecase" width="500" />
 </p>
+
  * Consumer A and B are in the same group
  * Consumer B asks to leave the group
  * When coordinator receives A's heartbeat, it informs them that it's time to rebalance.
@@ -390,6 +407,7 @@ The process is similar when a consumer doesn't send a heartbeat for a long time:
 <p align="left">
     <img src="./images/consumer-no-heartbeat-usecase.png" alt="consumer-no-heartbeat-usecase" width="500" />
 </p>
+
 ### **State storage**
 
 The state storage stores mapping between partitions and consumers, as well as the last consumed offsets for a partition.
@@ -397,6 +415,7 @@ The state storage stores mapping between partitions and consumers, as well as th
 <p align="left">
     <img src="./images/state-storage.png" alt="state-storage" width="500" />
 </p>
+
 Group 1's offset is at 6, meaning all previous messages are consumed. If a consumer crashes, the new consumer will continue from that message on wards.
  
 Data access patterns for consumer states:
@@ -423,6 +442,7 @@ It is a hierarchical key-value store, commonly used for a distributed configurat
 <p align="left">
     <img src="./images/zookeeper.png" alt="zookeeper" width="500" />
 </p>
+
 With this change, the broker only needs to maintain data for the messages. Metadata and state storage is in Zookeeper.
 
 Zookeeper also helps with leader election of the broker replicas.
@@ -434,6 +454,7 @@ In distributed systems, hardware issues are inevitable. We can tackle this via r
 <p align="left">
     <img src="./images/replication-example.png" alt="replication-example" width="500" />
 </p>
+
  * Each partition is replicated across multiple brokers, but there is only one leader replica.
  * Producers send messages to leader replicas
  * Followers pull the replicated messages from the leader
@@ -452,6 +473,7 @@ The `replica.lag.max.messages` defines how many messages can a replica be laggin
 <p align="left">
     <img src="./images/in-sync-replicas-example.png" alt="in-sync-replicas-example" width="500" />
 </p>
+
  * Committed offset is 13
  * Two new messages are written to the leader, but not committed yet.
  * A message is committed once all replicas in the ISR have synchronized that message
@@ -469,11 +491,13 @@ Acknowledgment handling is configurable.
 <p align="left">
     <img src="./images/ack-all.png" alt="ack-all" width="500" />
 </p>
+
 `ACK=1` means that producer receives acknowledgment once leader receives the message. Message sending is fast, but message durability is low.
 
 <p align="left">
     <img src="./images/ack-1.png" alt="ack-1" width="500" />
 </p>
+
 `ACK=0` means that producer sends messages without waiting for any acknowledgment from leader. Message sending is fastest, message durability is lowest.
 
 **What each setting actually loses, concretely:**
@@ -491,6 +515,7 @@ Note the symmetry with quorum reads and writes in [Chapter 6](../06.%20Key-Value
 <p align="left">
     <img src="./images/ack-0.png" alt="ack-0" width="500" />
 </p>
+
 On the consumer side, we can connect all consumers to the leader for a partition and let them read messages from it:
  * This makes for the simplest design and easiest operation
  * Messages in a partition are sent to only one consumer in a group, which limits the connections to the leader replica
@@ -523,6 +548,7 @@ How do brokers handle failure?
 <p align="left">
     <img src="./images/broker-failure-recovery.png" alt="broker-failure-recovery" width="500" />
 </p>
+
  * Once a broker fails, there are still enough replicas to avoid partition data loss
  * A new leader is elected and the broker coordinator redistributes partitions which were at the failed broker to existing replicas
  * Existing replicas pick up the new partitions and act as followers until they're caught up with the leader and become ISR
@@ -537,6 +563,7 @@ How do we handle redistribution of replicas when a new broker is added?
 <p align="left">
     <img src="./images/broker-replica-redistribution.png" alt="broker-replica-redistribution" width="500" />
 </p>
+
  * We can temporarily allow more replicas than configured, until new broker catches up
  * Once it does, we can remove the partition replica which is no longer needed
 
@@ -562,11 +589,13 @@ In terms of data storage, we can only store new messages to the new partition vs
 <p align="left">
     <img src="./images/partition-exmaple.png" alt="partition-example" width="500" />
 </p>
+
 Decreasing the number of partitions is more involved:
 
 <p align="left">
     <img src="./images/partition-decrease.png" alt="partition-decrease" width="500" />
 </p>
+
  * Once a partition is decommissioned, new messages are only received by remaining partitions
  * The decommissioned partition isn't removed immediately as messages can still be consumed from it
  * Only once a pre-configured retention period passes do we truncate the data and free up storage space
@@ -584,6 +613,7 @@ With this guarantee, messages are delivered not more than once and could not be 
 <p align="left">
     <img src="./images/at-most-once.png" alt="at-most-once" width="500" />
 </p>
+
  * Producer sends a message asynchronously to a topic. If message delivery fails, there is no retry.
  * Consumer fetches message and immediately commits offset. If consumer crashes before processing the message, the message will not be processed.
 
@@ -594,6 +624,7 @@ A message can be sent more than once and no message should be left unprocessed.
 <p align="left">
     <img src="./images/at-least-once.png" alt="at-least-once" width="500" />
 </p>
+
  * Producer sends message with `ack=1` or `ack=all`. If there is any issue, it will keep retrying.
  * Consumer fetches the message and consumes the offset only after it's done processing it.
  * It is possible for a message to be delivered more than once if eg consumer crashes before committing offset but after processing it.
@@ -644,6 +675,7 @@ We can resolve this using message filtering.
 <p align="left">
     <img src="./images/message-filtering.png" alt="message-filtering" width="500" />
 </p>
+
 #### Delayed messages & scheduled messages
 
 For some use-cases, we might want to delay or schedule message delivery. 
@@ -654,6 +686,7 @@ This can be achieved by sending messages to temporary storage in the broker and 
 <p align="left">
     <img src="./images/delayed-message-implementation.png" alt="delayed-message-implementation" width="500" />
 </p>
+
  * The temporary storage can be one or more special message topics
  * The timing function can be achieved using dedicated delay queues or a [hierarchical time wheel](http://www.cs.columbia.edu/~nahum/w6998/papers/sosp87-timing-wheels.pdf)
 

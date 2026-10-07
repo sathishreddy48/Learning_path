@@ -75,6 +75,7 @@ Apart from the mailing protocol, there are some DNS records we need to configure
 <p align="left">
     <img src="./images/dns-lookup.png" alt="dns-lookup" width="500" />
 </p>
+
 Email attachments are sent base64-encoded and there is usually a size limit of 25mb on most mail services.
 This is configurable and varies from individual to corporate accounts.
 
@@ -89,6 +90,7 @@ Traditional mail servers work well when there are a limited number of users, con
 <p align="left">
     <img src="./images/traditional-mail-server.png" alt="traditional-mail-server" width="500" />
 </p>
+
 - Alice logs into her Outlook email and presses "send". Email is sent to Outlook mail server. Communication is via SMTP.
 - Outlook server queries DNS to find MX record for gmail.com and transfers the email to their servers. Communication is via SMTP.
 - Bob fetches emails from his gmail server via IMAP/POP.
@@ -98,6 +100,7 @@ In traditional mail servers, emails were stored on the local file system. Every 
 <p align="left">
     <img src="./images/local-dir-storage.png" alt="local-dir-storage" width="500" />
 </p>
+
 As the scale grew, disk I/O became a bottleneck. Also, it doesn't satisfy our high availability and reliability requirements.
 Disks can be damaged and server can go down.
 
@@ -146,6 +149,7 @@ Here's the high-level design of the distributed mail server:
 <p align="left">
     <img src="./images/high-level-architecture.png" alt="high-level-architecture" width="500" />
 </p>
+
 - **Webmail** - users use web browsers to send/receive emails
 - **Web servers** - public-facing request/response services used to manage login, signup, user profile, etc.
 - **Real-time servers** - Used for pushing new email updates to clients in real-time. We use websockets for real-time communication but fallback to long-polling for older browsers that don't support them.
@@ -159,6 +163,7 @@ Here's what the email sending flow looks like:
 <p align="left">
     <img src="./images/email-sending-flow.png" alt="email-sending-flow" width="500" />
 </p>
+
 - User writes an email and presses "send". Email is sent to load balancer.
 - Load balancer rate limits excessive mail sends and routes to one of the web servers.
 - Web servers do basic email validation (eg email size) and short-circuits outbound flow if domain is same as sender. But does spam check first.
@@ -176,6 +181,7 @@ Here's the email receiving flow:
 <p align="left">
     <img src="./images/email-receiving-flkow.png" alt="email-receiving-flow" width="500" />
 </p>
+
 - Incoming emails arrive at the SMTP load balancer. Mails are distributed to SMTP servers, where mail acceptance policy is done (eg invalid emails are directly discarded).
 - If attachment of email is too large, we can put it in object store (s3).
 - Mail processing workers do preliminary checks, after which mails are forwarded to storage, cache, object store and real-time servers.
@@ -233,16 +239,19 @@ Legend for tables to follow:
 <p align="left">
     <img src="./images/legend.png" alt="legend" width="500" />
 </p>
+
 Here is the folders table:
 
 <p align="left">
     <img src="./images/folders-table.png" alt="folders-table" width="500" />
 </p>
+
 emails table:
 
 <p align="left">
     <img src="./images/emails-table.png" alt="emails-table" width="500" />
 </p>
+
 - email_id is timeuuid which allows sorting based on timestamp when email was created
 
 Attachments are stored in a separate table, identified by filename:
@@ -250,6 +259,7 @@ Attachments are stored in a separate table, identified by filename:
 <p align="left">
     <img src="./images/attachments.png" alt="attachments" width="500" />
 </p>
+
 Supporting fetching read/unread emails is easy in a traditional relational database, but not in Cassandra, since filtering on non-partition/clustering key is prohibited.
 One workaround is to fetch all emails in a folder and filter in-memory, but that doesn't work well for a big-enough application.
 
@@ -262,6 +272,7 @@ That is the recurring shape of denormalisation: you move cost from read time to 
 <p align="left">
     <img src="./images/read-unread-emails.png" alt="read-unread-emails" width="500" />
 </p>
+
 In order to support conversation threads, we can include some headers, which mail clients interpret and use to reconstruct a conversation thread:
 
 ```
@@ -346,6 +357,7 @@ To achieve this search functionality, one option is to use an Elasticsearch clus
 <p align="left">
     <img src="./images/elasticsearch.png" alt="elasticsearch" width="500" />
 </p>
+
 Mutating operations are async via Kafka in order to decouple services from the reindexing flow.
 Actually searching for data happens synchronously.
 
@@ -363,6 +375,7 @@ Its core idea is to store data in-memory until a predefined threshold is reached
 <p align="left">
     <img src="./images/lsm-tree.png" alt="lsm-tree" width="500" />
 </p>
+
 Main trade-offs between the two approaches:
 - Elasticsearch scales to some extent, whereas a custom search engine can be fine-tuned for the email use-case, allowing it to scale further.
 - Elasticsearch is a separate service we need to maintain, alongside the metadata store. A custom solution can be the datastore itself.
@@ -377,6 +390,7 @@ To ensure high availability, we can also use a multi-DC setup with leader-follow
 <p align="left">
     <img src="./images/multi-dc-example.png" alt="multi-dc-example" width="500" />
 </p>
+
 ---
 
 ## Step 4: Wrap Up

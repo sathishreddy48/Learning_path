@@ -165,6 +165,7 @@ A potential improvement is to build an index on the longitude and latitude colum
   <p align="left">
     <img src="./images/geohash-radius-mapping.png" alt="Geohash Radius" width="400" />
   </p>
+
 - Geohash guarantees that the longer a shared prefix is between two geohashes, the closer they are.
 
 **This prefix property is the whole trick, and it is what makes an ordinary database index work again.** Because nearby points share a leading string, "find everything in this cell" becomes a **prefix match**, and a prefix match on a sorted key is a **range scan** — precisely the operation a B-tree or a Redis sorted set is built for:
