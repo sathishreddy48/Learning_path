@@ -16,9 +16,10 @@ Chapters are being progressively expanded beyond plain summaries. The ones that 
 - **`Gotchas & failure modes`** — the things that bite in production: replication lag, cache stampede, hot shards, split-brain.
 - **`> **Interview angle:**`** callouts — what an interviewer is usually probing for in that section.
 - **Mermaid diagrams** alongside the book's images. These render on GitHub; where they don't render, the surrounding tables and prose carry the same information.
-- **Self-check questions** and a glossary at the end of the longer chapters.
+- **Self-check questions**, a glossary, and a one-table "problem → technique" summary at the end of each chapter.
+- **Cross-links between chapters**, because the same few ideas recur: fan-out on write vs on read, an immutable log plus a derived view, idempotency instead of exactly-once delivery, and hot keys that partitioning cannot fix.
 
-Chapters 1-25 have had this pass and are the current reference for the format.
+**All 28 chapters have now had this pass.** Chapters 5, 6 and 11 are good places to see the format at its fullest.
 
 ## Chapters
 
@@ -110,3 +111,58 @@ Chapters 1-25 have had this pass and are the current reference for the format.
 - [Differential Synchronization](https://neil.fraser.name/writing/sync/)
 - [Differential Synchronization Video](https://www.youtube.com/watch?v=S2Hp_1jqpY8)
 - [How We’ve Scaled Dropbox](https://www.youtube.com/watch?v=PE4gwstWhmc&feature=youtu.be)
+
+
+### Proximity Service, Nearby Friends & Google Maps
+- [Geohash Algorithm](https://www.movable-type.co.uk/scripts/geohash.html)
+- [Google S2 Geometry](https://s2geometry.io/)
+- [Uber H3 — hexagonal hierarchical spatial index](https://h3geo.org/)
+- [Quadtree Indexing](https://en.wikipedia.org/wiki/Quadtree)
+
+
+### Distributed Message Queue
+- [Kafka design documentation](https://kafka.apache.org/documentation/#design)
+- [The Log: What every software engineer should know about real-time data](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying)
+- [KRaft — Kafka without ZooKeeper](https://developer.confluent.io/learn/kraft/)
+
+
+### Metrics Monitoring and Alerting
+- [Gorilla: A Fast, Scalable, In-Memory Time Series Database](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf)
+- [Prometheus: instrumentation and naming](https://prometheus.io/docs/practices/naming/)
+- [Google SRE Book — Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/)
+
+
+### Ad Click Event Aggregation
+- [Streaming 101 / 102 — event time, windows and watermarks](https://www.oreilly.com/radar/the-world-beyond-batch-streaming-101/)
+- [Flink: event time and watermarks](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/)
+
+
+### Hotel Reservation, Payment System & Digital Wallet
+- [Stripe: idempotent requests](https://docs.stripe.com/api/idempotent_requests)
+- [Pattern: Saga](https://microservices.io/patterns/data/saga.html)
+- [Martin Fowler — Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html)
+- [In Search of an Understandable Consensus Algorithm (Raft)](https://raft.github.io/raft.pdf)
+- [Accounting for Developers](https://www.moderntreasury.com/journal/accounting-for-developers-part-i)
+
+
+### Distributed Email Service
+- [RFC 7208 — Sender Policy Framework](https://datatracker.ietf.org/doc/html/rfc7208)
+- [RFC 6376 — DomainKeys Identified Mail](https://datatracker.ietf.org/doc/html/rfc6376)
+- [RFC 7489 — DMARC](https://datatracker.ietf.org/doc/html/rfc7489)
+
+
+### S3-like Object Storage
+- [Erasure coding durability calculations (Backblaze)](https://github.com/Backblaze/erasure-coding-durability)
+- [Amazon S3 strong consistency](https://aws.amazon.com/blogs/aws/amazon-s3-update-strong-read-after-write-consistency/)
+- [Facebook f4: Warm BLOB storage](https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-muralidhar.pdf)
+
+
+### Real-time Gaming Leaderboard
+- [Redis sorted sets](https://redis.io/docs/latest/develop/data-types/sorted-sets/)
+- [Skip lists (Pugh, 1990)](https://15721.courses.cs.cmu.edu/spring2018/papers/08-oltpindexes1/pugh-skiplists-cacm1990.pdf)
+
+
+### Stock Exchange
+- [The LMAX Architecture (Martin Fowler)](https://martinfowler.com/articles/lmax.html)
+- [LMAX Disruptor](https://lmax-exchange.github.io/disruptor/)
+- [Latency numbers every programmer should know](https://colin-scott.github.io/personal_website/research/interactive_latency.html)
