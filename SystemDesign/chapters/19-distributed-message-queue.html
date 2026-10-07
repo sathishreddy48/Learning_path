@@ -1,0 +1,1077 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 19: Distributed Message Queue — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="19-distributed-message-queue">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 19 of 28</div>
+  <h1>Chapter 19: Distributed Message Queue</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</a></li><li><a href="#step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap Up</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>We'll be designing a <strong>distributed message queue</strong> in this chapter.</p>
+<p>Benefits of message queues:</p>
+<ul>
+<li><strong>Decoupling</strong>: Eliminates tight coupling between components. Let them update separately.</li>
+<li><strong>Improved scalability</strong>: Producers and consumers can be scaled independently based on traffic.</li>
+<li><strong>Increased availability</strong>: If one part of the system goes down, other parts continue interacting with the queue.</li>
+<li><strong>Better performance</strong>: Producers can produce messages without waiting for consumer confirmation.</li>
+</ul>
+<p>Some popular message queue implementations - Kafka, RabbitMQ, RocketMQ, Apache Pulsar, ActiveMQ, ZeroMQ.</p>
+<p>Strictly speaking, Kafka and Pulsar are not message queues. They are event streaming platforms.
+There is however a convergence of features which blurs the distinction between message queues and event streaming platforms.</p>
+<p>In this chapter, we'll be building a message queue with support for more advanced features such as long data retention, repeated message consumption, etc.</p>
+<p><strong>The one-sentence version:</strong> what this chapter actually designs is <strong>a distributed, replicated, append-only log</strong> — not a queue. A queue is a collection you remove things from; a log is a file you append to, and readers track their own position in it. Every distinctive feature in the requirements falls out of that one substitution:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Requirement</th>
+<th>Why the log gives it to you for free</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Two weeks of retention</td>
+<td>Nothing is ever deleted on consumption; deletion is a separate time-based policy</td>
+</tr>
+<tr>
+<td>Repeated consumption</td>
+<td>A reader's position is just a number; rewind it and read again</td>
+</tr>
+<tr>
+<td>Multiple independent consumers</td>
+<td>Each group keeps its own offset; storage cost does not change</td>
+</tr>
+<tr>
+<td>Order preservation</td>
+<td>A file has an intrinsic order, and offsets <em>are</em> that order</td>
+</tr>
+<tr>
+<td>High throughput</td>
+<td>Appending to a file is sequential I/O, which is 2–3 orders of magnitude faster than random</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The deepest consequence is this: <strong>the consumer's offset is the only mutable state in the system.</strong> Messages are immutable, segments are immutable once rolled, and the broker holds no per-consumer bookkeeping about what has been delivered. That is what makes brokers cheap, replay free, and adding a new consumer group a zero-cost operation.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Traditional queue (point-to-point)</th>
+<th>Log (this design)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Storage model</td>
+<td>Mutable collection; consume = remove</td>
+<td>Append-only file; consume = advance a cursor</td>
+</tr>
+<tr>
+<td>After consumption</td>
+<td>Message is gone</td>
+<td>Message is still there until retention expires</td>
+</tr>
+<tr>
+<td>Mutable state</td>
+<td>Per-message delivery state in the broker</td>
+<td><strong>One offset per consumer group</strong></td>
+</tr>
+<tr>
+<td>Replay</td>
+<td>Impossible</td>
+<td>Reset the offset</td>
+</tr>
+<tr>
+<td>Second consumer of the same data</td>
+<td>Needs a copy of the message</td>
+<td>Costs nothing</td>
+</tr>
+<tr>
+<td>Ordering</td>
+<td>Best-effort at most</td>
+<td>Guaranteed within a partition</td>
+</tr>
+<tr>
+<td>Per-message operations</td>
+<td>Acknowledge, delete, requeue, priority</td>
+<td>None — the log is immutable</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The things in the last row are what you give up, and they are real: a log cannot requeue one message, cannot delete one message, and has no notion of per-message priority.</p>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-establish-design-scope">
+<h2 id="step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</h2>
+<p>Message queues ought to support few basic features - producers produce messages and consumers consume them.
+There are, however, different considerations with regards to performance, message delivery, data retention, etc.</p>
+<p>Here's a set of potential questions between Candidate and Interviewer:</p>
+<ul>
+<li>C: What's the format and average message size? Is it text only?</li>
+<li>I: Messages are text-only and usually a few KBs</li>
+<li>C: Can messages be repeatedly consumed?</li>
+<li>I: Yes, messages can be repeatedly consumed by different consumers. This is an added requirement, which traditional message queues don't support.</li>
+<li>C: Are messages consumed in the same order they were produced?</li>
+<li>I: Yes, order guarantee should be preserved. This is an added requirement, traditional message queues don't support this.</li>
+<li>C: What are the data retention requirements?</li>
+<li>I: Messages need to have a retention of two weeks. This is an added requirement.</li>
+<li>C: How many producers and consumers do we want to support?</li>
+<li>I: The more, the better.</li>
+<li>C: What data delivery semantic do we want to support? At-most-once, at-least-once, exactly-once?</li>
+<li>I: We definitely want to support at-least-once. Ideally, we can support all and make them configurable.</li>
+<li>C: What's the target throughput for end-to-end latency?</li>
+<li>I: It should support high throughput for use cases like log aggregation and low throughput for more traditional use cases.</li>
+</ul>
+<h3 id="functional-requirements"><strong>Functional requirements</strong></h3>
+<ul>
+<li>Producers send messages to a message queue</li>
+<li>Consumers consume messages from the queue</li>
+<li>Messages can be consumed once or repeatedly</li>
+<li>Historical data can be truncated</li>
+<li>Message size is in the KB range</li>
+<li>Order of messages needs to be preserved</li>
+<li>Data delivery semantics is configurable - at-most-once/at-least-once/exactly-once.</li>
+</ul>
+<h3 id="non-functional-requirements"><strong>Non-functional requirements</strong></h3>
+<ul>
+<li><strong>High throughput or low latency</strong>: Configurable based on use-case</li>
+<li><strong>Scalable</strong>: system should be distributed and support a sudden surge in message volume</li>
+<li><strong>Persistent and durable</strong>: data should be persisted on disk and replicated among nodes</li>
+</ul>
+<p>Traditional message queues typically don't support data retention and don't provide ordering guarantees. This greatly simplifies the design and we'll discuss it.</p>
+<h3 id="the-number-that-justifies-the-whole-storage-design">The number that justifies the whole storage design</h3>
+<p>The chapter later says it is a misconception that disks are slow. It is worth quantifying, because the gap is the entire reason this design works:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Access pattern</th>
+<th>HDD throughput</th>
+<th>Messages/sec at ~4 KB each</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Random 4 KB I/O</td>
+<td>~0.4–1 MB/s (a few hundred IOPS)</td>
+<td><strong>~100–250</strong></td>
+</tr>
+<tr>
+<td><strong>Sequential</strong></td>
+<td><strong>~100–200 MB/s</strong></td>
+<td><strong>~25,000–50,000 per disk</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>That is a <strong>two-to-three order of magnitude</strong> difference on the same hardware, and it is not much narrower on SSDs. &quot;Is the disk fast?&quot; is the wrong question; &quot;is the access pattern sequential?&quot; is the right one. A database storing messages in a B-tree does random I/O and lands in the top row. An append-only log does sequential I/O and lands in the bottom row — which is why the answer to &quot;what database should hold the messages?&quot; is &quot;none&quot;.</p>
+<p>Two further multipliers stack on top:</p>
+<ul>
+<li><strong>Batching</strong> amortises the fixed costs. A network round trip and a syscall cost roughly the same whether they carry one message or a thousand, so batching 100 messages per request divides per-message overhead by 100 — at the cost of waiting for the batch to fill, which is the latency/throughput dial the chapter returns to repeatedly.</li>
+<li><strong>Zero-copy</strong> removes the data from the CPU's path entirely. Because the message format is identical on the wire, on disk and in the consumer, the broker never has to parse or re-serialise anything: it can hand a byte range from the OS page cache straight to a socket (<code>sendfile</code>) without copying it into user space. This is what the chapter means by &quot;immutable to avoid extra copying&quot;, and it is why a broker can saturate a network interface while barely using its CPU. It also explains a design constraint that otherwise looks like fussiness — <strong>the moment the broker needs to understand message contents, zero-copy is lost</strong>, which is the real cost of the payload-based filtering discussed near the end.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>leading with &quot;I'd build this as a replicated append-only log rather than a queue, because the retention and replay requirements make the offset the only mutable state&quot; frames the entire design in one sentence. Then quantify sequential versus random I/O — that number is why the design is allowed to be this simple.</p>
+</div>
+<hr>
+</section>
+<section id="step-2-propose-high-level-design-and-get-buy-in">
+<h2 id="step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</h2>
+<p>Key components of a message queue:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/message-queue-components.png" alt="message-queue-components" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Producer sends messages to a queue</li>
+<li>Consumer subscribes to a queue and consumes the subscribed messages</li>
+<li>Message queue is a service in the middle which decouples producers from consumers, letting them scale independently.</li>
+<li>Producer and consumer are both clients, while the message queue is the server.</li>
+</ul>
+<h3 id="messaging-models"><strong>Messaging models</strong></h3>
+<p>The first type of messaging model is point-to-point and it's commonly found in traditional message queues:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/point-to-point-model.png" alt="point-to-point-model" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>A message is sent to a queue and it's consumed by exactly one consumer.</li>
+<li>There can be multiple consumers, but a message is consumed only once.</li>
+<li>Once message is acknowledged as consumed, it is removed from the queue.</li>
+<li>There is no data retention in the point-to-point model, but there is such in our design.</li>
+</ul>
+<p>On the other hand, the publish-subscribe model is more common for event streaming platforms:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/publish-subscribe-model.png" alt="publish-subscribe-model" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>In this model, messages are associated to a topic.</li>
+<li>Consumers are subscribed to a topic and they receive all messages sent to this topic.</li>
+</ul>
+<h3 id="topics-partitions-and-brokers"><strong>Topics, partitions and brokers</strong></h3>
+<p>What if the data volume for a topic is too large? One way to scale is by splitting a topic into partitions (aka sharding):</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/partitions.png" alt="partitions" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Messages sent to a topic are evenly distributed across partitions</li>
+<li>The servers that host partitions are called brokers</li>
+<li>Each topic operates like a queue using FIFO for message processing. Message order is preserved within a partition.</li>
+<li>The position of a message within the partition is called an <strong>offset</strong>.</li>
+</ul>
+<figure class="mermaid-fig">
+<svg id="mmd-45b5a21ecff1853e" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1526.67px; background-color: transparent;" viewBox="0 0 1526.671875 382.5" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-45b5a21ecff1853e{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-45b5a21ecff1853e .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-45b5a21ecff1853e .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-45b5a21ecff1853e .error-icon{fill:#f4f6f8;}#mmd-45b5a21ecff1853e .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-45b5a21ecff1853e .edge-thickness-normal{stroke-width:1px;}#mmd-45b5a21ecff1853e .edge-thickness-thick{stroke-width:3.5px;}#mmd-45b5a21ecff1853e .edge-pattern-solid{stroke-dasharray:0;}#mmd-45b5a21ecff1853e .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-45b5a21ecff1853e .edge-pattern-dashed{stroke-dasharray:3;}#mmd-45b5a21ecff1853e .edge-pattern-dotted{stroke-dasharray:2;}#mmd-45b5a21ecff1853e .marker{fill:#637381;stroke:#637381;}#mmd-45b5a21ecff1853e .marker.cross{stroke:#637381;}#mmd-45b5a21ecff1853e svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-45b5a21ecff1853e p{margin:0;}#mmd-45b5a21ecff1853e .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-45b5a21ecff1853e .cluster-label text{fill:#454f5b;}#mmd-45b5a21ecff1853e .cluster-label span{color:#454f5b;}#mmd-45b5a21ecff1853e .cluster-label span p{background-color:transparent;}#mmd-45b5a21ecff1853e .label text,#mmd-45b5a21ecff1853e span{fill:#161c24;color:#161c24;}#mmd-45b5a21ecff1853e .node rect,#mmd-45b5a21ecff1853e .node circle,#mmd-45b5a21ecff1853e .node ellipse,#mmd-45b5a21ecff1853e .node polygon,#mmd-45b5a21ecff1853e .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-45b5a21ecff1853e .rough-node .label text,#mmd-45b5a21ecff1853e .node .label text,#mmd-45b5a21ecff1853e .image-shape .label,#mmd-45b5a21ecff1853e .icon-shape .label{text-anchor:middle;}#mmd-45b5a21ecff1853e .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-45b5a21ecff1853e .rough-node .label,#mmd-45b5a21ecff1853e .node .label,#mmd-45b5a21ecff1853e .image-shape .label,#mmd-45b5a21ecff1853e .icon-shape .label{text-align:center;}#mmd-45b5a21ecff1853e .node.clickable{cursor:pointer;}#mmd-45b5a21ecff1853e .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-45b5a21ecff1853e .arrowheadPath{fill:#000000;}#mmd-45b5a21ecff1853e .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-45b5a21ecff1853e .flowchart-link{stroke:#637381;fill:none;}#mmd-45b5a21ecff1853e .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-45b5a21ecff1853e .edgeLabel p{background-color:#ffffff;}#mmd-45b5a21ecff1853e .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-45b5a21ecff1853e .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-45b5a21ecff1853e .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-45b5a21ecff1853e .cluster text{fill:#454f5b;}#mmd-45b5a21ecff1853e .cluster span{color:#454f5b;}#mmd-45b5a21ecff1853e .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-45b5a21ecff1853e .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-45b5a21ecff1853e div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-45b5a21ecff1853e .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-45b5a21ecff1853e rect.text{fill:none;stroke-width:0;}#mmd-45b5a21ecff1853e .icon-shape,#mmd-45b5a21ecff1853e .image-shape{background-color:#ffffff;text-align:center;}#mmd-45b5a21ecff1853e .icon-shape p,#mmd-45b5a21ecff1853e .image-shape p{background-color:#ffffff;padding:2px;}#mmd-45b5a21ecff1853e .icon-shape .label rect,#mmd-45b5a21ecff1853e .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-45b5a21ecff1853e .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-45b5a21ecff1853e .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-45b5a21ecff1853e .node .neo-node{stroke:#299a8d;}#mmd-45b5a21ecff1853e [data-look="neo"].node rect,#mmd-45b5a21ecff1853e [data-look="neo"].cluster rect,#mmd-45b5a21ecff1853e [data-look="neo"].node polygon{stroke:url(#mmd-45b5a21ecff1853e-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-45b5a21ecff1853e [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-45b5a21ecff1853e [data-look="neo"].node path{stroke:url(#mmd-45b5a21ecff1853e-gradient);stroke-width:1px;}#mmd-45b5a21ecff1853e [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-45b5a21ecff1853e [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-45b5a21ecff1853e [data-look="neo"].node circle{stroke:url(#mmd-45b5a21ecff1853e-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-45b5a21ecff1853e [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-45b5a21ecff1853e [data-look="neo"].icon-shape .icon{fill:url(#mmd-45b5a21ecff1853e-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-45b5a21ecff1853e [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-45b5a21ecff1853e-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-45b5a21ecff1853e :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-45b5a21ecff1853e_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-45b5a21ecff1853e_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-45b5a21ecff1853e_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-45b5a21ecff1853e_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-45b5a21ecff1853e_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-45b5a21ecff1853e_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-45b5a21ecff1853e_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-45b5a21ecff1853e_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-45b5a21ecff1853e_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-45b5a21ecff1853e_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-45b5a21ecff1853e_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-45b5a21ecff1853e_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"><g class="cluster" id="mmd-45b5a21ecff1853e-LOG" data-look="classic"><rect style="" x="496.25" y="8" width="1022.421875" height="244.5"/><g class="cluster-label" transform="translate(911.546875, 8)"><foreignObject width="191.828125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5;"><span class="nodeLabel"><p>partition 0 — append-only log</p></span></div></foreignObject></g></g></g><g class="edgePaths"><path d="M114.688,56.75L118.854,56.75C123.021,56.75,131.354,56.75,139.021,56.75C146.688,56.75,153.688,56.75,157.188,56.75L160.688,56.75" id="mmd-45b5a21ecff1853e-L_P1_K_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_P1_K_0" data-points="W3sieCI6MTE0LjY4NzUsInkiOjU2Ljc1fSx7IngiOjEzOS42ODc1LCJ5Ijo1Ni43NX0seyJ4IjoxNjQuNjg3NSwieSI6NTYuNzV9XQ==" data-look="classic" marker-end="url(#mmd-45b5a21ecff1853e_flowchart-v2-pointEnd)"/><path d="M385.891,56.75L395.087,56.75C404.284,56.75,422.677,56.75,441.07,56.75C459.464,56.75,477.857,56.75,496.04,63.155C514.224,69.56,532.198,82.369,541.185,88.774L550.171,95.179" id="mmd-45b5a21ecff1853e-L_K_M0_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_K_M0_0" data-points="W3sieCI6Mzg1Ljg5MDYyNSwieSI6NTYuNzV9LHsieCI6NDQxLjA3MDMxMjUsInkiOjU2Ljc1fSx7IngiOjQ5Ni4yNSwieSI6NTYuNzV9LHsieCI6NTUzLjQyODg1Mzc1NDk0MDcsInkiOjk3LjV9XQ==" data-look="classic" marker-end="url(#mmd-45b5a21ecff1853e_flowchart-v2-pointEnd)"/><path d="M624.203,120L637.491,120C650.779,120,677.354,120,699.181,121.397C721.007,122.794,738.084,125.587,746.623,126.984L755.162,128.381" id="mmd-45b5a21ecff1853e-L_M0_M1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M0_M1_0" data-points="W3sieCI6NjI0LjIwMzEyNSwieSI6MTIwfSx7IngiOjcwMy45Mjk2ODc1LCJ5IjoxMjB9LHsieCI6NzU5LjEwOTM3NSwieSI6MTI5LjAyNjI5MjYzMzg3MjQ2fV0=" data-look="classic" marker-end="url(#mmd-45b5a21ecff1853e_flowchart-v2-pointEnd)"/><path d="M835.203,135.25L839.37,135.25C843.536,135.25,851.87,135.25,859.536,135.25C867.203,135.25,874.203,135.25,877.703,135.25L881.203,135.25" id="mmd-45b5a21ecff1853e-L_M1_M2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M1_M2_0" data-points="W3sieCI6ODM1LjIwMzEyNSwieSI6MTM1LjI1fSx7IngiOjg2MC4yMDMxMjUsInkiOjEzNS4yNX0seyJ4Ijo4ODUuMjAzMTI1LCJ5IjoxMzUuMjV9XQ==" data-look="classic" marker-end="url(#mmd-45b5a21ecff1853e_flowchart-v2-pointEnd)"/><path d="M963.25,135.25L967.417,135.25C971.583,135.25,979.917,135.25,989.299,135.25C998.682,135.25,1009.115,135.25,1014.331,135.25L1019.547,135.25" id="mmd-45b5a21ecff1853e-L_M2_M3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M2_M3_0" data-points="W3sieCI6OTYzLjI1LCJ5IjoxMzUuMjV9LHsieCI6OTg4LjI1LCJ5IjoxMzUuMjV9LHsieCI6MTAyMy41NDY4NzUsInkiOjEzNS4yNX1d" data-look="classic" marker-end="url(#mmd-45b5a21ecff1853e_flowchart-v2-pointEnd)"/><path d="M1101.922,135.25L1112.835,135.25C1123.747,135.25,1145.573,135.25,1165.024,136.628C1184.475,138.006,1201.552,140.763,1210.091,142.141L1218.629,143.519" id="mmd-45b5a21ecff1853e-L_M3_M4_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M3_M4_0" data-points="W3sieCI6MTEwMS45MjE4NzUsInkiOjEzNS4yNX0seyJ4IjoxMTY3LjM5ODQzNzUsInkiOjEzNS4yNX0seyJ4IjoxMjIyLjU3ODEyNSwieSI6MTQ0LjE1NjEzMTEzOTQwNzk2fV0=" data-look="classic" marker-end="url(#mmd-45b5a21ecff1853e_flowchart-v2-pointEnd)"/><path d="M1301.188,150.5L1305.354,150.5C1309.521,150.5,1317.854,150.5,1325.521,150.5C1333.188,150.5,1340.188,150.5,1343.688,150.5L1347.188,150.5" id="mmd-45b5a21ecff1853e-L_M4_M5_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M4_M5_0" data-points="W3sieCI6MTMwMS4xODc1LCJ5IjoxNTAuNX0seyJ4IjoxMzI2LjE4NzUsInkiOjE1MC41fSx7IngiOjEzNTEuMTg3NSwieSI6MTUwLjV9XQ==" data-look="classic" marker-end="url(#mmd-45b5a21ecff1853e_flowchart-v2-pointEnd)"/><path d="M1093.573,287.5L1105.877,274.333C1118.181,261.167,1142.79,234.833,1164.165,216.099C1185.539,197.364,1203.68,186.228,1212.75,180.661L1221.82,175.093" id="mmd-45b5a21ecff1853e-L_GA_M4_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_GA_M4_0" data-points="W3sieCI6MTA5My41NzI4OTM0MTUxNzg3LCJ5IjoyODcuNX0seyJ4IjoxMTY3LjM5ODQzNzUsInkiOjIwOC41fSx7IngiOjEyMjUuMjI5MzkxMTYzNzkzLCJ5IjoxNzN9XQ==" data-look="classic" marker-end="url(#mmd-45b5a21ecff1853e_flowchart-v2-pointEnd)"/><path d="M622.557,287.5L636.119,271.792C649.681,256.083,676.805,224.667,699.312,203.394C721.818,182.121,739.706,170.992,748.65,165.428L757.594,159.863" id="mmd-45b5a21ecff1853e-L_GB_M1_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_GB_M1_0" data-points="W3sieCI6NjIyLjU1Njc0MzQyMTA1MjYsInkiOjI4Ny41fSx7IngiOjcwMy45Mjk2ODc1LCJ5IjoxOTMuMjV9LHsieCI6NzYwLjk5MDc3MzE2ODEwMzUsInkiOjE1Ny43NX1d" data-look="classic" marker-end="url(#mmd-45b5a21ecff1853e_flowchart-v2-pointEnd)"/><path d="M352.805,183.25L367.516,183.25C382.227,183.25,411.648,183.25,435.556,183.25C459.464,183.25,477.857,183.25,496.04,176.845C514.224,170.44,532.198,157.631,541.185,151.226L550.171,144.821" id="mmd-45b5a21ecff1853e-L_GC_M0_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_GC_M0_0" data-points="W3sieCI6MzUyLjgwNDY4NzUsInkiOjE4My4yNX0seyJ4Ijo0NDEuMDcwMzEyNSwieSI6MTgzLjI1fSx7IngiOjQ5Ni4yNSwieSI6MTgzLjI1fSx7IngiOjU1My40Mjg4NTM3NTQ5NDA3LCJ5IjoxNDIuNX1d" data-look="classic" marker-end="url(#mmd-45b5a21ecff1853e_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_P1_K_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_K_M0_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_M0_M1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_M1_M2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_M2_M3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_M3_M4_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_M4_M5_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(1153.6514, 223.21057)"><g class="label" data-id="L_GA_M4_0" transform="translate(-30.1796875, -10.5)"><foreignObject width="60.359375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>next read</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(685.20193, 214.94138)"><g class="label" data-id="L_GB_M1_0" transform="translate(-30.1796875, -10.5)"><foreignObject width="60.359375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>next read</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(441.0703125, 183.25)"><g class="label" data-id="L_GC_M0_0" transform="translate(-30.1796875, -10.5)"><foreignObject width="60.359375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>next read</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-45b5a21ecff1853e-flowchart-P1-0" data-look="classic" transform="translate(61.34375, 56.75)"><rect class="basic label-container" style="" x="-53.34375" y="-22.5" width="106.6875" height="45"/><g class="label" style="" transform="translate(-29.34375, -10.5)"><rect/><foreignObject width="58.6875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>producer</p></span></div></foreignObject></g></g><g class="node default" id="mmd-45b5a21ecff1853e-flowchart-K-1" data-look="classic" transform="translate(275.2890625, 56.75)"><rect class="basic label-container" style="" x="-110.6015625" y="-33" width="221.203125" height="66"/><g class="label" style="" transform="translate(-86.6015625, -21)"><rect/><foreignObject width="173.203125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>partition key:<br />hash(key) % numPartitions</p></span></div></foreignObject></g></g><g class="node default" id="mmd-45b5a21ecff1853e-flowchart-M0-3" data-look="classic" transform="translate(585, 120)"><rect class="basic label-container" style="" x="-39.203125" y="-22.5" width="78.40625" height="45"/><g class="label" style="" transform="translate(-15.203125, -10.5)"><rect/><foreignObject width="30.40625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>off 0</p></span></div></foreignObject></g></g><g class="node default" id="mmd-45b5a21ecff1853e-flowchart-M1-5" data-look="classic" transform="translate(797.15625, 135.25)"><rect class="basic label-container" style="" x="-38.046875" y="-22.5" width="76.09375" height="45"/><g class="label" style="" transform="translate(-14.046875, -10.5)"><rect/><foreignObject width="28.09375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>off 1</p></span></div></foreignObject></g></g><g class="node default" id="mmd-45b5a21ecff1853e-flowchart-M2-6" data-look="classic" transform="translate(924.2265625, 135.25)"><rect class="basic label-container" style="" x="-39.0234375" y="-22.5" width="78.046875" height="45"/><g class="label" style="" transform="translate(-15.0234375, -10.5)"><rect/><foreignObject width="30.046875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>off 2</p></span></div></foreignObject></g></g><g class="node default" id="mmd-45b5a21ecff1853e-flowchart-M3-7" data-look="classic" transform="translate(1062.734375, 135.25)"><rect class="basic label-container" style="" x="-39.1875" y="-22.5" width="78.375" height="45"/><g class="label" style="" transform="translate(-15.1875, -10.5)"><rect/><foreignObject width="30.375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>off 3</p></span></div></foreignObject></g></g><g class="node default" id="mmd-45b5a21ecff1853e-flowchart-M4-8" data-look="classic" transform="translate(1261.8828125, 150.5)"><rect class="basic label-container" style="" x="-39.3046875" y="-22.5" width="78.609375" height="45"/><g class="label" style="" transform="translate(-15.3046875, -10.5)"><rect/><foreignObject width="30.609375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>off 4</p></span></div></foreignObject></g></g><g class="node default" id="mmd-45b5a21ecff1853e-flowchart-M5-9" data-look="classic" transform="translate(1422.4296875, 150.5)"><rect class="basic label-container" style="" x="-71.2421875" y="-22.5" width="142.484375" height="45"/><g class="label" style="" transform="translate(-47.2421875, -10.5)"><rect/><foreignObject width="94.484375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>off 5 = log end</p></span></div></foreignObject></g></g><g class="node default" id="mmd-45b5a21ecff1853e-flowchart-GA-10" data-look="classic" transform="translate(1062.734375, 320.5)"><rect class="basic label-container" style="" x="-49.484375" y="-33" width="98.96875" height="66"/><g class="label" style="" transform="translate(-25.484375, -21)"><rect/><foreignObject width="50.96875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>group A<br />offset 4</p></span></div></foreignObject></g></g><g class="node default" id="mmd-45b5a21ecff1853e-flowchart-GB-12" data-look="classic" transform="translate(585, 331)"><rect class="basic label-container" style="" x="-63.75" y="-43.5" width="127.5" height="87"/><g class="label" style="" transform="translate(-39.75, -31.5)"><rect/><foreignObject width="79.5" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>group B<br />offset 1<br />lagging by 4</p></span></div></foreignObject></g></g><g class="node default" id="mmd-45b5a21ecff1853e-flowchart-GC-14" data-look="classic" transform="translate(275.2890625, 183.25)"><rect class="basic label-container" style="" x="-77.515625" y="-43.5" width="155.03125" height="87"/><g class="label" style="" transform="translate(-53.515625, -31.5)"><rect/><foreignObject width="107.03125" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>group C<br />offset 0<br />replaying history</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-45b5a21ecff1853e-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-45b5a21ecff1853e-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-45b5a21ecff1853e-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>Three consumer groups, one copy of the data, three independent positions. Group B is <strong>lagging</strong> by four messages; group C has reset its offset to replay history. Nothing about the log changes to accommodate any of them — which is the property that makes retention, replay and multi-consumer fan-out all the same feature.</p>
+<ul>
+<li>Each message produced is sent to a specific partition. A partition key specifies which partition a message should land in.
+<ul>
+<li>Eg a <code>user_id</code> can be used as a partition key to guarantee order of messages for the same user.</li>
+</ul>
+</li>
+<li>Each consumer subscribes to one or more partitions. When there are multiple consumers for the same messages, they form a consumer group.</li>
+</ul>
+<p><strong>The partition is the unit of everything</strong>, and recognising that resolves most confusion about this system:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Scope</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ordering guarantee</td>
+<td><strong>Within one partition only</strong> — never across a topic</td>
+</tr>
+<tr>
+<td>Parallelism</td>
+<td>One partition per consumer in a group; partitions cap consumer count</td>
+</tr>
+<tr>
+<td>Offset</td>
+<td>Per partition, per consumer group</td>
+</tr>
+<tr>
+<td>Replication</td>
+<td>Per partition (one leader, N followers)</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Per partition, as a series of segment files</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>So <strong>order and parallelism are in direct tension, and partition count is the dial between them.</strong> Total ordering across a topic requires exactly one partition, which means exactly one consumer and no scaling at all. The usual resolution is to accept <em>per-key</em> ordering instead: partition by <code>user_id</code> and all events for one user are ordered, while different users proceed in parallel. That is almost always what the business requirement actually needs, and converting &quot;we need ordering&quot; into &quot;we need ordering per entity&quot; is the key move.</p>
+<p>The partition key therefore decides two things at once: <strong>what is ordered</strong> and <strong>how evenly load is spread.</strong> Choosing a key with few distinct values, or one dominated by a handful of hot entities, produces a hot partition that no amount of broker capacity fixes — and the ordering guarantee prevents you from spreading that key's messages out, because that is exactly what it promises not to do.</p>
+<h3 id="consumer-groups"><strong>Consumer groups</strong></h3>
+<p>Consumer groups are a set of consumers working together to consume messages from a topic:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/consumer-groups.png" alt="consumer-groups" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Messages are replicated per consumer group (not per consumer).</li>
+<li>Each consumer group maintains its own offset.</li>
+<li>Reading messages in parallel by a consumer group improves throughput but hampers the ordering guarantee.</li>
+<li>This can be mitigated by only allowing one consumer from a group to be subscribed to a partition.</li>
+<li>This means that we can't have more consumers in a group than there are partitions.</li>
+</ul>
+<h3 id="high-level-architecture"><strong>High-level architecture</strong></h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/high-level-architecture.png" alt="high-level-architecture" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li><strong>Clients</strong>: producer and consumer. Producer pushes messages to a designated topic. Consumer group subscribes to messages from a topic.</li>
+<li><strong>Brokers</strong>: hold multiple partitions. A partition holds a subset of messages for a topic.</li>
+<li><strong>Data storage</strong>: stores messages in partitions.</li>
+<li><strong>State storage</strong>: keeps the consumer states.</li>
+<li><strong>Metadata storage</strong>: stores configuration and topic properties</li>
+<li><strong>Coordination service</strong>: responsible for service discovery (which brokers are alive) and leader election (which broker is leader, responsible for assigning partitions).</li>
+</ul>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<p>In order to achieve high throughput and preserve the high data retention requirement, we made some important design choices:</p>
+<ul>
+<li>We chose an on-disk data structure which takes advantage of the properties of modern HDD and disk caching strategies of modern OS-es.</li>
+<li>The message data structure is immutable to avoid extra copying, which we want to avoid in a high volume/high traffic system.</li>
+<li>We designed our writes around batching as small I/O is an enemy of high throughput.</li>
+</ul>
+<h3 id="data-storage"><strong>Data storage</strong></h3>
+<p>In order to find the best data store for messages, we must examine a message's properties:</p>
+<ul>
+<li>Write-heavy, read-heavy</li>
+<li>No update/delete operations. In traditional message queues, there is a &quot;delete&quot; operation as messages are not retained.</li>
+<li>Predominantly sequential read/write access pattern.</li>
+</ul>
+<p>What are our options:</p>
+<ul>
+<li><strong>Database</strong>: not ideal as typical databases don't support well both write and read heavy systems.</li>
+<li><strong>Write-ahead log (WAL)</strong>: a plain text file which only supports appending to it and is very HDD-friendly.
+<ul>
+<li>We split partitions into segments to avoid maintaining a very large file.</li>
+<li>Old segments are read-only. Writes are accepted by latest segment only.</li>
+</ul>
+</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/wal-example.png" alt="wal-example" data-width="500" style="max-width:500px" />
+</p>
+<p>WAL files are extremely efficient when used with traditional HDDs.</p>
+<p>There is a misconception that HDD access is slow, but that hugely depends on the access pattern.
+When the access pattern is sequential (as in our case), HDDs can achieve several MB/s write/read speed which is sufficient for our needs.
+We also piggyback on the fact that the OS caches disk data in memory aggressively.</p>
+<h3 id="message-data-structure"><strong>Message data structure</strong></h3>
+<p>It is important that the message schema is compliant between producer, queue and consumer to avoid extra copying. This allows much more efficient processing.</p>
+<p>Example message structure:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/message-structure.png" alt="message-structure" data-width="500" style="max-width:500px" />
+</p>
+<p>The key of the message specifies which partition a message belongs to. An example mapping is <code>hash(key) % numPartitions</code>.
+For more flexibility, the producer can override default keys in order to control which partitions messages are distributed to.</p>
+<p>The message value is the payload of a message. It can be plaintext or a compressed binary block.</p>
+<p><strong>Note:</strong> Message keys, unlike traditional KV stores, need not be unique. It is acceptable to have duplicate keys and for it to even be missing.</p>
+<p>Other message fields:</p>
+<ul>
+<li><strong>Topic</strong>: topic the message belongs to</li>
+<li><strong>Partition</strong>: The ID of the partition a message belongs to</li>
+<li><strong>Offset</strong>: The position of the message in a partition. A message can be located via <code>topic</code>, <code>partition</code>, <code>offset</code>.</li>
+<li><strong>Timestamp</strong>: When the message is stored</li>
+<li><strong>Size</strong>: the size of this message</li>
+<li><strong>CRC</strong>: checksum to ensure message integrity</li>
+</ul>
+<p>Additional features such as filtering can be supported by adding additional fields.</p>
+<h3 id="batching"><strong>Batching</strong></h3>
+<p>Batching is critical for the performance of our system. We apply it in the producer, consumer and message queue.</p>
+<p>It is critical because:</p>
+<ul>
+<li>It allows the operating system to group messages together, amortizing the cost of expensive network round trips</li>
+<li>Messages are written to the WAL in groups sequentially, which leads to a lot of sequential writes and disk caching.</li>
+</ul>
+<p>There is a trade-off between latency and throughput:</p>
+<ul>
+<li>High batching leads to high throughput and higher latency.</li>
+<li>Less batching leads to lower throughput and lower latency.</li>
+</ul>
+<p>If we need to support lower latency since the system is deployed as a traditional message queue, the system could be tuned to use a smaller batch size.</p>
+<p>If tuned for throughput, we might need more partitions per topic to compensate for the slower sequential disk write throughput.</p>
+<h3 id="producer-flow"><strong>Producer flow</strong></h3>
+<p>If a producer wants to send a message to a partition, which broker should it connect to?</p>
+<p>One option is to introduce a routing layer, which route messages to the correct broker. If replication is enabled, the correct broker is the leader replica:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/routing-layer.png" alt="routing-layer" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Routing layer reads the replication plan from the metadata store and caches it locally.</li>
+<li>Producer sends a message to the routing layer.</li>
+<li>Message is forwarded to broker 1 who is the leader of the given partition</li>
+<li>Follower replicas pull the new message from the leader. Once enough confirmations are received, the leader commits the data and responds to the producer.</li>
+</ul>
+<p>The reason for having replicas is to enable fault tolerance.</p>
+<p>This approach works but has some drawbacks:</p>
+<ul>
+<li>Additional network hops due to the extra component</li>
+<li>The design doesn't enable batching messages</li>
+</ul>
+<p>To mitigate these issues, we can embed the routing layer into the producer:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/routing-layer-producer.png" alt="routing-layer-producer" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Fewer network hops lead to lower latency</li>
+<li>Producers can control which partition a message is routed to</li>
+<li>The buffer allows us to batch messages in-memory and send out larger batches in a single request, which increases throughput.</li>
+</ul>
+<p>The batch size choice is a classical trade-off between throughput and latency.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/batch-size-throughput-vs-latency.png" alt="batch-size-throughput-vs-latency" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Larger batch size leads to longer wait time before batch is committed.</li>
+<li>Smaller batch size leads to request being sent sooner and having lower latency but lower throughput.</li>
+</ul>
+<h3 id="consumer-flow"><strong>Consumer flow</strong></h3>
+<p>The consumer specifies its offset in a partition and receives a chunk of messages, beginning from that offset:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/consumer-example.png" alt="consumer-example" data-width="500" style="max-width:500px" />
+</p>
+<p>One important consideration when designing the consumer is whether to use a push or a pull model:</p>
+<ul>
+<li><strong>Push model</strong>: leads to lower latency as broker pushes messages to consumer as it receives them.
+<ul>
+<li>However, if rate of consumption falls behind the rate of production, the consumer can be overwhelmed.</li>
+<li>It is challenging to deal with consumers with varying processing power as the broker controls the rate of consumption.</li>
+</ul>
+</li>
+<li><strong>Pull model</strong>: leads to the consumer controlling the consumption rate.
+<ul>
+<li>If rate of consumption is slow, consumer will not be overwhelmed and we can scale it to catch up.</li>
+<li>The pull model is more suitable for batch processing, because with the push model, the broker can't know how many messages a consumer can handle.</li>
+<li>With the pull model, on the other hand, consumers can aggressively fetch large message batches.</li>
+<li>The down side is the higher latency and extra network calls when there are no new messages. Latter issue can be mitigated using long polling.</li>
+</ul>
+</li>
+</ul>
+<p>Hence, most message queues (and us) choose the pull model.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/consumer-flow.png" alt="consumer-flow" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>A new consumer subscribes to topic A and joins group 1.</li>
+<li>The correct broker node is found by hashing the group name. This way, all consumers in a group connect to the same broker.</li>
+<li>Note that this consumer group coordinator is different from the coordination service (ZooKeeper).</li>
+<li>Coordinator confirms that the consumer has joined the group and assigns partition 2 to that consumer.</li>
+<li>There are different partition assignment strategies - round-robin, range, etc.</li>
+<li>Consumer fetches latest messages from the last offset. The state storage keeps the consumer offsets.</li>
+<li>Consumer processes messages and commits the offset to the broker. The order of those operations affects the message delivery semantics.</li>
+</ul>
+<h3 id="consumer-rebalancing"><strong>Consumer rebalancing</strong></h3>
+<p>Consumer rebalancing is responsible for deciding which consumers are responsible for which partition.</p>
+<p>This process occurs when a consumer joins/leaves or a partition is added/removed.</p>
+<p>The broker, acting as a coordinator plays a huge role in orchestrating the rebalancing workflow.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/consumer-rebalancing.png" alt="consumer-rebalancing" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>All consumers from the same group are connected to the same coordinator. The coordinator is found by hashing the group name.</li>
+<li>When the consumer list changes, the coordinator chooses a new leader of the group.</li>
+<li>The leader of the group calculates a new partition dispatch plan and reports it back to the coordinator, which broadcasts it to the other consumers.</li>
+</ul>
+<p>When the coordinator stops receiving heartbeats from the consumers in a group, a rebalancing is triggered:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/consumer-rebalance-example.png" alt="consumer-rebalance-example" data-width="500" style="max-width:500px" />
+</p>
+<p>Let's explore what happens when a consumer joins a group:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/consumer-join-group-usecase.png" alt="consumer-join-group-usecase" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Initially, only consumer A is in the group and it consumes all partitions.</li>
+<li>Consumer B sends a request to join the group.</li>
+<li>The coordinator notifies all group members that it's time to rebalance passively - as a response to the heartbeat.</li>
+<li>Once all consumers rejoin the group, the coordinator chooses a leader and notifies the rest about the election result.</li>
+<li>The leader generates the partition dispatch plan and sends it to the coordinator. Others wait for the dispatch plan.</li>
+<li>Consumers start consuming from the newly assigned partitions.</li>
+</ul>
+<p>Here's what happens when a consumer leaves the group:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/consumer-leaves-group-usecase.png" alt="consumer-leaves-group-usecase" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Consumer A and B are in the same group</li>
+<li>Consumer B asks to leave the group</li>
+<li>When coordinator receives A's heartbeat, it informs them that it's time to rebalance.</li>
+<li>The rest of the steps are the same.</li>
+</ul>
+<p>The process is similar when a consumer doesn't send a heartbeat for a long time:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/consumer-no-heartbeat-usecase.png" alt="consumer-no-heartbeat-usecase" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="state-storage"><strong>State storage</strong></h3>
+<p>The state storage stores mapping between partitions and consumers, as well as the last consumed offsets for a partition.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/state-storage.png" alt="state-storage" data-width="500" style="max-width:500px" />
+</p>
+<p>Group 1's offset is at 6, meaning all previous messages are consumed. If a consumer crashes, the new consumer will continue from that message on wards.</p>
+<p>Data access patterns for consumer states:</p>
+<ul>
+<li>Frequent read/write operations, but low volume</li>
+<li>Data is updated frequently, but rarely deleted</li>
+<li>Random read/write</li>
+<li>Data consistency is important</li>
+</ul>
+<p>Given these requirements, a fast KV storage like Zookeeper is ideal.</p>
+<h3 id="metadata-storage"><strong>Metadata storage</strong></h3>
+<p>The metadata storage stores configuration and topic properties - partition number, retention period, replica distribution.</p>
+<p>Metadata doesn't change often and volume is small, but there is a high consistency requirement.
+Zookeeper is a good choice for this storage.</p>
+<h3 id="zookeeper"><strong>ZooKeeper</strong></h3>
+<p>Zookeeper is essential for building distributed message queues.</p>
+<p>It is a hierarchical key-value store, commonly used for a distributed configuration, synchronization service and naming registry (ie service discovery).</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/zookeeper.png" alt="zookeeper" data-width="500" style="max-width:500px" />
+</p>
+<p>With this change, the broker only needs to maintain data for the messages. Metadata and state storage is in Zookeeper.</p>
+<p>Zookeeper also helps with leader election of the broker replicas.</p>
+<h3 id="replication"><strong>Replication</strong></h3>
+<p>In distributed systems, hardware issues are inevitable. We can tackle this via replication to achieve high availability.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/replication-example.png" alt="replication-example" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Each partition is replicated across multiple brokers, but there is only one leader replica.</li>
+<li>Producers send messages to leader replicas</li>
+<li>Followers pull the replicated messages from the leader</li>
+<li>Once enough replicas are synchronized, the leader returns acknowledgment to the producer</li>
+<li>Distribution of replicas for each partition is called the replica distribution plan.</li>
+<li>The leader for a given partition creates the replica distribution plan and saves it in Zookeeper</li>
+</ul>
+<h3 id="in-sync-replicas"><strong>In-sync replicas</strong></h3>
+<p>One problem we need to tackle is keeping messages in-sync between the leader and the followers for a given partition.</p>
+<p>In-sync replicas (ISR) are replicas for a partition that stay in-sync with the leader.</p>
+<p>The <code>replica.lag.max.messages</code> defines how many messages can a replica be lagging behind the leader to be considered in-sync.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/in-sync-replicas-example.png" alt="in-sync-replicas-example" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Committed offset is 13</li>
+<li>Two new messages are written to the leader, but not committed yet.</li>
+<li>A message is committed once all replicas in the ISR have synchronized that message</li>
+<li>Replica 2 and 3 have fully caught up with leader, hence, they are in ISR</li>
+<li>Replica 4 has lagged behind, hence, is removed from ISR for now</li>
+</ul>
+<p>ISR reflects a trade-off between performance and durability.</p>
+<ul>
+<li>In order for producers not to lose messages, all replicas should be in sync before sending an acknowledgment</li>
+<li>But a slow replica will cause the whole partition to become unavailable</li>
+</ul>
+<p>Acknowledgment handling is configurable.</p>
+<p><code>ACK=all</code> means that all replicas in ISR have to sync a message. Message sending is slow, but message durability is highest.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/ack-all.png" alt="ack-all" data-width="500" style="max-width:500px" />
+</p>
+<p><code>ACK=1</code> means that producer receives acknowledgment once leader receives the message. Message sending is fast, but message durability is low.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/ack-1.png" alt="ack-1" data-width="500" style="max-width:500px" />
+</p>
+<p><code>ACK=0</code> means that producer sends messages without waiting for any acknowledgment from leader. Message sending is fastest, message durability is lowest.</p>
+<p><strong>What each setting actually loses, concretely:</strong></p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Acknowledged when</th>
+<th>Lost if…</th>
+<th>Use for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ACK=0</code></td>
+<td>Message leaves the producer</td>
+<td>Anything at all goes wrong — including the broker being down</td>
+<td>Metrics, traces, where volume beats completeness</td>
+</tr>
+<tr>
+<td><code>ACK=1</code></td>
+<td>Leader has written it</td>
+<td><strong>The leader fails before a follower replicates it</strong> — silently, with the producer believing it succeeded</td>
+<td>Logs, analytics</td>
+</tr>
+<tr>
+<td><code>ACK=all</code></td>
+<td>All ISR members have it</td>
+<td>Every ISR replica is lost simultaneously</td>
+<td>Anything whose loss is a defect</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>The trap in <code>ACK=all</code> is worth knowing.</strong> It means &quot;all replicas <em>currently in the ISR</em>&quot;, and the ISR shrinks when followers fall behind. If every follower lags and is evicted, the ISR is just the leader — and <code>ACK=all</code> has silently degraded to <code>ACK=1</code> without any configuration changing. The safeguard is a <strong>minimum ISR size</strong>: refuse writes rather than accept them with inadequate replication. Without it, the strongest durability setting provides the weakest guarantee exactly when the cluster is unhealthy, which is when you need it.</p>
+<p>Note the symmetry with quorum reads and writes in <a href="06-key-value-store.html#3-consistency">Chapter 6</a>: <code>ACK</code> is <code>W</code>, the ISR is <code>N</code>, and the same trade of latency against durability applies.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/ack-0.png" alt="ack-0" data-width="500" style="max-width:500px" />
+</p>
+<p>On the consumer side, we can connect all consumers to the leader for a partition and let them read messages from it:</p>
+<ul>
+<li>This makes for the simplest design and easiest operation</li>
+<li>Messages in a partition are sent to only one consumer in a group, which limits the connections to the leader replica</li>
+<li>The number of connections to leader replica is typically not high as long as the topic is not super hot</li>
+<li>We can scale a hot topic by increasing the number of partitions and consumers</li>
+<li>In certain scenarios, it might make sense to let a consumer lead from an ISR, eg if they're located in a separate DC</li>
+</ul>
+<p>The ISR list is maintained by the leader who tracks the lag between itself and each replica.</p>
+<h3 id="scalability"><strong>Scalability</strong></h3>
+<p>Let's evaluate how we can scale different parts of the system.</p>
+<h4 id="producer">Producer</h4>
+<p>The producer is much smaller than the consumer. Its scalability can easily be achieved by adding/removing new producer instances.</p>
+<h4 id="consumer">Consumer</h4>
+<p>Consumer groups are isolated from each other. It is easy to add/remove consumer groups at will.</p>
+<p>Rebalancing helps handle the case when consumers are added/removed from a group gracefully.</p>
+<p>Consumer groups and rebalancing together help us achieve scalability and fault tolerance.</p>
+<h4 id="broker">Broker</h4>
+<p>How do brokers handle failure?</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/broker-failure-recovery.png" alt="broker-failure-recovery" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Once a broker fails, there are still enough replicas to avoid partition data loss</li>
+<li>A new leader is elected and the broker coordinator redistributes partitions which were at the failed broker to existing replicas</li>
+<li>Existing replicas pick up the new partitions and act as followers until they're caught up with the leader and become ISR</li>
+</ul>
+<p>Additional considerations to make the broker fault-tolerant:</p>
+<ul>
+<li>The minimum number of ISRs balances latency and safety. You can fine-tune it to meet your needs.</li>
+<li>If all replicas of a partition are in the same node, then it's a waste of resources. Replicas should be across different brokers.</li>
+<li>If all replicas of a partition crash, then the data is lost forever. Spreading replicas across data centers can help, but it adds up a lot of latency. One option is to use <a href="https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=27846330" target="_blank" rel="noopener">data mirroring</a> as a work around.</li>
+</ul>
+<p>How do we handle redistribution of replicas when a new broker is added?</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/broker-replica-redistribution.png" alt="broker-replica-redistribution" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>We can temporarily allow more replicas than configured, until new broker catches up</li>
+<li>Once it does, we can remove the partition replica which is no longer needed</li>
+</ul>
+<h4 id="partition">Partition</h4>
+<p>Whenever a new partition is added, the producer is notified and consumer rebalancing is triggered.</p>
+<p><strong>And the per-key ordering guarantee breaks at that moment.</strong> If messages are routed by <code>hash(key) % numPartitions</code>, then changing <code>numPartitions</code> changes the destination of almost every key — this is precisely the rehashing problem from <a href="05-consistent-hashing.html#the-rehashing-problem">Chapter 5</a>. A user whose events were landing in partition 3 now lands in partition 7, while their earlier messages sit unconsumed in partition 3. Two partitions now hold that user's history with no defined order between them.</p>
+<p>There is no clean fix, only choices:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>Consequence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Accept a temporary ordering break</td>
+<td>Simplest; fine if ordering is advisory or the gap can be drained first</td>
+</tr>
+<tr>
+<td>Drain before expanding</td>
+<td>Stop producing, let consumers reach the end, then add partitions</td>
+</tr>
+<tr>
+<td>Over-provision partitions up front</td>
+<td>The usual real-world answer — create far more partitions than needed, since they are cheap and resizing is not</td>
+</tr>
+<tr>
+<td>Consistent hashing on the key ring</td>
+<td>Moves only <code>1/N</code> of keys, but is not how mainstream brokers route</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>This is why partition count is treated as a near-permanent decision: <strong>increasing it breaks per-key ordering, and decreasing it is the involved process described below.</strong> Over-provisioning is cheap insurance.</p>
+<p>In terms of data storage, we can only store new messages to the new partition vs. trying to copy all old ones:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/partition-exmaple.png" alt="partition-example" data-width="500" style="max-width:500px" />
+</p>
+<p>Decreasing the number of partitions is more involved:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/partition-decrease.png" alt="partition-decrease" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Once a partition is decommissioned, new messages are only received by remaining partitions</li>
+<li>The decommissioned partition isn't removed immediately as messages can still be consumed from it</li>
+<li>Only once a pre-configured retention period passes do we truncate the data and free up storage space</li>
+<li>During the transitional period, producers only send messages to active partitions, but consumers read from all</li>
+<li>Once retention period expires, consumers are rebalanced</li>
+</ul>
+<h3 id="data-delivery-semantics"><strong>Data delivery semantics</strong></h3>
+<p>Let's discuss different delivery semantics.</p>
+<h4 id="at-most-once">At-most once</h4>
+<p>With this guarantee, messages are delivered not more than once and could not be delivered at all.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/at-most-once.png" alt="at-most-once" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Producer sends a message asynchronously to a topic. If message delivery fails, there is no retry.</li>
+<li>Consumer fetches message and immediately commits offset. If consumer crashes before processing the message, the message will not be processed.</li>
+</ul>
+<h4 id="at-least-once">At-least once</h4>
+<p>A message can be sent more than once and no message should be left unprocessed.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/at-least-once.png" alt="at-least-once" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Producer sends message with <code>ack=1</code> or <code>ack=all</code>. If there is any issue, it will keep retrying.</li>
+<li>Consumer fetches the message and consumes the offset only after it's done processing it.</li>
+<li>It is possible for a message to be delivered more than once if eg consumer crashes before committing offset but after processing it.</li>
+<li>This is why, this is good for use-cases where data duplication is acceptable or deduplication is possible.</li>
+</ul>
+<h4 id="exactly-once">Exactly once</h4>
+<p>Extremely costly to implement for the system, albeit it's the friendliest guarantee to users:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/exactly-once.png" alt="exactly-once" data-width="500" style="max-width:500px" />
+</p>
+<p><strong>What makes it expensive, and what it does not give you.</strong> Two mechanisms are required, and they address two different duplicate sources:</p>
+<ol>
+<li><strong>Idempotent producer.</strong> Each producer is assigned an ID and tags every message with a per-partition sequence number. A retried send carries the same sequence number, so the broker recognises and discards it. This removes duplicates caused by producer retries — without it, <code>ACK=all</code> plus retry <em>guarantees</em> occasional duplicates, since a lost acknowledgement is indistinguishable from a lost message.</li>
+<li><strong>Transactions.</strong> Consuming, processing and committing the new offset must be atomic with the output being written, or a crash between the two reintroduces a duplicate or a loss. This means a transaction coordinator, a transaction log, and consumers that refuse to read uncommitted records.</li>
+</ol>
+<p>And the crucial limitation: <strong>this is exactly-once within the system, not exactly-once in the world.</strong> If processing a message charges a credit card or sends an email, those are external side effects that no broker transaction can roll back. End-to-end exactly-once still requires the <em>consumer's</em> side effect to be idempotent — an idempotency key at the payment provider (<a href="26-payment-system.html">Chapter 26</a>) or a dedup check before sending (<a href="10-notification-system.html#reliability">Chapter 10</a>).</p>
+<p>The honest summary, and the right thing to say out loud: <strong>at-least-once delivery plus idempotent processing is what almost every production system actually does</strong>, because it is far cheaper and achieves the same observable outcome.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>At-most-once</th>
+<th>At-least-once</th>
+<th>Exactly-once</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Producer</td>
+<td>Fire and forget</td>
+<td>Retry until acked</td>
+<td>Idempotent, sequence-numbered</td>
+</tr>
+<tr>
+<td>Offset commit</td>
+<td><strong>Before</strong> processing</td>
+<td><strong>After</strong> processing</td>
+<td>Atomically with the output</td>
+</tr>
+<tr>
+<td>Duplicates</td>
+<td>No</td>
+<td><strong>Yes, expect them</strong></td>
+<td>No (within the system)</td>
+</tr>
+<tr>
+<td>Message loss</td>
+<td>Yes</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>Lowest</td>
+<td>Low</td>
+<td>High — coordinator, transaction log, throughput penalty</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="advanced-features"><strong>Advanced features</strong></h3>
+<p>Let's discuss some advanced features, we might discuss in the interview.</p>
+<h4 id="message-filtering">Message filtering</h4>
+<p>Some consumers might want to only consume messages of a certain type within a partition.</p>
+<p>This can be achieved by building separate topics for each subset of messages, but this can be costly if systems have too many differing use-cases.</p>
+<ul>
+<li>It is a waste of resources to store the same message on different topics</li>
+<li>Producer is now tightly coupled to consumers as it changes with each new consumer requirement</li>
+</ul>
+<p>We can resolve this using message filtering.</p>
+<ul>
+<li>A naive approach would be to do the filtering on the consumer-side, but that introduces unnecessary consumer traffic</li>
+<li>Alternatively, messages can have tags attached to them and consumers can specify which tags they're subscribed to</li>
+<li>Filtering could also be done via the message payloads but that can be challenging and unsafe for encrypted/serialized messages</li>
+<li>For more complex mathematical formulae, the broker could implement a grammar parser or script executor, but that can be heavyweight for the message queue</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/message-filtering.png" alt="message-filtering" data-width="500" style="max-width:500px" />
+</p>
+<h4 id="delayed-messages--scheduled-messages">Delayed messages &amp; scheduled messages</h4>
+<p>For some use-cases, we might want to delay or schedule message delivery.
+For example, we might submit a payment verification check for 30m from now, which triggers the consumer to see if a payment was successful.</p>
+<p>This can be achieved by sending messages to temporary storage in the broker and moving the message to the partition at the right time:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/19.%20Distributed%20Message%20Queue/images/delayed-message-implementation.png" alt="delayed-message-implementation" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>The temporary storage can be one or more special message topics</li>
+<li>The timing function can be achieved using dedicated delay queues or a <a href="http://www.cs.columbia.edu/~nahum/w6998/papers/sosp87-timing-wheels.pdf" target="_blank" rel="noopener">hierarchical time wheel</a></li>
+</ul>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
+<p>Additional talking points:</p>
+<ul>
+<li><strong>Protocol of communication</strong>: Important considerations - support all use-cases and high data volume, as well as verify message integrity. Popular protocols - AMQP and Kafka protocol.</li>
+<li><strong>Retry consumption</strong>: if we can't process a message immediately, we could send it to a dedicated retry topic to be attempted later.</li>
+<li><strong>Historical data archive</strong>: old messages can be backed up in high-capacity storages such as HDFS or object storage (eg S3).</li>
+</ul>
+<p><strong>Why the retry topic is not optional.</strong> Offsets advance in order, so a message the consumer cannot process is a wall: you either stop (and the partition's lag grows without bound) or skip it (and lose it silently). A <strong>poison message</strong> therefore blocks everything behind it — head-of-line blocking at the partition level. Moving the failure aside into a retry topic, and after N attempts into a dead letter topic, is what lets the main partition keep moving. Note what this costs: the retried message is now out of order relative to the stream it came from, so the ordering guarantee you worked to preserve is given up for exactly those messages.</p>
+<p><strong>Retention and compaction are two different reclamation policies</strong>, and the chapter only describes the first:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Policy</th>
+<th>Deletes</th>
+<th>Good for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Time/size retention</strong></td>
+<td>Everything older than two weeks, or beyond N bytes</td>
+<td>Event streams, logs — this chapter's requirement</td>
+</tr>
+<tr>
+<td><strong>Log compaction</strong></td>
+<td>Superseded values, keeping the <strong>latest message per key</strong> forever</td>
+<td>State and changelogs — &quot;the current value of every account&quot;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Compaction turns the log into something you can rebuild state from no matter how old it is, which is what makes a log usable as a system of record rather than a transport.</p>
+<p><strong>One thing that has changed since this design was written:</strong> mainstream brokers have moved off ZooKeeper. Kafka's KRaft mode runs the metadata log through Raft inside the brokers themselves, removing an entire external system that had to be operated, secured and scaled separately — and that was a hard limit on partition counts. The <em>role</em> ZooKeeper plays here (consistent metadata, leader election, membership) is still required; it is now served by an internal consensus group rather than a separate cluster.</p>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Consumer lag is the metric that matters.</strong> Throughput looks healthy right up until consumers fall permanently behind. Lag — the gap between the log end and a group's offset — is the only signal that distinguishes &quot;keeping up&quot; from &quot;slowly drowning&quot;, and the only one that predicts data loss when retention expires before the consumer arrives.</li>
+<li><strong>Retention expiry is silent data loss.</strong> A consumer down for longer than the retention window comes back to find its offset no longer exists. There is no error at write time, no alarm, no partial delivery — the data was correctly deleted on schedule. Retention must exceed your worst realistic outage, and lag alarms must fire long before it.</li>
+<li><strong>Adding partitions breaks per-key ordering.</strong> <code>hash(key) % N</code> changes when <code>N</code> does. Over-provision partitions instead.</li>
+<li><strong>A skewed partition key is unfixable by scaling.</strong> The ordering guarantee is a promise not to spread one key out, so a dominant key means a hot partition by design. Fix the key, not the cluster.</li>
+<li><strong>Partition count caps consumer parallelism.</strong> Ten partitions means at most ten useful consumers in a group; the eleventh sits idle. Scaling consumers beyond partitions does nothing.</li>
+<li><strong>Rebalancing is a stop-the-world event.</strong> During a rebalance, nobody in the group consumes. A rolling restart of 50 consumers can trigger 50 rebalances in sequence, each pausing the group — the deploy itself causes the lag spike. Static group membership and incremental cooperative rebalancing exist specifically to avoid this.</li>
+<li><strong>A slow consumer looks exactly like a dead one.</strong> Missing heartbeats trigger a rebalance, the partition is reassigned, the original consumer finishes its work and commits — now two consumers have processed the same messages. Keep processing time well under the heartbeat timeout, or heartbeat from a separate thread.</li>
+<li><strong><code>ACK=all</code> can silently become <code>ACK=1</code>.</strong> If all followers fall out of the ISR, &quot;all in-sync replicas&quot; is just the leader. Set a minimum ISR and prefer rejecting writes to accepting under-replicated ones.</li>
+<li><strong><code>ACK=1</code> loses acknowledged messages.</strong> A leader failure between the local write and replication loses data the producer believes was accepted. This is the normal, expected behaviour of that setting, not a bug.</li>
+<li><strong>A poison message blocks its partition.</strong> Offsets are ordered, so one unprocessable message stalls everything behind it. Retry topic, then dead letter topic — and accept that those messages lose their ordering.</li>
+<li><strong>At-least-once means duplicates will happen.</strong> Not &quot;might&quot;. Consumers must be idempotent; discovering this in production is the common version of learning it.</li>
+<li><strong>Exactly-once does not extend past the system boundary.</strong> External side effects still need their own idempotency keys.</li>
+<li><strong>Replicas on the same broker or rack are not replication.</strong> Three copies that fail together are one copy. Spread across brokers and failure domains, and across data centres only with awareness of the latency cost.</li>
+<li><strong>Payload filtering destroys zero-copy.</strong> Tag-based filtering stays cheap because the broker reads headers; inspecting or decrypting payloads forces data through the CPU and gives up the design's main throughput advantage.</li>
+<li><strong>The coordination service is a hard dependency.</strong> Without consistent metadata and leader election, brokers cannot agree on who owns a partition. Losing quorum there stops the cluster even if every broker is healthy.</li>
+<li><strong>Decreasing partitions takes a full retention period.</strong> The decommissioned partition must remain readable until its data expires, so shrinking is a two-week operation, not a configuration change.</li>
+<li><strong>A consumer that commits before processing has chosen at-most-once</strong> — possibly without realising it. The order of &quot;process&quot; and &quot;commit offset&quot; <em>is</em> the delivery semantic.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Two-week retention and replay</td>
+<td>Append-only log; consumption advances an offset instead of deleting</td>
+</tr>
+<tr>
+<td>Ordering</td>
+<td>Guaranteed within a partition; partition by key for per-entity ordering</td>
+</tr>
+<tr>
+<td>Parallelism</td>
+<td>Multiple partitions; one consumer per partition per group</td>
+</tr>
+<tr>
+<td>High throughput on cheap disks</td>
+<td>Purely sequential writes to segment files, exploiting the OS page cache</td>
+</tr>
+<tr>
+<td>Amortising network and syscall cost</td>
+<td>Batching in producer, broker and consumer</td>
+</tr>
+<tr>
+<td>Not spending CPU on message bytes</td>
+<td>Identical wire/disk/consumer format, served with zero-copy</td>
+</tr>
+<tr>
+<td>Managing a huge partition file</td>
+<td>Segment files; old segments immutable and independently truncatable</td>
+</tr>
+<tr>
+<td>Routing to the right broker</td>
+<td>Routing layer embedded in the producer, reading the plan from metadata</td>
+</tr>
+<tr>
+<td>Consumers not being overwhelmed</td>
+<td>Pull model with long polling, so consumers set their own rate</td>
+</tr>
+<tr>
+<td>Durability of a partition</td>
+<td>Leader/follower replication, ISR tracking, configurable <code>ACK</code></td>
+</tr>
+<tr>
+<td>Avoiding under-replicated writes</td>
+<td>Minimum ISR size; reject rather than accept</td>
+</tr>
+<tr>
+<td>Surviving a broker loss</td>
+<td>Leader election via the coordination service; followers catch up and rejoin the ISR</td>
+</tr>
+<tr>
+<td>Reassigning work as consumers change</td>
+<td>Consumer group coordinator plus rebalancing protocol</td>
+</tr>
+<tr>
+<td>Remembering consumer progress</td>
+<td>Offsets in state storage (consistent KV / ZooKeeper, or an internal log)</td>
+</tr>
+<tr>
+<td>Unprocessable messages</td>
+<td>Retry topic, then dead letter topic</td>
+</tr>
+<tr>
+<td>Duplicates from retries</td>
+<td>Idempotent producer with per-partition sequence numbers</td>
+</tr>
+<tr>
+<td>Atomic consume-process-commit</td>
+<td>Transactions with a coordinator — expensive; usually replaced by idempotent consumers</td>
+</tr>
+<tr>
+<td>Consumers wanting a subset</td>
+<td>Tag-based filtering in the broker, which preserves zero-copy</td>
+</tr>
+<tr>
+<td>Delayed or scheduled delivery</td>
+<td>Temporary topics plus a timing wheel, promoted to the real partition when due</td>
+</tr>
+<tr>
+<td>Data older than retention</td>
+<td>Archive to object storage or HDFS</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Why is this design better described as a log than a queue, and which single piece of mutable state makes that work?</li>
+<li>Quantify sequential versus random disk throughput. What does that rule out as a message store?</li>
+<li>What does zero-copy mean here, and which proposed feature would destroy it?</li>
+<li>What exactly is the scope of the ordering guarantee, and what does total ordering across a topic cost?</li>
+<li>You need &quot;events in order&quot;. How do you reconcile that with parallelism?</li>
+<li>A topic has 10 partitions and you run 15 consumers in one group. What happens?</li>
+<li>Why does adding partitions break per-key ordering, and which earlier chapter is this the same problem as?</li>
+<li><code>ACK=all</code> is configured and a message is acknowledged, yet it is lost. Give the scenario.</li>
+<li>Why is the pull model chosen over push, and what does it cost?</li>
+<li>A consumer takes 10 minutes to process a batch while the heartbeat timeout is 30 seconds. Describe the failure.</li>
+<li>A consumer group is offline for three weeks with two-week retention. What happens when it returns, and what warning would have fired?</li>
+<li>One message cannot be deserialised. What happens to the partition, and what is the fix — including what the fix costs?</li>
+<li>Where exactly does &quot;exactly-once&quot; stop applying?</li>
+<li>What is the difference between retention and compaction, and when do you want each?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Topic / partition / broker</strong></td>
+<td>A logical stream; a shard of it with its own order; the server hosting partitions</td>
+</tr>
+<tr>
+<td><strong>Offset</strong></td>
+<td>A message's position in a partition — and the consumer's bookmark</td>
+</tr>
+<tr>
+<td><strong>Segment</strong></td>
+<td>One file of a partition's log; sealed and read-only once rolled</td>
+</tr>
+<tr>
+<td><strong>WAL (write-ahead log)</strong></td>
+<td>The append-only on-disk structure holding messages</td>
+</tr>
+<tr>
+<td><strong>Partition key</strong></td>
+<td>The field deciding a message's partition — and therefore its ordering scope</td>
+</tr>
+<tr>
+<td><strong>Consumer group</strong></td>
+<td>Consumers cooperatively covering a topic's partitions, with a shared offset per partition</td>
+</tr>
+<tr>
+<td><strong>Rebalancing</strong></td>
+<td>Reassigning partitions among a group's consumers; pauses consumption while it runs</td>
+</tr>
+<tr>
+<td><strong>Group coordinator</strong></td>
+<td>The broker managing a group's membership and offsets</td>
+</tr>
+<tr>
+<td><strong>Consumer lag</strong></td>
+<td>Distance between the log end and a group's offset — the system's key health metric</td>
+</tr>
+<tr>
+<td><strong>Replica / ISR</strong></td>
+<td>Copies of a partition; those keeping up with the leader</td>
+</tr>
+<tr>
+<td><strong><code>ACK</code> (0/1/all)</strong></td>
+<td>How much replication a producer waits for before considering a write done</td>
+</tr>
+<tr>
+<td><strong>Minimum ISR</strong></td>
+<td>The floor below which writes are rejected rather than under-replicated</td>
+</tr>
+<tr>
+<td><strong>Batching</strong></td>
+<td>Grouping messages per request or per write to amortise fixed costs</td>
+</tr>
+<tr>
+<td><strong>Zero-copy</strong></td>
+<td>Serving bytes from page cache to socket without passing through user space</td>
+</tr>
+<tr>
+<td><strong>Idempotent producer</strong></td>
+<td>Per-producer sequence numbers letting the broker discard retried sends</td>
+</tr>
+<tr>
+<td><strong>Poison message</strong></td>
+<td>An unprocessable message that blocks its partition</td>
+</tr>
+<tr>
+<td><strong>Retry / dead letter topic</strong></td>
+<td>Where failed messages go so the main partition can proceed</td>
+</tr>
+<tr>
+<td><strong>Log compaction</strong></td>
+<td>Retaining only the latest message per key, indefinitely</td>
+</tr>
+<tr>
+<td><strong>Timing wheel</strong></td>
+<td>The structure used to schedule delayed message promotion</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="05-consistent-hashing.html#the-rehashing-problem">Chapter 5 – Design Consistent Hashing</a> — why <code>hash(key) % N</code> makes partition count hard to change.</li>
+<li><a href="06-key-value-store.html#3-consistency">Chapter 6 – Design A Key-Value Store</a> — quorums, where <code>ACK</code> and the ISR are <code>W</code> and <code>N</code> by other names, and the same log-structured storage ideas.</li>
+<li><a href="10-notification-system.html#reliability">Chapter 10 – Design A Notification System</a> — at-least-once delivery handled with idempotent processing, which is what most systems do instead of exactly-once.</li>
+<li><a href="21-ad-click-event-aggregation.html">Chapter 21 – Ad Click Event Aggregation</a> — this queue as the backbone of a streaming pipeline, including what exactly-once really costs there.</li>
+<li><a href="20-metrics-monitoring-and-alerting-system.html">Chapter 20 – Metrics Monitoring and Alerting System</a> — another high-volume ingest pipeline built on the same primitives.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

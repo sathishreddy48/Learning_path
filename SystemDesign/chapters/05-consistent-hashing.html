@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 5: Design Consistent Hashing — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="05-consistent-hashing">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Building Blocks › Chapter 5 of 28</div>
+  <h1>Chapter 5: Design Consistent Hashing</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#the-rehashing-problem">The Rehashing Problem</a></li><li><a href="#consistent-hashing">Consistent Hashing</a></li><li><a href="#challenges-and-solutions">Challenges and Solutions</a></li><li><a href="#affected-keys">Affected Keys</a></li><li><a href="#benefits-of-consistent-hashing">Benefits of Consistent Hashing</a></li><li><a href="#real-world-applications">Real-World Applications</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>This chapter explores consistent hashing, a technique essential for achieving horizontal scaling by efficiently distributing requests and data across servers. It minimizes data redistribution when servers are added or removed and ensures an even distribution of data to mitigate issues like server hotspots.</p>
+<p><strong>The one-sentence version:</strong> with ordinary <code>hash(key) % N</code>, changing the number of servers remaps almost every key; with consistent hashing, it remaps roughly <code>1/N</code> of them. That difference is what makes it possible to add a cache node at peak traffic without taking the database down with you.</p>
+<p>This is a <em>technique</em> chapter rather than a system-design chapter — it is the mechanism behind the sharding in <a href="01-scaling.html#section-12-database-scaling">Chapter 1 §12</a> and the partitioning in <a href="06-key-value-store.html">Chapter 6</a>, and it turns up constantly as a follow-up question elsewhere.</p>
+</section>
+<section id="the-rehashing-problem">
+<h2 id="the-rehashing-problem">The Rehashing Problem</h2>
+<h3 id="explanation">Explanation</h3>
+<p>In traditional hashing methods, such as <code>serverIndex = hash(key) % N</code>, data redistribution becomes problematic when the number of servers changes. For example:</p>
+<ul>
+<li>
+<p>Removing a server causes most keys to be reassigned, leading to cache misses.</p>
+</li>
+<li>
+<p>Adding a server results in unnecessary key redistributions.</p>
+<img loading="lazy" decoding="async" src="../../system-design-notes/05.%20Consistent%20Hashing/images/server-hashing.png"  alt="Server hashing" data-width="450" style="max-width:450px">
+</li>
+<li>
+<p>This approach works well when the size of the server pool is fixed. However, problems arise when new servers are added, or existing servers are removed.</p>
+<img loading="lazy" decoding="async" src="../../system-design-notes/05.%20Consistent%20Hashing/images/server-hashing-miss.png"  alt="Server hashing Miss" data-width="450" style="max-width:450px">
+</li>
+</ul>
+<h3 id="key-issue">Key Issue</h3>
+<p>Redistribution of most keys when server count changes causes inefficiency and overload.</p>
+<h3 id="how-bad-is-it-exactly">How bad is it, exactly?</h3>
+<p>Take four servers and six keys. The assignment is <code>hash(key) % 4</code>:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>hash</th>
+<th><code>% 4</code></th>
+<th><code>% 3</code> after server 1 dies</th>
+<th>Moved?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>key0</td>
+<td>18358617</td>
+<td>1</td>
+<td>0</td>
+<td><strong>yes</strong></td>
+</tr>
+<tr>
+<td>key1</td>
+<td>26143584</td>
+<td>0</td>
+<td>0</td>
+<td>no</td>
+</tr>
+<tr>
+<td>key2</td>
+<td>18131146</td>
+<td>2</td>
+<td>1</td>
+<td><strong>yes</strong></td>
+</tr>
+<tr>
+<td>key3</td>
+<td>35863496</td>
+<td>0</td>
+<td>2</td>
+<td><strong>yes</strong></td>
+</tr>
+<tr>
+<td>key4</td>
+<td>34085809</td>
+<td>1</td>
+<td>1</td>
+<td>no</td>
+</tr>
+<tr>
+<td>key5</td>
+<td>27581703</td>
+<td>3</td>
+<td>0</td>
+<td><strong>yes</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Losing one server out of four moved <strong>two-thirds of the keys</strong>, even though only a quarter of the capacity disappeared. In general, going from <code>N</code> to <code>N-1</code> servers leaves only about <code>1/N</code> of keys in place — the modulus changed, so almost every key computes a different answer.</p>
+<p><strong>Why this is a production emergency, not an inconvenience.</strong> If these servers are a cache, nearly every key is now on the wrong node, so nearly every request is a cache miss, and the full read load lands on the database at the exact moment you are already one server short. This is the cold-cache outage pattern from <a href="01-scaling.html#section-6-caching">Chapter 1 §6</a>, triggered by a routine scaling event.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>being able to state &quot;mod-N remaps roughly <code>(N-1)/N</code> of keys, consistent hashing remaps roughly <code>1/N</code>&quot; with the reasoning behind it is the core of this chapter. Everything else is detail.</p>
+</div>
+</section>
+<section id="consistent-hashing">
+<h2 id="consistent-hashing">Consistent Hashing</h2>
+<h3 id="definition">Definition</h3>
+<p>Consistent hashing ensures that only a fraction of keys are remapped when servers are added or removed. This minimizes disruptions and enhances scalability.</p>
+<p>The trick is to stop computing a server <em>index</em> — which depends on <code>N</code> and therefore changes when <code>N</code> changes — and instead give keys and servers <strong>fixed positions</strong> in a shared space, then assign each key to whichever server is nearest. A server's position does not move when another server joins or leaves, so only the keys in the immediate neighbourhood of the change are affected.</p>
+<h3 id="key-concepts">Key Concepts</h3>
+<ol>
+<li><strong>Hash Space and Ring:</strong> The hash space forms a continuous ring, with hash values distributed from <code>0</code> to <code>2^160-1</code> (e.g., using hash function like SHA-1). By connecting both ends we get a ring. <p align="center">
+ <img loading="lazy" decoding="async" src="../../system-design-notes/05.%20Consistent%20Hashing/images/hash-ring.png"  alt="Hash Ring" data-width="450" style="max-width:450px">
+ </p>
+</li>
+</ol>
+<ul>
+<li>
+<p>Using the same hash function f, we map servers based on server IP or name onto the ring.</p>
+  <p align="center">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/05.%20Consistent%20Hashing/images/server-ring.png"  alt="Server Ring" data-width="450" style="max-width:450px">
+  </p>
+</li>
+</ul>
+<ol start="2">
+<li><strong>Server Lookup</strong></li>
+</ol>
+<ul>
+<li>
+<p>A key's server is determined by traversing clockwise on the ring until a server is found.</p>
+<p align="center">
+<img loading="lazy" decoding="async" src="../../system-design-notes/05.%20Consistent%20Hashing/images/server-lookup.png"  alt="Server Lookup" data-width="450" style="max-width:450px">
+</p>
+</li>
+</ul>
+<ol start="3">
+<li><strong>Adding and Removing Servers</strong></li>
+</ol>
+<ul>
+<li>
+<p>Adding a server redistributes only nearby keys. Only a fraction of keys are redistributed to the new server.</p>
+<p align="center">
+<img loading="lazy" decoding="async" src="../../system-design-notes/05.%20Consistent%20Hashing/images/adding-server.png"  alt="Adding Server" data-width="450" style="max-width:450px">
+</p>
+</li>
+<li>
+<p>Removing a server affects only the keys in its range. Only keys from the removed server are reassigned to the next server clockwise.</p>
+<p align="center">
+<img loading="lazy" decoding="async" src="../../system-design-notes/05.%20Consistent%20Hashing/images/removing-server.png"  alt="Removing Server" data-width="450" style="max-width:450px">
+</p>
+</li>
+</ul>
+<h3 id="the-lookup-step-by-step">The lookup, step by step</h3>
+<figure class="mermaid-fig">
+<svg id="mmd-ae8d035837eb5827" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1238.36px; background-color: transparent;" viewBox="0 0 1238.359375 100.25" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-ae8d035837eb5827{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-ae8d035837eb5827 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-ae8d035837eb5827 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-ae8d035837eb5827 .error-icon{fill:#f4f6f8;}#mmd-ae8d035837eb5827 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-ae8d035837eb5827 .edge-thickness-normal{stroke-width:1px;}#mmd-ae8d035837eb5827 .edge-thickness-thick{stroke-width:3.5px;}#mmd-ae8d035837eb5827 .edge-pattern-solid{stroke-dasharray:0;}#mmd-ae8d035837eb5827 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-ae8d035837eb5827 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-ae8d035837eb5827 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-ae8d035837eb5827 .marker{fill:#637381;stroke:#637381;}#mmd-ae8d035837eb5827 .marker.cross{stroke:#637381;}#mmd-ae8d035837eb5827 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-ae8d035837eb5827 p{margin:0;}#mmd-ae8d035837eb5827 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-ae8d035837eb5827 .cluster-label text{fill:#454f5b;}#mmd-ae8d035837eb5827 .cluster-label span{color:#454f5b;}#mmd-ae8d035837eb5827 .cluster-label span p{background-color:transparent;}#mmd-ae8d035837eb5827 .label text,#mmd-ae8d035837eb5827 span{fill:#161c24;color:#161c24;}#mmd-ae8d035837eb5827 .node rect,#mmd-ae8d035837eb5827 .node circle,#mmd-ae8d035837eb5827 .node ellipse,#mmd-ae8d035837eb5827 .node polygon,#mmd-ae8d035837eb5827 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-ae8d035837eb5827 .rough-node .label text,#mmd-ae8d035837eb5827 .node .label text,#mmd-ae8d035837eb5827 .image-shape .label,#mmd-ae8d035837eb5827 .icon-shape .label{text-anchor:middle;}#mmd-ae8d035837eb5827 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-ae8d035837eb5827 .rough-node .label,#mmd-ae8d035837eb5827 .node .label,#mmd-ae8d035837eb5827 .image-shape .label,#mmd-ae8d035837eb5827 .icon-shape .label{text-align:center;}#mmd-ae8d035837eb5827 .node.clickable{cursor:pointer;}#mmd-ae8d035837eb5827 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-ae8d035837eb5827 .arrowheadPath{fill:#000000;}#mmd-ae8d035837eb5827 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-ae8d035837eb5827 .flowchart-link{stroke:#637381;fill:none;}#mmd-ae8d035837eb5827 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-ae8d035837eb5827 .edgeLabel p{background-color:#ffffff;}#mmd-ae8d035837eb5827 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-ae8d035837eb5827 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-ae8d035837eb5827 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-ae8d035837eb5827 .cluster text{fill:#454f5b;}#mmd-ae8d035837eb5827 .cluster span{color:#454f5b;}#mmd-ae8d035837eb5827 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-ae8d035837eb5827 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-ae8d035837eb5827 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-ae8d035837eb5827 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-ae8d035837eb5827 rect.text{fill:none;stroke-width:0;}#mmd-ae8d035837eb5827 .icon-shape,#mmd-ae8d035837eb5827 .image-shape{background-color:#ffffff;text-align:center;}#mmd-ae8d035837eb5827 .icon-shape p,#mmd-ae8d035837eb5827 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-ae8d035837eb5827 .icon-shape .label rect,#mmd-ae8d035837eb5827 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-ae8d035837eb5827 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-ae8d035837eb5827 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-ae8d035837eb5827 .node .neo-node{stroke:#299a8d;}#mmd-ae8d035837eb5827 [data-look="neo"].node rect,#mmd-ae8d035837eb5827 [data-look="neo"].cluster rect,#mmd-ae8d035837eb5827 [data-look="neo"].node polygon{stroke:url(#mmd-ae8d035837eb5827-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-ae8d035837eb5827 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-ae8d035837eb5827 [data-look="neo"].node path{stroke:url(#mmd-ae8d035837eb5827-gradient);stroke-width:1px;}#mmd-ae8d035837eb5827 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-ae8d035837eb5827 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-ae8d035837eb5827 [data-look="neo"].node circle{stroke:url(#mmd-ae8d035837eb5827-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-ae8d035837eb5827 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-ae8d035837eb5827 [data-look="neo"].icon-shape .icon{fill:url(#mmd-ae8d035837eb5827-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-ae8d035837eb5827 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-ae8d035837eb5827-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-ae8d035837eb5827 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-ae8d035837eb5827_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-ae8d035837eb5827_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-ae8d035837eb5827_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-ae8d035837eb5827_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-ae8d035837eb5827_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-ae8d035837eb5827_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-ae8d035837eb5827_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-ae8d035837eb5827_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-ae8d035837eb5827_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-ae8d035837eb5827_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-ae8d035837eb5827_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-ae8d035837eb5827_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M78.281,41L82.448,41C86.615,41,94.948,41,102.615,41C110.281,41,117.281,41,120.781,41L124.281,41" id="mmd-ae8d035837eb5827-L_K_H_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_K_H_0" data-points="W3sieCI6NzguMjgxMjUsInkiOjQxfSx7IngiOjEwMy4yODEyNSwieSI6NDF9LHsieCI6MTI4LjI4MTI1LCJ5Ijo0MX1d" data-look="classic" marker-end="url(#mmd-ae8d035837eb5827_flowchart-v2-pointEnd)"/><path d="M293.688,41L297.854,41C302.021,41,310.354,41,318.021,41C325.688,41,332.688,41,336.188,41L339.688,41" id="mmd-ae8d035837eb5827-L_H_W_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_H_W_0" data-points="W3sieCI6MjkzLjY4NzUsInkiOjQxfSx7IngiOjMxOC42ODc1LCJ5Ijo0MX0seyJ4IjozNDMuNjg3NSwieSI6NDF9XQ==" data-look="classic" marker-end="url(#mmd-ae8d035837eb5827_flowchart-v2-pointEnd)"/><path d="M560.234,26.088L576.979,23.781C593.724,21.475,627.214,16.863,678.466,14.556C729.719,12.25,798.734,12.25,855.172,12.25C911.609,12.25,955.469,12.25,981.386,13.146C1007.304,14.041,1015.279,15.832,1019.267,16.728L1023.255,17.624" id="mmd-ae8d035837eb5827-L_W_N_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_W_N_0" data-points="W3sieCI6NTYwLjIzNDM3NSwieSI6MjYuMDg3NTMxMzQ0NzM1OTU3fSx7IngiOjY2MC43MDMxMjUsInkiOjEyLjI1fSx7IngiOjg2Ny43NSwieSI6MTIuMjV9LHsieCI6OTk5LjMyODEyNSwieSI6MTIuMjV9LHsieCI6MTAyNy4xNTc2MDg2OTU2NTIyLCJ5IjoxOC41fV0=" data-look="classic" marker-end="url(#mmd-ae8d035837eb5827_flowchart-v2-pointEnd)"/><path d="M560.234,55.912L576.979,58.219C593.724,60.525,627.214,65.137,660.036,67.444C692.859,69.75,725.016,69.75,741.094,69.75L757.172,69.75" id="mmd-ae8d035837eb5827-L_W_F_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_W_F_0" data-points="W3sieCI6NTYwLjIzNDM3NSwieSI6NTUuOTEyNDY4NjU1MjY0MDR9LHsieCI6NjYwLjcwMzEyNSwieSI6NjkuNzV9LHsieCI6NzYxLjE3MTg3NSwieSI6NjkuNzV9XQ==" data-look="classic" marker-end="url(#mmd-ae8d035837eb5827_flowchart-v2-pointEnd)"/><path d="M974.328,69.75L978.495,69.75C982.661,69.75,990.995,69.75,999.149,68.854C1007.304,67.959,1015.279,66.168,1019.267,65.272L1023.255,64.376" id="mmd-ae8d035837eb5827-L_F_N_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_F_N_0" data-points="W3sieCI6OTc0LjMyODEyNSwieSI6NjkuNzV9LHsieCI6OTk5LjMyODEyNSwieSI6NjkuNzV9LHsieCI6MTAyNy4xNTc2MDg2OTU2NTIyLCJ5Ijo2My41fV0=" data-look="classic" marker-end="url(#mmd-ae8d035837eb5827_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_K_H_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_H_W_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_W_N_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(660.703125, 69.75)"><g class="label" data-id="L_W_F_0" transform="translate(-75.46875, -10.5)"><foreignObject width="150.9375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>past the end of the ring</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_F_N_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-ae8d035837eb5827-flowchart-K-0" data-look="classic" transform="translate(43.140625, 41)"><rect class="basic label-container" style="" x="-35.140625" y="-22.5" width="70.28125" height="45"/><g class="label" style="" transform="translate(-11.140625, -10.5)"><rect/><foreignObject width="22.28125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>key</p></span></div></foreignObject></g></g><g class="node default" id="mmd-ae8d035837eb5827-flowchart-H-1" data-look="classic" transform="translate(210.984375, 41)"><rect class="basic label-container" style="" x="-82.703125" y="-33" width="165.40625" height="66"/><g class="label" style="" transform="translate(-58.703125, -21)"><rect/><foreignObject width="117.40625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>hash(key)<br />a point on the ring</p></span></div></foreignObject></g></g><g class="node default" id="mmd-ae8d035837eb5827-flowchart-W-3" data-look="classic" transform="translate(451.9609375, 41)"><rect class="basic label-container" style="" x="-108.2734375" y="-33" width="216.546875" height="66"/><g class="label" style="" transform="translate(-84.2734375, -21)"><rect/><foreignObject width="168.546875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>walk clockwise<br />to the next server position</p></span></div></foreignObject></g></g><g class="node default" id="mmd-ae8d035837eb5827-flowchart-N-5" data-look="classic" transform="translate(1127.34375, 41)"><rect class="basic label-container" style="" x="-103.015625" y="-22.5" width="206.03125" height="45"/><g class="label" style="" transform="translate(-79.015625, -10.5)"><rect/><foreignObject width="158.03125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>that server owns the key</p></span></div></foreignObject></g></g><g class="node default" id="mmd-ae8d035837eb5827-flowchart-F-7" data-look="classic" transform="translate(867.75, 69.75)"><rect class="basic label-container" style="" x="-106.578125" y="-22.5" width="213.15625" height="45"/><g class="label" style="" transform="translate(-82.578125, -10.5)"><rect/><foreignObject width="165.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>wrap around to position 0</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-ae8d035837eb5827-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-ae8d035837eb5827-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-ae8d035837eb5827-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>The wrap-around is not a special case to be apologised for — it is what makes the space a <em>ring</em> rather than a line, and it means every point has an owner.</p>
+<p><strong>Implementation note.</strong> The ring is not a literal circular structure. It is a <strong>sorted array of server positions</strong>, and the clockwise walk is a <strong>binary search</strong> for the first position greater than <code>hash(key)</code>, wrapping to index 0 if there is none. That makes lookup <code>O(log n)</code> in the number of positions, and <code>n</code> is small — this is why the whole thing is cheap enough to run on every request.</p>
+</section>
+<section id="challenges-and-solutions">
+<h2 id="challenges-and-solutions">Challenges and Solutions</h2>
+<h3 id="two-issues-in-basic-approach">Two Issues in Basic Approach</h3>
+<ol>
+<li><strong>Uneven Partition Sizes:</strong> Servers may have unequal data partitions.</li>
+<li><strong>Non-uniform Key Distribution:</strong> Some servers may receive significantly more keys than others.</li>
+</ol>
+<p>Both stem from the same cause: with only a handful of servers hashed onto a huge ring, their positions land wherever the hash function puts them, which is <strong>random, not evenly spaced</strong>. Three servers might sit close together on one arc, leaving one server responsible for most of the ring. Removing a server makes it worse — its entire range is inherited by a single successor, which now owns a double-sized partition.</p>
+<h3 id="solution-virtual-nodes">Solution: Virtual Nodes</h3>
+<ul>
+<li>
+<p>Each server is represented by multiple virtual nodes on the ring uniformly distributed on the ring.</p>
+</li>
+<li>
+<p>Virtual nodes improve key distribution and balance load. As the number of virtual nodes increases, the distribution of keys       becomes more balanced. This is because the standard deviation gets smaller with more virtual nodes, leading to balanced data distribution.</p>
+<p align="center">
+<img loading="lazy" decoding="async" src="../../system-design-notes/05.%20Consistent%20Hashing/images/virtual-nodes.png"   alt="Virtual Nodes" data-width="450" style="max-width:450px">
+</p>
+</li>
+</ul>
+<p>Instead of hashing <code>server1</code> once, hash <code>server1#0</code>, <code>server1#1</code>, … <code>server1#199</code> and place all 200 points on the ring. Each server now owns 200 small scattered arcs instead of one large contiguous one, and the law of large numbers does the balancing for you.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Virtual nodes per server</th>
+<th>Approximate standard deviation of load</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Very large — individual servers can own multiples of their fair share</td>
+</tr>
+<tr>
+<td>100</td>
+<td>~10% of the mean</td>
+</tr>
+<tr>
+<td>200</td>
+<td>~5% of the mean</td>
+</tr>
+<tr>
+<td>512 / 1024</td>
+<td>Smaller still, with diminishing returns</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>The trade-off:</strong> more virtual nodes means better balance but a larger ring to store, search, and distribute to every client. Several hundred per server is the usual range (Cassandra historically defaulted to 256), and the right number depends on how much imbalance you can tolerate.</p>
+<p>Virtual nodes also unlock <strong>heterogeneous hardware</strong>: give a server twice the capacity twice as many virtual nodes and it receives roughly twice the keys — proportional weighting that plain consistent hashing cannot express.</p>
+<p><strong>A second benefit that is easy to miss:</strong> when a server fails, its virtual nodes are scattered around the ring, so its load is inherited by <em>many</em> successors in small pieces rather than dumped wholesale onto one neighbour. Failure spreads out instead of cascading.</p>
+</section>
+<section id="affected-keys">
+<h2 id="affected-keys">Affected Keys</h2>
+<p>When servers are added or removed:</p>
+<ul>
+<li>
+<p><strong>Added Server:</strong> Affected keys are those between the new server and its predecessor.
+In the following example server 4 is added onto the ring. The affected range starts from s4 (newly
+added node) and moves anticlockwise around the ring until a server is found (s3). Thus, keys
+located between s3 and s4 need to be redistributed to s4.</p>
+<p align="center">
+<img loading="lazy" decoding="async" src="../../system-design-notes/05.%20Consistent%20Hashing/images/server-addition.png"   alt="Server Addition" data-width="450" style="max-width:450px">
+</p>
+</li>
+<li>
+<p><strong>Removed Server:</strong> Affected keys are those between the removed server and its predecessor. In the following example when a server (s1) is removed, the affected range starts from s1
+(removed node) and moves anticlockwise around the ring until a server is found (s0). Thus, keys located between s0 and s1 must be redistributed to s2.</p>
+<p align="center">
+<img loading="lazy" decoding="async" src="../../system-design-notes/05.%20Consistent%20Hashing/images/server-removed.png"   alt="Server Removed" data-width="450" style="max-width:450px">
+</p>
+</li>
+</ul>
+<p>The rule in one line: <strong>a change affects only the arc between the changed node and its anticlockwise predecessor.</strong> Every other key keeps the same owner, which is precisely the property the mod-N scheme lacks.</p>
+
+<figure class="anim" id="anim-consistent-hashing" data-anim="anim-consistent-hashing">
+  <figcaption class="anim-head">
+    <span class="anim-title">Try it: how many keys actually move?</span>
+    <span class="anim-caption">Add and remove servers and watch the share of keys that get remapped. Switch between plain <code>hash(key) % N</code> and the hash ring to see the difference the chapter is describing.</span>
+  </figcaption>
+  <div class="anim-stage" data-anim-stage>
+    <noscript><p class="anim-fallback">This interactive explainer needs JavaScript. The surrounding text and diagrams carry the same information.</p></noscript>
+  </div>
+</figure>
+</section>
+<section id="benefits-of-consistent-hashing">
+<h2 id="benefits-of-consistent-hashing">Benefits of Consistent Hashing</h2>
+<ul>
+<li><strong>Minimized Redistribution:</strong> Only a fraction of keys are reassigned.</li>
+<li><strong>Scalability:</strong> Enables horizontal scaling.</li>
+<li><strong>Mitigates Hotspots:</strong> Balances data distribution to avoid server overload.</li>
+</ul>
+<h3 id="compared-with-the-alternatives">Compared with the alternatives</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Scheme</th>
+<th>Keys moved when a node changes</th>
+<th>Lookup cost</th>
+<th>Weighted nodes</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong><code>hash(key) % N</code></strong></td>
+<td>~all of them</td>
+<td>O(1)</td>
+<td>No</td>
+<td>Fine only for a genuinely fixed pool</td>
+</tr>
+<tr>
+<td><strong>Consistent hashing</strong></td>
+<td>~<code>1/N</code></td>
+<td>O(log n)</td>
+<td>Yes, via virtual nodes</td>
+<td>The general answer; needs virtual nodes to balance</td>
+</tr>
+<tr>
+<td><strong>Rendezvous (HRW) hashing</strong></td>
+<td>~<code>1/N</code></td>
+<td>O(n) — hash against every node</td>
+<td>Yes, natively</td>
+<td>Simpler, no ring to maintain; fine for small <code>n</code></td>
+</tr>
+<tr>
+<td><strong>Jump consistent hash</strong></td>
+<td>~<code>1/N</code></td>
+<td>O(log n)</td>
+<td>No</td>
+<td>Very fast and compact, but nodes must be numbered <code>0..n-1</code>, so arbitrary removal is awkward</td>
+</tr>
+<tr>
+<td><strong>Maglev hashing</strong></td>
+<td>Small</td>
+<td>O(1) via a lookup table</td>
+<td>Yes</td>
+<td>Google's load-balancer scheme; optimised for fast lookup and connection stability</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>It balances keys, not traffic.</strong> Consistent hashing distributes the <em>key space</em> evenly; it says nothing about how often each key is requested. One viral key still saturates one node — the hot-key problem from <a href="01-scaling.html#section-6-caching">Chapter 1 §6</a>, which needs replication or a local cache instead. <strong>Consistent hashing is not a solution to hot keys</strong>, and claiming otherwise is a common misstep.</li>
+<li><strong>Adding a node still causes a miss burst.</strong> <code>1/N</code> of keys move, so <code>1/N</code> of cache reads miss and fall through to the database. Much better than mod-N, but not free — add nodes gradually rather than doubling the cluster at peak.</li>
+<li><strong>Every client must agree on the ring.</strong> The ring is shared state. If two clients disagree about which nodes exist, they will route the same key to different servers and silently split the data. Ring membership therefore needs a distribution mechanism — a config service, or a gossip protocol as in <a href="06-key-value-store.html#5-handling-failures">Chapter 6</a>.</li>
+<li><strong>The hash function must distribute uniformly.</strong> MD5 and SHA-1 are fine, and faster non-cryptographic hashes like MurmurHash are common. Language-provided <code>hashCode</code>-style functions often are not uniform enough, and a clustered hash reintroduces the imbalance virtual nodes exist to remove.</li>
+<li><strong>Cryptographic strength is irrelevant here.</strong> SHA-1 is used for its distribution, not its security; its collision weaknesses do not matter for partitioning.</li>
+<li><strong>Replication needs care with virtual nodes.</strong> &quot;Store copies on the next N nodes clockwise&quot; can land several replicas on the <em>same physical server</em>, because consecutive virtual nodes may belong to one machine — which silently destroys your redundancy. Skip virtual nodes belonging to a server you have already chosen. See <a href="06-key-value-store.html#2-data-replication">Chapter 6 §2</a>.</li>
+<li><strong>Imbalance is bounded only on average.</strong> Even with virtual nodes, load varies. The <em>consistent hashing with bounded loads</em> variant caps how much any node may exceed the mean by overflowing to the next node, trading strict placement for a hard fairness guarantee.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>the follow-ups that separate depth from recall are &quot;how do you actually find the right node — surely you don't walk a circle?&quot; (sorted array plus binary search) and &quot;doesn't this fix the celebrity problem?&quot; (no — it balances keys, not requests).</p>
+</div>
+</section>
+<section id="real-world-applications">
+<h2 id="real-world-applications">Real-World Applications</h2>
+<ul>
+<li>Amazon Dynamo DB</li>
+<li>Apache Cassandra</li>
+<li>Discord</li>
+<li>Akamai CDN</li>
+<li>Maglev Load Balancer</li>
+</ul>
+<p>Broadly, it shows up wherever a <em>changing</em> set of nodes must agree on who owns what without coordination:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Use</th>
+<th>What the &quot;key&quot; is</th>
+<th>Why it matters here</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Distributed caches (Memcached, Redis clusters)</td>
+<td>Cache key</td>
+<td>Avoids mass misses when a node is added or lost</td>
+</tr>
+<tr>
+<td>Partitioned databases (Cassandra, DynamoDB)</td>
+<td>Partition key</td>
+<td>Enables adding capacity without a full reshard</td>
+</tr>
+<tr>
+<td>Load balancers (Maglev)</td>
+<td>Connection 5-tuple</td>
+<td>Keeps a connection pinned to one backend across pool changes</td>
+</tr>
+<tr>
+<td>CDNs (Akamai)</td>
+<td>Content URL</td>
+<td>Keeps a given object on the same edge node, so it stays cached</td>
+</tr>
+<tr>
+<td>Chat and presence sharding (Discord)</td>
+<td>Guild / room ID</td>
+<td>Routes all traffic for a room to the node holding its state</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>With 10 servers and <code>hash(key) % N</code>, roughly what fraction of keys move when one server is removed? And with consistent hashing?</li>
+<li>Why does adding a server to a mod-N cache cluster risk taking down the database?</li>
+<li>How is the &quot;walk clockwise&quot; step actually implemented, and what is its complexity?</li>
+<li>Three servers hash to nearby positions on the ring. What goes wrong, and what fixes it?</li>
+<li>You give one server 400 virtual nodes and the others 200. What have you expressed?</li>
+<li>A single key receives 40% of all traffic. Does consistent hashing help? What does?</li>
+<li>Why can &quot;replicate to the next 3 nodes clockwise&quot; be unsafe when virtual nodes are in use?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Hash ring</strong></td>
+<td>The hash output space <code>0 .. 2^160-1</code> treated as a circle, with both ends joined</td>
+</tr>
+<tr>
+<td><strong>Rehashing problem</strong></td>
+<td>Mass key remapping when <code>N</code> changes under <code>hash(key) % N</code></td>
+</tr>
+<tr>
+<td><strong>Virtual node (vnode)</strong></td>
+<td>One of many ring positions representing a single physical server</td>
+</tr>
+<tr>
+<td><strong>Successor</strong></td>
+<td>The first server found walking clockwise from a position — the owner of that key</td>
+</tr>
+<tr>
+<td><strong>Affected range</strong></td>
+<td>The arc between a changed node and its anticlockwise predecessor; the only keys that move</td>
+</tr>
+<tr>
+<td><strong>Rendezvous hashing</strong></td>
+<td>An alternative that scores every node per key and picks the highest</td>
+</tr>
+<tr>
+<td><strong>Bounded loads</strong></td>
+<td>A variant capping how far any node's load may exceed the average</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="01-scaling.html#section-12-database-scaling">Chapter 1 §12 – Database Scaling</a> — the sharding problem this technique solves.</li>
+<li><a href="06-key-value-store.html">Chapter 6 – Design A Key-Value Store</a> — consistent hashing used in anger, with replication on top.</li>
+<li><a href="07-unique-id-generator.html">Chapter 7 – Unique ID Generator</a> — the other thing sharding breaks.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+<script src="../assets/js/anim-consistent-hashing.js"></script>
+</body>
+</html>

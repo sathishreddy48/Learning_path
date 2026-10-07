@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 4: Design a Rate Limiter — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="04-rate-limiter">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Building Blocks › Chapter 4 of 28</div>
+  <h1>Chapter 4: Design a Rate Limiter</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#benefits-of-rate-limiting">Benefits of Rate Limiting</a></li><li><a href="#step-1-understanding-the-problem">Step 1: Understanding the Problem</a></li><li><a href="#step-2-high-level-design">Step 2: High-Level Design</a></li><li><a href="#step-3-rate-limiting-algorithms">Step 3: Rate Limiting Algorithms</a></li><li><a href="#high-level-architecture">High-Level Architecture</a></li><li><a href="#advanced-considerations">Advanced Considerations</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>This chapter explores the design and implementation of a rate limiter—a system component used to control traffic rates sent by clients or services. Rate limiters are crucial for preventing abuse, reducing costs, and ensuring the stability of server resources. Examples of their use include limiting posts, account creations, and reward claims.</p>
+<p>The mechanic is simple: count how many requests an identified client has made in a time window, and if the count exceeds a threshold, reject the excess — conventionally with <strong>HTTP 429 Too Many Requests</strong>. Almost all of the design work is in the three decisions underneath that sentence:</p>
+<ol>
+<li><strong>Who is &quot;the client&quot;?</strong> An IP, a user ID, an API key, a tenant — this choice decides whether the limiter is fair or useless.</li>
+<li><strong>How do you count?</strong> Five standard algorithms, trading accuracy against memory and burst tolerance.</li>
+<li><strong>Where does the count live?</strong> The moment you have more than one limiter instance, counting becomes a distributed-systems problem.</li>
+</ol>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>this is a deceptively small problem that goes deep fast. Interviewers use it because the naive answer (&quot;a counter in Redis&quot;) is reachable in two minutes, leaving twenty minutes to probe race conditions, accuracy trade-offs, and what happens when Redis is down. Expect the whole interview to live in <a href="#step-3-rate-limiting-algorithms">Step 3</a> and <a href="#advanced-considerations">Advanced Considerations</a>.</p>
+</div>
+</section>
+<section id="benefits-of-rate-limiting">
+<h2 id="benefits-of-rate-limiting">Benefits of Rate Limiting</h2>
+<ul>
+<li><strong>Preventing DoS Attacks:</strong> Blocking excess calls to avoid resource starvation.</li>
+<li><strong>Cost Reduction:</strong> Limiting unnecessary requests to reduce server expenses.</li>
+<li><strong>Preventing Overloads:</strong> Filtering out excessive requests to stabilize server performance.</li>
+<li><strong>Protecting a fragile downstream dependency.</strong> Often the thing you are really protecting is not your own service but a slow database, a third-party API with its own quota, or an expensive ML model behind it.</li>
+<li><strong>Fairness between tenants.</strong> On a shared platform, one customer's runaway script should degrade their own experience, not everyone's. This is frequently the <em>primary</em> motivation, not abuse prevention.</li>
+<li><strong>Enforcing a commercial tier.</strong> Free tier 100 requests/day, paid tier 100,000 — the rate limiter is how the pricing page becomes real.</li>
+</ul>
+</section>
+<section id="step-1-understanding-the-problem">
+<h2 id="step-1-understanding-the-problem">Step 1: Understanding the Problem</h2>
+<h3 id="key-features">Key Features</h3>
+<ul>
+<li>Server-side API rate limiter.</li>
+<li>Support for multiple throttle rules.</li>
+<li>Handle large-scale systems in distributed environments.</li>
+<li>Option for a standalone service or application-level code.</li>
+<li>Inform users when throttled.</li>
+</ul>
+<h3 id="requirements">Requirements</h3>
+<ul>
+<li>Accurate request throttling.</li>
+<li>Minimal latency.</li>
+<li>Low memory usage.</li>
+<li>Distributed capability.</li>
+<li>Clear exception handling.</li>
+<li>High fault tolerance.</li>
+</ul>
+<h3 id="questions-worth-asking">Questions worth asking</h3>
+<p>Following the framework from <a href="03-system-design-framework.html">Chapter 3</a>, the answers here change the design materially:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Why it changes the design</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>What identifies a client?</strong> IP, user ID, API key?</td>
+<td>IP-based limiting breaks behind corporate NAT and mobile carrier gateways — thousands of real users share one address. Authenticated user IDs are far more accurate but unavailable for login and signup endpoints, which are exactly the ones most needing protection</td>
+</tr>
+<tr>
+<td><strong>How strict must it be?</strong></td>
+<td>&quot;Never exceed the limit&quot; forces an expensive exact algorithm; &quot;roughly right&quot; allows a cheap approximate one</td>
+</tr>
+<tr>
+<td><strong>One limit, or many?</strong></td>
+<td>Per-endpoint, per-tenant, and global limits compose, and a request may need several checks</td>
+</tr>
+<tr>
+<td><strong>Throttle or queue?</strong></td>
+<td>Rejecting is simple; delaying excess requests is traffic <em>shaping</em>, a different design</td>
+</tr>
+<tr>
+<td><strong>Scale?</strong></td>
+<td>At a few thousand QPS a single Redis is fine. At a million, the counter itself must be partitioned</td>
+</tr>
+<tr>
+<td><strong>What happens if the limiter fails?</strong></td>
+<td>The fail-open vs fail-closed decision — see <a href="#gotchas--failure-modes">Gotchas</a></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="step-2-high-level-design">
+<h2 id="step-2-high-level-design">Step 2: High-Level Design</h2>
+<h3 id="placement-options">Placement Options</h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/04.%20Rate%20Limiter/images/rate_limiter_architecture.png"  alt="Rate Limiting Middleware Architecture" data-width="550" style="max-width:550px">
+</p>
+<ol>
+<li><strong>Client-Side Implementation:</strong> Unreliable due to potential misuse.</li>
+<li><strong>Server-Side Implementation:</strong> Preferred for control and reliability.</li>
+<li><strong>Middleware (API Gateway):</strong> A flexible option for integrated rate limiting.</li>
+</ol>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Placement</th>
+<th>Pros</th>
+<th>Cons</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Client-side</strong></td>
+<td>No server cost; avoids the request entirely</td>
+<td><strong>Not a security control</strong> — a client you don't run can simply not implement it. Useful only as a politeness measure</td>
+</tr>
+<tr>
+<td><strong>Server-side</strong> (in your app)</td>
+<td>Full control; can use application context like user tier</td>
+<td>Every service reimplements it; the request already consumed a connection and a thread before being rejected</td>
+</tr>
+<tr>
+<td><strong>Middleware / API gateway</strong></td>
+<td>One implementation for all services; rejects traffic before it reaches your app</td>
+<td>Another hop; limited application context; may be a managed product with its own constraints</td>
+</tr>
+</tbody>
+</table>
+</div>
+<figure class="mermaid-fig">
+<svg id="mmd-5156a3fc623a9e34" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 846.328px; background-color: transparent;" viewBox="0 0 846.328125 191.6129150390625" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-5156a3fc623a9e34{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-5156a3fc623a9e34 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-5156a3fc623a9e34 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-5156a3fc623a9e34 .error-icon{fill:#f4f6f8;}#mmd-5156a3fc623a9e34 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-5156a3fc623a9e34 .edge-thickness-normal{stroke-width:1px;}#mmd-5156a3fc623a9e34 .edge-thickness-thick{stroke-width:3.5px;}#mmd-5156a3fc623a9e34 .edge-pattern-solid{stroke-dasharray:0;}#mmd-5156a3fc623a9e34 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-5156a3fc623a9e34 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-5156a3fc623a9e34 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-5156a3fc623a9e34 .marker{fill:#637381;stroke:#637381;}#mmd-5156a3fc623a9e34 .marker.cross{stroke:#637381;}#mmd-5156a3fc623a9e34 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-5156a3fc623a9e34 p{margin:0;}#mmd-5156a3fc623a9e34 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-5156a3fc623a9e34 .cluster-label text{fill:#454f5b;}#mmd-5156a3fc623a9e34 .cluster-label span{color:#454f5b;}#mmd-5156a3fc623a9e34 .cluster-label span p{background-color:transparent;}#mmd-5156a3fc623a9e34 .label text,#mmd-5156a3fc623a9e34 span{fill:#161c24;color:#161c24;}#mmd-5156a3fc623a9e34 .node rect,#mmd-5156a3fc623a9e34 .node circle,#mmd-5156a3fc623a9e34 .node ellipse,#mmd-5156a3fc623a9e34 .node polygon,#mmd-5156a3fc623a9e34 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-5156a3fc623a9e34 .rough-node .label text,#mmd-5156a3fc623a9e34 .node .label text,#mmd-5156a3fc623a9e34 .image-shape .label,#mmd-5156a3fc623a9e34 .icon-shape .label{text-anchor:middle;}#mmd-5156a3fc623a9e34 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-5156a3fc623a9e34 .rough-node .label,#mmd-5156a3fc623a9e34 .node .label,#mmd-5156a3fc623a9e34 .image-shape .label,#mmd-5156a3fc623a9e34 .icon-shape .label{text-align:center;}#mmd-5156a3fc623a9e34 .node.clickable{cursor:pointer;}#mmd-5156a3fc623a9e34 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-5156a3fc623a9e34 .arrowheadPath{fill:#000000;}#mmd-5156a3fc623a9e34 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-5156a3fc623a9e34 .flowchart-link{stroke:#637381;fill:none;}#mmd-5156a3fc623a9e34 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-5156a3fc623a9e34 .edgeLabel p{background-color:#ffffff;}#mmd-5156a3fc623a9e34 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-5156a3fc623a9e34 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-5156a3fc623a9e34 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-5156a3fc623a9e34 .cluster text{fill:#454f5b;}#mmd-5156a3fc623a9e34 .cluster span{color:#454f5b;}#mmd-5156a3fc623a9e34 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-5156a3fc623a9e34 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-5156a3fc623a9e34 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-5156a3fc623a9e34 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-5156a3fc623a9e34 rect.text{fill:none;stroke-width:0;}#mmd-5156a3fc623a9e34 .icon-shape,#mmd-5156a3fc623a9e34 .image-shape{background-color:#ffffff;text-align:center;}#mmd-5156a3fc623a9e34 .icon-shape p,#mmd-5156a3fc623a9e34 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-5156a3fc623a9e34 .icon-shape .label rect,#mmd-5156a3fc623a9e34 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-5156a3fc623a9e34 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-5156a3fc623a9e34 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-5156a3fc623a9e34 .node .neo-node{stroke:#299a8d;}#mmd-5156a3fc623a9e34 [data-look="neo"].node rect,#mmd-5156a3fc623a9e34 [data-look="neo"].cluster rect,#mmd-5156a3fc623a9e34 [data-look="neo"].node polygon{stroke:url(#mmd-5156a3fc623a9e34-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5156a3fc623a9e34 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-5156a3fc623a9e34 [data-look="neo"].node path{stroke:url(#mmd-5156a3fc623a9e34-gradient);stroke-width:1px;}#mmd-5156a3fc623a9e34 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5156a3fc623a9e34 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-5156a3fc623a9e34 [data-look="neo"].node circle{stroke:url(#mmd-5156a3fc623a9e34-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5156a3fc623a9e34 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-5156a3fc623a9e34 [data-look="neo"].icon-shape .icon{fill:url(#mmd-5156a3fc623a9e34-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5156a3fc623a9e34 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-5156a3fc623a9e34-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5156a3fc623a9e34 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-5156a3fc623a9e34_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5156a3fc623a9e34_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5156a3fc623a9e34_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5156a3fc623a9e34_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5156a3fc623a9e34_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5156a3fc623a9e34_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5156a3fc623a9e34_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5156a3fc623a9e34_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5156a3fc623a9e34_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5156a3fc623a9e34_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5156a3fc623a9e34_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-5156a3fc623a9e34_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M100.422,82.176L117.565,80.422C134.708,78.668,168.995,75.161,202.617,74.66C236.238,74.16,269.195,76.667,285.674,77.92L302.152,79.173" id="mmd-5156a3fc623a9e34-L_C_G_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_G_0" data-points="W3sieCI6MTAwLjQyMTg3NSwieSI6ODIuMTc1ODE0NzY3MDk2NTF9LHsieCI6MjAzLjI4MTI1LCJ5Ijo3MS42NTMyMjY4NTI0MTY5OX0seyJ4IjozMDYuMTQwNjI1LCJ5Ijo3OS40NzY2OTU1MjQ0ODY4MX1d" data-look="classic" marker-end="url(#mmd-5156a3fc623a9e34_flowchart-v2-pointEnd)"/><path d="M306.141,94.33L288.997,95.634C271.854,96.938,237.568,99.545,203.944,99.163C170.321,98.781,137.361,95.41,120.881,93.724L104.401,92.038" id="mmd-5156a3fc623a9e34-L_G_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_G_C_0" data-points="W3sieCI6MzA2LjE0MDYyNSwieSI6OTQuMzI5NzU4MTgwMzQ3MTd9LHsieCI6MjAzLjI4MTI1LCJ5IjoxMDIuMTUzMjI2ODUyNDE2OTl9LHsieCI6MTAwLjQyMTg3NSwieSI6OTEuNjMwNjM4OTM3NzM3NDd9XQ==" data-look="classic" marker-end="url(#mmd-5156a3fc623a9e34_flowchart-v2-pointEnd)"/><path d="M501.422,60.017L519.288,55.098C537.154,50.178,572.885,40.339,607.951,35.42C643.016,30.5,677.414,30.5,694.613,30.5L711.813,30.5" id="mmd-5156a3fc623a9e34-L_G_S_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_G_S_0" data-points="W3sieCI6NTAxLjQyMTg3NSwieSI6NjAuMDE3MDkzNTQ0NDUzMDF9LHsieCI6NjA4LjYxNzE4NzUsInkiOjMwLjV9LHsieCI6NzE1LjgxMjUsInkiOjMwLjV9XQ==" data-look="classic" marker-end="url(#mmd-5156a3fc623a9e34_flowchart-v2-pointEnd)"/><path d="M505.278,114.851L522.501,119.594C539.725,124.336,574.171,133.821,613.074,138.564C651.977,143.306,695.336,143.306,717.016,143.306L738.695,143.306" id="mmd-5156a3fc623a9e34-L_G_R_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_G_R_0" data-points="W3sieCI6NTAxLjQyMTg3NSwieSI6MTEzLjc4OTM2MDE2MDM4MDk3fSx7IngiOjYwOC42MTcxODc1LCJ5IjoxNDMuMzA2NDUzNzA0ODMzOTh9LHsieCI6NzQyLjY5NTMxMjUsInkiOjE0My4zMDY0NTM3MDQ4MzM5OH1d" data-look="classic" marker-start="url(#mmd-5156a3fc623a9e34_flowchart-v2-pointStart)" marker-end="url(#mmd-5156a3fc623a9e34_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_C_G_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(203.162, 102.14103)"><g class="label" data-id="L_G_C_0" transform="translate(-77.859375, -10.5)"><foreignObject width="155.71875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>429 Too Many Requests</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(608.6171875, 30.5)"><g class="label" data-id="L_G_S_0" transform="translate(-34.5625, -10.5)"><foreignObject width="69.125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>within limit</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(608.6171875, 143.30645370483398)"><g class="label" data-id="L_G_R_0" transform="translate(-82.1953125, -10.5)"><foreignObject width="164.390625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>read &amp; increment counter</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-5156a3fc623a9e34-flowchart-C-0" data-look="classic" transform="translate(54.2109375, 86.90322685241699)"><rect class="basic label-container" style="" x="-46.2109375" y="-22.5" width="92.421875" height="45"/><g class="label" style="" transform="translate(-22.2109375, -10.5)"><rect/><foreignObject width="44.421875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Clients</p></span></div></foreignObject></g></g><g class="node default" id="mmd-5156a3fc623a9e34-flowchart-G-1" data-look="classic" transform="translate(403.78125, 86.90322685241699)"><rect class="basic label-container" style="" x="-97.640625" y="-33" width="195.28125" height="66"/><g class="label" style="" transform="translate(-73.640625, -21)"><rect/><foreignObject width="147.28125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>API Gateway<br />rate limiter middleware</p></span></div></foreignObject></g></g><g class="node default" id="mmd-5156a3fc623a9e34-flowchart-S-5" data-look="classic" transform="translate(777.0703125, 30.5)"><rect class="basic label-container" style="" x="-61.2578125" y="-22.5" width="122.515625" height="45"/><g class="label" style="" transform="translate(-37.2578125, -10.5)"><rect/><foreignObject width="74.515625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>API Servers</p></span></div></foreignObject></g></g><g class="node default" id="mmd-5156a3fc623a9e34-flowchart-R-7" data-look="classic" transform="translate(777.0703125, 143.30645370483398)"><path d="M0,8.870967741935484 a34.375,8.870967741935484 0,0,0 68.75,0 a34.375,8.870967741935484 0,0,0 -68.75,0 l0,62.87096774193549 a34.375,8.870967741935484 0,0,0 68.75,0 l0,-62.87096774193549" class="basic label-container outer-path" style="" transform="translate(-34.375, -40.30645161290323)"/><g class="label" style="" transform="translate(-28.375, -13)"><rect/><foreignObject width="56.75" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Redis<br />counters</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-5156a3fc623a9e34-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-5156a3fc623a9e34-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-5156a3fc623a9e34-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>The important property of this shape is that <strong>rejected traffic never reaches your application servers</strong>, which is the whole point when the limiter exists to survive a traffic flood.</p>
+<h3 id="guidelines-for-placement">Guidelines for Placement</h3>
+<ul>
+<li>Evaluate current tech stack and choose efficient options.</li>
+<li>Select appropriate algorithms based on business needs.</li>
+<li>Use an API gateway if microservices are employed.</li>
+<li>Opt for commercial solutions if resources are limited.</li>
+</ul>
+</section>
+<section id="step-3-rate-limiting-algorithms">
+<h2 id="step-3-rate-limiting-algorithms">Step 3: Rate Limiting Algorithms</h2>
+<p>All five answer the same question — &quot;has this client exceeded its allowance?&quot; — and differ in how precisely they measure the window and how much memory they spend doing it.</p>
+<h3 id="1-token-bucket">1. Token Bucket</h3>
+<p align="left">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/04.%20Rate%20Limiter/images/token-bucket.png"  alt="Token Bucket Algorithm" data-width="550" style="max-width:550px">
+</p>
+<ul>
+<li><strong>Description:</strong> Tokens are added to a bucket at a fixed rate; each request consumes a token.</li>
+<li><strong>Parameters:</strong> Bucket size and refill rate.</li>
+<li><strong>Pros:</strong> Easy to implement, memory-efficient, supports traffic bursts.</li>
+<li><strong>Cons:</strong> Requires careful parameter tuning.</li>
+</ul>
+<p><strong>Worked example.</strong> Bucket size 4, refill rate 4 tokens/minute. A client idle for a minute has 4 tokens saved up, so it may fire 4 requests instantly — then it is throttled to one request every 15 seconds until it builds up credit again.</p>
+<p>The two parameters do genuinely different jobs, and conflating them is the usual tuning mistake:</p>
+<ul>
+<li><strong>Refill rate</strong> sets the sustained throughput you are willing to serve.</li>
+<li><strong>Bucket size</strong> sets how large a burst you tolerate, by deciding how much unused allowance can accumulate.</li>
+</ul>
+<p>Implementation is cheap because you don't store a token count ticking down in real time — you store <code>(tokens_remaining, last_refill_timestamp)</code> per client, <strong>two values</strong>, and compute the refill lazily on each request from elapsed time.</p>
+<p>This is the most widely used algorithm in practice (Stripe, Amazon API Gateway, and most API products behave this way), because allowing short bursts while capping sustained rate matches how real clients actually behave.</p>
+<h3 id="2-leaking-bucket">2. Leaking Bucket</h3>
+<p align="left">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/04.%20Rate%20Limiter/images/leaking-bucket.png"  alt="Leaking Bucket Algorithm" data-width="550" style="max-width:550px">
+</p>
+<ul>
+<li>
+<p><strong>Description:</strong> Processes requests at a fixed rate using a FIFO queue.</p>
+</li>
+<li>
+<p><strong>Pros:</strong> Memory-efficient, stable outflow rate.</p>
+</li>
+<li>
+<p><strong>Cons:</strong> Traffic bursts may delay recent requests.</p>
+<p>Example: https://github.com/uber-go/ratelimit</p>
+</li>
+</ul>
+<p><strong>The distinction that matters:</strong> token bucket is a <em>policing</em> algorithm — it rejects excess immediately. Leaking bucket is a <em>shaping</em> algorithm — it queues excess and releases it at a constant rate. That makes leaking bucket the right choice when the downstream system needs a perfectly smooth input (a legacy service that falls over above 100 QPS, a third-party API with a hard quota), and the wrong choice for a user-facing API, where a request queued for 30 seconds is worse for the user than a fast rejection they can retry.</p>
+<p>If the queue fills, requests are dropped — so the queue length is a latency budget, not a safety net.</p>
+<h3 id="3-fixed-window-counter">3. Fixed Window Counter</h3>
+<p align="left">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/04.%20Rate%20Limiter/images/fixed-window-counter.png"  alt="Fixed Window Counter" data-width="550" style="max-width:550px">
+</p>
+<ul>
+<li>
+<p><strong>Description:</strong> Divides time into fixed intervals and uses counters to limit requests.</p>
+</li>
+<li>
+<p><strong>Pros:</strong> Simple, efficient for specific use cases.</p>
+</li>
+<li>
+<p><strong>Cons:</strong> Traffic spikes at window edges can exceed limits.</p>
+</li>
+<li>
+<p>Sudden burst of traffic at the edges of time windows
+could cause more requests than allowed quota to go through.</p>
+<img loading="lazy" decoding="async" src="../../system-design-notes/04.%20Rate%20Limiter/images/fixed-window-issue.png"  alt="Fixed Window Issue" data-width="550" style="max-width:550px">
+</li>
+</ul>
+<p><strong>The edge problem, concretely.</strong> With a limit of 5 requests per minute, a client sends 5 requests between 00:30 and 01:00, then 5 more between 01:00 and 01:30. Both windows are within limit, yet <strong>10 requests landed inside a single 60-second span</strong> — double the intended rate. In the worst case this algorithm permits 2× the configured limit.</p>
+<p>It is nonetheless extremely common, because it is one Redis operation (<code>INCR</code> with a TTL) and the 2× worst case is often acceptable. It is a poor choice when the limit protects something with a hard ceiling.</p>
+<h3 id="4-sliding-window-log">4. Sliding Window Log</h3>
+<p align="left">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/04.%20Rate%20Limiter/images/sliding-window-log.png"  alt="Sliding Window Log" data-width="550" style="max-width:550px">
+</p>
+<ul>
+<li><strong>Description:</strong> Tracks timestamps to allow a rolling time window.</li>
+<li><strong>Pros:</strong> Accurate rate limiting.</li>
+<li><strong>Cons:</strong> High memory consumption.</li>
+</ul>
+<p>This is the <strong>exact</strong> algorithm: keep a timestamp for every accepted request, drop timestamps older than the window, and compare the remaining count to the limit. It has no edge-case inaccuracy at all.</p>
+<p>The cost is memory proportional to the <em>limit</em> multiplied by the <em>number of clients</em>. With a 1,000 requests/minute limit and 1 million active clients, that is 1 billion timestamps — at 8 bytes each, 8 GB of raw data, and considerably more once you account for the per-entry overhead of a Redis sorted set. Note that it also stores timestamps for <strong>rejected</strong> requests in some implementations, which means an attacker can inflate your memory usage by sending traffic you are already refusing.</p>
+<p>Use it when exactness is genuinely required and the client count is modest.</p>
+<h3 id="5-sliding-window-counter">5. Sliding Window Counter</h3>
+<p align="left">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/04.%20Rate%20Limiter/images/sliding-window-counter.png"  alt="Fixed Window Counter" data-width="550" style="max-width:550px">
+</p>
+<ul>
+<li><strong>Description:</strong> Combines fixed window and sliding log methods for smoothing spikes.</li>
+<li><strong>Pros:</strong> Memory-efficient, handles traffic bursts.</li>
+<li><strong>Cons:</strong> Approximation may not be perfectly strict.</li>
+</ul>
+<p>It keeps only two counters — current window and previous window — and estimates the rolling count by weighting the previous window by how much of it still overlaps:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>count = requests_in_current_window
+      + requests_in_previous_window x (overlap % of previous window)
+</code></pre></div>
+<p><strong>Worked example.</strong> Limit 7 requests/minute. The previous minute saw 5 requests, the current minute has seen 3, and we are 30% into the current minute:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>count = 3 + 5 x (100% - 30%)
+      = 3 + 3.5
+      = 6.5  -&gt;  6 requests
+6 &lt; 7, so the request is allowed.
+</code></pre></div>
+<p>The approximation assumes requests were spread evenly across the previous window, which is not always true — so it can occasionally admit slightly more or fewer than the exact limit. In practice the error is small (Cloudflare reported well under 1% of requests being wrongly handled), which is why this is the usual choice when fixed-window's 2× burst is unacceptable but a timestamp log is too expensive.</p>
+<h3 id="choosing-between-them">Choosing between them</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Algorithm</th>
+<th>Accuracy</th>
+<th>Memory per client</th>
+<th>Allows bursts?</th>
+<th>Complexity</th>
+<th>Reach for it when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Token bucket</strong></td>
+<td>Good</td>
+<td>2 values</td>
+<td><strong>Yes, deliberately</strong></td>
+<td>Low</td>
+<td>The default for user-facing APIs</td>
+</tr>
+<tr>
+<td><strong>Leaking bucket</strong></td>
+<td>Good</td>
+<td>Queue size</td>
+<td>No — smooths instead</td>
+<td>Medium</td>
+<td>A downstream system needs a constant rate</td>
+</tr>
+<tr>
+<td><strong>Fixed window</strong></td>
+<td>Poor (up to 2× overshoot)</td>
+<td>1 counter</td>
+<td>At window edges, accidentally</td>
+<td><strong>Lowest</strong></td>
+<td>Simplicity matters more than precision</td>
+</tr>
+<tr>
+<td><strong>Sliding window log</strong></td>
+<td><strong>Exact</strong></td>
+<td>1 timestamp per request</td>
+<td>No</td>
+<td>Medium</td>
+<td>Hard limits, modest client counts</td>
+</tr>
+<tr>
+<td><strong>Sliding window counter</strong></td>
+<td>Very good (approximate)</td>
+<td>2 counters</td>
+<td>Slightly</td>
+<td>Medium</td>
+<td>Best general accuracy-to-cost ratio</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>do not just list all five. Pick one, justify it against the requirements you established, and name its weakness. &quot;Token bucket, because API clients legitimately burst and I want to allow that — the tuning risk is that an over-large bucket lets a client dump its whole daily allowance in one second.&quot;</p>
+</div>
+
+<figure class="anim" id="anim-rate-limiter" data-anim="anim-rate-limiter">
+  <figcaption class="anim-head">
+    <span class="anim-title">Try it: the five algorithms on one traffic stream</span>
+    <span class="anim-caption">Every panel sees exactly the same requests. Send a steady trickle, then a burst, then a burst that straddles a window boundary, and watch where each algorithm accepts and where it rejects.</span>
+  </figcaption>
+  <div class="anim-stage" data-anim-stage>
+    <noscript><p class="anim-fallback">This interactive explainer needs JavaScript. The surrounding text and diagrams carry the same information.</p></noscript>
+  </div>
+</figure>
+</section>
+<section id="high-level-architecture">
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+<p align="left">
+  <img loading="lazy" decoding="async" style="margin-left: 40px; margin-top: 40px; margin-bottom: 20px;;max-width:550px" src="../../system-design-notes/04.%20Rate%20Limiter/images/architecture.png" alt="Architecture" data-width="550">
+</p>
+<ul>
+<li><strong>Data Storage:</strong> Use in-memory caching (e.g., Redis) for fast counter operations.</li>
+<li><strong>Steps:</strong>
+<ol>
+<li>Client sends request to middleware.</li>
+<li>Middleware checks counters in Redis.</li>
+<li>Request is processed or rejected based on limits.</li>
+</ol>
+</li>
+</ul>
+<p>Redis is the standard choice here for three specific reasons, worth being able to state: it is in-memory so the check costs well under a millisecond; <code>INCR</code> and <code>EXPIRE</code> give atomic counting and automatic cleanup without a sweeper job; and it is shared, so every limiter instance sees the same count.</p>
+<figure class="mermaid-fig">
+<svg id="mmd-e9137e099fa8fbca" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 723.469px; background-color: transparent;" viewBox="0 -0.000003814697265625 723.46875 187.64187622070312" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-e9137e099fa8fbca{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-e9137e099fa8fbca .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-e9137e099fa8fbca .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-e9137e099fa8fbca .error-icon{fill:#f4f6f8;}#mmd-e9137e099fa8fbca .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-e9137e099fa8fbca .edge-thickness-normal{stroke-width:1px;}#mmd-e9137e099fa8fbca .edge-thickness-thick{stroke-width:3.5px;}#mmd-e9137e099fa8fbca .edge-pattern-solid{stroke-dasharray:0;}#mmd-e9137e099fa8fbca .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-e9137e099fa8fbca .edge-pattern-dashed{stroke-dasharray:3;}#mmd-e9137e099fa8fbca .edge-pattern-dotted{stroke-dasharray:2;}#mmd-e9137e099fa8fbca .marker{fill:#637381;stroke:#637381;}#mmd-e9137e099fa8fbca .marker.cross{stroke:#637381;}#mmd-e9137e099fa8fbca svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-e9137e099fa8fbca p{margin:0;}#mmd-e9137e099fa8fbca .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-e9137e099fa8fbca .cluster-label text{fill:#454f5b;}#mmd-e9137e099fa8fbca .cluster-label span{color:#454f5b;}#mmd-e9137e099fa8fbca .cluster-label span p{background-color:transparent;}#mmd-e9137e099fa8fbca .label text,#mmd-e9137e099fa8fbca span{fill:#161c24;color:#161c24;}#mmd-e9137e099fa8fbca .node rect,#mmd-e9137e099fa8fbca .node circle,#mmd-e9137e099fa8fbca .node ellipse,#mmd-e9137e099fa8fbca .node polygon,#mmd-e9137e099fa8fbca .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-e9137e099fa8fbca .rough-node .label text,#mmd-e9137e099fa8fbca .node .label text,#mmd-e9137e099fa8fbca .image-shape .label,#mmd-e9137e099fa8fbca .icon-shape .label{text-anchor:middle;}#mmd-e9137e099fa8fbca .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-e9137e099fa8fbca .rough-node .label,#mmd-e9137e099fa8fbca .node .label,#mmd-e9137e099fa8fbca .image-shape .label,#mmd-e9137e099fa8fbca .icon-shape .label{text-align:center;}#mmd-e9137e099fa8fbca .node.clickable{cursor:pointer;}#mmd-e9137e099fa8fbca .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-e9137e099fa8fbca .arrowheadPath{fill:#000000;}#mmd-e9137e099fa8fbca .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-e9137e099fa8fbca .flowchart-link{stroke:#637381;fill:none;}#mmd-e9137e099fa8fbca .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-e9137e099fa8fbca .edgeLabel p{background-color:#ffffff;}#mmd-e9137e099fa8fbca .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-e9137e099fa8fbca .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-e9137e099fa8fbca .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-e9137e099fa8fbca .cluster text{fill:#454f5b;}#mmd-e9137e099fa8fbca .cluster span{color:#454f5b;}#mmd-e9137e099fa8fbca .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-e9137e099fa8fbca .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-e9137e099fa8fbca div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-e9137e099fa8fbca .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-e9137e099fa8fbca rect.text{fill:none;stroke-width:0;}#mmd-e9137e099fa8fbca .icon-shape,#mmd-e9137e099fa8fbca .image-shape{background-color:#ffffff;text-align:center;}#mmd-e9137e099fa8fbca .icon-shape p,#mmd-e9137e099fa8fbca .image-shape p{background-color:#ffffff;padding:2px;}#mmd-e9137e099fa8fbca .icon-shape .label rect,#mmd-e9137e099fa8fbca .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-e9137e099fa8fbca .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-e9137e099fa8fbca .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-e9137e099fa8fbca .node .neo-node{stroke:#299a8d;}#mmd-e9137e099fa8fbca [data-look="neo"].node rect,#mmd-e9137e099fa8fbca [data-look="neo"].cluster rect,#mmd-e9137e099fa8fbca [data-look="neo"].node polygon{stroke:url(#mmd-e9137e099fa8fbca-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e9137e099fa8fbca [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-e9137e099fa8fbca [data-look="neo"].node path{stroke:url(#mmd-e9137e099fa8fbca-gradient);stroke-width:1px;}#mmd-e9137e099fa8fbca [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e9137e099fa8fbca [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-e9137e099fa8fbca [data-look="neo"].node circle{stroke:url(#mmd-e9137e099fa8fbca-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e9137e099fa8fbca [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-e9137e099fa8fbca [data-look="neo"].icon-shape .icon{fill:url(#mmd-e9137e099fa8fbca-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e9137e099fa8fbca [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-e9137e099fa8fbca-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e9137e099fa8fbca :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-e9137e099fa8fbca_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e9137e099fa8fbca_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e9137e099fa8fbca_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e9137e099fa8fbca_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e9137e099fa8fbca_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e9137e099fa8fbca_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e9137e099fa8fbca_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e9137e099fa8fbca_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e9137e099fa8fbca_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e9137e099fa8fbca_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e9137e099fa8fbca_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-e9137e099fa8fbca_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M95.734,38.673L115.379,36.807C135.023,34.941,174.313,31.209,212.551,32.553C250.79,33.897,287.979,40.316,306.573,43.526L325.168,46.735" id="mmd-e9137e099fa8fbca-L_C_M_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_M_0" data-points="W3sieCI6OTUuNzM0Mzc1LCJ5IjozOC42NzI5Mjk4Mjc2NDc1N30seyJ4IjoyMTMuNjAxNTYyNSwieSI6MjcuNDc3NTI1NzExMDU5NTd9LHsieCI6MzI5LjEwOTM3NSwieSI6NDcuNDE1NzM1OTA2OTI5OTN9XQ==" data-look="classic" marker-end="url(#mmd-e9137e099fa8fbca_flowchart-v2-pointEnd)"/><path d="M98.094,147.435L117.345,147.435C136.596,147.435,175.099,147.435,213.007,137.989C250.915,128.544,288.228,109.653,306.884,100.208L325.541,90.762" id="mmd-e9137e099fa8fbca-L_RC_M_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RC_M_0" data-points="W3sieCI6OTguMDkzNzUsInkiOjE0Ny40MzQ3MDE5MTk1NTU2Nn0seyJ4IjoyMTMuNjAxNTYyNSwieSI6MTQ3LjQzNDcwMTkxOTU1NTY2fSx7IngiOjMyOS4xMDkzNzUsInkiOjg4Ljk1NTQ4OTM2OTU4ODE4fV0=" data-look="classic" marker-end="url(#mmd-e9137e099fa8fbca_flowchart-v2-pointEnd)"/><path d="M455.455,50.03L466.582,48.673C477.71,47.316,499.964,44.602,523.414,43.245C546.865,41.887,571.51,41.887,583.833,41.887L596.156,41.887" id="mmd-e9137e099fa8fbca-L_M_R_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_R_0" data-points="W3sieCI6NDUxLjQ4NDM3NSwieSI6NTAuNTE0NjY5MzU0NjI4NjZ9LHsieCI6NTIyLjIxODc1LCJ5Ijo0MS44ODc0MDkyMTAyMDUwOH0seyJ4Ijo2MDAuMTU2MjUsInkiOjQxLjg4NzQwOTIxMDIwNTA4fV0=" data-look="classic" marker-start="url(#mmd-e9137e099fa8fbca_flowchart-v2-pointStart)" marker-end="url(#mmd-e9137e099fa8fbca_flowchart-v2-pointEnd)"/><path d="M329.109,57.978L309.858,57.978C290.607,57.978,252.104,57.978,213.872,56.175C175.64,54.372,137.678,50.766,118.697,48.963L99.716,47.16" id="mmd-e9137e099fa8fbca-L_M_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_C_0" data-points="W3sieCI6MzI5LjEwOTM3NSwieSI6NTcuOTc3NTI1NzExMDU5NTd9LHsieCI6MjEzLjYwMTU2MjUsInkiOjU3Ljk3NzUyNTcxMTA1OTU3fSx7IngiOjk1LjczNDM3NSwieSI6NDYuNzgyMTIxNTk0NDcxNTd9XQ==" data-look="classic" marker-end="url(#mmd-e9137e099fa8fbca_flowchart-v2-pointEnd)"/><path d="M438.509,90.978L452.461,100.527C466.412,110.077,494.315,129.176,519.39,138.725C544.464,148.275,566.708,148.275,577.831,148.275L588.953,148.275" id="mmd-e9137e099fa8fbca-L_M_S_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_S_0" data-points="W3sieCI6NDM4LjUwODk3MjQ0MzYzOSwieSI6OTAuOTc3NTI1NzExMDU5NTd9LHsieCI6NTIyLjIxODc1LCJ5IjoxNDguMjc0ODE4NDIwNDEwMTZ9LHsieCI6NTkyLjk1MzEyNSwieSI6MTQ4LjI3NDgxODQyMDQxMDE2fV0=" data-look="classic" marker-end="url(#mmd-e9137e099fa8fbca_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_C_M_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(213.6015625, 147.43470191955566)"><g class="label" data-id="L_RC_M_0" transform="translate(-45.953125, -21)"><foreignObject width="91.90625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>rules loaded<br />in background</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(522.21875, 41.88740921020508)"><g class="label" data-id="L_M_R_0" transform="translate(-45.734375, -10.5)"><foreignObject width="91.46875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>INCR / EXPIRE</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(213.6015625, 57.97752571105957)"><g class="label" data-id="L_M_C_0" transform="translate(-90.5078125, -10.5)"><foreignObject width="181.015625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>over limit: 429 + Retry-After</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(522.21875, 148.27481842041016)"><g class="label" data-id="L_M_S_0" transform="translate(-34.5625, -10.5)"><foreignObject width="69.125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>within limit</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-e9137e099fa8fbca-flowchart-C-0" data-look="classic" transform="translate(53.046875, 42.72752571105957)"><rect class="basic label-container" style="" x="-42.6875" y="-22.5" width="85.375" height="45"/><g class="label" style="" transform="translate(-18.6875, -10.5)"><rect/><foreignObject width="37.375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Client</p></span></div></foreignObject></g></g><g class="node default" id="mmd-e9137e099fa8fbca-flowchart-M-1" data-look="classic" transform="translate(390.296875, 57.97752571105957)"><rect class="basic label-container" style="" x="-61.1875" y="-33" width="122.375" height="66"/><g class="label" style="" transform="translate(-37.1875, -21)"><rect/><foreignObject width="74.375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Rate limiter<br />middleware</p></span></div></foreignObject></g></g><g class="node default" id="mmd-e9137e099fa8fbca-flowchart-RC-2" data-look="classic" transform="translate(53.046875, 147.43470191955566)"><path d="M0,10.47145140200494 a45.046875,10.47145140200494 0,0,0 90.09375,0 a45.046875,10.47145140200494 0,0,0 -90.09375,0 l0,43.47145140200494 a45.046875,10.47145140200494 0,0,0 90.09375,0 l0,-43.47145140200494" class="basic label-container outer-path" style="" transform="translate(-45.046875, -32.20717710300741)"/><g class="label" style="" transform="translate(-39.046875, -2.5)"><rect/><foreignObject width="78.09375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Rules cache</p></span></div></foreignObject></g></g><g class="node default" id="mmd-e9137e099fa8fbca-flowchart-R-5" data-look="classic" transform="translate(654.2109375, 41.88740921020508)"><path d="M0,11.594275755747704 a54.0546875,11.594275755747704 0,0,0 108.109375,0 a54.0546875,11.594275755747704 0,0,0 -108.109375,0 l0,44.5942757557477 a54.0546875,11.594275755747704 0,0,0 108.109375,0 l0,-44.5942757557477" class="basic label-container outer-path" style="" transform="translate(-54.0546875, -33.89141363362155)"/><g class="label" style="" transform="translate(-48.0546875, -2.5)"><rect/><foreignObject width="96.109375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Redis counters</p></span></div></foreignObject></g></g><g class="node default" id="mmd-e9137e099fa8fbca-flowchart-S-9" data-look="classic" transform="translate(654.2109375, 148.27481842041016)"><rect class="basic label-container" style="" x="-61.2578125" y="-22.5" width="122.515625" height="45"/><g class="label" style="" transform="translate(-37.2578125, -10.5)"><rect/><foreignObject width="74.515625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>API Servers</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-e9137e099fa8fbca-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-e9137e099fa8fbca-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-e9137e099fa8fbca-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<h3 id="rate-limiting-rules">Rate limiting rules</h3>
+<p>Rules are configuration, not code — typically written as files, held on disk, and loaded into an in-memory cache by a background worker so the hot path never reads from disk:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button></div><pre data-lang="yaml"><code>domain: auth
+descriptors:
+  - key: auth_type
+    value: login
+    rate_limit:
+      unit: minute
+      requests_per_unit: 5
+</code></pre></div>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button></div><pre data-lang="yaml"><code>domain: messaging
+descriptors:
+  - key: message_type
+    value: marketing
+    rate_limit:
+      unit: day
+      requests_per_unit: 5
+</code></pre></div>
+<h3 id="what-the-client-sees-when-throttled">What the client sees when throttled</h3>
+<p>Rejecting correctly is part of the design, and it is commonly overlooked:</p>
+<ul>
+<li><strong><code>429 Too Many Requests</code></strong> is the status code.</li>
+<li><strong><code>Retry-After</code></strong> tells the client how long to wait. Without it, clients retry immediately and make the overload worse.</li>
+<li>Informational headers let a well-behaved client self-regulate <em>before</em> being rejected:</li>
+</ul>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Header</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>X-Ratelimit-Limit</code></td>
+<td>How many requests the client may make per window</td>
+</tr>
+<tr>
+<td><code>X-Ratelimit-Remaining</code></td>
+<td>How many remain in the current window</td>
+</tr>
+<tr>
+<td><code>X-Ratelimit-Retry-After</code></td>
+<td>Seconds to wait before retrying</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Rejected requests can also be dropped silently or pushed to a queue for later processing, depending on how important they are — a dropped analytics event is fine; a dropped payment webhook is not.</p>
+</section>
+<section id="advanced-considerations">
+<h2 id="advanced-considerations">Advanced Considerations</h2>
+<h3 id="distributed-environments">Distributed Environments</h3>
+<ul>
+<li><strong>Challenges:</strong> Race conditions, synchronization issues.</li>
+<li><strong>Solutions:</strong> Use locks, Lua scripts, or sorted sets in Redis. Employ centralized data stores for synchronization.</li>
+</ul>
+<p><strong>The race condition, concretely.</strong> Two requests from the same client arrive at two limiter instances simultaneously. Both read <code>counter = 3</code>, both add one, both write <code>4</code>. The true count should be 5, and under sustained concurrency a client can substantially exceed its limit.</p>
+<p>The fix is to make read-modify-write <strong>atomic</strong>, and the options are not equal:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>Verdict</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Locks</strong></td>
+<td>Technically correct, but a lock per request adds a round trip and serialises your hottest path. Usually the wrong answer despite being the first one people reach for</td>
+</tr>
+<tr>
+<td><strong>Redis <code>INCR</code></strong></td>
+<td>Already atomic server-side, and returns the new value. Sufficient for fixed-window counters</td>
+</tr>
+<tr>
+<td><strong>Lua script</strong></td>
+<td>Runs atomically inside Redis, so multi-step logic (token bucket refill, sliding window counter) stays race-free in one round trip. The general answer</td>
+</tr>
+<tr>
+<td><strong>Sorted sets</strong> (<code>ZADD</code> + <code>ZREMRANGEBYSCORE</code> + <code>ZCARD</code>)</td>
+<td>The natural fit for sliding window log, ideally wrapped in a Lua script or pipeline</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Synchronization</strong> is the other half. Sticky sessions — pinning a client to one limiter instance so its counter stays local — appear to solve the problem and reintroduce every drawback from <a href="01-scaling.html#section-8-stateless-web-tier">Chapter 1 §8</a>: you can no longer scale or redeploy the limiter freely. A centralized store keeps the limiter tier stateless, which is what you want.</p>
+<h3 id="performance-optimizations">Performance Optimizations</h3>
+<ul>
+<li>Multi-data center setups for reduced latency.</li>
+<li>Eventual consistency models for synchronization.</li>
+</ul>
+<p>Cross-region latency (~100 ms, see <a href="02-back-of-the-envelope-estimation.html">Chapter 2</a>) makes a synchronous global counter impossible to put on the request path. The usual compromise is <strong>per-region counters with eventual reconciliation</strong>: a client is allowed up to its limit in each region, so a globally distributed attacker can exceed the global limit by roughly the number of regions. That is normally an acceptable trade for keeping the check fast — but say so explicitly rather than claiming a global limit you cannot enforce.</p>
+<h3 id="monitoring">Monitoring</h3>
+<ul>
+<li>Regular analytics to ensure algorithm effectiveness and adjust rules as needed.</li>
+</ul>
+<p>Specifically, watch for the two failure directions: <strong>too strict</strong> (legitimate users getting 429s — check the rejection rate per endpoint and per tier) and <strong>too loose</strong> (the limit never triggers during real traffic surges, so it isn't protecting anything).</p>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Fail-open or fail-closed?</strong> If Redis is unreachable, do you let every request through or reject every request? <strong>Fail-open</strong> is usually right for a limiter protecting against abuse — a brief period of unlimited traffic beats a total outage — but <strong>fail-closed</strong> is right when the limiter protects something that will be damaged by overload. Decide deliberately; an unhandled exception in the limiter decides it for you, badly.</li>
+<li><strong>The limiter is now on the critical path.</strong> Every request pays its latency and depends on its availability. This is the argument for a local in-process cache in front of the shared counter, accepting slight inaccuracy for resilience.</li>
+<li><strong>Identifying the client is the weakest link.</strong> IP limiting punishes everyone behind a corporate NAT or a mobile carrier gateway, while IPv6 gives an attacker effectively unlimited addresses. User-ID limiting is accurate but unavailable precisely on login and signup. The practical answer is layered limits — a loose IP limit plus a tight per-account limit — and a separate, much stricter limit on authentication endpoints.</li>
+<li><strong>Synchronised retries after a reset.</strong> With fixed windows, every throttled client retries the instant the window rolls over, producing a spike at each boundary. Jitter the <code>Retry-After</code> value, and prefer clients that back off exponentially.</li>
+<li><strong>Retry storms.</strong> A client that retries immediately on 429 turns one rejection into a flood. <code>Retry-After</code> plus documented exponential backoff is the mitigation — and the reason the headers above are worth implementing.</li>
+<li><strong>Clock skew.</strong> Time-window algorithms depend on consistent time across instances. Compute the window from the Redis server's clock rather than each limiter's local clock.</li>
+<li><strong>Rate limiting the wrong unit.</strong> Limiting <em>requests</em> when the real constraint is work done means one expensive query can still exhaust the backend while staying within limit. For such APIs, charge a variable number of tokens per request by cost.</li>
+<li><strong>Limits that aren't communicated are a support burden.</strong> Publish them in the docs and surface them in headers; silent throttling makes clients think your API is broken.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>&quot;what happens when Redis goes down?&quot; is the most common follow-up in this chapter, and the expected answer is an explicit fail-open/fail-closed decision tied to <em>why</em> the limiter exists. The second most common is the race condition — make sure you can describe the interleaving and why a Lua script beats a lock.</p>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Why is a client-side rate limiter not a security control?</li>
+<li>A limit of 100 requests/minute uses a fixed window. What is the largest number of requests a client can make in any 60-second span, and why?</li>
+<li>Which algorithm would you pick for an API whose clients legitimately burst, and what is its tuning risk?</li>
+<li>Two limiter instances both read a counter of 3 at the same moment. What goes wrong, and what are three ways to fix it?</li>
+<li>Your rate limiter's Redis cluster becomes unreachable. What should happen to incoming traffic, and what does the answer depend on?</li>
+<li>Why is IP-based limiting a poor fit for a mobile app, and what would you use instead on a login endpoint?</li>
+<li>You run in three regions and cannot afford a synchronous global counter. What is the actual limit a determined client can achieve?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Throttling</strong></td>
+<td>Rejecting or delaying requests that exceed an allowance</td>
+</tr>
+<tr>
+<td><strong>Policing vs shaping</strong></td>
+<td>Rejecting excess traffic (token bucket) vs queueing and smoothing it (leaking bucket)</td>
+</tr>
+<tr>
+<td><strong>Burst</strong></td>
+<td>A short spike of requests above the sustained rate, which token bucket permits by design</td>
+</tr>
+<tr>
+<td><strong>429</strong></td>
+<td><code>Too Many Requests</code> — the HTTP status for a throttled request</td>
+</tr>
+<tr>
+<td><strong><code>Retry-After</code></strong></td>
+<td>Response header telling the client how long to wait</td>
+</tr>
+<tr>
+<td><strong>Fail-open / fail-closed</strong></td>
+<td>On limiter failure, allowing all traffic through vs rejecting all of it</td>
+</tr>
+<tr>
+<td><strong>Atomic increment</strong></td>
+<td>A read-modify-write that cannot interleave with another, e.g. Redis <code>INCR</code></td>
+</tr>
+<tr>
+<td><strong>Sticky session</strong></td>
+<td>Pinning a client to one server instance — convenient here, but it makes the tier stateful</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="01-scaling.html">Chapter 1 – Scale From Zero To Millions Of Users</a> — the caching and stateless-tier ideas this chapter depends on.</li>
+<li><a href="05-consistent-hashing.html">Chapter 5 – Design Consistent Hashing</a> — how to partition the counter store once one Redis is not enough.</li>
+<li><a href="https://martinfowler.com/bliki/CircuitBreaker.html" target="_blank" rel="noopener">Circuit Breaker</a> — the complementary pattern: rate limiting protects you from your callers, circuit breaking protects you from your dependencies.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+<script src="../assets/js/anim-rate-limiter.js"></script>
+</body>
+</html>

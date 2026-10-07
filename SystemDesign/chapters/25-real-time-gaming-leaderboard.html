@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 25: Real-time Gaming Leaderboard — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="25-real-time-gaming-leaderboard">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 25 of 28</div>
+  <h1>Chapter 25: Real-time Gaming Leaderboard</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</a></li><li><a href="#step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap Up</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>We are going to design a <strong>leaderboard</strong> for an online mobile game:</p>
+<p><strong>The one-sentence version:</strong> this chapter is about <strong>one operation that databases do not provide cheaply — rank.</strong> Storing scores is trivial, and so is finding the top 10 with an index. But answering <em>&quot;what position is this particular user in?&quot;</em> means counting everyone ahead of them, which is <code>O(N)</code> and gets slower the further down the leaderboard you look. A sorted set answers it in <code>O(log N)</code>, and that single capability is the reason the chapter exists.</p>
+<p>Two framing points worth carrying through:</p>
+<ul>
+<li><strong>Redis here is the system of record, not a cache.</strong> There is no slower, more authoritative store behind it that could repopulate the leaderboard. That changes the requirements completely — persistence, replication and failover all become correctness concerns rather than performance ones.</li>
+<li><strong>The data is bounded and disposable.</strong> A new tournament starts each month, so a leaderboard has a known maximum size and a natural expiry. This is what makes a single in-memory instance a credible answer rather than a liability.</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/leaderboard.png" alt="leaderboard" data-width="500" style="max-width:500px" />
+</p>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-establish-design-scope">
+<h2 id="step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</h2>
+<ul>
+<li>C: How is the score calculated for the leaderboard?</li>
+<li>I: User gets a point whenever they win a match.</li>
+<li>C: Are all players included in the leaderboard?</li>
+<li>I: Yes</li>
+<li>C: Is there a time segment, associated with the leaderboard?</li>
+<li>I: Each month, a new tournament starts which starts a new leaderboard.</li>
+<li>C: Can we assume we only care about top 10 users?</li>
+<li>I: We want to display top 10 users, along with position of specific user. If time permits, we can discuss showing users around particular user in the leaderboard.</li>
+<li>C: How many users are in a tournament?</li>
+<li>I: 5mil DAU and 25mil MAU</li>
+<li>C: How many matches are played on average during a tournament?</li>
+<li>I: Each player plays 10 matches per day on average</li>
+<li>C: How do we determine the rank if two players have the same score?</li>
+<li>I: Their rank is the same in that case. If time permits, we can discuss breaking ties.</li>
+<li>C: Does the leaderboard need to be real-time?</li>
+<li>I: Yes, we want to present real-time results or as close as possible to real-time. It is not okay to present batched result history.</li>
+</ul>
+<h3 id="functional-requirements"><strong>Functional requirements</strong></h3>
+<ul>
+<li>Display top 10 players on leaderboard</li>
+<li>Show a user's specific rank</li>
+<li>Display users which are four places above and below given user (bonus)</li>
+</ul>
+<h3 id="non-functional-requirements"><strong>Non-functional requirements</strong></h3>
+<ul>
+<li>Real-time updates on scores</li>
+<li>Score update is reflected on the leaderboard in real-time</li>
+<li>General scalability, availability, reliability</li>
+</ul>
+<h3 id="back-of-the-envelope-estimation"><strong>Back-of-the-envelope estimation</strong></h3>
+<p>With 5mil DAU, if the game has an even distribution of players during a 24h period, we'd have an average of 50 users per second.
+However, since distribution is typically uneven, we can estimate that the peak online users would be 250 users per second.</p>
+<p>QPS for users scoring a point - given 10 games per day on average, 50 users/s * 10 = 500 QPS. Peak QPS = 2500.</p>
+<p>QPS for fetching the top 10 leaderboard - assuming users open that once a day on average, QPS is 50.</p>
+<h3 id="this-is-a-small-system-and-saying-so-is-the-point">This is a small system, and saying so is the point</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Derivation</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Score updates</td>
+<td>58 users/sec × 10 matches</td>
+<td><strong>~500 QPS</strong> (peak ~2,500)</td>
+</tr>
+<tr>
+<td>Leaderboard reads</td>
+<td>5 M / 86,400</td>
+<td><strong>~50 QPS</strong></td>
+</tr>
+<tr>
+<td>Players in a tournament</td>
+<td>25 M MAU</td>
+<td>25 million entries</td>
+</tr>
+<tr>
+<td>Memory</td>
+<td>25 M × ~130 bytes of sorted-set entry</td>
+<td><strong>~3.25 GB — one Redis instance</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Five hundred writes per second and fifty reads per second is, by this book's standards, nothing. There is no throughput problem, no storage problem, and no sharding problem at the stated scale — the chapter is explicit that one Redis instance suffices.</p>
+<p><strong>So the difficulty is entirely about the shape of the query, not its volume.</strong> That is unusual and worth naming: most chapters are hard because of scale, and this one is hard because <code>rank</code> is an awkward operation no matter how little data you have. A candidate who spends the interview sharding has mis-identified the problem.</p>
+<p>The scaling discussion only becomes real at the hypothetical 10× growth the chapter introduces later — 500 M DAU, 65 GB, 250 K QPS — and it is worth treating that as a separate, clearly-labelled extension rather than the baseline design.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>compute the QPS, state that one instance handles it, and then pivot to &quot;the interesting problem is answering <code>rank</code> for a user in the middle of the leaderboard&quot;. That reframing is what the question is testing.</p>
+</div>
+</section>
+<section id="step-2-propose-high-level-design-and-get-buy-in">
+<h2 id="step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</h2>
+<h3 id="api-design"><strong>API Design</strong></h3>
+<p>The first API we need is one to update a user's score:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>POST /v1/scores
+</code></pre></div>
+<p>This API takes two params - <code>user_id</code> and <code>points</code> scored for winning a game.</p>
+<p>This API should only be accessible to game servers, not end clients.</p>
+<p>Next one is for getting the top 10 players of the leaderboard:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>GET /v1/scores
+</code></pre></div>
+<p>Example response:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>{
+  &quot;data&quot;: [
+    {
+      &quot;user_id&quot;: &quot;user_id1&quot;,
+      &quot;user_name&quot;: &quot;alice&quot;,
+      &quot;rank&quot;: 1,
+      &quot;score&quot;: 12543
+    },
+    {
+      &quot;user_id&quot;: &quot;user_id2&quot;,
+      &quot;user_name&quot;: &quot;bob&quot;,
+      &quot;rank&quot;: 2,
+      &quot;score&quot;: 11500
+    }
+  ],
+  ...
+  &quot;total&quot;: 10
+}
+</code></pre></div>
+<p>You can also get the score of a particular user:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>GET /v1/scores/{:user_id}
+</code></pre></div>
+<p>Example response:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>{
+    &quot;user_info&quot;: {
+        &quot;user_id&quot;: &quot;user5&quot;,
+        &quot;score&quot;: 1000,
+        &quot;rank&quot;: 6,
+    }
+}
+</code></pre></div>
+<h3 id="high-level-architecture"><strong>High-level architecture</strong></h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/high-level-architecture.png" alt="high-level-architecture" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>When a player wins a game, client sends a request to the game service</li>
+<li>Game service validates if win is valid and calls the leaderboard service to update the player's score</li>
+<li>Leaderboard service updates the user's score in the leaderboard store</li>
+<li>Player makes a call to leaderboard service to fetch leaderboard data, eg top 10 players and given player's rank</li>
+</ul>
+<p>An alternative design which was considered is the client updating their score directly within the leaderboard service:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/alternative-design.png" alt="alternative-design" data-width="500" style="max-width:500px" />
+</p>
+<p>This option is not secure as it's susceptible to man-in-the-middle attacks. Players can put a proxy and change their score as they please.</p>
+<p>One additional caveat is that for games, where the game logic is managed by the server, cliets don't need to call the server explicitly to record their win.
+Servers do it automatically for them based on the game logic.</p>
+<p>One additional consideration is whether we should put a message queue between the game server and the leaderboard service. This would be useful if other services are interested in game results, but that is not an explicit requirement in the interview so far, hence it's not included in the design:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/message-queue-based-comm.png" alt="message-queue-based-comm" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="data-models"><strong>Data models</strong></h3>
+<p>Let's discuss the options we have for storing leaderboard data - relational DBs, Redis, NoSQL.</p>
+<p>The NoSQL solution is discussed in the deep dive section.</p>
+<h4 id="relational-database-solution">Relational database solution</h4>
+<p>If the scale doesn't matter and we don't have that many users, a relational DB serves us quite well.</p>
+<p>We can start from a simple leaderboard table, one for each month (personal note - this doesn't make sense. You can just add a <code>month</code> column and avoid the headache of maintaining new tables each month):</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/leaderboard-table.png" alt="leaderboard-table" data-width="500" style="max-width:500px" />
+</p>
+<p>There is additional data to include in there, but that is irrelevant to the queries we'd run, so it's omitted.</p>
+<p>What happens when a user wins a point?</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/user-wins-point.png" alt="user-wins-point" data-width="500" style="max-width:500px" />
+</p>
+<p>If a user doesn't exist in the table yet, we need to insert them first:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>INSERT INTO leaderboard (user_id, score) VALUES ('mary1934', 1);
+</code></pre></div>
+<p>On subsequent calls, we'd just update their score:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>UPDATE leaderboard set score=score + 1 where user_id='mary1934';
+</code></pre></div>
+<p>How do we find the top players of a leaderboard?</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/find-leaderboard-position.png" alt="find-leaderboard-position" data-width="500" style="max-width:500px" />
+</p>
+<p>We can run the following query:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>SELECT (@rownum := @rownum + 1) AS rank, user_id, score
+FROM leaderboard
+ORDER BY score DESC;
+</code></pre></div>
+<p>This is not performant though as it makes a table scan to order all records in the database table.</p>
+<p>We can optimize it by adding an index on <code>score</code> and using the <code>LIMIT</code> operation to avoid scanning everything:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>SELECT (@rownum := @rownum + 1) AS rank, user_id, score
+FROM leaderboard
+ORDER BY score DESC
+LIMIT 10;
+</code></pre></div>
+<p>This approach, however, doesn't scale well if the user is not at the top of the leaderboard and you'd want to locate their rank.</p>
+<p><strong>This is the crux of the chapter, and it deserves to be made concrete.</strong> The top-10 query is fine — an index on <code>score</code> plus <code>LIMIT 10</code> reads ten index entries. But finding one user's rank is a different query:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button></div><pre data-lang="sql"><code>SELECT COUNT(*) FROM leaderboard WHERE score &gt; (
+  SELECT score FROM leaderboard WHERE user_id = 'mary1934'
+);
+</code></pre></div>
+<p>That counts <strong>every player ahead of them</strong>. For a user in 20-millionth place it visits 20 million index entries, and the cost grows the <em>worse</em> a player is doing — so the query is slowest for the overwhelming majority of users, who are the ones most likely to want to know their rank.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Query</th>
+<th>Relational cost</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Top 10</td>
+<td><strong>Cheap</strong></td>
+<td>Index scan, stop after 10</td>
+</tr>
+<tr>
+<td>Rank of a top player</td>
+<td>Cheap</td>
+<td>Few rows ahead of them</td>
+</tr>
+<tr>
+<td><strong>Rank of an average player</strong></td>
+<td><strong>O(N)</strong></td>
+<td>Count everyone above</td>
+</tr>
+<tr>
+<td>Four players above and below a given user</td>
+<td><strong>O(N)</strong></td>
+<td>Must know their rank first</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Window functions (<code>RANK() OVER (ORDER BY score DESC)</code>) do not rescue this — they still have to order and number the whole set before filtering to one row. The problem is not SQL's syntax; it is that <strong>a B-tree index gives you ordering but not position</strong>, because a tree node does not know how many entries precede it. (Databases <em>could</em> support this with order-statistic trees that store subtree counts; mainstream ones do not.)</p>
+<p>So the requirement &quot;show a user's specific rank&quot; is the one that eliminates the relational solution, and it does so regardless of scale.</p>
+<h4 id="redis-solution">Redis solution</h4>
+<p>We want to find a solution, which works well even for millions of players without having to fallback on complex database queries.</p>
+<p>Redis is an in-memory data store, which is fast as it works in-memory and has a suitable data structure to serve our needs - sorted set.</p>
+<p>A sorted set is a data structure similar to sets in programming languages, which allows you to keep a data structure sorted by a given criteria.
+Internally, it is implemented using a hash-map to maintain mapping between key (user_id) and value (score) and a skip list which maps scores to users in sorted order:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/sorted-set.png" alt="sorted-set" data-width="500" style="max-width:500px" />
+</p>
+<p>How does a skip list work?</p>
+<ul>
+<li>It is a linked list which allows for fast search</li>
+<li>It consists of a sorted linked list and multi-level indexes</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/skip-list.png" alt="skip-list" data-width="500" style="max-width:500px" />
+</p>
+<p>This structure enables us to quickly search for specific values when the data set is large enough.
+In the example below (64 nodes), it requires traversing 62 nodes in a base linked list to find the given value and 11 nodes in the skip-list case:</p>
+<p><strong>Why a skip list rather than a balanced tree.</strong> Both give <code>O(log N)</code> search; the skip list is chosen because it is dramatically simpler to implement correctly (no rotations or rebalancing — levels are assigned by coin flip, so balance is probabilistic), it supports ordered range scans naturally by walking the bottom list, and it is friendlier to concurrent access since an insert touches only a few forward pointers. It is a case where a probabilistic structure wins on engineering grounds rather than asymptotics.</p>
+<p><strong>And here is why this specific structure solves the chapter's problem</strong>, which the diagram does not make obvious. Redis's sorted set maintains, alongside each skip-list node, a <strong>span</strong> — the number of bottom-level nodes each forward pointer skips. Walking down from the top while summing those spans yields the number of elements passed, which <em>is</em> the rank. That is the order-statistic capability a B-tree index lacks, and it is the entire reason <code>ZREVRANK</code> is <code>O(log N)</code> instead of <code>O(N)</code>.</p>
+<p><strong>Every requirement in this chapter maps to exactly one command:</strong></p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Requirement</th>
+<th>Command</th>
+<th>Complexity</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Player wins a match</td>
+<td><code>ZINCRBY leaderboard 1 user_id</code></td>
+<td><code>O(log N)</code></td>
+</tr>
+<tr>
+<td>Top 10 players</td>
+<td><code>ZREVRANGE leaderboard 0 9 WITHSCORES</code></td>
+<td><code>O(log N + 10)</code></td>
+</tr>
+<tr>
+<td><strong>A user's rank</strong></td>
+<td><code>ZREVRANK leaderboard user_id</code></td>
+<td><strong><code>O(log N)</code></strong></td>
+</tr>
+<tr>
+<td>Four above and below a user</td>
+<td><code>ZREVRANK</code>, then <code>ZREVRANGE rank-4 rank+4</code></td>
+<td><code>O(log N + 9)</code></td>
+</tr>
+<tr>
+<td>Number of players</td>
+<td><code>ZCARD leaderboard</code></td>
+<td><code>O(1)</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The relational design needed a table scan for two of those five. That is the whole argument, and it is worth being able to state it in this form.</p>
+<p><strong>Ties, which the chapter defers.</strong> Redis orders equal scores <strong>lexicographically by member</strong>, so two players on the same score are ranked by their user ID — deterministic, but arbitrary and unfair (it systematically favours whoever's name sorts first). If ties should go to whoever reached the score first, the usual trick is to pack a timestamp into the score itself:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>composite = points × 2^k − timestamp     # earlier timestamp ⇒ higher composite
+</code></pre></div>
+<p>This works, with a caveat worth knowing: sorted-set scores are IEEE-754 doubles with a <strong>53-bit mantissa</strong>, so the points and the timestamp together must fit in 53 bits of precision or the low-order bits — the tiebreak — are silently rounded away.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/skip-list-performance.png" alt="skip-list-performance" data-width="500" style="max-width:500px" />
+</p>
+<p>Sorted sets are more performant than relational databases as the data is kept sorted at all times at the price of O(logN) add and find operation.</p>
+<p>In contract, here's an example nested query we need to run to find the rank of a given user in a relational DB:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>SELECT *,(SELECT COUNT(*) FROM leaderboard lb2
+WHERE lb2.score &gt;= lb1.score) RANK
+FROM leaderboard lb1
+WHERE lb1.user_id = {:user_id};
+</code></pre></div>
+<p>What operations do we need to operate our leaderboard in Redis?</p>
+<ul>
+<li><strong>ZADD</strong> - insert the user into the set if they don't exist. Otherwise, update the score. O(logN) time complexity.</li>
+<li><strong>ZINCRBY</strong> - increment the score of a user by given amount. If user doesn't exist, score starts at zero. O(logN) time complexity.</li>
+<li><strong>ZRANGE/ZREVRANGE</strong> - fetch a range of users, sorted by their score. We can specify order (ASC/DESC), offset and result size. O(logN+M) time complexity where M is result size.</li>
+<li><strong>ZRANK/ZREVRANK</strong> - Fetch the position (rank) of given user in ASC/DESC order. O(logN) time complexity.</li>
+</ul>
+<p>What happens when a user scores a point?</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>ZINCRBY leaderboard_feb_2021 1 'mary1934'
+</code></pre></div>
+<p>There's a new leaderboard created every month while old ones are moved to historical storage.</p>
+<p>What happens when a user fetches top 10 players?</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>ZREVRANGE leaderboard_feb_2021 0 9 WITHSCORES
+</code></pre></div>
+<p>Example result:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>[(user2,score2),(user1,score1),(user5,score5)...]
+</code></pre></div>
+<p>What about user fetching their leaderboard position?</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/leaderboard-position-of-user.png" alt="leaderboard-position-of-user" data-width="500" style="max-width:500px" />
+</p>
+<p>This can be easily achieved by the following query, given that we know a user's leaderboard position:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>ZREVRANGE leaderboard_feb_2021 357 365
+</code></pre></div>
+<p>A user's position can be fetched using <code>ZREVRANK &lt;user-id&gt;</code>.</p>
+<p>Let's explore what our storage requirements are:</p>
+<ul>
+<li>Assuming worst-case scenario of all 25mil MAU participating in the game for a given month</li>
+<li>ID is 24-character string and score is 16-bit integer, we need 26 bytes * 25mil = ~650MB of storage</li>
+<li>Even if we double the storage cost due to the overhead of the skip list, this would still easily fit in a modern redis cluster</li>
+</ul>
+<p>Another non-functional requirement to consider is supporting 2500 updates per second. This is well within a single Redis server's capabilities.</p>
+<p>Additional caveats:</p>
+<ul>
+<li>We can spin up a Redis replica to avoid losing data when a redis server crashes</li>
+<li>We can still leverage Redis persistence to not lose data in the event of a crash</li>
+<li>We'll need two supporting tables in MySQL to fetch user details such as username, display name, etc as well as store when eg a user won a game</li>
+<li>The second table in MySQL can be used to reconstruct leaderboard when there is an infrastructure failure</li>
+<li>As a small performance optimization, we could cache the user details of top 10 players as they'd be frequently accessed</li>
+</ul>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<h3 id="to-use-a-cloud-provider-or-not"><strong>To use a cloud provider or not</strong></h3>
+<p>We can either choose to deploy and manage our own services or use a cloud provider to manage them for us.</p>
+<p>If we choose to manage the services ourselves, we'll use redis for leaderboard data, mysql for user profile and potentially a cache for user profile if we want to scale the database:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/manage-services-ourselves.png" alt="manage-services-ourselves" data-width="500" style="max-width:500px" />
+</p>
+<p>Alternatively, we could use cloud offerings to manage a lot of the services for us. For example, we can use AWS API Gateway to route API calls to AWS Lambda functions:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/api-gateway-mapping.png" alt="api-gateway-mapping" data-width="500" style="max-width:500px" />
+</p>
+<p>AWS Lambda enables us to run code without managing or provisioning servers ourselves. It runs only when needed and scales automatically.</p>
+<p>Example of a user scoring a point:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/user-scoring-point-lambda.png" alt="user-scoring-point-lambda" data-width="500" style="max-width:500px" />
+</p>
+<p>Example user retrieving leaderboard:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/user-retrieve-leaderboard.png" alt="user-retrieve-leaderboard" data-width="500" style="max-width:500px" />
+</p>
+<p>Lambdas are an implementation of a serverless architecture. We don't need to manage scaling and environment setup.</p>
+<p>Author recommends going with this approach if we build the game from the ground up.</p>
+<h3 id="scaling-redis"><strong>Scaling Redis</strong></h3>
+<p>With 5mil DAU, we can get away with a single Redis instance from both a storage and QPS perspective.</p>
+<p>However, if we imagine userbase grows 10x to 500mil DAU, then we'd need 65gb for storage and QPS goes to 250k.</p>
+<p>Such scale would require sharding.</p>
+<p>One way to achieve it is by range-partitioning the data:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/range-partition.png" alt="range-partition" data-width="500" style="max-width:500px" />
+</p>
+<p><strong>Before sharding, note what a leaderboard <em>is</em> in Redis terms: a single key.</strong> The whole sorted set lives under one key, and Redis Cluster shards <em>by key</em> — so Redis Cluster cannot split one leaderboard across nodes at all. &quot;Sharding the leaderboard&quot; necessarily means <strong>deciding to store it as several separate sorted sets</strong> and reassembling answers in the application. That is why both options below are application-level schemes rather than a configuration change, and it is the detail that makes this section harder than it looks.</p>
+<p>In this example, we'll shard based on user's score. We'll maintain the mapping between user_id and shard in application code.
+We can do that either via MySQL or another cache for the mapping itself.</p>
+<p><strong>Two problems with range-partitioning by score that the chapter does not raise</strong>, and both are structural:</p>
+<ul>
+<li><strong>Scores change, so users migrate between shards.</strong> Range partitioning normally assumes the partition key is stable; here the key is the thing being updated. Every score increment risks crossing a boundary, which means a remove-from-one-shard plus add-to-another, plus an update to the <code>user_id → shard</code> mapping — three operations, non-atomic, on what should be a single <code>ZINCRBY</code>. A crash in the middle duplicates or loses the player.</li>
+<li><strong>The score distribution is extremely skewed.</strong> Almost everyone has a low score and very few have high ones, so equal-width ranges like <code>[0–100]</code> and <code>[900–1000]</code> hold wildly different populations. The lowest bucket holds most of the user base and becomes the hot shard — and it is also where new players start, so it absorbs most of the write traffic too.</li>
+</ul>
+<p>To fetch the top 10 players, we'd query the shard with the highest scores (<code>[900-1000]</code>).</p>
+<p>To fetch a user's rank, we'll need to calculate the rank within the user's shard and add up all users with higher scores in other shards.
+The latter is a O(1) operation as total records per shard can quickly be accessed via the info keyspace command.</p>
+<p>Alternatively, we can use hash partitioning via Redis Cluster. It is a proxy which distributes data across redis nodes based on partitioning similar to consistent hashing, but not exactly the same:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/hash-partition.png" alt="hash-partition" data-width="500" style="max-width:500px" />
+</p>
+<p>Calculating the top 10 players is challenging with this setup. We'll need to get the top 10 players of each shard and merge the results in the application:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/top-10-players-calculation.png" alt="top-10-players-calculation" data-width="500" style="max-width:500px" />
+</p>
+<p>There are some limitations with the hash partitioning:</p>
+<ul>
+<li>If we need to fetch top K users, where K is high, latency can increase as we'll need to fetch a lot of data from all the shards</li>
+<li>Latency increases as the number of partitions grows</li>
+<li>There is no straightforward approach to determine a user's rank</li>
+</ul>
+<p>Due to all this, the author leans towards using fixed partitions for this problem.</p>
+<p><strong>There is a third approach that real systems use, and it sidesteps both</strong>: separate the two queries, because they have completely different requirements.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Query</th>
+<th>Who asks</th>
+<th>Accuracy needed</th>
+<th>Mechanism</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Top 10 (or top 1,000)</td>
+<td>Everyone, constantly</td>
+<td><strong>Exact</strong></td>
+<td>One small sorted set holding only high scorers — tiny, cheap, unsharded</td>
+</tr>
+<tr>
+<td>&quot;What rank am I?&quot; for the long tail</td>
+<td>One user about themselves</td>
+<td><strong>Approximate is fine</strong></td>
+<td>A histogram of score buckets: rank ≈ sum of counts in higher buckets + position within your bucket</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The insight is that nobody in 4,312,887th place needs that number to be exact — they need it to be roughly right and to move when they score. Maintaining per-bucket counters makes that an <code>O(buckets)</code> sum instead of an <code>O(N)</code> count, and the counters are trivially shardable because they are just numbers being incremented. Meanwhile the exact top-K set stays small enough to live on one node.</p>
+<p><strong>Separating &quot;exact for the few, approximate for the many&quot; is the general technique</strong>, and it is the same instinct as the cheap-over-approximation-then-exact-check pattern in <a href="18-google-maps.html#improvement---adaptive-eta-and-rerouting">Chapter 18</a> and <a href="06-key-value-store.html">Chapter 6</a> — spend precision only where someone will notice.</p>
+<p>Also worth noting about the read path: at 50 QPS, <strong>the top-10 query does not need to be fast, it needs to be cached.</strong> A one-second TTL on the top 10 reduces it to roughly one Redis call per second, and no human perceives a leaderboard that is one second stale.</p>
+<p>Other caveats:</p>
+<ul>
+<li>
+<p>A best practice is to allocate twice as much memory as required for write-heavy redis nodes to accommodate snapshots if required</p>
+<p>The reason is <code>fork()</code> and copy-on-write: Redis snapshots by forking a child process that shares memory pages with the parent, and every page the parent then <em>writes</em> must be copied. Under heavy writes a large fraction of the dataset gets copied during the snapshot, so peak usage approaches twice the dataset size. Being out of memory at that moment means the snapshot fails or the kernel kills Redis — which, since Redis is the system of record here, means losing the leaderboard.</p>
+</li>
+<li>
+<p><strong>Persistence and replication are correctness requirements, not optimisations.</strong> Nothing else holds the leaderboard, so an unreplicated instance with persistence disabled loses a month-long tournament on a single restart. Enable AOF (and know that <code>appendfsync everysec</code> can still lose up to a second of scores), run a replica, and consider writing score events to a durable log as well so the leaderboard can be rebuilt from scratch — which also gives you an audit trail for disputes.</p>
+</li>
+<li>
+<p>We can use a tool called Redis-benchmark to track the performance of a redis setup and make data-driven decisions</p>
+</li>
+</ul>
+<h3 id="alternative-solution-nosql"><strong>Alternative solution: NoSQL</strong></h3>
+<p>An alternative solution to consider is using an appropriate NoSQL database optimized for:</p>
+<ul>
+<li>heavy writes</li>
+<li>effectively sorting items within the same partition by score</li>
+</ul>
+<p>DynamoDB, Cassandra or MongoDB are all good fits.</p>
+<p>In this chapter, the author has decided to use DynamoDB. It is a fully-managed NoSQL database, which offers reliable performance and great scalability.
+It also enables usage of global secondary indexes when we need to query fields not part of the primary key.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/dynamo-db.png" alt="dynamo-db" data-width="500" style="max-width:500px" />
+</p>
+<p>Let's start from a table for storing a leaderboard for a chess game:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/chess-game-leaderboard-table-1.png" alt="chess-game-leaderboard-table-1" data-width="500" style="max-width:500px" />
+</p>
+<p>This works well, but doesn't scale well if we need to query anything by score. Hence, we can put the score as a sort key:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/chess-game-leaderboard-table-2.png" alt="chess-game-leaderboard-table-2" data-width="500" style="max-width:500px" />
+</p>
+<p>Another problem with this design is that we're partitioning by month. This leads to a hotspot partition as the latest month will be unevenly accessed compared to the others.</p>
+<p>We could use a technique called write sharding, where we append a partition number for each key, calculated via <code>user_id % num_partitions</code>:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/chess-game-leaderboard-table-3.png" alt="chess-game-leaderboard-table-3" data-width="500" style="max-width:500px" />
+</p>
+<p>An important trade-off to consider is how many partitions we should use:</p>
+<ul>
+<li>The more partitions there are, the higher the write scalability</li>
+<li>However, read scalability suffers as we need to query more partitions to collect aggregate results</li>
+</ul>
+<p>Using this approach requires that we use the &quot;scatter-gather&quot; technique we saw earlier, which grows in time complexity as we add more partitions:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/25.%20Real-time%20Gaming%20Leaderboard/images/scatter-gather-2.png" alt="scatter-gather-2" data-width="500" style="max-width:500px" />
+</p>
+<p>To make a good evaluation on the number of partitions, we'd need to do some benchmarking.</p>
+<p>This NoSQL approach still has one major downside - it is hard to calculate the specific rank of a user.</p>
+<p>If we have sufficient scale to require us to shard, we could then perhaps tell users what &quot;percentile&quot; of scores they're in.</p>
+<p>A cron job can periodically run to analyze score distributions, based on which a user's percentile is determined, eg:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>10th percentile = score &lt; 100
+20th percentile = score &lt; 500
+...
+90th percentile = score &lt; 6500
+</code></pre></div>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
+<p>Other things to discuss if time permits:</p>
+<ul>
+<li><strong>Faster retrieval</strong> - We can cache the user object via a Redis hash with mapping <code>user_id -&gt; user object</code>. This enables faster retrieval vs. querying the database.</li>
+<li><strong>Breaking ties</strong> - When two players have the same score, we can break the tie by sorting them based on last played game.</li>
+<li><strong>System failure recovery</strong> - In the event of a large-scale Redis outage, we can recreate the leaderboard by going through the MySQL WAL entries and recreate it via an ad-hoc script</li>
+</ul>
+<p>That last point is the one to make unprompted rather than &quot;if time permits&quot;, because it answers the obvious objection to putting the system of record in memory: <strong>the leaderboard is derived state.</strong> If every score event is durably recorded somewhere (a relational WAL, a Kafka topic, an append-only log), then the sorted set is a materialised view that can be rebuilt by replaying them. That converts &quot;Redis is a single point of failure for a month of tournament data&quot; into &quot;Redis is a fast index we can regenerate&quot;, which is a completely different risk profile — and it is the same relationship as between the raw events and the aggregates in <a href="21-ad-click-event-aggregation.html">Chapter 21</a>.</p>
+<figure class="mermaid-fig">
+<svg id="mmd-fe9fb0362a3ec5eb" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1523.08px; background-color: transparent;" viewBox="0 0 1523.078125 222.07479858398438" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-fe9fb0362a3ec5eb{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-fe9fb0362a3ec5eb .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-fe9fb0362a3ec5eb .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-fe9fb0362a3ec5eb .error-icon{fill:#f4f6f8;}#mmd-fe9fb0362a3ec5eb .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-fe9fb0362a3ec5eb .edge-thickness-normal{stroke-width:1px;}#mmd-fe9fb0362a3ec5eb .edge-thickness-thick{stroke-width:3.5px;}#mmd-fe9fb0362a3ec5eb .edge-pattern-solid{stroke-dasharray:0;}#mmd-fe9fb0362a3ec5eb .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-fe9fb0362a3ec5eb .edge-pattern-dashed{stroke-dasharray:3;}#mmd-fe9fb0362a3ec5eb .edge-pattern-dotted{stroke-dasharray:2;}#mmd-fe9fb0362a3ec5eb .marker{fill:#637381;stroke:#637381;}#mmd-fe9fb0362a3ec5eb .marker.cross{stroke:#637381;}#mmd-fe9fb0362a3ec5eb svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-fe9fb0362a3ec5eb p{margin:0;}#mmd-fe9fb0362a3ec5eb .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-fe9fb0362a3ec5eb .cluster-label text{fill:#454f5b;}#mmd-fe9fb0362a3ec5eb .cluster-label span{color:#454f5b;}#mmd-fe9fb0362a3ec5eb .cluster-label span p{background-color:transparent;}#mmd-fe9fb0362a3ec5eb .label text,#mmd-fe9fb0362a3ec5eb span{fill:#161c24;color:#161c24;}#mmd-fe9fb0362a3ec5eb .node rect,#mmd-fe9fb0362a3ec5eb .node circle,#mmd-fe9fb0362a3ec5eb .node ellipse,#mmd-fe9fb0362a3ec5eb .node polygon,#mmd-fe9fb0362a3ec5eb .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-fe9fb0362a3ec5eb .rough-node .label text,#mmd-fe9fb0362a3ec5eb .node .label text,#mmd-fe9fb0362a3ec5eb .image-shape .label,#mmd-fe9fb0362a3ec5eb .icon-shape .label{text-anchor:middle;}#mmd-fe9fb0362a3ec5eb .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-fe9fb0362a3ec5eb .rough-node .label,#mmd-fe9fb0362a3ec5eb .node .label,#mmd-fe9fb0362a3ec5eb .image-shape .label,#mmd-fe9fb0362a3ec5eb .icon-shape .label{text-align:center;}#mmd-fe9fb0362a3ec5eb .node.clickable{cursor:pointer;}#mmd-fe9fb0362a3ec5eb .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-fe9fb0362a3ec5eb .arrowheadPath{fill:#000000;}#mmd-fe9fb0362a3ec5eb .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-fe9fb0362a3ec5eb .flowchart-link{stroke:#637381;fill:none;}#mmd-fe9fb0362a3ec5eb .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-fe9fb0362a3ec5eb .edgeLabel p{background-color:#ffffff;}#mmd-fe9fb0362a3ec5eb .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-fe9fb0362a3ec5eb .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-fe9fb0362a3ec5eb .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-fe9fb0362a3ec5eb .cluster text{fill:#454f5b;}#mmd-fe9fb0362a3ec5eb .cluster span{color:#454f5b;}#mmd-fe9fb0362a3ec5eb .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-fe9fb0362a3ec5eb .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-fe9fb0362a3ec5eb div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-fe9fb0362a3ec5eb .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-fe9fb0362a3ec5eb rect.text{fill:none;stroke-width:0;}#mmd-fe9fb0362a3ec5eb .icon-shape,#mmd-fe9fb0362a3ec5eb .image-shape{background-color:#ffffff;text-align:center;}#mmd-fe9fb0362a3ec5eb .icon-shape p,#mmd-fe9fb0362a3ec5eb .image-shape p{background-color:#ffffff;padding:2px;}#mmd-fe9fb0362a3ec5eb .icon-shape .label rect,#mmd-fe9fb0362a3ec5eb .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-fe9fb0362a3ec5eb .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-fe9fb0362a3ec5eb .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-fe9fb0362a3ec5eb .node .neo-node{stroke:#299a8d;}#mmd-fe9fb0362a3ec5eb [data-look="neo"].node rect,#mmd-fe9fb0362a3ec5eb [data-look="neo"].cluster rect,#mmd-fe9fb0362a3ec5eb [data-look="neo"].node polygon{stroke:url(#mmd-fe9fb0362a3ec5eb-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-fe9fb0362a3ec5eb [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-fe9fb0362a3ec5eb [data-look="neo"].node path{stroke:url(#mmd-fe9fb0362a3ec5eb-gradient);stroke-width:1px;}#mmd-fe9fb0362a3ec5eb [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-fe9fb0362a3ec5eb [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-fe9fb0362a3ec5eb [data-look="neo"].node circle{stroke:url(#mmd-fe9fb0362a3ec5eb-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-fe9fb0362a3ec5eb [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-fe9fb0362a3ec5eb [data-look="neo"].icon-shape .icon{fill:url(#mmd-fe9fb0362a3ec5eb-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-fe9fb0362a3ec5eb [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-fe9fb0362a3ec5eb-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-fe9fb0362a3ec5eb :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-fe9fb0362a3ec5eb_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-fe9fb0362a3ec5eb_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-fe9fb0362a3ec5eb_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-fe9fb0362a3ec5eb_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-fe9fb0362a3ec5eb_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-fe9fb0362a3ec5eb_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-fe9fb0362a3ec5eb_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-fe9fb0362a3ec5eb_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-fe9fb0362a3ec5eb_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-fe9fb0362a3ec5eb_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-fe9fb0362a3ec5eb_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-fe9fb0362a3ec5eb_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M234.906,41L239.073,41C243.24,41,251.573,41,263.819,47.489C276.065,53.978,292.224,66.956,300.303,73.445L308.383,79.934" id="mmd-fe9fb0362a3ec5eb-L_GS_API_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_GS_API_0" data-points="W3sieCI6MjM0LjkwNjI1LCJ5Ijo0MX0seyJ4IjoyNTkuOTA2MjUsInkiOjQxfSx7IngiOjMxMS41MDEyNjQyNDE3OTMyLCJ5Ijo4Mi40MzkwMjU4Nzg5MDYyNX1d" data-look="classic" marker-end="url(#mmd-fe9fb0362a3ec5eb_flowchart-v2-pointEnd)"/><path d="M376.797,127.439L383.852,131.697C390.907,135.954,405.016,144.469,415.57,148.727C426.125,152.984,433.125,152.984,436.625,152.984L440.125,152.984" id="mmd-fe9fb0362a3ec5eb-L_API_LOG_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_LOG_0" data-points="W3sieCI6Mzc2Ljc5NzM3MDgwMzMxOTIsInkiOjEyNy40MzkwMjU4Nzg5MDYyNX0seyJ4Ijo0MTkuMTI1LCJ5IjoxNTIuOTg0Mjc5NjMyNTY4MzZ9LHsieCI6NDQ0LjEyNSwieSI6MTUyLjk4NDI3OTYzMjU2ODM2fV0=" data-look="classic" marker-end="url(#mmd-fe9fb0362a3ec5eb_flowchart-v2-pointEnd)"/><path d="M376.797,82.439L383.852,78.181C390.907,73.924,405.016,65.409,433.904,61.151C462.792,56.894,506.458,56.894,558.82,56.894C611.182,56.894,672.24,56.894,714.986,60.18C757.733,63.467,782.17,70.04,794.388,73.327L806.606,76.614" id="mmd-fe9fb0362a3ec5eb-L_API_Z_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_Z_0" data-points="W3sieCI6Mzc2Ljc5NzM3MDgwMzMxOTIsInkiOjgyLjQzOTAyNTg3ODkwNjI1fSx7IngiOjQxOS4xMjUsInkiOjU2Ljg5Mzc3MjEyNTI0NDE0fSx7IngiOjU1MC4xMjUsInkiOjU2Ljg5Mzc3MjEyNTI0NDE0fSx7IngiOjczMy4yOTY4NzUsInkiOjU2Ljg5Mzc3MjEyNTI0NDE0fSx7IngiOjgxMC40Njg3NSwieSI6NzcuNjUyNzE3ODI0NjAwMDN9XQ==" data-look="classic" marker-end="url(#mmd-fe9fb0362a3ec5eb_flowchart-v2-pointEnd)"/><path d="M1013.344,73.876L1017.51,69.387C1021.677,64.897,1030.01,55.918,1037.677,51.429C1045.344,46.939,1052.344,46.939,1055.844,46.939L1059.344,46.939" id="mmd-fe9fb0362a3ec5eb-L_Z_TOP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Z_TOP_0" data-points="W3sieCI6MTAxMy4zNDM3NSwieSI6NzMuODc2MDcxMjQ0OTIxMDZ9LHsieCI6MTAzOC4zNDM3NSwieSI6NDYuOTM5MDI1ODc4OTA2MjV9LHsieCI6MTA2My4zNDM3NSwieSI6NDYuOTM5MDI1ODc4OTA2MjV9XQ==" data-look="classic" marker-end="url(#mmd-fe9fb0362a3ec5eb_flowchart-v2-pointEnd)"/><path d="M1013.344,136.002L1017.51,140.491C1021.677,144.981,1030.01,153.96,1039.536,158.45C1049.063,162.939,1059.781,162.939,1065.141,162.939L1070.5,162.939" id="mmd-fe9fb0362a3ec5eb-L_Z_RNK_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Z_RNK_0" data-points="W3sieCI6MTAxMy4zNDM3NSwieSI6MTM2LjAwMTk4MDUxMjg5MTQ0fSx7IngiOjEwMzguMzQzNzUsInkiOjE2Mi45MzkwMjU4Nzg5MDYyNX0seyJ4IjoxMDc0LjUsInkiOjE2Mi45MzkwMjU4Nzg5MDYyNX1d" data-look="classic" marker-end="url(#mmd-fe9fb0362a3ec5eb_flowchart-v2-pointEnd)"/><path d="M1227.688,162.939L1233.714,162.939C1239.74,162.939,1251.792,162.939,1261.318,162.939C1270.844,162.939,1277.844,162.939,1281.344,162.939L1284.844,162.939" id="mmd-fe9fb0362a3ec5eb-L_RNK_NBR_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RNK_NBR_0" data-points="W3sieCI6MTIyNy42ODc1LCJ5IjoxNjIuOTM5MDI1ODc4OTA2MjV9LHsieCI6MTI2My44NDM3NSwieSI6MTYyLjkzOTAyNTg3ODkwNjI1fSx7IngiOjEyODguODQzNzUsInkiOjE2Mi45MzkwMjU4Nzg5MDYyNX1d" data-look="classic" marker-end="url(#mmd-fe9fb0362a3ec5eb_flowchart-v2-pointEnd)"/><path d="M656.125,152.984L668.987,152.984C681.849,152.984,707.573,152.984,732.653,149.698C757.733,146.411,782.17,139.838,794.388,136.551L806.606,133.264" id="mmd-fe9fb0362a3ec5eb-L_LOG_Z_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_LOG_Z_0" data-points="W3sieCI6NjU2LjEyNSwieSI6MTUyLjk4NDI3OTYzMjU2ODM2fSx7IngiOjczMy4yOTY4NzUsInkiOjE1Mi45ODQyNzk2MzI1NjgzNn0seyJ4Ijo4MTAuNDY4NzUsInkiOjEzMi4yMjUzMzM5MzMyMTI0OH1d" data-look="classic" marker-end="url(#mmd-fe9fb0362a3ec5eb_flowchart-v2-pointEnd)"/><path d="M178.398,168.878L191.983,168.878C205.568,168.878,232.737,168.878,254.401,162.389C276.065,155.9,292.224,142.922,300.303,136.433L308.383,129.944" id="mmd-fe9fb0362a3ec5eb-L_PROF_API_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PROF_API_0" data-points="W3sieCI6MTc4LjM5ODQzNzUsInkiOjE2OC44NzgwNTE3NTc4MTI1fSx7IngiOjI1OS45MDYyNSwieSI6MTY4Ljg3ODA1MTc1NzgxMjV9LHsieCI6MzExLjUwMTI2NDI0MTc5MzIsInkiOjEyNy40MzkwMjU4Nzg5MDYyNX1d" data-look="classic" marker-end="url(#mmd-fe9fb0362a3ec5eb_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_GS_API_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_LOG_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_Z_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_Z_TOP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_Z_RNK_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RNK_NBR_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(733.296875, 152.98427963256836)"><g class="label" data-id="L_LOG_Z_0" transform="translate(-52.171875, -21)"><foreignObject width="104.34375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>replay to rebuild<br />after an outage</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_PROF_API_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-fe9fb0362a3ec5eb-flowchart-GS-0" data-look="classic" transform="translate(121.453125, 41)"><rect class="basic label-container" style="" x="-113.453125" y="-33" width="226.90625" height="66"/><g class="label" style="" transform="translate(-89.453125, -21)"><rect/><foreignObject width="178.90625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>game servers<br />(only they may post scores)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-fe9fb0362a3ec5eb-flowchart-API-1" data-look="classic" transform="translate(339.515625, 104.93902587890625)"><rect class="basic label-container" style="" x="-54.609375" y="-22.5" width="109.21875" height="45"/><g class="label" style="" transform="translate(-30.609375, -10.5)"><rect/><foreignObject width="61.21875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>score API</p></span></div></foreignObject></g></g><g class="node default" id="mmd-fe9fb0362a3ec5eb-flowchart-LOG-3" data-look="classic" transform="translate(550.125, 152.98427963256836)"><path d="M0,15.72700296735905 a106,15.72700296735905 0,0,0 212,0 a106,15.72700296735905 0,0,0 -212,0 l0,90.72700296735906 a106,15.72700296735905 0,0,0 212,0 l0,-90.72700296735906" class="basic label-container outer-path" style="" transform="translate(-106, -61.090504451038576)"/><g class="label" style="" transform="translate(-100, -23.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>durable score log<br />MySQL / Kafka — source of truth</p></span></div></foreignObject></g></g><g class="node default" id="mmd-fe9fb0362a3ec5eb-flowchart-Z-5" data-look="classic" transform="translate(911.90625, 104.93902587890625)"><path d="M0,15.468928707586732 a101.4375,15.468928707586732 0,0,0 202.875,0 a101.4375,15.468928707586732 0,0,0 -202.875,0 l0,69.46892870758673 a101.4375,15.468928707586732 0,0,0 202.875,0 l0,-69.46892870758673" class="basic label-container outer-path" style="" transform="translate(-101.4375, -50.2033930613801)"/><g class="label" style="" transform="translate(-95.4375, -13)"><rect/><foreignObject width="190.875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Redis sorted set<br />ZINCRBY — materialised view</p></span></div></foreignObject></g></g><g class="node default" id="mmd-fe9fb0362a3ec5eb-flowchart-TOP-7" data-look="classic" transform="translate(1151.09375, 46.93902587890625)"><rect class="basic label-container" style="" x="-87.75" y="-33" width="175.5" height="66"/><g class="label" style="" transform="translate(-63.75, -21)"><rect/><foreignObject width="127.5" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>ZREVRANGE 0 9<br />top 10 (cached ~1s)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-fe9fb0362a3ec5eb-flowchart-RNK-9" data-look="classic" transform="translate(1151.09375, 162.93902587890625)"><rect class="basic label-container" style="" x="-76.59375" y="-33" width="153.1875" height="66"/><g class="label" style="" transform="translate(-52.59375, -21)"><rect/><foreignObject width="105.1875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>ZREVRANK user<br />exact rank</p></span></div></foreignObject></g></g><g class="node default" id="mmd-fe9fb0362a3ec5eb-flowchart-NBR-11" data-look="classic" transform="translate(1401.9609375, 162.93902587890625)"><rect class="basic label-container" style="" x="-113.1171875" y="-33" width="226.234375" height="66"/><g class="label" style="" transform="translate(-89.1171875, -21)"><rect/><foreignObject width="178.234375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>ZREVRANGE rank-4 rank+4<br />neighbours</p></span></div></foreignObject></g></g><g class="node default" id="mmd-fe9fb0362a3ec5eb-flowchart-PROF-14" data-look="classic" transform="translate(121.453125, 168.8780517578125)"><path d="M0,11.918699718752045 a56.9453125,11.918699718752045 0,0,0 113.890625,0 a56.9453125,11.918699718752045 0,0,0 -113.890625,0 l0,65.91869971875204 a56.9453125,11.918699718752045 0,0,0 113.890625,0 l0,-65.91869971875204" class="basic label-container outer-path" style="" transform="translate(-56.9453125, -44.87804957812806)"/><g class="label" style="" transform="translate(-50.9453125, -13)"><rect/><foreignObject width="101.890625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>MySQL + cache<br />user profiles</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-fe9fb0362a3ec5eb-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-fe9fb0362a3ec5eb-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-fe9fb0362a3ec5eb-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Rank is the operation that breaks the relational design</strong>, and it breaks worst for average players — <code>COUNT(*) WHERE score &gt; x</code> visits every row above them. Top-10 is easy; rank is not.</li>
+<li><strong>A leaderboard is one Redis key, so Redis Cluster cannot shard it.</strong> Any sharding scheme must deliberately split it into several sorted sets and merge in the application.</li>
+<li><strong>Range-partitioning by score means users migrate between shards as they score.</strong> The partition key is the mutable value, so a single increment becomes a non-atomic remove-add-remap across three systems.</li>
+<li><strong>Score distributions are heavily skewed.</strong> Equal-width score ranges put most of the population — and most of the write traffic, since new players start at zero — in the lowest bucket.</li>
+<li><strong>Hash partitioning makes rank effectively unanswerable</strong> and makes large top-K a scatter-gather over every shard, with latency growing as partitions are added.</li>
+<li><strong>Redis is the system of record, so persistence is a correctness concern.</strong> With AOF <code>everysec</code>, a crash can lose a second of scores; with persistence off, a restart loses the tournament. Replicate, and keep a durable score log so the set can be rebuilt.</li>
+<li><strong>Snapshotting can double memory.</strong> <code>fork()</code> plus copy-on-write under a write-heavy load copies much of the dataset. Provision 2× or the snapshot fails — or the OOM killer takes the leaderboard.</li>
+<li><strong>Ties default to alphabetical order by user ID</strong>, which is deterministic and quietly unfair. Packing a timestamp into the score fixes it, but sorted-set scores are doubles — exceed the 53-bit mantissa and the tiebreak silently rounds away.</li>
+<li><strong>Client-reported scores are the primary leaderboard exploit.</strong> The chapter is right that the score API must be reachable only by game servers; the moment a client can post its own score, the leaderboard measures packet-crafting skill. Server-side validation, plausibility checks (score rate per player) and anomaly detection on the top ranks are all part of the design.</li>
+<li><strong>Players with no score are absent from the set</strong>, so <code>ZREVRANK</code> returns nil rather than &quot;last&quot;. The API needs a defined answer for an unranked user.</li>
+<li><strong>Monthly rollover is a discontinuity.</strong> A new tournament means a new key, archiving the old set, and deciding exactly when the switch happens across timezones — plus what a player sees if they finish a match in the boundary second.</li>
+<li><strong>&quot;Real-time&quot; is a product claim, not a latency budget.</strong> Scores are visible within a round trip, but the <em>displayed</em> leaderboard is whatever the client last fetched. Caching the top 10 for a second is invisible to users and removes almost all read load; the honest statement is &quot;fresh within about a second&quot;, not &quot;real-time&quot;.</li>
+<li><strong>Large K is expensive in any sharded design.</strong> Top 10 is nine extra entries; top 10,000 across 16 shards is 160,000 entries fetched and discarded.</li>
+<li><strong>Serverless has a cold-start and a per-invocation cost.</strong> The Lambda design removes operational burden and adds latency variance on cold paths plus a cost model that scales with request count — fine at 500 QPS, worth re-examining at 250 K.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Answering a user's rank in better than <code>O(N)</code></td>
+<td>Sorted set over a skip list with per-pointer spans — <code>ZREVRANK</code> in <code>O(log N)</code></td>
+</tr>
+<tr>
+<td>Top 10</td>
+<td><code>ZREVRANGE 0 9</code>, cached for ~1 second</td>
+</tr>
+<tr>
+<td>Four players above and below</td>
+<td><code>ZREVRANK</code> then a <code>ZREVRANGE</code> on the surrounding offsets</td>
+</tr>
+<tr>
+<td>Incrementing a score</td>
+<td><code>ZINCRBY</code> — one <code>O(log N)</code> operation, no read-modify-write</td>
+</tr>
+<tr>
+<td>25 M players</td>
+<td>~3.25 GB in one Redis instance; no sharding required at stated scale</td>
+</tr>
+<tr>
+<td>Monthly tournaments</td>
+<td>A sorted set per tournament; bounded size and natural expiry</td>
+</tr>
+<tr>
+<td>Redis holding the only copy</td>
+<td>Durable score log as the source of truth; sorted set as a rebuildable view</td>
+</tr>
+<tr>
+<td>Surviving a restart</td>
+<td>AOF plus a replica, with 2× memory headroom for fork-based snapshots</td>
+</tr>
+<tr>
+<td>Fair tie-breaking</td>
+<td>Composite score packing a timestamp, within the 53-bit mantissa</td>
+</tr>
+<tr>
+<td>Rank at 500 M players</td>
+<td>Exact top-K in one small set, plus bucket-count histogram for approximate long-tail rank</td>
+</tr>
+<tr>
+<td>Cheating</td>
+<td>Score API restricted to game servers; server-side validation and rate plausibility checks</td>
+</tr>
+<tr>
+<td>User profile lookups for display</td>
+<td><code>user_id → user object</code> Redis hash in front of MySQL</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Which single requirement eliminates the relational solution, and why does scale not matter to that argument?</li>
+<li>Why is finding the rank of a player in 20-millionth place expensive, and why is top-10 cheap?</li>
+<li>Why doesn't a B-tree index give you position, and what does a sorted set maintain that provides it?</li>
+<li>Map all four functional requirements to Redis commands and give each one's complexity.</li>
+<li>Why a skip list rather than a balanced tree?</li>
+<li>A leaderboard is a single Redis key. What does that imply about Redis Cluster?</li>
+<li>What goes wrong when you range-partition by score — name both problems.</li>
+<li>How would you answer &quot;what rank am I?&quot; for 500 million players without an <code>O(N)</code> count?</li>
+<li>Why must Redis persistence be configured here when it would be optional for a cache?</li>
+<li>Why does a write-heavy Redis node need twice its dataset in memory?</li>
+<li>Two players have 500 points. Who ranks higher by default, and why is that a problem?</li>
+<li>How do you break ties by time, and what numeric limit constrains the trick?</li>
+<li>What is the single most important access-control rule in this design, and what happens without it?</li>
+<li>A player has never scored. What does <code>ZREVRANK</code> return, and what should the API say?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Rank</strong></td>
+<td>A player's position in the ordering — the operation this chapter exists to make cheap</td>
+</tr>
+<tr>
+<td><strong>Sorted set (ZSET)</strong></td>
+<td>Redis structure combining a hash map and a skip list, ordered by score</td>
+</tr>
+<tr>
+<td><strong>Skip list</strong></td>
+<td>Probabilistically balanced linked list with multi-level indexes giving <code>O(log N)</code> search</td>
+</tr>
+<tr>
+<td><strong>Span</strong></td>
+<td>The count of nodes a skip-list forward pointer skips; summing spans yields rank</td>
+</tr>
+<tr>
+<td><strong><code>ZINCRBY</code> / <code>ZREVRANGE</code> / <code>ZREVRANK</code></strong></td>
+<td>Increment a score; read a range by descending score; read a member's descending rank</td>
+</tr>
+<tr>
+<td><strong>Order-statistic structure</strong></td>
+<td>One that can report <em>how many</em> elements precede a given element</td>
+</tr>
+<tr>
+<td><strong>Composite score</strong></td>
+<td>Points packed with a timestamp into one numeric score for deterministic tie-breaking</td>
+</tr>
+<tr>
+<td><strong>Range vs hash partitioning</strong></td>
+<td>Splitting by score interval vs by hashed member; the former migrates users, the latter loses rank</td>
+</tr>
+<tr>
+<td><strong>Approximate rank</strong></td>
+<td>Score-bucket counters giving near-correct rank for the long tail at <code>O(buckets)</code></td>
+</tr>
+<tr>
+<td><strong>Materialised view</strong></td>
+<td>The leaderboard understood as derived state, rebuildable from a durable score log</td>
+</tr>
+<tr>
+<td><strong>AOF / RDB</strong></td>
+<td>Redis append-only log and point-in-time snapshot persistence modes</td>
+</tr>
+<tr>
+<td><strong>Copy-on-write fork</strong></td>
+<td>Snapshot mechanism whose memory cost rises with the write rate during the snapshot</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="06-key-value-store.html">Chapter 6 – Design A Key-Value Store</a> — what sits behind Redis conceptually, and the durability machinery this chapter needs.</li>
+<li><a href="21-ad-click-event-aggregation.html">Chapter 21 – Ad Click Event Aggregation</a> — raw events as the source of truth with aggregates as rebuildable views, which is the right way to think about this leaderboard.</li>
+<li><a href="11-news-feed-system.html">Chapter 11 – Design A News Feed System</a> — counter caches and atomic increments at a much larger write rate.</li>
+<li><a href="05-consistent-hashing.html#gotchas--failure-modes">Chapter 5 – Design Consistent Hashing</a> — why partitioning the leaderboard does not solve a hot key.</li>
+<li><a href="18-google-maps.html#improvement---adaptive-eta-and-rerouting">Chapter 18 – Design Google Maps</a> — the same &quot;approximate for the many, exact for the few&quot; instinct in a different domain.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,804 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 26: Payment System — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="26-payment-system">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 26 of 28</div>
+  <h1>Chapter 26: Payment System</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</a></li><li><a href="#step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap Up</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>We'll design a <strong>payment system</strong> in this chapter, which underpins all of modern <strong>e-commerce</strong>.</p>
+<p>A <strong>payment system</strong> is used to settle financial transactions, transferring monetary value.</p>
+<p><strong>The one-sentence version:</strong> at <strong>~11 transactions per second</strong> this is the lowest-throughput system in the book and comfortably the hardest, because money movement has two properties nothing else here has — <strong>it cannot be lost, and it cannot be undone.</strong> Combine that with the fact that the authoritative record lives in systems you do not control (the PSP, the card networks, the banks) and is only confirmed to you hours later, and the shape of the problem appears.</p>
+<p><strong>Two mechanisms do almost all of the work, and everything else is plumbing:</strong></p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Mechanism</th>
+<th>Job</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Idempotency keys</strong></td>
+<td>Make sure an operation that is retried is not <em>performed</em> twice</td>
+</tr>
+<tr>
+<td><strong>Reconciliation</strong></td>
+<td>Detect, after the fact, the cases where your records and reality diverged</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The second is the one worth internalising, because it is counter-intuitive. You cannot <em>prevent</em> inconsistency in a flow that spans your database, a third-party API and a bank — no transaction spans those systems, and no protocol will give you one. So reconciliation is not a safety net bolted on at the end; <strong>it is the correctness mechanism.</strong> The design accepts that it will sometimes be wrong and guarantees that it will find out and fix it.</p>
+<p>It is worth contrasting with <a href="21-ad-click-event-aggregation.html">Chapter 21</a>, which is also about money:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Ch 21 — Ad click aggregation</th>
+<th>Ch 26 — Payment system</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Throughput</td>
+<td>50,000 events/sec</td>
+<td><strong>11 transactions/sec</strong></td>
+</tr>
+<tr>
+<td>Operation</td>
+<td><strong>Counts</strong> money</td>
+<td><strong>Moves</strong> money</td>
+</tr>
+<tr>
+<td>Wrong answer</td>
+<td>Recompute from raw events</td>
+<td><strong>Cannot be recomputed</strong> — a charge happened</td>
+</tr>
+<tr>
+<td>Fix for an error</td>
+<td>Replay the pipeline</td>
+<td>A <em>new, compensating</em> transaction</td>
+</tr>
+<tr>
+<td>Authority</td>
+<td>Your batch job</td>
+<td>An external bank, hours later</td>
+</tr>
+</tbody>
+</table>
+</div>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-establish-design-scope">
+<h2 id="step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</h2>
+<ul>
+<li>C: What kind of payment system are we building?</li>
+<li>I: A payment backend for an e-commerce system, similar to Amazon.com. It handles everything related to money movement.</li>
+<li>C: What payment options are supported - Credit cards, PayPal, bank cards, etc?</li>
+<li>I: The system should support all these options in real life. For the purposes of the interview, we can use credit card payments.</li>
+<li>C: Do we handle credit card processing ourselves?</li>
+<li>I: No, we use a third-party provider like Stripe, Braintree, Square, etc.</li>
+<li>C: Do we store credit card data in our system?</li>
+<li>I: Due to compliance reasons, we do not store credit card data directly in our systems. We rely on third-party payment processors.</li>
+<li>C: Is the application global? Do we need to support different currencies and international payments?</li>
+<li>I: The application is global, but we assume only one currency is used for the purposes of the interview.</li>
+<li>C: How many payment transactions per day do we support?</li>
+<li>I: 1mil transactions per day.</li>
+<li>C: Do we need to support the payout flow to eg payout to payers each month?</li>
+<li>I: Yes, we need to support that</li>
+<li>C: Is there anything else I should pay attention to?</li>
+<li>I: We need to support reconciliations to fix any inconsistencies in communicating with internal and external systems.</li>
+</ul>
+<h3 id="functional-requirements"><strong>Functional requirements</strong></h3>
+<ul>
+<li>Pay-in flow - payment system receives money from customers on behalf of merchants</li>
+<li>Pay-out flow - payment system sends money to sellers around the world</li>
+</ul>
+<h3 id="non-functional-requirements"><strong>Non-functional requirements</strong></h3>
+<ul>
+<li>Reliability and fault-tolerance. Failed payments need to be carefully handled</li>
+<li>A reconciliation between internal and external systems needs to be setup.</li>
+</ul>
+<h3 id="back-of-the-envelope-estimation"><strong>Back-of-the-envelope estimation</strong></h3>
+<p>The system needs to process 1mil transactions per day, which is 10 transactions per second.</p>
+<p>This is not a high throughput for any database system, so it's not the focus of this interview.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Derivation</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transactions/sec</td>
+<td>1 M / 86,400</td>
+<td><strong>~11.6 TPS</strong></td>
+</tr>
+<tr>
+<td>Storage/day</td>
+<td>1 M × ~1 KB of payment and ledger records</td>
+<td>~1 GB/day</td>
+</tr>
+<tr>
+<td>Storage at 7-year regulatory retention</td>
+<td>1 GB × 365 × 7</td>
+<td><strong>~2.5 TB</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>So: eleven writes per second and a couple of terabytes. <strong>Saying out loud that the scale is irrelevant is the right opening move</strong>, because it redirects the interview to where the difficulty actually is — correctness, auditability and recovery — and it licenses the single most important design decision in the chapter: <strong>use a boring relational database with real ACID transactions.</strong> Nothing about this workload forces you off it, and everything about the requirements wants it.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>candidates who reach for sharding, NoSQL or eventual consistency here have misread the problem. The correct instinct is the opposite: take the strongest consistency guarantees available, because the volume never makes you pay for them.</p>
+</div>
+</section>
+<section id="step-2-propose-high-level-design-and-get-buy-in">
+<h2 id="step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</h2>
+<p>At a high-level, we have three actors, participating in money movement:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/26.%20Payment%20System/images/high-level-flow.png" alt="high-level-flow" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="pay-in-flow"><strong>Pay-in flow</strong></h3>
+<p>Here's the high-level overview of the pay-in flow:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/26.%20Payment%20System/images/payin-flow-high-level.png" alt="pay-in-flow-high-level" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Payment service - accepts payment events and coordinates the payment process. It typically also does a risk check using a third-party provider for AML violations or criminal activity.</li>
+<li>Payment executor - executes a single payment order via the Payment Service Provider (PSP). Payment events may contain several payment orders.</li>
+<li>Payment service provider (PSP) - moves money from one account to another, eg from buyer's credit card account to e-commerce site's bank account.</li>
+<li>Card schemes - organizations that process credit card operations, eg Visa MasterCard, etc.</li>
+<li>Ledger - keeps financial record of all payment transactions.</li>
+<li>Wallet - keeps the account balance for all merchants.</li>
+</ul>
+<p>Here's an example pay-in flow:</p>
+<ul>
+<li>user clicks &quot;place order&quot; and a payment event is sent to the payment service</li>
+<li>payment service stores the event in its database</li>
+<li>payment service calls the payment executor for all payment orders, part of that payment event</li>
+<li>payment executor stores the payment order in its database</li>
+<li>payment executor calls external PSP to process the credit card payment</li>
+<li>After the payment executor processes the payment, the payment service updates the wallet to record how much money the seller has</li>
+<li>wallet service stores updated balance information in its database</li>
+<li>payment service calls the ledger to record all money movements</li>
+</ul>
+<h3 id="apis-for-payment-service"><strong>APIs for payment service</strong></h3>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>POST /v1/payments
+{
+  &quot;buyer_info&quot;: {...},
+  &quot;checkout_id&quot;: &quot;some_id&quot;,
+  &quot;credit_card_info&quot;: {...},
+  &quot;payment_orders&quot;: [{...}, {...}, {...}]
+}
+</code></pre></div>
+<p>Example <code>payment_order</code>:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>{
+  &quot;seller_account&quot;: &quot;SELLER_IBAN&quot;,
+  &quot;amount&quot;: &quot;3.15&quot;,
+  &quot;currency&quot;: &quot;USD&quot;,
+  &quot;payment_order_id&quot;: &quot;globally_unique_payment_id&quot;
+}
+</code></pre></div>
+<p>Caveats:</p>
+<ul>
+<li>The <code>payment_order_id</code> is forwarded to the PSP to deduplicate payments, ie it is the idempotency key.</li>
+<li>The amount field is <code>string</code> as <code>double</code> is not appropriate for representing monetary values.</li>
+</ul>
+<p><strong>That second caveat is one line and deserves several, because using a float for money is the most common and most expensive bug in this domain.</strong> IEEE-754 binary floating point cannot represent most decimal fractions exactly — <code>0.1</code> is stored as a value very slightly above or below one tenth — so:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>0.1 + 0.2 == 0.30000000000000004     # not 0.3
+</code></pre></div>
+<p>Individually invisible; in aggregate, fatal. Sum a million transactions and the error accumulates into real discrepancies, and a double-entry ledger whose debits and credits differ by a fraction of a cent fails its own integrity check. Worse, the error is <em>inconsistent</em> — the same logical total computed in a different order gives a different answer, which makes reconciliation mismatches that cannot be explained or reproduced.</p>
+<p>The two correct representations:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>Example</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Integer minor units</strong></td>
+<td><code>$3.15</code> → <code>315</code> (cents)</td>
+<td>Exact, fast, the usual choice; the currency's exponent must travel with it (JPY has 0 decimals, BHD has 3)</td>
+</tr>
+<tr>
+<td><strong>Fixed-point decimal</strong></td>
+<td><code>DECIMAL(19,4)</code>, <code>BigDecimal</code></td>
+<td>Exact, handles more decimal places for FX rates and interest</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The amount is carried as a <strong>string</strong> across the API boundary precisely so that no JSON parser silently turns it into a double on the way through — the same hazard as 64-bit IDs in JavaScript from <a href="07-unique-id-generator.html#gotchas--failure-modes">Chapter 7</a>, with money instead of identifiers.</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>GET /v1/payments/{:id}
+</code></pre></div>
+<p>This endpoint returns the execution status of a single payment, based on the <code>payment_order_id</code>.</p>
+<h3 id="payment-service-data-model"><strong>Payment service data model</strong></h3>
+<p>We need to maintain two tables - <code>payment_events</code> and <code>payment_orders</code>.</p>
+<p>For payments, performance is typically not an important factor. Strong consistency, however, is.</p>
+<p>Other considerations for choosing the database:</p>
+<ul>
+<li>Strong market of DBAs to hire to administer the database</li>
+<li>Proven track-record where the database has been used by other big financial institutions</li>
+<li>Richness of supporting tools</li>
+<li>Traditional SQL over NoSQL/NewSQL for its ACID guarantees</li>
+</ul>
+<p>Here's what the <code>payment_events</code> table contains:</p>
+<ul>
+<li><code>checkout_id</code> - string, primary key</li>
+<li><code>buyer_info</code> - string (personal note - prob a foreign key to another table is more appropriate)</li>
+<li><code>seller_info</code> - string (personal note - same remark as above)</li>
+<li><code>credit_card_info</code> - depends on card provider</li>
+<li><code>is_payment_done</code> - boolean</li>
+</ul>
+<p>Here's what the <code>payment_orders</code> table contains:</p>
+<ul>
+<li><code>payment_order_id</code> - string, primary key</li>
+<li><code>buyer_account</code> - string</li>
+<li><code>amount</code> - string</li>
+<li><code>currency</code> - string</li>
+<li><code>checkout_id</code> - string, foreign key</li>
+<li><code>payment_order_status</code> - enum (<code>NOT_STARTED</code>, <code>EXECUTING</code>, <code>SUCCESS</code>, <code>FAILED</code>)</li>
+<li><code>ledger_updated</code> - boolean</li>
+<li><code>wallet_updated</code> - boolean</li>
+</ul>
+<p>Caveats:</p>
+<ul>
+<li>there are many payment orders, linked to a given payment event</li>
+<li>we don't need the <code>seller_info</code> for the pay-in flow. That's required on pay-out only</li>
+<li><code>ledger_updated</code> and <code>wallet_updated</code> are updated when the respective service is called to record the result of a payment</li>
+<li>payment transitions are managed by a background job, which checks updates of in-flight payments and triggers an alert if a payment is not processed in a reasonable timeframe</li>
+</ul>
+<p><strong>The <code>ledger_updated</code> and <code>wallet_updated</code> booleans are more interesting than they look: they are a persisted to-do list, and they are what make the whole flow resumable.</strong> A payment involves several side effects that cannot be performed in one transaction — call the PSP, update the wallet, post to the ledger — so a crash can happen between any two of them. Recording <em>which steps have completed</em> means the background job can pick up any payment, see exactly what remains, and finish it.</p>
+<p>That turns an unreliable multi-step process into a convergent one:</p>
+<figure class="mermaid-fig">
+<svg id="mmd-636d62f3b7b857e3" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="statediagram" style="max-width: 848.89px; background-color: transparent;" viewBox="0 0 848.8898315429688 673.1499633789062" role="graphics-document document" aria-roledescription="stateDiagram"><style>#mmd-636d62f3b7b857e3{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-636d62f3b7b857e3 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-636d62f3b7b857e3 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-636d62f3b7b857e3 .error-icon{fill:#f4f6f8;}#mmd-636d62f3b7b857e3 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-636d62f3b7b857e3 .edge-thickness-normal{stroke-width:1px;}#mmd-636d62f3b7b857e3 .edge-thickness-thick{stroke-width:3.5px;}#mmd-636d62f3b7b857e3 .edge-pattern-solid{stroke-dasharray:0;}#mmd-636d62f3b7b857e3 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-636d62f3b7b857e3 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-636d62f3b7b857e3 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-636d62f3b7b857e3 .marker{fill:#637381;stroke:#637381;}#mmd-636d62f3b7b857e3 .marker.cross{stroke:#637381;}#mmd-636d62f3b7b857e3 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-636d62f3b7b857e3 p{margin:0;}#mmd-636d62f3b7b857e3 defs [id$="-barbEnd"]{fill:#637381;stroke:#637381;}#mmd-636d62f3b7b857e3 g.stateGroup text{fill:#299a8d;stroke:none;font-size:10px;}#mmd-636d62f3b7b857e3 g.stateGroup text{fill:#161c24;stroke:none;font-size:10px;}#mmd-636d62f3b7b857e3 g.stateGroup .state-title{font-weight:bolder;fill:#161c24;}#mmd-636d62f3b7b857e3 g.stateGroup rect{fill:#f1f7f6;stroke:#299a8d;}#mmd-636d62f3b7b857e3 g.stateGroup line{stroke:#637381;stroke-width:1;}#mmd-636d62f3b7b857e3 .transition{stroke:#637381;stroke-width:1;fill:none;}#mmd-636d62f3b7b857e3 .stateGroup .composit{fill:#ffffff;border-bottom:1px;}#mmd-636d62f3b7b857e3 .stateGroup .alt-composit{fill:#e0e0e0;border-bottom:1px;}#mmd-636d62f3b7b857e3 .state-note{stroke:#e76f51;fill:#fcf4f2;}#mmd-636d62f3b7b857e3 .state-note text{fill:#161c24;stroke:none;font-size:10px;}#mmd-636d62f3b7b857e3 .stateLabel .box{stroke:none;stroke-width:0;fill:#f1f7f6;opacity:0.5;}#mmd-636d62f3b7b857e3 .edgeLabel .label rect{fill:#f1f7f6;opacity:0.5;}#mmd-636d62f3b7b857e3 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-636d62f3b7b857e3 .edgeLabel p{background-color:#ffffff;}#mmd-636d62f3b7b857e3 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-636d62f3b7b857e3 .edgeLabel .label text{fill:#161c24;}#mmd-636d62f3b7b857e3 .label div .edgeLabel{color:#161c24;}#mmd-636d62f3b7b857e3 .stateLabel text{fill:#161c24;font-size:10px;font-weight:bold;}#mmd-636d62f3b7b857e3 .node circle.state-start{fill:#637381;stroke:#637381;}#mmd-636d62f3b7b857e3 .node .fork-join{fill:#637381;stroke:#637381;}#mmd-636d62f3b7b857e3 .node circle.state-end{fill:#299a8d;stroke:#ffffff;stroke-width:1.5;}#mmd-636d62f3b7b857e3 .end-state-inner{fill:#ffffff;stroke-width:1.5;}#mmd-636d62f3b7b857e3 .node rect{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-636d62f3b7b857e3 .node polygon{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-636d62f3b7b857e3 [id$="-barbEnd"]{fill:#637381;}#mmd-636d62f3b7b857e3 .statediagram-cluster rect{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-636d62f3b7b857e3 .cluster-label,#mmd-636d62f3b7b857e3 .nodeLabel{color:#161c24;}#mmd-636d62f3b7b857e3 .statediagram-cluster rect.outer{rx:5px;ry:5px;}#mmd-636d62f3b7b857e3 .statediagram-state .divider{stroke:#299a8d;}#mmd-636d62f3b7b857e3 .statediagram-state .title-state{rx:5px;ry:5px;}#mmd-636d62f3b7b857e3 .statediagram-cluster.statediagram-cluster .inner{fill:#ffffff;}#mmd-636d62f3b7b857e3 .statediagram-cluster.statediagram-cluster-alt .inner{fill:#f4f6f8;}#mmd-636d62f3b7b857e3 .statediagram-cluster .inner{rx:0;ry:0;}#mmd-636d62f3b7b857e3 .statediagram-state rect.basic{rx:5px;ry:5px;}#mmd-636d62f3b7b857e3 .statediagram-state rect.divider{stroke-dasharray:10,10;fill:#f4f6f8;}#mmd-636d62f3b7b857e3 .note-edge{stroke-dasharray:5;}#mmd-636d62f3b7b857e3 .statediagram-note rect{fill:#fcf4f2;stroke:#e76f51;stroke-width:1px;rx:0;ry:0;}#mmd-636d62f3b7b857e3 .statediagram-note rect{fill:#fcf4f2;stroke:#e76f51;stroke-width:1px;rx:0;ry:0;}#mmd-636d62f3b7b857e3 .statediagram-note text{fill:#161c24;}#mmd-636d62f3b7b857e3 .statediagram-note .nodeLabel{color:#161c24;}#mmd-636d62f3b7b857e3 .statediagram .edgeLabel{color:red;}#mmd-636d62f3b7b857e3 [id$="-dependencyStart"],#mmd-636d62f3b7b857e3 [id$="-dependencyEnd"]{fill:#637381;stroke:#637381;stroke-width:1;}#mmd-636d62f3b7b857e3 .statediagramTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-636d62f3b7b857e3 [data-look="neo"].statediagram-cluster rect{fill:#f1f7f6;stroke:url(#mmd-636d62f3b7b857e3-gradient);stroke-width:1;}#mmd-636d62f3b7b857e3 [data-look="neo"].statediagram-cluster rect.outer{rx:5px;ry:5px;filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-636d62f3b7b857e3 .node .neo-node{stroke:#299a8d;}#mmd-636d62f3b7b857e3 [data-look="neo"].node rect,#mmd-636d62f3b7b857e3 [data-look="neo"].cluster rect,#mmd-636d62f3b7b857e3 [data-look="neo"].node polygon{stroke:url(#mmd-636d62f3b7b857e3-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-636d62f3b7b857e3 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-636d62f3b7b857e3 [data-look="neo"].node path{stroke:url(#mmd-636d62f3b7b857e3-gradient);stroke-width:1px;}#mmd-636d62f3b7b857e3 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-636d62f3b7b857e3 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-636d62f3b7b857e3 [data-look="neo"].node circle{stroke:url(#mmd-636d62f3b7b857e3-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-636d62f3b7b857e3 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-636d62f3b7b857e3 [data-look="neo"].icon-shape .icon{fill:url(#mmd-636d62f3b7b857e3-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-636d62f3b7b857e3 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-636d62f3b7b857e3-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-636d62f3b7b857e3 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><defs><marker id="mmd-636d62f3b7b857e3_stateDiagram-barbEnd" refX="19" refY="7" markerWidth="20" markerHeight="14" markerUnits="userSpaceOnUse" orient="auto"><path d="M 19,7 L9,13 L14,7 L9,1 Z"/></marker></defs><g class="root"><g class="clusters"><g class="note-cluster" id="mmd-636d62f3b7b857e3-state-EXECUTING----parent-8"><rect x="8" y="330" width="258.28125" height="137" fill="none"/></g></g><g class="edgePaths"><path d="M525.328,22L525.328,27.917C525.328,33.833,525.328,45.667,525.328,57.5C525.328,69.333,525.328,81.167,525.328,87.083L525.328,93" id="mmd-636d62f3b7b857e3-edge0" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge0" data-points="W3sieCI6NTI1LjMyODEyNSwieSI6MjJ9LHsieCI6NTI1LjMyODEyNSwieSI6NTcuNX0seyJ4Ijo1MjUuMzI4MTI1LCJ5Ijo5M31d" data-look="classic" marker-end="url(#mmd-636d62f3b7b857e3_stateDiagram-barbEnd)"/><path d="M525.328,130L525.328,137.667C525.328,145.333,525.328,160.667,525.328,176C525.328,191.333,525.328,206.667,525.328,214.333L525.328,222" id="mmd-636d62f3b7b857e3-edge1" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge1" data-points="W3sieCI6NTI1LjMyODEyNSwieSI6MTMwfSx7IngiOjUyNS4zMjgxMjUsInkiOjE3Nn0seyJ4Ijo1MjUuMzI4MTI1LCJ5IjoyMjJ9XQ==" data-look="classic" marker-end="url(#mmd-636d62f3b7b857e3_stateDiagram-barbEnd)"/><path d="M572.648,252.354L600.689,259.378C628.729,266.403,684.809,280.451,712.85,293.392C740.89,306.333,740.89,318.167,740.89,332.417C740.89,346.667,740.89,363.333,740.89,371.667L740.89,380" id="mmd-636d62f3b7b857e3-edge2" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge2" data-points="W3sieCI6NTcyLjY0ODQzNzUsInkiOjI1Mi4zNTQxMzExMDM2NTI1fSx7IngiOjc0MC44ODk4NDM3NTA3NDUxLCJ5IjoyOTQuNX0seyJ4Ijo3NDAuODg5ODQzNzUwNzQ1MSwieSI6MzMwfSx7IngiOjc0MC44ODk4NDM3NTA3NDUxLCJ5IjozODB9XQ==" data-look="classic" marker-end="url(#mmd-636d62f3b7b857e3_stateDiagram-barbEnd)"/><path d="M478.008,253.746L453.743,260.539C429.479,267.331,380.951,280.915,356.686,293.624C332.422,306.333,332.422,318.167,332.422,332.417C332.422,346.667,332.422,363.333,332.422,371.667L332.422,380" id="mmd-636d62f3b7b857e3-edge3" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge3" data-points="W3sieCI6NDc4LjAwNzgxMjUsInkiOjI1My43NDYzMTQ1OTU4MjA1fSx7IngiOjMzMi40MjE4NzUsInkiOjI5NC41fSx7IngiOjMzMi40MjE4NzUsInkiOjMzMH0seyJ4IjozMzIuNDIxODc1LCJ5IjozODB9XQ==" data-look="classic" marker-end="url(#mmd-636d62f3b7b857e3_stateDiagram-barbEnd)"/><path d="M332.422,417L332.422,425.333C332.422,433.667,332.422,450.333,332.422,466.333C332.422,482.333,332.422,497.667,332.422,512.999C332.422,528.331,332.422,543.662,332.422,551.328L332.422,558.993" id="mmd-636d62f3b7b857e3-edge7" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge7" data-points="W3sieCI6MzMyLjQyMTg3NSwieSI6NDE3fSx7IngiOjMzMi40MjE4NzUsInkiOjQ2N30seyJ4IjozMzIuNDIxODc1LCJ5Ijo1MTN9LHsieCI6MzMyLjQyMTg3NSwieSI6NTU4Ljk5MzM1MzM2Njg1MTh9XQ==" data-look="classic" marker-end="url(#mmd-636d62f3b7b857e3_stateDiagram-barbEnd)"/><path d="M478.008,247.083L421.197,254.986C364.385,262.888,250.763,278.694,193.952,292.514C137.141,306.333,137.141,318.167,137.141,328.25C137.141,338.333,137.141,346.667,137.141,350.833L137.141,355" id="mmd-636d62f3b7b857e3-EXECUTING-EXECUTING----note-8" class="edge-thickness-normal edge-pattern-solid transition note-edge" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="EXECUTING-EXECUTING----note-8" data-points="W3sieCI6NDc4LjAwNzgxMjUsInkiOjI0Ny4wODI2MzU2NDY0MzM3NH0seyJ4IjoxMzcuMTQwNjI1LCJ5IjoyOTQuNX0seyJ4IjoxMzcuMTQwNjI1LCJ5IjozMzB9LHsieCI6MTM3LjE0MDYyNSwieSI6MzU1fV0=" data-look="classic"/><path d="M508.85,259L505.287,263C501.724,267,494.598,275,503.654,279C512.709,283,537.947,283,547.003,279C556.058,275,548.933,267,545.37,263L541.807,259" id="mmd-636d62f3b7b857e3-edge4" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge4" data-points="W3sieCI6NTA4Ljg0OTUyMjA1ODgyMzU0LCJ5IjoyNTl9LHsieCI6NDg3LjQ3MTg3NSwieSI6MjgzfSx7IngiOjU2My4xODQzNzUsInkiOjI4M30seyJ4Ijo1NDEuODA2NzI3OTQxMTc2NSwieSI6MjU5fV0=" data-look="classic" marker-end="url(#mmd-636d62f3b7b857e3_stateDiagram-barbEnd)"/><path d="M726.887,417L723.859,421C720.832,425,714.776,433,722.472,437C730.167,441,751.613,441,759.308,437C767.003,433,760.948,425,757.92,421L754.893,417" id="mmd-636d62f3b7b857e3-edge6" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge6" data-points="W3sieCI6NzI2Ljg4Njk3NjEwMzY4NjMsInkiOjQxN30seyJ4Ijo3MDguNzIxMDkzNzUwNzQ1LCJ5Ijo0NDF9LHsieCI6NzczLjA1ODU5Mzc1MDc0NTEsInkiOjQ0MX0seyJ4Ijo3NTQuODkyNzExMzk3ODAzOSwieSI6NDE3fV0=" data-look="classic" marker-end="url(#mmd-636d62f3b7b857e3_stateDiagram-barbEnd)"/></g><g class="edgeLabels"><g class="edgeLabel" transform="translate(525.328125, 57.5)"><g class="label" data-id="edge0" transform="translate(-78.2421875, -10.5)"><foreignObject width="156.484375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>payment order recorded</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(525.328125, 176)"><g class="label" data-id="edge1" transform="translate(-100, -21)"><foreignObject width="200" height="42"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="edgeLabel"><p>call PSP (with idempotency key)</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(740.8898437507451, 294.5)"><g class="label" data-id="edge2" transform="translate(-43.3125, -10.5)"><foreignObject width="86.625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>PSP confirms</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(332.421875, 294.5)"><g class="label" data-id="edge3" transform="translate(-41.890625, -10.5)"><foreignObject width="83.78125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>PSP declines</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(525.328125, 297.5)"><g class="label" data-id="edge4" transform="translate(-72.90625, -10.5)"><foreignObject width="145.8125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>retry — safe, same key</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(740.8898437507451, 466)"><g class="label" data-id="edge6" transform="translate(-100, -21)"><foreignObject width="200" height="42"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="edgeLabel"><p>background job sets ledger_updated</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(332.421875, 513)"><g class="label" data-id="edge7" transform="translate(-100, -21)"><foreignObject width="200" height="42"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="edgeLabel"><p>retry queue or dead letter queue</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="EXECUTING-EXECUTING----note-8" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-636d62f3b7b857e3-state-root_start-0" data-look="classic" transform="translate(525.328125, 15)"><circle class="state-start" r="7" width="14" height="14"/></g><g class="node  statediagram-state" id="mmd-636d62f3b7b857e3-state-NOT_STARTED-1" data-look="classic" transform="translate(525.328125, 111.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-56.9765625" y="-18.5" width="113.953125" height="37"/><g class="label" style="" transform="translate(-48.9765625, -10.5)"><rect/><foreignObject width="97.953125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>NOT_STARTED</p></span></div></foreignObject></g></g><g class="node  statediagram-state" id="mmd-636d62f3b7b857e3-state-EXECUTING-8" data-look="classic" transform="translate(525.328125, 240.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-47.3203125" y="-18.5" width="94.640625" height="37"/><g class="label" style="" transform="translate(-39.3203125, -10.5)"><rect/><foreignObject width="78.640625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>EXECUTING</p></span></div></foreignObject></g></g><g class="node  statediagram-state" id="mmd-636d62f3b7b857e3-state-SUCCESS-6" data-look="classic" transform="translate(740.8898437507451, 398.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-40.2109375" y="-18.5" width="80.421875" height="37"/><g class="label" style="" transform="translate(-32.2109375, -10.5)"><rect/><foreignObject width="64.421875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>SUCCESS</p></span></div></foreignObject></g></g><g class="node  statediagram-state" id="mmd-636d62f3b7b857e3-state-FAILED-7" data-look="classic" transform="translate(332.421875, 398.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-31.140625" y="-18.5" width="62.28125" height="37"/><g class="label" style="" transform="translate(-23.140625, -10.5)"><rect/><foreignObject width="46.28125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>FAILED</p></span></div></foreignObject></g></g><g class="node default" id="mmd-636d62f3b7b857e3-state-root_end-7" data-look="classic" transform="translate(332.421875, 566)"><g class="outer-path"><path d="M7 0 C7 0.40517908122283747, 6.964012880168563 0.816513743121899, 6.893654271085456 1.2155372436685123 C6.823295662002349 1.6145607442151257, 6.716427752933756 2.013397210557766, 6.5778483455013586 2.394141003279681 C6.439268938068961 2.7748847960015954, 6.26476736710249 3.149104622578984, 6.062177826491071 3.4999999999999996 C5.859588285879653 3.8508953774210153, 5.622755194947063 4.189128084166967, 5.362311101832846 4.499513267805774 C5.10186700871863 4.809898451444582, 4.809898451444583 5.10186700871863, 4.499513267805775 5.362311101832846 C4.189128084166968 5.622755194947063, 3.8508953774210166 5.859588285879652, 3.500000000000001 6.06217782649107 C3.149104622578985 6.264767367102489, 2.7748847960015963 6.439268938068961, 2.3941410032796817 6.5778483455013586 C2.013397210557767 6.716427752933756, 1.6145607442151264 6.823295662002349, 1.2155372436685128 6.893654271085456 C0.8165137431218992 6.964012880168563, 0.4051790812228379 7, 4.286263797015736e-16 7 C-0.405179081222837 7, -0.8165137431218985 6.964012880168563, -1.2155372436685121 6.893654271085456 C-1.6145607442151257 6.823295662002349, -2.0133972105577667 6.716427752933756, -2.394141003279681 6.5778483455013586 C-2.774884796001595 6.439268938068961, -3.149104622578983 6.26476736710249, -3.4999999999999982 6.062177826491071 C-3.8508953774210135 5.859588285879653, -4.189128084166966 5.6227551949470636, -4.499513267805773 5.362311101832848 C-4.809898451444581 5.101867008718632, -5.101867008718628 4.809898451444586, -5.3623111018328435 4.499513267805779 C-5.622755194947059 4.189128084166971, -5.859588285879649 3.8508953774210206, -6.062177826491068 3.5000000000000053 C-6.264767367102486 3.14910462257899, -6.439268938068958 2.774884796001602, -6.577848345501356 2.394141003279688 C-6.716427752933754 2.0133972105577738, -6.823295662002347 1.614560744215134, -6.893654271085454 1.215537243668521 C-6.9640128801685615 0.816513743121908, -6.999999999999999 0.4051790812228472, -7 1.0183126166254463e-14 C-7.000000000000001 -0.40517908122282686, -6.964012880168565 -0.8165137431218878, -6.893654271085459 -1.215537243668501 C-6.823295662002352 -1.6145607442151142, -6.716427752933759 -2.0133972105577542, -6.577848345501363 -2.394141003279669 C-6.439268938068967 -2.7748847960015834, -6.264767367102496 -3.149104622578972, -6.062177826491078 -3.4999999999999876 C-5.859588285879661 -3.8508953774210033, -5.6227551949470715 -4.1891280841669545, -5.362311101832856 -4.499513267805763 C-5.10186700871864 -4.809898451444571, -4.809898451444594 -5.10186700871862, -4.499513267805787 -5.362311101832836 C-4.189128084166979 -5.622755194947053, -3.850895377421028 -5.859588285879643, -3.5000000000000133 -6.062177826491062 C-3.1491046225789985 -6.264767367102482, -2.774884796001611 -6.439268938068954, -2.3941410032796973 -6.577848345501353 C-2.0133972105577835 -6.716427752933752, -1.6145607442151435 -6.823295662002345, -1.2155372436685306 -6.893654271085453 C-0.8165137431219176 -6.9640128801685615, -0.40517908122285695 -6.999999999999999, -1.9937625952807352e-14 -7 C0.4051790812228171 -7.000000000000001, 0.8165137431218781 -6.964012880168565, 1.2155372436684913 -6.89365427108546 C1.6145607442151044 -6.823295662002354, 2.013397210557745 -6.716427752933763, 2.3941410032796595 -6.5778483455013665 C2.774884796001574 -6.43926893806897, 3.149104622578963 -6.2647673671025, 3.499999999999979 -6.062177826491083 C3.8508953774209953 -5.859588285879665, 4.189128084166947 -5.622755194947077, 4.499513267805756 -5.362311101832862 C4.809898451444564 -5.1018670087186475, 5.101867008718613 -4.809898451444602, 5.362311101832829 -4.499513267805796 C5.622755194947046 -4.189128084166989, 5.859588285879637 -3.8508953774210393, 6.062177826491056 -3.500000000000025 C6.2647673671024755 -3.1491046225790105, 6.439268938068949 -2.774884796001623, 6.577848345501348 -2.3941410032797092 C6.716427752933747 -2.0133972105577955, 6.823295662002342 -1.6145607442151562, 6.893654271085451 -1.2155372436685434 C6.96401288016856 -0.8165137431219307, 6.982275711847575 -0.2025895406114567, 7 -3.2800750208310675e-14 C7.017724288152425 0.2025895406113911, 7.017724288152424 -0.2025895406114242, 7 0" stroke="none" stroke-width="0" fill="#f1f7f6" style=""/><path d="M7 0 C7 0.40517908122283747, 6.964012880168563 0.816513743121899, 6.893654271085456 1.2155372436685123 C6.823295662002349 1.6145607442151257, 6.716427752933756 2.013397210557766, 6.5778483455013586 2.394141003279681 C6.439268938068961 2.7748847960015954, 6.26476736710249 3.149104622578984, 6.062177826491071 3.4999999999999996 C5.859588285879653 3.8508953774210153, 5.622755194947063 4.189128084166967, 5.362311101832846 4.499513267805774 C5.10186700871863 4.809898451444582, 4.809898451444583 5.10186700871863, 4.499513267805775 5.362311101832846 C4.189128084166968 5.622755194947063, 3.8508953774210166 5.859588285879652, 3.500000000000001 6.06217782649107 C3.149104622578985 6.264767367102489, 2.7748847960015963 6.439268938068961, 2.3941410032796817 6.5778483455013586 C2.013397210557767 6.716427752933756, 1.6145607442151264 6.823295662002349, 1.2155372436685128 6.893654271085456 C0.8165137431218992 6.964012880168563, 0.4051790812228379 7, 4.286263797015736e-16 7 C-0.405179081222837 7, -0.8165137431218985 6.964012880168563, -1.2155372436685121 6.893654271085456 C-1.6145607442151257 6.823295662002349, -2.0133972105577667 6.716427752933756, -2.394141003279681 6.5778483455013586 C-2.774884796001595 6.439268938068961, -3.149104622578983 6.26476736710249, -3.4999999999999982 6.062177826491071 C-3.8508953774210135 5.859588285879653, -4.189128084166966 5.6227551949470636, -4.499513267805773 5.362311101832848 C-4.809898451444581 5.101867008718632, -5.101867008718628 4.809898451444586, -5.3623111018328435 4.499513267805779 C-5.622755194947059 4.189128084166971, -5.859588285879649 3.8508953774210206, -6.062177826491068 3.5000000000000053 C-6.264767367102486 3.14910462257899, -6.439268938068958 2.774884796001602, -6.577848345501356 2.394141003279688 C-6.716427752933754 2.0133972105577738, -6.823295662002347 1.614560744215134, -6.893654271085454 1.215537243668521 C-6.9640128801685615 0.816513743121908, -6.999999999999999 0.4051790812228472, -7 1.0183126166254463e-14 C-7.000000000000001 -0.40517908122282686, -6.964012880168565 -0.8165137431218878, -6.893654271085459 -1.215537243668501 C-6.823295662002352 -1.6145607442151142, -6.716427752933759 -2.0133972105577542, -6.577848345501363 -2.394141003279669 C-6.439268938068967 -2.7748847960015834, -6.264767367102496 -3.149104622578972, -6.062177826491078 -3.4999999999999876 C-5.859588285879661 -3.8508953774210033, -5.6227551949470715 -4.1891280841669545, -5.362311101832856 -4.499513267805763 C-5.10186700871864 -4.809898451444571, -4.809898451444594 -5.10186700871862, -4.499513267805787 -5.362311101832836 C-4.189128084166979 -5.622755194947053, -3.850895377421028 -5.859588285879643, -3.5000000000000133 -6.062177826491062 C-3.1491046225789985 -6.264767367102482, -2.774884796001611 -6.439268938068954, -2.3941410032796973 -6.577848345501353 C-2.0133972105577835 -6.716427752933752, -1.6145607442151435 -6.823295662002345, -1.2155372436685306 -6.893654271085453 C-0.8165137431219176 -6.9640128801685615, -0.40517908122285695 -6.999999999999999, -1.9937625952807352e-14 -7 C0.4051790812228171 -7.000000000000001, 0.8165137431218781 -6.964012880168565, 1.2155372436684913 -6.89365427108546 C1.6145607442151044 -6.823295662002354, 2.013397210557745 -6.716427752933763, 2.3941410032796595 -6.5778483455013665 C2.774884796001574 -6.43926893806897, 3.149104622578963 -6.2647673671025, 3.499999999999979 -6.062177826491083 C3.8508953774209953 -5.859588285879665, 4.189128084166947 -5.622755194947077, 4.499513267805756 -5.362311101832862 C4.809898451444564 -5.1018670087186475, 5.101867008718613 -4.809898451444602, 5.362311101832829 -4.499513267805796 C5.622755194947046 -4.189128084166989, 5.859588285879637 -3.8508953774210393, 6.062177826491056 -3.500000000000025 C6.2647673671024755 -3.1491046225790105, 6.439268938068949 -2.774884796001623, 6.577848345501348 -2.3941410032797092 C6.716427752933747 -2.0133972105577955, 6.823295662002342 -1.6145607442151562, 6.893654271085451 -1.2155372436685434 C6.96401288016856 -0.8165137431219307, 6.982275711847575 -0.2025895406114567, 7 -3.2800750208310675e-14 C7.017724288152425 0.2025895406113911, 7.017724288152424 -0.2025895406114242, 7 0" stroke="#637381" stroke-width="2" fill="none" stroke-dasharray="0 0" style=""/><g><path d="M2.5 0 C2.5 0.14470681472244193, 2.487147457203058 0.29161205111496386, 2.46201938253052 0.4341204441673258 C2.436891307857982 0.5766288372196877, 2.3987241974763416 0.7190704323420595, 2.3492315519647713 0.8550503583141718 C2.299738906453201 0.991030284286284, 2.2374169168223177 1.124680222349637, 2.165063509461097 1.2499999999999998 C2.092710102099876 1.3753197776503625, 2.0081268553382365 1.496117172916774, 1.915111107797445 1.6069690242163481 C1.8220953602566536 1.7178208755159223, 1.7178208755159226 1.8220953602566536, 1.6069690242163484 1.915111107797445 C1.4961171729167742 2.0081268553382365, 1.375319777650363 2.0927101020998755, 1.2500000000000002 2.1650635094610964 C1.1246802223496375 2.2374169168223172, 0.9910302842862845 2.2997389064532, 0.8550503583141721 2.349231551964771 C0.7190704323420597 2.3987241974763416, 0.576628837219688 2.436891307857982, 0.43412044416732604 2.46201938253052 C0.291612051114964 2.487147457203058, 0.14470681472244212 2.5, 1.5308084989341916e-16 2.5 C-0.1447068147224418 2.5, -0.2916120511149638 2.487147457203058, -0.43412044416732576 2.46201938253052 C-0.5766288372196877 2.436891307857982, -0.7190704323420595 2.3987241974763416, -0.8550503583141718 2.3492315519647713 C-0.991030284286284 2.299738906453201, -1.124680222349637 2.2374169168223177, -1.2499999999999996 2.165063509461097 C-1.375319777650362 2.092710102099876, -1.4961171729167733 2.008126855338237, -1.6069690242163475 1.9151111077974459 C-1.7178208755159217 1.8220953602566548, -1.822095360256653 1.7178208755159234, -1.9151111077974443 1.6069690242163495 C-2.0081268553382357 1.4961171729167755, -2.0927101020998746 1.3753197776503645, -2.1650635094610955 1.250000000000002 C-2.2374169168223164 1.1246802223496395, -2.2997389064531992 0.9910302842862865, -2.34923155196477 0.8550503583141743 C-2.3987241974763407 0.7190704323420621, -2.436891307857981 0.5766288372196907, -2.4620193825305194 0.434120444167329 C-2.487147457203058 0.29161205111496724, -2.5 0.14470681472244545, -2.5 3.636830773662308e-15 C-2.5 -0.14470681472243818, -2.4871474572030587 -0.2916120511149599, -2.4620193825305208 -0.4341204441673218 C-2.436891307857983 -0.5766288372196837, -2.398724197476343 -0.7190704323420553, -2.3492315519647726 -0.8550503583141675 C-2.2997389064532023 -0.9910302842862798, -2.23741691682232 -1.1246802223496328, -2.165063509461099 -1.2499999999999956 C-2.092710102099878 -1.3753197776503583, -2.00812685533824 -1.4961171729167695, -1.9151111077974488 -1.606969024216344 C-1.8220953602566576 -1.7178208755159183, -1.7178208755159263 -1.82209536025665, -1.6069690242163523 -1.9151111077974416 C-1.4961171729167784 -2.0081268553382334, -1.3753197776503672 -2.0927101020998724, -1.2500000000000047 -2.1650635094610937 C-1.1246802223496422 -2.237416916822315, -0.9910302842862897 -2.299738906453198, -0.8550503583141776 -2.3492315519647686 C-0.7190704323420656 -2.3987241974763394, -0.5766288372196942 -2.4368913078579806, -0.43412044416733236 -2.462019382530519 C-0.29161205111497057 -2.4871474572030574, -0.1447068147224489 -2.4999999999999996, -7.120580697431198e-15 -2.5 C0.14470681472243463 -2.5000000000000004, 0.29161205111495647 -2.487147457203059, 0.4341204441673183 -2.4620193825305217 C0.5766288372196802 -2.436891307857984, 0.7190704323420518 -2.3987241974763442, 0.8550503583141642 -2.349231551964774 C0.9910302842862766 -2.2997389064532037, 1.1246802223496295 -2.2374169168223212, 1.2499999999999925 -2.165063509461101 C1.3753197776503554 -2.0927101020998804, 1.4961171729167668 -2.008126855338242, 1.6069690242163412 -1.915111107797451 C1.7178208755159157 -1.82209536025666, 1.8220953602566472 -1.7178208755159294, 1.915111107797439 -1.6069690242163557 C2.0081268553382308 -1.496117172916782, 2.09271010209987 -1.3753197776503712, 2.1650635094610915 -1.2500000000000089 C2.237416916822313 -1.1246802223496466, 2.299738906453196 -0.9910302842862939, 2.3492315519647673 -0.855050358314182 C2.3987241974763385 -0.71907043234207, 2.4368913078579792 -0.5766288372196986, 2.462019382530518 -0.4341204441673369 C2.487147457203057 -0.29161205111497523, 2.4936698970884197 -0.07235340736123454, 2.5 -1.1714553645825241e-14 C2.5063301029115803 0.07235340736121111, 2.50633010291158 -0.07235340736122292, 2.5 0" stroke="none" stroke-width="0" fill="#299a8d" style=""/><path d="M2.5 0 C2.5 0.14470681472244193, 2.487147457203058 0.29161205111496386, 2.46201938253052 0.4341204441673258 C2.436891307857982 0.5766288372196877, 2.3987241974763416 0.7190704323420595, 2.3492315519647713 0.8550503583141718 C2.299738906453201 0.991030284286284, 2.2374169168223177 1.124680222349637, 2.165063509461097 1.2499999999999998 C2.092710102099876 1.3753197776503625, 2.0081268553382365 1.496117172916774, 1.915111107797445 1.6069690242163481 C1.8220953602566536 1.7178208755159223, 1.7178208755159226 1.8220953602566536, 1.6069690242163484 1.915111107797445 C1.4961171729167742 2.0081268553382365, 1.375319777650363 2.0927101020998755, 1.2500000000000002 2.1650635094610964 C1.1246802223496375 2.2374169168223172, 0.9910302842862845 2.2997389064532, 0.8550503583141721 2.349231551964771 C0.7190704323420597 2.3987241974763416, 0.576628837219688 2.436891307857982, 0.43412044416732604 2.46201938253052 C0.291612051114964 2.487147457203058, 0.14470681472244212 2.5, 1.5308084989341916e-16 2.5 C-0.1447068147224418 2.5, -0.2916120511149638 2.487147457203058, -0.43412044416732576 2.46201938253052 C-0.5766288372196877 2.436891307857982, -0.7190704323420595 2.3987241974763416, -0.8550503583141718 2.3492315519647713 C-0.991030284286284 2.299738906453201, -1.124680222349637 2.2374169168223177, -1.2499999999999996 2.165063509461097 C-1.375319777650362 2.092710102099876, -1.4961171729167733 2.008126855338237, -1.6069690242163475 1.9151111077974459 C-1.7178208755159217 1.8220953602566548, -1.822095360256653 1.7178208755159234, -1.9151111077974443 1.6069690242163495 C-2.0081268553382357 1.4961171729167755, -2.0927101020998746 1.3753197776503645, -2.1650635094610955 1.250000000000002 C-2.2374169168223164 1.1246802223496395, -2.2997389064531992 0.9910302842862865, -2.34923155196477 0.8550503583141743 C-2.3987241974763407 0.7190704323420621, -2.436891307857981 0.5766288372196907, -2.4620193825305194 0.434120444167329 C-2.487147457203058 0.29161205111496724, -2.5 0.14470681472244545, -2.5 3.636830773662308e-15 C-2.5 -0.14470681472243818, -2.4871474572030587 -0.2916120511149599, -2.4620193825305208 -0.4341204441673218 C-2.436891307857983 -0.5766288372196837, -2.398724197476343 -0.7190704323420553, -2.3492315519647726 -0.8550503583141675 C-2.2997389064532023 -0.9910302842862798, -2.23741691682232 -1.1246802223496328, -2.165063509461099 -1.2499999999999956 C-2.092710102099878 -1.3753197776503583, -2.00812685533824 -1.4961171729167695, -1.9151111077974488 -1.606969024216344 C-1.8220953602566576 -1.7178208755159183, -1.7178208755159263 -1.82209536025665, -1.6069690242163523 -1.9151111077974416 C-1.4961171729167784 -2.0081268553382334, -1.3753197776503672 -2.0927101020998724, -1.2500000000000047 -2.1650635094610937 C-1.1246802223496422 -2.237416916822315, -0.9910302842862897 -2.299738906453198, -0.8550503583141776 -2.3492315519647686 C-0.7190704323420656 -2.3987241974763394, -0.5766288372196942 -2.4368913078579806, -0.43412044416733236 -2.462019382530519 C-0.29161205111497057 -2.4871474572030574, -0.1447068147224489 -2.4999999999999996, -7.120580697431198e-15 -2.5 C0.14470681472243463 -2.5000000000000004, 0.29161205111495647 -2.487147457203059, 0.4341204441673183 -2.4620193825305217 C0.5766288372196802 -2.436891307857984, 0.7190704323420518 -2.3987241974763442, 0.8550503583141642 -2.349231551964774 C0.9910302842862766 -2.2997389064532037, 1.1246802223496295 -2.2374169168223212, 1.2499999999999925 -2.165063509461101 C1.3753197776503554 -2.0927101020998804, 1.4961171729167668 -2.008126855338242, 1.6069690242163412 -1.915111107797451 C1.7178208755159157 -1.82209536025666, 1.8220953602566472 -1.7178208755159294, 1.915111107797439 -1.6069690242163557 C2.0081268553382308 -1.496117172916782, 2.09271010209987 -1.3753197776503712, 2.1650635094610915 -1.2500000000000089 C2.237416916822313 -1.1246802223496466, 2.299738906453196 -0.9910302842862939, 2.3492315519647673 -0.855050358314182 C2.3987241974763385 -0.71907043234207, 2.4368913078579792 -0.5766288372196986, 2.462019382530518 -0.4341204441673369 C2.487147457203057 -0.29161205111497523, 2.4936698970884197 -0.07235340736123454, 2.5 -1.1714553645825241e-14 C2.5063301029115803 0.07235340736121111, 2.50633010291158 -0.07235340736122292, 2.5 0" stroke="#299a8d" stroke-width="2" fill="none" stroke-dasharray="0 0" style=""/></g></g></g><g class="node statediagram-note" id="mmd-636d62f3b7b857e3-state-EXECUTING----note-8" data-look="classic" transform="translate(137.140625, 398.5)"><g class="basic label-container outer-path"><path d="M-94.140625 -43.5 L94.140625 -43.5 L94.140625 43.5 L-94.140625 43.5" stroke="none" stroke-width="0" fill="#fcf4f2" style=""/><path d="M-94.140625 -43.5 C-53.8602723697153 -43.5, -13.579919739430593 -43.5, 94.140625 -43.5 M-94.140625 -43.5 C-27.62884201164421 -43.5, 38.88294097671158 -43.5, 94.140625 -43.5 M94.140625 -43.5 C94.140625 -19.873200546934985, 94.140625 3.75359890613003, 94.140625 43.5 M94.140625 -43.5 C94.140625 -18.727465106477048, 94.140625 6.045069787045904, 94.140625 43.5 M94.140625 43.5 C40.969497695066266 43.5, -12.201629609867467 43.5, -94.140625 43.5 M94.140625 43.5 C19.570325223900895 43.5, -54.99997455219821 43.5, -94.140625 43.5 M-94.140625 43.5 C-94.140625 12.110618919518707, -94.140625 -19.278762160962586, -94.140625 -43.5 M-94.140625 43.5 C-94.140625 12.846332711213861, -94.140625 -17.807334577572277, -94.140625 -43.5" stroke="#e76f51" stroke-width="1.3" fill="none" stroke-dasharray="0 0" style=""/></g><g class="label noteLabel" style="" transform="translate(-82.140625, -31.5)"><rect/><foreignObject width="164.28125" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>stuck here too long =<br />alert; status unknown,<br />reconcile against the PSP</p></span></div></foreignObject></g></g><g class="label edgeLabel" id="EXECUTING---EXECUTING---1" transform="translate(525.328125, 398.5)"><rect width="0.1" height="0.1"/><g class="label" style="" transform="translate(0, 0)"><rect/><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 10px; text-align: center;"><span class="nodeLabel"></span></div></foreignObject></g></g><g class="label edgeLabel" id="EXECUTING---EXECUTING---2" transform="translate(571.78125, 566)"><rect width="0.1" height="0.1"/><g class="label" style="" transform="translate(0, 0)"><rect/><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 10px; text-align: center;"><span class="nodeLabel"></span></div></foreignObject></g></g><g class="label edgeLabel" id="SUCCESS---SUCCESS---1" transform="translate(680.8898437507451, 566)"><rect width="0.1" height="0.1"/><g class="label" style="" transform="translate(0, 0)"><rect/><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 10px; text-align: center;"><span class="nodeLabel"></span></div></foreignObject></g></g><g class="label edgeLabel" id="SUCCESS---SUCCESS---2" transform="translate(740.8898437507451, 665.0500000007451)"><rect width="0.1" height="0.1"/><g class="label" style="" transform="translate(0, 0)"><rect/><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 10px; text-align: center;"><span class="nodeLabel"></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-636d62f3b7b857e3-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-636d62f3b7b857e3-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-636d62f3b7b857e3-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p><strong>The crucial detail is that the payment order is written to the database <em>before</em> the PSP is called.</strong> If the process dies immediately after the external call, there is still a local record saying &quot;I was in the middle of charging this card&quot;, which is the only thing that lets reconciliation ask the PSP what actually happened. A design that calls the PSP first and records afterwards can lose all knowledge that a charge was ever attempted — and an unrecorded charge is the worst outcome available, because the customer has paid and your system does not know.</p>
+<p>This is the same &quot;record intent, then act&quot; ordering as the metadata commit in <a href="15-google-drive.html#file-upload-flow">Chapter 15</a> and <a href="24-s3-like-object-storage.html">Chapter 24</a>, applied to an external side effect instead of to storage.</p>
+<h3 id="double-entry-ledger-system"><strong>Double-entry ledger system</strong></h3>
+<p>The double-entry accounting mechanism is key to any payment system. It is a mechanism of tracking money movements by always applying money operations to two accounts, where one's account balance increases (credit) and the other decreases (debit):</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Account</th>
+<th>Debit</th>
+<th>Credit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>buyer</td>
+<td>$1</td>
+<td></td>
+</tr>
+<tr>
+<td>seller</td>
+<td></td>
+<td>$1</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Sum of all transaction entries is always zero. This mechanism provides end-to-end traceability of all money movements within the system.</p>
+<p><strong>&quot;Sum of all entries is always zero&quot; is not an accounting nicety — it is a continuously checkable invariant</strong>, and that is why double-entry has survived since the 15th century. At any moment you can sum every entry in the ledger; if the total is not zero, money has been created or destroyed by a bug, and you know it without needing an external reference. No single-entry design gives you that, because there is nothing to check against.</p>
+<p>Three consequences follow, and they shape the whole system:</p>
+<p><strong>The ledger is append-only and immutable.</strong> You never edit an entry. A mistake is corrected by posting a <em>reversing</em> entry, which leaves both the error and its correction permanently visible. That is what makes the ledger auditable — history cannot be rewritten — and it is the same immutability argument as <a href="24-s3-like-object-storage.html">Chapter 24</a>.</p>
+<p><strong>A refund is therefore a new transaction, not an undo.</strong> This is the practical form of &quot;money movement cannot be rolled back&quot;: the original charge happened, is recorded, and stays recorded; the refund is a second, opposite movement. Anyone reasoning about this system as though failed operations can be rolled back has the wrong model.</p>
+<p><strong>The ledger is the source of truth and the wallet is a derived view.</strong> The ledger says what happened; the wallet says what the balance <em>currently is</em>, which is a sum over the ledger. That means the wallet can always be rebuilt by replaying the ledger — and if the wallet and the ledger disagree, the ledger wins. This is now the third instance of the same pattern in the book:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>Source of truth</th>
+<th>Derived view</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="21-ad-click-event-aggregation.html">21 – Ad clicks</a></td>
+<td>Raw click events</td>
+<td>Per-minute aggregates</td>
+</tr>
+<tr>
+<td><a href="25-real-time-gaming-leaderboard.html">25 – Leaderboard</a></td>
+<td>Durable score log</td>
+<td>Redis sorted set</td>
+</tr>
+<tr>
+<td><strong>26 – Payments</strong></td>
+<td><strong>Double-entry ledger</strong></td>
+<td><strong>Wallet balance</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Keeping an immutable log of events plus a rebuildable projection of current state is one of the most generally useful structures in system design, and payments is where it is least optional.</p>
+<h3 id="hosted-payment-page"><strong>Hosted payment page</strong></h3>
+<p>To avoid storing credit card information and having to comply with various heavy regulations, most companies prefer utilizing a widget, provided by PSPs, which store and handle credit card payments for you:</p>
+<p><strong>The regulation being avoided is PCI DSS, and the saving is enormous.</strong> If card numbers ever touch your servers, your entire environment falls within PCI scope — which means network segmentation, encryption at rest and in transit, access controls, logging, quarterly scans, annual audits, and the full Self-Assessment Questionnaire D with hundreds of controls. If the card number goes directly from the customer's browser to the PSP and you only ever hold a token, your scope collapses to the much shorter SAQ A.</p>
+<p>So the hosted page is not primarily a convenience: <strong>it is a deliberate transfer of regulatory liability</strong>, and it is why nearly every company that is not itself a payment processor uses one. The engineering cost is that you give up control of the checkout UI and gain an asynchronous, webhook-driven flow instead of a synchronous result — which is exactly the complexity the rest of this chapter deals with.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/26.%20Payment%20System/images/hosted-payment-page.png" alt="hosted-payment-page" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="pay-out-flow"><strong>Pay-out flow</strong></h3>
+<p>The components of the pay-out flow are very similar to the pay-in flow.</p>
+<p>Main differences:</p>
+<ul>
+<li>money is moved from e-commerce site's bank account to merchant's bank account</li>
+<li>we can utilize a third-party account payable provider such as Tipalti</li>
+<li>There's a lot of bookkeeping and regulatory requirements to handle with regards to pay-outs as well</li>
+</ul>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<p>This section focuses on making the system faster, more robust and secure.</p>
+<h3 id="psp-integration"><strong>PSP Integration</strong></h3>
+<p>If our system can directly connect to banks or card schemes, payment can be made without a PSP.
+These kinds of connections are very rare and uncommon, typically done at large companies which can justify the investment.</p>
+<p>If we go down the traditional route, a PSP can be integrated in one of two ways:</p>
+<ul>
+<li>Through API, if our payment system can collect payment information</li>
+<li>Through a hosted payment page to avoid dealing with payment information regulations</li>
+</ul>
+<p>Here's how the hosted payment page workflow works:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/26.%20Payment%20System/images/hosted-payment-page-workflow.png" alt="hosted-payment-page-workflow" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>User clicks &quot;checkout&quot; button in the browser</li>
+<li>Client calls the payment service with the payment order information</li>
+<li>After receiving payment order information, the payment service sends a payment registration request to the PSP.</li>
+<li>The PSP receives payment info such as currency, amount, expiration, etc, as well as a UUID for idempotency purposes. Typically the UUID of the payment order.</li>
+<li>The PSP returns a token back which uniquely identifies the payment registration. The token is stored in the payment service database.</li>
+<li>Once token is stored, the user is served with a PSP-hosted payment page. It is initialized using the token as well as a redirect URL for success/failure.</li>
+<li>User fills in payment details on the PSP page, PSP processes payment and returns the payment status</li>
+<li>User is now redirected back to the redirectURL. Example redirect url - <code>https://your-company.com/?tokenID=JIOUIQ123NSF&amp;payResult=X324FSa</code></li>
+<li>Asynchronously, the PSP calls our payment service via a webhook to inform our backend of the payment result</li>
+<li>Payment service records the payment result based on the webhook received</li>
+</ul>
+<p><strong>Three things about webhooks that this flow depends on and that are easy to get wrong:</strong></p>
+<ul>
+<li><strong>They are at-least-once and unordered.</strong> A PSP will retry a webhook it believes was not acknowledged, and under retry two webhooks for the same payment can arrive out of order — a <code>succeeded</code> after a <code>pending</code>, or a duplicate <code>succeeded</code>. The handler must therefore be idempotent and must ignore a transition that moves the state backwards.</li>
+<li><strong>They must be authenticated.</strong> A webhook endpoint is a public URL that tells your system a payment succeeded. Unverified, it is an instruction to ship goods for free. PSPs sign the payload (typically HMAC over the raw body with a shared secret); verify the signature on the <strong>raw bytes</strong> before parsing, and reject anything unsigned.</li>
+<li><strong>The webhook can beat your own bookkeeping.</strong> The PSP may call your webhook before the synchronous registration response has been committed locally, so the handler can receive a result for a payment it has no record of. The handler must tolerate that — park it and retry, rather than rejecting it as unknown.</li>
+</ul>
+<p>And note the redirect URL is <strong>not</strong> a trustworthy result. <code>?payResult=X324FSa</code> is a value the customer's browser can edit. The redirect tells the user what happened; the webhook tells the system.</p>
+<h3 id="reconciliation"><strong>Reconciliation</strong></h3>
+<p>The previous section explains the happy path of a payment. Unhappy paths are detected and reconciled using a background reconciliation process.</p>
+<p>Every night, the PSP sends a settlement file which our system uses to compare the external system's state against our internal system's state.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/26.%20Payment%20System/images/settlement-report.png" alt="settlement-report" data-width="500" style="max-width:500px" />
+</p>
+<p>This process can also be used to detect internal inconsistencies between eg the ledger and the wallet services.</p>
+<p>Mismatches are handled manually by the finance team. Mismatches are handled as:</p>
+<ul>
+<li>classifiable, hence, it is a known mismatch which can be adjusted using a standard procedure</li>
+<li>classifiable, but can't be automated. Manually adjusted by the finance team</li>
+<li>unclassifiable. Manually investigated and adjusted by the finance team</li>
+</ul>
+<p><strong>Reconciliation deserves to be understood as the design's correctness guarantee rather than as a cleanup chore.</strong> No transaction can span your database, the PSP's API and a bank's ledger, so there is no way to make the three agree atomically. What reconciliation provides is a different and achievable guarantee: <strong>any divergence will be detected within one settlement cycle and corrected.</strong></p>
+<p>The three mismatch categories are really a maturity ladder, and the useful observation is which direction you want to move:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Example</th>
+<th>Handling</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Known and automatable</td>
+<td>A payment our side marked <code>EXECUTING</code> that the PSP reports as settled</td>
+<td>Script applies the standard adjustment</td>
+</tr>
+<tr>
+<td>Known, not automatable</td>
+<td>Amount differs because of an FX rate or a fee we did not model</td>
+<td>Finance applies a judged adjustment</td>
+</tr>
+<tr>
+<td><strong>Unclassifiable</strong></td>
+<td>A settled payment with no corresponding record at all</td>
+<td><strong>Investigation — and a bug</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Every unclassifiable mismatch is a signal that the system has a failure mode nobody has modelled yet, so the health of a payment system can be measured by how much of its reconciliation is automated and whether the unclassifiable bucket is shrinking. A growing unclassifiable backlog is the clearest early warning that something is structurally wrong.</p>
+<p>Three practical points the chapter leaves out:</p>
+<ul>
+<li><strong>Reconcile internally as well as externally.</strong> Comparing the ledger against the wallet catches your own bugs without waiting for the PSP's file. Since the wallet is a projection of the ledger, that check is just &quot;does the sum match?&quot;.</li>
+<li><strong>Settlement files have a cutoff and a timezone.</strong> A payment at 23:59 local time may fall in either day's file depending on the PSP's clock, which produces apparent mismatches that resolve themselves the next day. Reconciliation must tolerate boundary effects rather than alerting on them.</li>
+<li><strong>Reconciliation is also the fraud and incident detector.</strong> Totals that drift in one direction, or a sudden rise in a particular mismatch class, surface problems that no single request-level check would.</li>
+</ul>
+<h3 id="handling-payment-processing-delays"><strong>Handling payment processing delays</strong></h3>
+<p>There are cases, where a payment can take hours to complete, although it typically takes seconds.</p>
+<p>This can happen due to:</p>
+<ul>
+<li>a payment being flagged as high-risk and someone has to manually review it</li>
+<li>credit card requires extra protection, eg 3D Secure Authentication, which requires extra details from card holder to complete</li>
+</ul>
+<p>These situations are handled by:</p>
+<ul>
+<li>waiting for the PSP to send us a webhook when a payment is complete or polling its API if the PSP doesn't provide webhooks</li>
+<li>showing a &quot;pending&quot; status to the user and giving them a page, where they can check-in for payment updates. We could also send them an email once their payment is complete</li>
+</ul>
+<h3 id="communication-among-internal-services"><strong>Communication among internal services</strong></h3>
+<p>There are two types of communication patterns services use to communicate with one another - synchronous and asynchronous.</p>
+<p>Synchronous communication (ie HTTP) works well for small-scale systems, but suffers as scale increases:</p>
+<ul>
+<li>low performance - request-response cycle is long as more services get involved in the call chain</li>
+<li>poor failure isolation - if PSPs or any other service fails, user will not receive a response</li>
+<li>tight coupling - sender needs to know the receiver</li>
+<li>hard to scale - not easy to support sudden increase in traffic due to not having a buffer</li>
+</ul>
+<p>Asynchronous communication can be divided into two categories.</p>
+<p>Single receiver - multiple receivers subscribe to the same topic and messages are processed only once:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/26.%20Payment%20System/images/single-receiver.png" alt="single-receiver" data-width="500" style="max-width:500px" />
+</p>
+<p>Multiple receivers - multiple receivers subscribe to the same topic, but messages are forwarded to all of them:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/26.%20Payment%20System/images/multiple-receiver.png" alt="multiple-receiver" data-width="500" style="max-width:500px" />
+</p>
+<p>Latter model works well for our payment system as a payment can trigger multiple side effects, handled by different services.</p>
+<p>In a nutshell, synchronous communication is simpler but doesn't allow services to be autonomous.
+Async communication trades simplicity and consistency for scalability and resilience.</p>
+<h3 id="handling-failed-payments"><strong>Handling failed payments</strong></h3>
+<p>Every payment system needs to address failed payments. Here are some of the mechanisms we'll use to achieve that:</p>
+<ul>
+<li>Tracking payment state - whenever a payment fails, we can determine whether to retry/refund based on the payment state.</li>
+<li>Retry queue - payments which we'll retry are published to a retry queue</li>
+<li>Dead-letter queue - payments which have terminally failed are pushed to a dead-letter queue, where the failed payment can be debugged and inspected.</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/26.%20Payment%20System/images/failed-payments.png" alt="failed-payments" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="exactly-once-delivery"><strong>Exactly-once delivery</strong></h3>
+<p>We need to ensure a payment gets processed exactly-once to avoid double-charging a customer.</p>
+<p>An operation is executed exactly-once if it is executed at-least-once and at-most-once at the same time.</p>
+<p>To achieve the at-least-once guarantee, we'll use a retry mechanism:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/26.%20Payment%20System/images/retry-mechanism.png" alt="retry-mechanism" data-width="500" style="max-width:500px" />
+</p>
+<p>Here are some common strategies on deciding the retry intervals:</p>
+<ul>
+<li>immediate retry - client immediately sends another request after failure</li>
+<li>fixed intervals - wait a fixed amount of time before retrying a payment</li>
+<li>incremental intervals - incrementally increase retry interval between each retry</li>
+<li>exponential back-off - double retry interval between subsequent retries</li>
+<li>cancel - client cancels the request. This happens when the error is terminal or retry threshold is reached</li>
+</ul>
+<p>As a rule of thumb, default to an exponential back-off retry strategy. A good practice is for the server to specify a retry interval using a <code>Retry-After</code> header.</p>
+<p>An issue with retries is that the server can potentially process a payment twice:</p>
+<ul>
+<li>client clicks the &quot;pay button&quot; twice, hence, they are charged twice</li>
+<li>payment is successfully processed by PSP, but not by downstream services (ledger, wallet). Retry causes the payment to be processed by the PSP again</li>
+</ul>
+<p>To address the double payment problem, we need to use an idempotency mechanism - a property that an operation applied multiple times is processed only once.</p>
+<p>From an API perspective, clients can make multiple calls which produce the same result.
+Idempotency is managed by a special header in the request (eg <code>idempotency-key</code>), which is typically a UUID.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/26.%20Payment%20System/images/idempotency-example.png" alt="idempotency-example" data-width="500" style="max-width:500px" />
+</p>
+<p>Idempotency can be achieved using the database's mechanism of adding unique key constraints:</p>
+<ul>
+<li>server attempts to insert a new row in the database</li>
+<li>the insertion fails due to a unique key constraint violation</li>
+<li>server detects that error and instead returns the existing object back to the client</li>
+</ul>
+<p><strong>The unique constraint is the whole mechanism, and the reason it works is that it is enforced by the storage engine rather than by application logic.</strong> Two concurrent requests carrying the same key both attempt the insert; exactly one can succeed. A check-then-insert in application code would race, which is the same argument as the reservation key in <a href="22-hotel-reservation-system.html#concurrency-issues">Chapter 22</a>.</p>
+<p>Three details that separate a working implementation from a broken one:</p>
+<p><strong>Store the response, not just the key.</strong> The point of idempotency is that a retry returns <em>the same answer</em>, so the stored record must include the original result. Returning &quot;already processed&quot; with no payload forces the client to guess what happened — which is exactly the uncertainty the key was supposed to remove.</p>
+<p><strong>Decide what happens when the same key arrives with a different payload.</strong> A client that reuses an idempotency key for a <em>different</em> payment has a bug, and silently returning the first payment's result would hide it while the second payment never happens. The standard behaviour, and Stripe's, is to <strong>reject the request with an error</strong>: store a fingerprint of the request body alongside the key and compare. Silence here is how a genuine missing payment becomes invisible.</p>
+<p><strong>Scope and expire keys deliberately.</strong> Keys are usually scoped per API endpoint and per account, and retained for a bounded window (24 hours is typical) — long enough to cover every realistic retry, short enough that the table does not grow forever. The window is a real trade-off: a retry after expiry will create a second payment.</p>
+<p><strong>Finally, be precise about what is actually guaranteed.</strong> &quot;Exactly-once&quot; here means at-least-once <em>delivery</em> plus idempotent <em>processing</em> — the same formulation as <a href="19-distributed-message-queue.html#exactly-once">Chapter 19</a> and <a href="10-notification-system.html#reliability">Chapter 10</a>. There is no distributed transaction and no two-phase commit across the PSP boundary; there is a retry loop whose repetition is harmless, which produces exactly-once <em>effects</em>.</p>
+<p>Idempotency is also applied at the PSP side, using the UUID sent at payment registration, which was previously discussed. PSPs will take care to not process payments with the same key twice.</p>
+<h3 id="consistency"><strong>Consistency</strong></h3>
+<p>There are several stateful services called throughout a payment's lifecycle - PSP, ledger, wallet, payment service.</p>
+<p>Communication between any two services can fail.
+We can ensure eventual data consistency between all services by implementing exactly-once processing and reconciliation.</p>
+<p>If we use replication, we'll have to deal with replication lag, which can lead to users observing inconsistent data between primary and replica databases.</p>
+<p>To mitigate that, we can serve all reads and writes from the primary database and only utilize replicas for redundancy and fail-over.
+Alternatively, we can ensure replicas are always in-sync by utilizing a consensus algorithm such as Paxos or Raft.
+We could also use a consensus-based distributed database such as YugabyteDB or CockroachDB.</p>
+<h3 id="payment-security"><strong>Payment security</strong></h3>
+<p>Here are some mechanisms we can use to ensure payment security:</p>
+<ul>
+<li>Request/response eavesdropping - we can use HTTPS to secure all communication</li>
+<li>Data tampering - enforce encryption and integrity monitoring</li>
+<li>Man-in-the-middle attacks - use SSL \w certificate pinning</li>
+<li>Data loss - replicate data across multiple regions and take data snapshots</li>
+<li>DDoS attack - implement rate limiting and firewall</li>
+<li>Card theft - use tokens instead of storing real card information in our system</li>
+<li>PCI compliance - a security standard for organizations which handle branded credit cards</li>
+<li>Fraud - address verification, card verification value (CVV), user behavior analysis, etc</li>
+</ul>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
+<p>Other talking points:</p>
+<ul>
+<li>Monitoring and alerting</li>
+<li>Debugging tools - we need tools which make it easy to understand why a payment has failed</li>
+<li>Currency exchange - important when designing a payment system for international use</li>
+<li>Geography - different regions might have different payment methods</li>
+<li>Cash payment - very common in places like India and Brazil</li>
+</ul>
+<h3 id="two-mechanisms-the-chapter-does-not-cover-and-both-come-up">Two mechanisms the chapter does not cover, and both come up</h3>
+<p><strong>Authorization versus capture.</strong> A card payment is normally two operations, not one: an <strong>authorization</strong> places a hold on the customer's funds and reserves them, and a <strong>capture</strong> actually transfers the money. They can be seconds or days apart — which is how e-commerce charges you when the item ships rather than when you order. The design consequences are real:</p>
+<ul>
+<li>An authorization <strong>expires</strong> (typically ~7 days), after which the hold disappears and the capture will fail.</li>
+<li>A capture can be for <strong>less</strong> than the authorized amount (partial shipment), and often not for more.</li>
+<li>&quot;Payment succeeded&quot; is therefore ambiguous: authorized, captured, or settled? Each is a different state with different reversibility, and the <code>payment_order_status</code> enum in this chapter's schema collapses all of them into <code>SUCCESS</code>.</li>
+</ul>
+<p>This is the hold-and-expiry pattern from <a href="22-hotel-reservation-system.html#what-is-missing-holds">Chapter 22</a>, implemented by the card networks rather than by you — including the expiry reaper.</p>
+<p><strong>Chargebacks.</strong> A customer can dispute a charge with their bank <em>months later</em>, and the funds are pulled back from you by the network, often with a fee, whether or not you agree. This is the only money movement in the system that you neither initiate nor can refuse, and it has to be modelled: a ledger entry reversing the original, a potential negative balance for a merchant who has already been paid out, and an evidence-submission workflow. A payment system that treats a settled payment as final will be wrong about its own balance sheet.</p>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Floats for money.</strong> <code>0.1 + 0.2 != 0.3</code>, errors accumulate inconsistently, and a double-entry ledger that does not sum to zero cannot be audited. Integer minor units or fixed-point decimal, and strings on the wire.</li>
+<li><strong>No transaction spans your database and the PSP.</strong> You cannot atomically charge a card and record the charge. Record intent first, use an idempotency key so retry is safe, and reconcile. Anyone proposing two-phase commit across that boundary has not noticed that the bank is not a participant.</li>
+<li><strong>A charge cannot be rolled back, only refunded.</strong> The compensating action is a <em>new</em> transaction with its own cost, timing and failure modes — unlike the inventory release in <a href="22-hotel-reservation-system.html">Chapter 22</a>, which genuinely undoes the earlier step.</li>
+<li><strong>Calling the PSP before recording locally can lose a charge entirely.</strong> A crash then leaves money taken and no record that it was ever attempted. This is the worst failure in the system and the ordering is the only defence.</li>
+<li><strong>A payment stuck in <code>EXECUTING</code> has an unknown outcome.</strong> It is not failed — the customer may have been charged. It must never be retried blindly without the idempotency key, and it must be resolved against the PSP, not guessed at.</li>
+<li><strong>Idempotency keys reused with a different payload must error, not succeed.</strong> Returning the first result hides a bug and silently drops a real payment.</li>
+<li><strong>Idempotency records must include the original response</strong>, or a retry cannot return the same answer and the client is left uncertain.</li>
+<li><strong>Idempotency keys expire.</strong> A retry after the window creates a second payment. Pick a window that exceeds every realistic retry path, including a human clicking &quot;pay&quot; again an hour later.</li>
+<li><strong>Webhooks are at-least-once, unordered, and publicly reachable.</strong> Verify the signature on the raw body, be idempotent, ignore backwards state transitions, and tolerate a webhook arriving before your own record of the payment exists.</li>
+<li><strong>The redirect URL is not a result.</strong> <code>payResult=...</code> is browser-supplied and editable. Trust the webhook or a server-side status query.</li>
+<li><strong>Retry storms make a struggling PSP worse.</strong> Exponential backoff with jitter, honour <code>Retry-After</code>, and use a circuit breaker — as in <a href="10-notification-system.html#retries-the-part-that-is-usually-wrong">Chapter 10</a>.</li>
+<li><strong>Replica lag can show a customer a payment that &quot;has not happened&quot;.</strong> Serve payment reads from the primary; use replicas only for redundancy.</li>
+<li><strong>An unclassifiable reconciliation backlog is a structural warning, not a workload.</strong> Each entry is a failure mode nobody modelled. Track the trend.</li>
+<li><strong>Settlement-file boundaries produce phantom mismatches.</strong> Timezone and cutoff differences shift payments between daily files. Tolerate boundary effects rather than paging on them.</li>
+<li><strong>Refunds after payout can make a merchant's balance negative.</strong> The money has already left for the seller when the buyer's refund arrives. The wallet must represent negative balances and the payout flow must handle recovery.</li>
+<li><strong>Test and live credentials must be impossible to confuse.</strong> The failure is symmetric and both directions are bad: real money moved in a test, or a customer's real payment silently going nowhere.</li>
+<li><strong>Currency exponents are not all 2.</strong> JPY has none, BHD has three. An amount is meaningless without its currency, and a hard-coded <code>× 100</code> is a bug waiting for an international launch.</li>
+<li><strong>PCI scope is determined by whether card data touches your systems</strong>, not by intent. One debug log line containing a card number brings the whole environment into scope.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Not charging a customer twice</td>
+<td>Client-supplied idempotency key enforced by a unique constraint, stored with its response</td>
+</tr>
+<tr>
+<td>Not losing a charge across a crash</td>
+<td>Record the payment order <em>before</em> calling the PSP</td>
+</tr>
+<tr>
+<td>Resuming a half-completed payment</td>
+<td>Per-step flags (<code>ledger_updated</code>, <code>wallet_updated</code>) as a persisted to-do list, driven by a background job</td>
+</tr>
+<tr>
+<td>No atomic commit across your DB, PSP and bank</td>
+<td>Accept divergence; detect and correct it by reconciliation</td>
+</tr>
+<tr>
+<td>Detecting divergence</td>
+<td>Nightly settlement-file comparison, plus internal ledger-vs-wallet checks</td>
+</tr>
+<tr>
+<td>Auditability and provable integrity</td>
+<td>Immutable double-entry ledger; debits equal credits, sum is zero</td>
+</tr>
+<tr>
+<td>Correcting a mistake</td>
+<td>A reversing entry — never an edit, never a delete</td>
+</tr>
+<tr>
+<td>Current balances</td>
+<td>Wallet as a rebuildable projection of the ledger</td>
+</tr>
+<tr>
+<td>Representing money exactly</td>
+<td>Integer minor units or fixed-point decimal; strings across API boundaries</td>
+</tr>
+<tr>
+<td>Avoiding PCI DSS scope</td>
+<td>Hosted payment page; hold only a PSP token, never a card number</td>
+</tr>
+<tr>
+<td>Asynchronous payment results</td>
+<td>Signed webhooks, idempotent handlers, plus polling as a fallback</td>
+</tr>
+<tr>
+<td>Payments that take hours</td>
+<td><code>pending</code> state, a status page, and notification on completion</td>
+</tr>
+<tr>
+<td>Transient PSP failures</td>
+<td>Exponential backoff with jitter, <code>Retry-After</code>, retry queue</td>
+</tr>
+<tr>
+<td>Terminally failed payments</td>
+<td>Dead letter queue for inspection</td>
+</tr>
+<tr>
+<td>One payment with many side effects</td>
+<td>Asynchronous publish/subscribe to ledger, wallet and notification consumers</td>
+</tr>
+<tr>
+<td>Strong consistency at 11 TPS</td>
+<td>Relational database, reads from the primary, or a Raft-based distributed SQL store</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>This is the lowest-throughput system in the book. Why is it also among the hardest?</li>
+<li>Which two mechanisms carry the correctness of this design, and which one is counter-intuitive?</li>
+<li>Why is reconciliation the correctness mechanism rather than a cleanup process?</li>
+<li>Why is <code>amount</code> a string in the API and never a <code>double</code> anywhere?</li>
+<li>What invariant does double-entry bookkeeping give you, and why is it valuable that you can check it without an external reference?</li>
+<li>Why is a refund not an undo? What does that tell you about compensating actions in this system?</li>
+<li>Which is the source of truth, the ledger or the wallet? What follows if they disagree?</li>
+<li>What are <code>ledger_updated</code> and <code>wallet_updated</code> really for?</li>
+<li>Why must the payment order be written before the PSP is called? Describe the failure if you reverse it.</li>
+<li>A payment has been in <code>EXECUTING</code> for an hour. What do you know, what don't you know, and what must you not do?</li>
+<li>A retry arrives with a known idempotency key but a different amount. What should happen, and why is returning the stored result dangerous?</li>
+<li>Give three ways a webhook handler can be wrong.</li>
+<li>Why is <code>?payResult=success</code> in the redirect URL not sufficient evidence of payment?</li>
+<li>What is the real reason for a hosted payment page, and what does it cost you?</li>
+<li>What is the difference between authorization and capture, and what does the chapter's <code>SUCCESS</code> status hide?</li>
+<li>A buyer is refunded after the seller has been paid out. What happens to the seller's balance?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Pay-in / pay-out</strong></td>
+<td>Collecting money from buyers; disbursing it to sellers</td>
+</tr>
+<tr>
+<td><strong>PSP</strong></td>
+<td>Payment Service Provider (Stripe, Braintree) — moves money and holds card data</td>
+</tr>
+<tr>
+<td><strong>Card scheme</strong></td>
+<td>Visa, Mastercard and similar networks that route and settle card transactions</td>
+</tr>
+<tr>
+<td><strong>Payment event / payment order</strong></td>
+<td>A checkout; one money movement within it, to one seller</td>
+</tr>
+<tr>
+<td><strong>Idempotency key</strong></td>
+<td>Client-generated unique identifier making a retried request harmless</td>
+</tr>
+<tr>
+<td><strong>Double-entry ledger</strong></td>
+<td>Every movement recorded as a debit and an equal credit; all entries sum to zero</td>
+</tr>
+<tr>
+<td><strong>Reversing entry</strong></td>
+<td>A new, opposite entry correcting an earlier one, since entries are immutable</td>
+</tr>
+<tr>
+<td><strong>Wallet</strong></td>
+<td>Current balance per merchant — a projection of the ledger</td>
+</tr>
+<tr>
+<td><strong>Reconciliation</strong></td>
+<td>Comparing internal records against the PSP's settlement file to detect divergence</td>
+</tr>
+<tr>
+<td><strong>Settlement file</strong></td>
+<td>The PSP's nightly authoritative record of what actually moved</td>
+</tr>
+<tr>
+<td><strong>Hosted payment page</strong></td>
+<td>PSP-served checkout form that keeps card data out of your systems</td>
+</tr>
+<tr>
+<td><strong>PCI DSS</strong></td>
+<td>Card-data security standard; scope depends on whether card numbers touch your systems</td>
+</tr>
+<tr>
+<td><strong>Tokenization</strong></td>
+<td>Replacing a card number with a PSP-issued token that is useless if stolen</td>
+</tr>
+<tr>
+<td><strong>Authorization / capture</strong></td>
+<td>Reserving funds; later actually transferring them — separate, time-limited operations</td>
+</tr>
+<tr>
+<td><strong>Chargeback</strong></td>
+<td>A bank-initiated reversal months later, which you cannot refuse</td>
+</tr>
+<tr>
+<td><strong>3D Secure</strong></td>
+<td>Extra cardholder authentication step, a common cause of multi-hour payment delays</td>
+</tr>
+<tr>
+<td><strong>Retry / dead letter queue</strong></td>
+<td>Where retryable and terminally failed payments go</td>
+</tr>
+<tr>
+<td><strong>Minor units</strong></td>
+<td>The smallest currency denomination (cents), used to store money as integers</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="27-digital-wallet.html">Chapter 27 – Digital Wallet</a> — the ledger and wallet taken seriously, with event sourcing and reproducible state.</li>
+<li><a href="22-hotel-reservation-system.html#concurrency-issues">Chapter 22 – Hotel Reservation System</a> — idempotency keys, sagas and holds, where the compensating action genuinely undoes the earlier step.</li>
+<li><a href="19-distributed-message-queue.html#exactly-once">Chapter 19 – Distributed Message Queue</a> — why &quot;exactly-once&quot; means at-least-once delivery plus idempotent processing.</li>
+<li><a href="21-ad-click-event-aggregation.html">Chapter 21 – Ad Click Event Aggregation</a> — counting money rather than moving it, and reconciliation in a streaming setting.</li>
+<li><a href="10-notification-system.html#retries-the-part-that-is-usually-wrong">Chapter 10 – Design A Notification System</a> — failure classification and backoff at a third-party boundary.</li>
+<li><a href="https://docs.stripe.com/api/idempotent_requests" target="_blank" rel="noopener">Stripe's idempotency documentation</a> — the canonical implementation of the key mechanism in this chapter.</li>
+</ul>
+<ul>
+<li>Google/Apple Pay integration</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 14: Design YouTube — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="14-youtube">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 1 Systems › Chapter 14 of 28</div>
+  <h1>Chapter 14: Design YouTube</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-scope">Step 1: Understand the Problem and Scope</a></li><li><a href="#step-2-high-level-design">Step 2: High-Level Design</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#system-optimizations">System Optimizations</a></li><li><a href="#error-handling">Error Handling</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>YouTube is a massive video streaming platform supporting video uploads, playback, and various interactions. This chapter focuses on designing a scalable video streaming system with the following core features:</p>
+<ul>
+<li><strong>Fast video uploads</strong></li>
+<li><strong>Smooth video streaming</strong></li>
+<li><strong>Ability to change video quality</strong></li>
+<li><strong>Low infrastructure cost</strong></li>
+<li><strong>High availability and reliability</strong></li>
+</ul>
+<p><strong>The one-sentence version:</strong> storing and streaming video is a solved problem — object storage holds the bytes, a CDN serves them — so the design pressure in this system is almost entirely <strong>cost</strong>. At the stated scale the bandwidth bill is roughly $55 M/year, which is why half of the chapter's optimisations are about <em>not</em> serving bytes, and why the other half is a batch compute pipeline for transcoding, which exists to make each byte served as small as possible.</p>
+<p>Read &quot;Low infrastructure cost&quot; in the feature list above as the primary requirement, not the fourth one.</p>
+<h3 id="key-statistics-2020">Key Statistics (2020)</h3>
+<ul>
+<li><strong>2 billion monthly active users</strong></li>
+<li><strong>5 billion videos watched per day</strong></li>
+<li><strong>37% of mobile internet traffic comes from YouTube</strong></li>
+<li>Available in <strong>80 languages</strong></li>
+<li><strong>$15.1 billion ad revenue</strong> in 2019</li>
+</ul>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-scope">
+<h2 id="step-1-understand-the-problem-and-scope">Step 1: Understand the Problem and Scope</h2>
+<h3 id="core-functionalities">Core Functionalities</h3>
+<ol>
+<li>Upload videos</li>
+<li>Watch videos</li>
+</ol>
+<h3 id="supported-platforms">Supported Platforms</h3>
+<ul>
+<li>Mobile apps, web browsers, and smart TVs</li>
+</ul>
+<h3 id="assumptions">Assumptions</h3>
+<ul>
+<li><strong>Daily Active Users (DAU):</strong> 5 million</li>
+<li><strong>Average Video Size:</strong> 300 MB</li>
+<li><strong>Upload Limits:</strong> Max 1 GB per video</li>
+<li><strong>Daily Storage Need:</strong> 150 TB</li>
+<li><strong>CDN Costs:</strong> 5 million * 5 videos * 0.3GB * $0.02 =  $150,000/day (using Amazon CloudFront)</li>
+</ul>
+<h3 id="bandwidth-not-disk-is-the-bill">Bandwidth, not disk, is the bill</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Derivation</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Daily egress</td>
+<td>5 M × 5 videos × 300 MB</td>
+<td><strong>7.5 PB/day</strong></td>
+</tr>
+<tr>
+<td>Daily CDN cost</td>
+<td>7.5 M GB × $0.02</td>
+<td><strong>$150,000/day ≈ $55 M/year</strong></td>
+</tr>
+<tr>
+<td>Daily upload volume</td>
+<td>Given</td>
+<td>150 TB/day</td>
+</tr>
+<tr>
+<td>Cost to <em>store</em> one day's uploads</td>
+<td>150 TB × ~$0.023/GB-month</td>
+<td><strong>~$3,500/month</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>One day of serving costs roughly <strong>forty times</strong> what it costs to store a whole day's uploads for a month. That ratio is the single most important number in the chapter, and it explains design choices that otherwise look like premature optimisation:</p>
+<ul>
+<li><strong>Tier by popularity.</strong> View counts follow a steep power law — a small fraction of videos account for most watch time. Serving only the popular tail from the CDN and the long tail from cheaper origin servers removes most of the bill while affecting almost no viewers.</li>
+<li><strong>Transcode on demand for cold videos.</strong> A video watched twice a year does not justify storing ten pre-made renditions. Generating them on request trades cheap storage against rare compute.</li>
+<li><strong>Build your own CDN and peer with ISPs.</strong> At $55 M/year, owning edge infrastructure and settling traffic directly with access networks stops being exotic and becomes straightforward arithmetic. This is why every large video platform eventually runs its own CDN.</li>
+</ul>
+<p>Note also what the storage number hides: one uploaded video becomes an entire <strong>rendition ladder</strong> (several resolutions × codecs), so transcoded output is typically 2–5× the source. The 150 TB/day of uploads lands as something closer to half a petabyte per day of stored, servable video.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>leading with the cost comparison — daily egress versus monthly storage of the same content — reframes the whole problem and makes every later optimisation follow naturally. An answer that treats this as &quot;upload to S3, serve from CloudFront, done&quot; has missed what makes the system hard.</p>
+</div>
+<hr>
+</section>
+<section id="step-2-high-level-design">
+<h2 id="step-2-high-level-design">Step 2: High-Level Design</h2>
+<h3 id="components">Components</h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/high-level-design.png" alt="High Level Design" data-width="400" style="max-width:400px">
+</p>
+<ol>
+<li><strong>Client:</strong> Devices like smartphones, computers, and TVs.</li>
+<li><strong>CDN (Content Delivery Network):</strong> Stores and streams videos.</li>
+<li><strong>API Servers:</strong> Handles all user interactions except video streaming (e.g., uploads, metadata updates).</li>
+<li><strong>Metadata Database:</strong> Stores video metadata (e.g., title, description, size).</li>
+<li><strong>Original Storage:</strong> Blob storage for uploaded videos.</li>
+<li><strong>Transcoding Servers:</strong> Convert videos into multiple resolutions and formats.</li>
+<li><strong>Transcoded Storage:</strong> Blob storage for transcoded videos.</li>
+</ol>
+<hr>
+<h3 id="core-workflows">Core Workflows</h3>
+<h4 id="1-video-uploading-flow">1. Video Uploading Flow</h4>
+<ul>
+<li>
+<p><strong>Parallel Processes:</strong></p>
+<ol>
+<li>Upload video to original storage.</li>
+<li>Update video metadata in the database.</li>
+</ol>
+</li>
+<li>
+<p><strong>Video Upload (Steps):</strong></p>
+  <p align="left">
+      <img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/video-uploading-flow.png" alt="Video Upload Flow" data-width="500" style="max-width:500px">
+  </p>
+<ul>
+<li>[1] Videos are uploaded to blob storage.</li>
+<li>[2] Transcoding servers convert videos to multiple formats.</li>
+<li>[3] One trasncoding is complete, following two steps are exectued in parallel.
+<ul>
+<li>[3a] Transcoded videos are sent to transcoded storage.</li>
+<li>[3b] Transcoding completion events are queued in the completion queue.</li>
+</ul>
+</li>
+<li>[3a.1] Videos are distributed to the CDN.</li>
+<li>[3b.1] Completion handlers update metadata and inform users.</li>
+</ul>
+<p><strong>The structural point in this flow is that the video bytes never touch the API servers.</strong> The client uploads directly to blob storage; the API tier only handles metadata and coordination. If 150 TB/day flowed through the API servers, they would need to be sized for petabyte-scale throughput to perform what is essentially bookkeeping. The pre-signed URL mechanism further down is what makes this safe — it lets an untrusted client write to your storage bucket, once, to a specific key, for a limited time.</p>
+<p><strong>And the completion queue is what makes the pipeline durable.</strong> Transcoding a 300 MB video takes minutes to hours of compute across many tasks. Nothing in that chain can be synchronous with the user's upload request, and anything that long-running will be interrupted — so progress is recorded as events, and failed stages are retried from persisted intermediate data rather than from the beginning.</p>
+</li>
+<li>
+<p><strong>Metadata Upload (Steps):</strong></p>
+  <p align="left">
+      <img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/metadata-upload.png" alt="Metadata Upload" data-height="500" style="max-height:500px">
+  </p>
+<ul>
+<li>The client in parallel sends a request to update the video metadata</li>
+<li>The request contains video metadata, including file name, size, format, etc.</li>
+</ul>
+</li>
+</ul>
+<h4 id="2-video-streaming-flow">2. Video Streaming Flow</h4>
+<p align="left">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/video-streaming-flow.png" alt="Video Streaming Flow" data-height="400" style="max-height:400px">
+</p>
+<ul>
+<li>Videos are streamed directly from the CDN using edge servers to minimize latency.</li>
+<li>Some of te popular streaming protocols are MPEG_DASH, Apple HLS, Adobe HDS.</li>
+<li><em>Different streaming protocols support different video encodings and playback players.</em></li>
+</ul>
+<p><strong>What these protocols actually do, and why it matters for the rest of the design.</strong> HLS and DASH are both <strong>adaptive bitrate</strong> (ABR) protocols, and they work the same way:</p>
+<ol>
+<li>The video is cut into short <strong>segments</strong> (typically 2–10 seconds), encoded at several quality levels.</li>
+<li>A <strong>manifest</strong> file lists every available rendition and its segments.</li>
+<li>The <em>client</em> measures its own throughput and chooses which rendition to fetch — <strong>for each segment independently</strong>.</li>
+</ol>
+<p>Three consequences worth stating explicitly:</p>
+<ul>
+<li><strong>&quot;Ability to change video quality&quot; is not a server feature.</strong> The server offers a menu; the player decides. That is why quality can change mid-playback without re-requesting the video.</li>
+<li><strong>This is why transcoding produces a ladder, not a file.</strong> The rendition ladder exists to give the player options, which is the direct cause of the 2–5× storage multiplication.</li>
+<li><strong>Everything is plain HTTP GETs of small files.</strong> No streaming protocol state lives on the server, which is exactly why a CDN — a machine that caches small files over HTTP — can serve video at all. Had video required stateful connections, the CDN strategy would be unavailable and the cost problem unsolvable.</li>
+</ul>
+<figure class="mermaid-fig">
+<svg id="mmd-872d59ca8a3b7c47" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1236.41px; background-color: transparent;" viewBox="0 0 1236.40625 156" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-872d59ca8a3b7c47{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-872d59ca8a3b7c47 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-872d59ca8a3b7c47 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-872d59ca8a3b7c47 .error-icon{fill:#f4f6f8;}#mmd-872d59ca8a3b7c47 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-872d59ca8a3b7c47 .edge-thickness-normal{stroke-width:1px;}#mmd-872d59ca8a3b7c47 .edge-thickness-thick{stroke-width:3.5px;}#mmd-872d59ca8a3b7c47 .edge-pattern-solid{stroke-dasharray:0;}#mmd-872d59ca8a3b7c47 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-872d59ca8a3b7c47 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-872d59ca8a3b7c47 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-872d59ca8a3b7c47 .marker{fill:#637381;stroke:#637381;}#mmd-872d59ca8a3b7c47 .marker.cross{stroke:#637381;}#mmd-872d59ca8a3b7c47 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-872d59ca8a3b7c47 p{margin:0;}#mmd-872d59ca8a3b7c47 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-872d59ca8a3b7c47 .cluster-label text{fill:#454f5b;}#mmd-872d59ca8a3b7c47 .cluster-label span{color:#454f5b;}#mmd-872d59ca8a3b7c47 .cluster-label span p{background-color:transparent;}#mmd-872d59ca8a3b7c47 .label text,#mmd-872d59ca8a3b7c47 span{fill:#161c24;color:#161c24;}#mmd-872d59ca8a3b7c47 .node rect,#mmd-872d59ca8a3b7c47 .node circle,#mmd-872d59ca8a3b7c47 .node ellipse,#mmd-872d59ca8a3b7c47 .node polygon,#mmd-872d59ca8a3b7c47 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-872d59ca8a3b7c47 .rough-node .label text,#mmd-872d59ca8a3b7c47 .node .label text,#mmd-872d59ca8a3b7c47 .image-shape .label,#mmd-872d59ca8a3b7c47 .icon-shape .label{text-anchor:middle;}#mmd-872d59ca8a3b7c47 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-872d59ca8a3b7c47 .rough-node .label,#mmd-872d59ca8a3b7c47 .node .label,#mmd-872d59ca8a3b7c47 .image-shape .label,#mmd-872d59ca8a3b7c47 .icon-shape .label{text-align:center;}#mmd-872d59ca8a3b7c47 .node.clickable{cursor:pointer;}#mmd-872d59ca8a3b7c47 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-872d59ca8a3b7c47 .arrowheadPath{fill:#000000;}#mmd-872d59ca8a3b7c47 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-872d59ca8a3b7c47 .flowchart-link{stroke:#637381;fill:none;}#mmd-872d59ca8a3b7c47 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-872d59ca8a3b7c47 .edgeLabel p{background-color:#ffffff;}#mmd-872d59ca8a3b7c47 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-872d59ca8a3b7c47 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-872d59ca8a3b7c47 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-872d59ca8a3b7c47 .cluster text{fill:#454f5b;}#mmd-872d59ca8a3b7c47 .cluster span{color:#454f5b;}#mmd-872d59ca8a3b7c47 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-872d59ca8a3b7c47 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-872d59ca8a3b7c47 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-872d59ca8a3b7c47 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-872d59ca8a3b7c47 rect.text{fill:none;stroke-width:0;}#mmd-872d59ca8a3b7c47 .icon-shape,#mmd-872d59ca8a3b7c47 .image-shape{background-color:#ffffff;text-align:center;}#mmd-872d59ca8a3b7c47 .icon-shape p,#mmd-872d59ca8a3b7c47 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-872d59ca8a3b7c47 .icon-shape .label rect,#mmd-872d59ca8a3b7c47 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-872d59ca8a3b7c47 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-872d59ca8a3b7c47 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-872d59ca8a3b7c47 .node .neo-node{stroke:#299a8d;}#mmd-872d59ca8a3b7c47 [data-look="neo"].node rect,#mmd-872d59ca8a3b7c47 [data-look="neo"].cluster rect,#mmd-872d59ca8a3b7c47 [data-look="neo"].node polygon{stroke:url(#mmd-872d59ca8a3b7c47-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-872d59ca8a3b7c47 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-872d59ca8a3b7c47 [data-look="neo"].node path{stroke:url(#mmd-872d59ca8a3b7c47-gradient);stroke-width:1px;}#mmd-872d59ca8a3b7c47 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-872d59ca8a3b7c47 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-872d59ca8a3b7c47 [data-look="neo"].node circle{stroke:url(#mmd-872d59ca8a3b7c47-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-872d59ca8a3b7c47 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-872d59ca8a3b7c47 [data-look="neo"].icon-shape .icon{fill:url(#mmd-872d59ca8a3b7c47-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-872d59ca8a3b7c47 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-872d59ca8a3b7c47-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-872d59ca8a3b7c47 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-872d59ca8a3b7c47_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-872d59ca8a3b7c47_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-872d59ca8a3b7c47_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-872d59ca8a3b7c47_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-872d59ca8a3b7c47_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-872d59ca8a3b7c47_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-872d59ca8a3b7c47_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-872d59ca8a3b7c47_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-872d59ca8a3b7c47_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-872d59ca8a3b7c47_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-872d59ca8a3b7c47_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-872d59ca8a3b7c47_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M95.656,78L99.823,78C103.99,78,112.323,78,119.99,78C127.656,78,134.656,78,138.156,78L141.656,78" id="mmd-872d59ca8a3b7c47-L_C_M_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_M_0" data-points="W3sieCI6OTUuNjU2MjUsInkiOjc4fSx7IngiOjEyMC42NTYyNSwieSI6Nzh9LHsieCI6MTQ1LjY1NjI1LCJ5Ijo3OH1d" data-look="classic" marker-end="url(#mmd-872d59ca8a3b7c47_flowchart-v2-pointEnd)"/><path d="M347.734,78L351.901,78C356.068,78,364.401,78,372.068,78C379.734,78,386.734,78,390.234,78L393.734,78" id="mmd-872d59ca8a3b7c47-L_M_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_D_0" data-points="W3sieCI6MzQ3LjczNDM3NSwieSI6Nzh9LHsieCI6MzcyLjczNDM3NSwieSI6Nzh9LHsieCI6Mzk3LjczNDM3NSwieSI6Nzh9XQ==" data-look="classic" marker-end="url(#mmd-872d59ca8a3b7c47_flowchart-v2-pointEnd)"/><path d="M516.902,59.198L529.668,54.415C542.434,49.632,567.967,40.066,589.7,35.283C611.432,30.5,629.365,30.5,638.331,30.5L647.297,30.5" id="mmd-872d59ca8a3b7c47-L_D_H_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_H_0" data-points="W3sieCI6NTE2LjkwMTU3Mzk4NjkxMDUsInkiOjU5LjE5ODQ0ODk4NjkxMDUzfSx7IngiOjU5My41LCJ5IjozMC41fSx7IngiOjY1MS4yOTY4NzUsInkiOjMwLjV9XQ==" data-look="classic" marker-end="url(#mmd-872d59ca8a3b7c47_flowchart-v2-pointEnd)"/><path d="M516.902,96.802L529.668,101.585C542.434,106.368,567.967,115.934,590.145,120.717C612.323,125.5,631.146,125.5,640.557,125.5L649.969,125.5" id="mmd-872d59ca8a3b7c47-L_D_L_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_L_0" data-points="W3sieCI6NTE2LjkwMTU3Mzk4NjkxMDUsInkiOjk2LjgwMTU1MTAxMzA4OTQ4fSx7IngiOjU5My41LCJ5IjoxMjUuNX0seyJ4Ijo2NTMuOTY4NzUsInkiOjEyNS41fV0=" data-look="classic" marker-end="url(#mmd-872d59ca8a3b7c47_flowchart-v2-pointEnd)"/><path d="M882.109,30.5L886.276,30.5C890.443,30.5,898.776,30.5,906.667,34.69C914.557,38.88,922.005,47.26,925.728,51.45L929.452,55.64" id="mmd-872d59ca8a3b7c47-L_H_E_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_H_E_0" data-points="W3sieCI6ODgyLjEwOTM3NSwieSI6MzAuNX0seyJ4Ijo5MDcuMTA5Mzc1LCJ5IjozMC41fSx7IngiOjkzMi4xMDkzNzUsInkiOjU4LjYyOTQzMTQ5MTc1MDMyNH1d" data-look="classic" marker-end="url(#mmd-872d59ca8a3b7c47_flowchart-v2-pointEnd)"/><path d="M879.438,125.5L884.049,125.5C888.661,125.5,897.885,125.5,906.221,121.31C914.557,117.12,922.005,108.74,925.728,104.55L929.452,100.36" id="mmd-872d59ca8a3b7c47-L_L_E_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_L_E_0" data-points="W3sieCI6ODc5LjQzNzUsInkiOjEyNS41fSx7IngiOjkwNy4xMDkzNzUsInkiOjEyNS41fSx7IngiOjkzMi4xMDkzNzUsInkiOjk3LjM3MDU2ODUwODI0OTY4fV0=" data-look="classic" marker-end="url(#mmd-872d59ca8a3b7c47_flowchart-v2-pointEnd)"/><path d="M1010.563,78L1017.193,78C1023.823,78,1037.083,78,1049.677,78C1062.271,78,1074.198,78,1080.161,78L1086.125,78" id="mmd-872d59ca8a3b7c47-L_E_O_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_E_O_0" data-points="W3sieCI6MTAxMC41NjI1LCJ5Ijo3OH0seyJ4IjoxMDUwLjM0Mzc1LCJ5Ijo3OH0seyJ4IjoxMDkwLjEyNSwieSI6Nzh9XQ==" data-look="classic" marker-end="url(#mmd-872d59ca8a3b7c47_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_C_M_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_M_D_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(593.5, 30.5)"><g class="label" data-id="L_D_H_0" transform="translate(-12.171875, -10.5)"><foreignObject width="24.34375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>fast</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(593.5, 125.5)"><g class="label" data-id="L_D_L_0" transform="translate(-32.796875, -10.5)"><foreignObject width="65.59375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>degrading</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_H_E_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_L_E_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(1050.34375, 78)"><g class="label" data-id="L_E_O_0" transform="translate(-14.78125, -10.5)"><foreignObject width="29.5625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>miss</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-872d59ca8a3b7c47-flowchart-C-0" data-look="classic" transform="translate(51.828125, 78)"><rect class="basic label-container" style="" x="-43.828125" y="-22.5" width="87.65625" height="45"/><g class="label" style="" transform="translate(-19.828125, -10.5)"><rect/><foreignObject width="39.65625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Player</p></span></div></foreignObject></g></g><g class="node default" id="mmd-872d59ca8a3b7c47-flowchart-M-1" data-look="classic" transform="translate(246.6953125, 78)"><rect class="basic label-container" style="" x="-101.0390625" y="-33" width="202.078125" height="66"/><g class="label" style="" transform="translate(-77.0390625, -21)"><rect/><foreignObject width="154.078125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>GET manifest<br />(renditions + segments)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-872d59ca8a3b7c47-flowchart-D-3" data-look="classic" transform="translate(466.71875, 78)"><polygon points="68.984375,0 137.96875,-68.984375 68.984375,-137.96875 0,-68.984375" class="label-container" transform="translate(-68.484375, 68.984375)"/><g class="label" style="" transform="translate(-35.984375, -21)"><rect/><foreignObject width="71.96875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>measure<br />throughput</p></span></div></foreignObject></g></g><g class="node default" id="mmd-872d59ca8a3b7c47-flowchart-H-5" data-look="classic" transform="translate(766.703125, 30.5)"><rect class="basic label-container" style="" x="-115.40625" y="-22.5" width="230.8125" height="45"/><g class="label" style="" transform="translate(-91.40625, -10.5)"><rect/><foreignObject width="182.8125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>GET segment_1080p_042.ts</p></span></div></foreignObject></g></g><g class="node default" id="mmd-872d59ca8a3b7c47-flowchart-L-7" data-look="classic" transform="translate(766.703125, 125.5)"><rect class="basic label-container" style="" x="-112.734375" y="-22.5" width="225.46875" height="45"/><g class="label" style="" transform="translate(-88.734375, -10.5)"><rect/><foreignObject width="177.46875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>GET segment_480p_043.ts</p></span></div></foreignObject></g></g><g class="node default" id="mmd-872d59ca8a3b7c47-flowchart-E-9" data-look="classic" transform="translate(971.3359375, 78)"><path d="M0,9.64019660548345 a39.2265625,9.64019660548345 0,0,0 78.453125,0 a39.2265625,9.64019660548345 0,0,0 -78.453125,0 l0,42.64019660548345 a39.2265625,9.64019660548345 0,0,0 78.453125,0 l0,-42.64019660548345" class="basic label-container outer-path" style="" transform="translate(-39.2265625, -30.960294908225176)"/><g class="label" style="" transform="translate(-33.2265625, -2.5)"><rect/><foreignObject width="66.453125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>CDN edge</p></span></div></foreignObject></g></g><g class="node default" id="mmd-872d59ca8a3b7c47-flowchart-O-13" data-look="classic" transform="translate(1159.265625, 78)"><path d="M0,13.130563798219585 a69.140625,13.130563798219585 0,0,0 138.28125,0 a69.140625,13.130563798219585 0,0,0 -138.28125,0 l0,67.13056379821958 a69.140625,13.130563798219585 0,0,0 138.28125,0 l0,-67.13056379821958" class="basic label-container outer-path" style="" transform="translate(-69.140625, -46.695845697329375)"/><g class="label" style="" transform="translate(-63.140625, -13)"><rect/><foreignObject width="126.28125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>origin /<br />transcoded storage</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-872d59ca8a3b7c47-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-872d59ca8a3b7c47-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-872d59ca8a3b7c47-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<hr>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<h3 id="video-transcoding">Video Transcoding</h3>
+<h4 id="importance">Importance</h4>
+<ol>
+<li>Raw video consumes large amounts of storage space. It Reduces storage space.</li>
+<li>Ensures compatibility across devices and browsers.</li>
+<li>Adapts video quality to network conditions.</li>
+</ol>
+<h4 id="components-1">Components</h4>
+<ul>
+<li><strong>Container:</strong> Encapsulates video, audio, and metadata (e.g., MP4, AVI).</li>
+<li><strong>Codecs:</strong> Compression and Decompression algorithms (e.g., H.264, VP9).</li>
+</ul>
+<h4 id="directed-acyclic-graph-dag-model">Directed Acyclic Graph (DAG) Model</h4>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/dag-video-transcoding.png" alt="DAG Video Transcoding" data-width="600" style="max-width:600px">
+</p>
+<ul>
+<li>Transcoding a video is computationally expensive and time-consuming.</li>
+<li>DAG Model defines tasks like encoding, thumbnail generation, and watermarking.</li>
+<li>Allows high parallelism in video processing.</li>
+</ul>
+<p><strong>Why a DAG rather than a pipeline.</strong> Transcoding is not one job but a set of jobs with a partial order: audio extraction and video encoding are independent of each other; thumbnail generation depends on having decoded video but not on the finished encode; a watermark must be applied before encoding, not after. A DAG expresses exactly those dependencies and nothing more, which lets the scheduler run everything that is currently unblocked in parallel.</p>
+<p>It also makes the work <strong>configurable per customer</strong>: the same engine produces a different graph for a video that needs a watermark and six renditions than for one that needs two renditions and no thumbnail. The chapter's note that the DAG comes from a configuration file written by client programmers is the point — the pipeline is a product surface, not a fixed sequence.</p>
+<ul>
+<li>The original video is split into video, audio, and metadata.
+<ul>
+<li>Video encodings: Videos are converted to support different resolutions, codec, bitrates.</li>
+<li>Thumbnail: It can either be uploaded by a user or automatically generated bythe system.</li>
+<li>Watermark: Image overlay on top of your video contains identifying information about the video.</li>
+</ul>
+</li>
+</ul>
+<hr>
+<h3 id="video-transcoding-architecture">Video Transcoding Architecture</h3>
+<p align="left">
+<img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/video-transcoding-architecture.png" alt="Video Transcoding" data-width="600" style="max-width:600px">
+</p>
+<ol>
+<li>
+<p><strong>Preprocessor:</strong> Splits videos into smaller chunks (GOP alignment). It has 4 responsibilities.</p>
+ <p align="left">
+     <img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/dag-config.png" alt="DAG Config" data-width="500" style="max-width:500px">
+ </p>
+<ul>
+<li>Video splitting: Video stream is split or further split into smaller Group of Pictures (GOP) alignment.</li>
+<li>It split videos by GOP alignment for old clients.</li>
+</ul>
+<p><strong>GOP alignment is the mechanism that makes parallel transcoding possible, and it is worth understanding rather than memorising.</strong> Compressed video does not store every frame in full. A <strong>Group of Pictures</strong> begins with an <strong>I-frame</strong> (a complete, independently decodable image) and is followed by <strong>P- and B-frames</strong>, which encode only the <em>differences</em> from other frames.</p>
+<p>That means a GOP boundary is the only place a video can be cut. Split in the middle of a GOP and the resulting fragment contains difference-frames whose reference image is in the other fragment — it cannot be decoded at all. Split on GOP boundaries and every chunk is self-contained.</p>
+<p>Once chunks are independent, transcoding becomes <strong>embarrassingly parallel</strong>: a two-hour video is hundreds of chunks that can be encoded simultaneously on hundreds of workers and concatenated afterwards. A one-hour video need not take an hour to process. This is the entire reason the preprocessor exists, and the same segment boundaries are later reused as the ABR segments the player fetches.</p>
+<ul>
+<li>It generates DAG based on configuration files client programmers write.</li>
+<li>It stores GOPs and metadata in temporary storage in case the encoding fails, the system could use persisted data for retry operations.</li>
+</ul>
+</li>
+<li>
+<p><strong>DAG Scheduler:</strong> Organizes tasks into sequential or parallel stages.</p>
+ <p align="left">
+     <img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/dag-scheduler.png" alt="DAG Scheduler" data-width="500" style="max-width:500px">
+ </p>
+<ul>
+<li>It splits a DAG graph into stages of tasks and puts them in the task queue in the resource manager.</li>
+<li>Stage 1: video, audio, and metadata.</li>
+<li>The video file is further split into two tasks in stage 2: video encoding and thumbnail.</li>
+</ul>
+</li>
+<li>
+<p><strong>Resource Manager:</strong> Responsible for managing the efficiency of resource allocation.It
+contains 3 queues and a task scheduler.</p>
+ <p align="left">
+     <img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/resource-manager.png" alt="Resource Manager" data-width="700" style="max-width:700px">
+ </p>
+<ul>
+<li>Task queue: priority queue that contains tasks to be executed.</li>
+<li>Worker queue: priority queue that contains worker utilization info.</li>
+<li>Running queue: contains  currently running tasks and workers running the tasks.</li>
+<li>Task scheduler: picks the optimal task/worker, and instructs the chosen task worker to execute the job.</li>
+</ul>
+</li>
+<li>
+<p><strong>Task Workers:</strong> Perform transcoding and other operations.</p>
+ <p align="left">
+     <img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/task-worker.png" alt="Task Worker" data-width="250" style="max-width:250px">
+</p>
+<ul>
+<li>Different task workers may run different tasks</li>
+</ul>
+</li>
+<li>
+<p><strong>Temporary Storage:</strong> Stores intermediate data for retries.</p>
+<ul>
+<li>The choice of storage system depends on factors like data type, data size, access frequency, data life span, etc.</li>
+</ul>
+</li>
+<li>
+<p><strong>Output:</strong> Transcoded videos ready for distribution.</p>
+</li>
+</ol>
+<figure class="mermaid-fig">
+<svg id="mmd-23775520f539eae0" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 875.828px; background-color: transparent;" viewBox="0 0 875.828125 814.8184204101562" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-23775520f539eae0{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-23775520f539eae0 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-23775520f539eae0 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-23775520f539eae0 .error-icon{fill:#f4f6f8;}#mmd-23775520f539eae0 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-23775520f539eae0 .edge-thickness-normal{stroke-width:1px;}#mmd-23775520f539eae0 .edge-thickness-thick{stroke-width:3.5px;}#mmd-23775520f539eae0 .edge-pattern-solid{stroke-dasharray:0;}#mmd-23775520f539eae0 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-23775520f539eae0 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-23775520f539eae0 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-23775520f539eae0 .marker{fill:#637381;stroke:#637381;}#mmd-23775520f539eae0 .marker.cross{stroke:#637381;}#mmd-23775520f539eae0 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-23775520f539eae0 p{margin:0;}#mmd-23775520f539eae0 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-23775520f539eae0 .cluster-label text{fill:#454f5b;}#mmd-23775520f539eae0 .cluster-label span{color:#454f5b;}#mmd-23775520f539eae0 .cluster-label span p{background-color:transparent;}#mmd-23775520f539eae0 .label text,#mmd-23775520f539eae0 span{fill:#161c24;color:#161c24;}#mmd-23775520f539eae0 .node rect,#mmd-23775520f539eae0 .node circle,#mmd-23775520f539eae0 .node ellipse,#mmd-23775520f539eae0 .node polygon,#mmd-23775520f539eae0 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-23775520f539eae0 .rough-node .label text,#mmd-23775520f539eae0 .node .label text,#mmd-23775520f539eae0 .image-shape .label,#mmd-23775520f539eae0 .icon-shape .label{text-anchor:middle;}#mmd-23775520f539eae0 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-23775520f539eae0 .rough-node .label,#mmd-23775520f539eae0 .node .label,#mmd-23775520f539eae0 .image-shape .label,#mmd-23775520f539eae0 .icon-shape .label{text-align:center;}#mmd-23775520f539eae0 .node.clickable{cursor:pointer;}#mmd-23775520f539eae0 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-23775520f539eae0 .arrowheadPath{fill:#000000;}#mmd-23775520f539eae0 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-23775520f539eae0 .flowchart-link{stroke:#637381;fill:none;}#mmd-23775520f539eae0 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-23775520f539eae0 .edgeLabel p{background-color:#ffffff;}#mmd-23775520f539eae0 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-23775520f539eae0 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-23775520f539eae0 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-23775520f539eae0 .cluster text{fill:#454f5b;}#mmd-23775520f539eae0 .cluster span{color:#454f5b;}#mmd-23775520f539eae0 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-23775520f539eae0 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-23775520f539eae0 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-23775520f539eae0 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-23775520f539eae0 rect.text{fill:none;stroke-width:0;}#mmd-23775520f539eae0 .icon-shape,#mmd-23775520f539eae0 .image-shape{background-color:#ffffff;text-align:center;}#mmd-23775520f539eae0 .icon-shape p,#mmd-23775520f539eae0 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-23775520f539eae0 .icon-shape .label rect,#mmd-23775520f539eae0 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-23775520f539eae0 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-23775520f539eae0 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-23775520f539eae0 .node .neo-node{stroke:#299a8d;}#mmd-23775520f539eae0 [data-look="neo"].node rect,#mmd-23775520f539eae0 [data-look="neo"].cluster rect,#mmd-23775520f539eae0 [data-look="neo"].node polygon{stroke:url(#mmd-23775520f539eae0-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-23775520f539eae0 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-23775520f539eae0 [data-look="neo"].node path{stroke:url(#mmd-23775520f539eae0-gradient);stroke-width:1px;}#mmd-23775520f539eae0 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-23775520f539eae0 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-23775520f539eae0 [data-look="neo"].node circle{stroke:url(#mmd-23775520f539eae0-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-23775520f539eae0 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-23775520f539eae0 [data-look="neo"].icon-shape .icon{fill:url(#mmd-23775520f539eae0-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-23775520f539eae0 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-23775520f539eae0-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-23775520f539eae0 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-23775520f539eae0_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-23775520f539eae0_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-23775520f539eae0_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-23775520f539eae0_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-23775520f539eae0_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-23775520f539eae0_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-23775520f539eae0_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-23775520f539eae0_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-23775520f539eae0_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-23775520f539eae0_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-23775520f539eae0_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-23775520f539eae0_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M455.742,53L455.742,57.167C455.742,61.333,455.742,69.667,455.742,77.333C455.742,85,455.742,92,455.742,95.5L455.742,99" id="mmd-23775520f539eae0-L_V_PP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_V_PP_0" data-points="W3sieCI6NDU1Ljc0MjE4NzUsInkiOjUzfSx7IngiOjQ1NS43NDIxODc1LCJ5Ijo3OH0seyJ4Ijo0NTUuNzQyMTg3NSwieSI6MTAzfV0=" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M526.445,190L533.217,194.167C539.989,198.333,553.534,206.667,560.306,214.333C567.078,222,567.078,229,567.078,232.5L567.078,236" id="mmd-23775520f539eae0-L_PP_TMP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PP_TMP_0" data-points="W3sieCI6NTI2LjQ0NDU3MTE2Nzg4MzIsInkiOjE5MH0seyJ4Ijo1NjcuMDc4MTI1LCJ5IjoyMTV9LHsieCI6NTY3LjA3ODEyNSwieSI6MjQwfV0=" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M385.04,190L378.268,194.167C371.495,198.333,357.951,206.667,351.179,216.869C344.406,227.071,344.406,239.142,344.406,245.178L344.406,251.213" id="mmd-23775520f539eae0-L_PP_DS_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PP_DS_0" data-points="W3sieCI6Mzg1LjAzOTgwMzgzMjExNjgsInkiOjE5MH0seyJ4IjozNDQuNDA2MjUsInkiOjIxNX0seyJ4IjozNDQuNDA2MjUsInkiOjI1NS4yMTMzNTYwMTgwNjY0fV0=" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M344.406,321.213L344.406,331.416C344.406,341.618,344.406,362.022,354.667,379.505C364.928,396.988,385.45,411.55,395.712,418.831L405.973,426.112" id="mmd-23775520f539eae0-L_DS_RM_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DS_RM_0" data-points="W3sieCI6MzQ0LjQwNjI1LCJ5IjozMjEuMjEzMzU2MDE4MDY2NH0seyJ4IjozNDQuNDA2MjUsInkiOjM4Mi40MjY3MTIwMzYxMzI4fSx7IngiOjQwOS4yMzQ3NzA1Njk2MjAyNSwieSI6NDI4LjQyNjcxMjAzNjEzMjh9XQ==" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M341.938,480.2L302.305,486.738C262.672,493.275,183.406,506.351,143.773,516.389C104.141,526.427,104.141,533.427,104.141,536.927L104.141,540.427" id="mmd-23775520f539eae0-L_RM_W1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RM_W1_0" data-points="W3sieCI6MzQxLjkzNzUsInkiOjQ4MC4xOTk4NzA1NzQwNzMwM30seyJ4IjoxMDQuMTQwNjI1LCJ5Ijo1MTkuNDI2NzEyMDM2MTMyOH0seyJ4IjoxMDQuMTQwNjI1LCJ5Ijo1NDQuNDI2NzEyMDM2MTMyOH1d" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M391.791,494.427L383.717,498.593C375.642,502.76,359.493,511.093,351.418,518.76C343.344,526.427,343.344,533.427,343.344,536.927L343.344,540.427" id="mmd-23775520f539eae0-L_RM_W2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RM_W2_0" data-points="W3sieCI6MzkxLjc5MTM1MjM3MDY4OTY1LCJ5Ijo0OTQuNDI2NzEyMDM2MTMyOH0seyJ4IjozNDMuMzQzNzUsInkiOjUxOS40MjY3MTIwMzYxMzI4fSx7IngiOjM0My4zNDM3NSwieSI6NTQ0LjQyNjcxMjAzNjEzMjh9XQ==" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M519.693,494.427L527.768,498.593C535.842,502.76,551.991,511.093,560.066,518.76C568.141,526.427,568.141,533.427,568.141,536.927L568.141,540.427" id="mmd-23775520f539eae0-L_RM_W3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RM_W3_0" data-points="W3sieCI6NTE5LjY5MzAyMjYyOTMxMDMsInkiOjQ5NC40MjY3MTIwMzYxMzI4fSx7IngiOjU2OC4xNDA2MjUsInkiOjUxOS40MjY3MTIwMzYxMzI4fSx7IngiOjU2OC4xNDA2MjUsInkiOjU0NC40MjY3MTIwMzYxMzI4fV0=" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M569.547,481.544L605.264,487.858C640.982,494.172,712.417,506.799,748.134,516.613C783.852,526.427,783.852,533.427,783.852,536.927L783.852,540.427" id="mmd-23775520f539eae0-L_RM_W4_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RM_W4_0" data-points="W3sieCI6NTY5LjU0Njg3NSwieSI6NDgxLjU0NDAwMzMzNTcxODV9LHsieCI6NzgzLjg1MTU2MjUsInkiOjUxOS40MjY3MTIwMzYxMzI4fSx7IngiOjc4My44NTE1NjI1LCJ5Ijo1NDQuNDI2NzEyMDM2MTMyOH1d" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M104.141,589.427L104.141,593.593C104.141,597.76,104.141,606.093,150.561,618.339C196.981,630.585,289.821,646.744,336.241,654.823L382.661,662.903" id="mmd-23775520f539eae0-L_W1_OUT_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_W1_OUT_0" data-points="W3sieCI6MTA0LjE0MDYyNSwieSI6NTg5LjQyNjcxMjAzNjEzMjh9LHsieCI6MTA0LjE0MDYyNSwieSI6NjE0LjQyNjcxMjAzNjEzMjh9LHsieCI6Mzg2LjYwMTU2MjUsInkiOjY2My41ODg3MTU1OTU5ODI0fV0=" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M343.344,589.427L343.344,593.593C343.344,597.76,343.344,606.093,350.464,615.613C357.584,625.133,371.824,635.84,378.944,641.193L386.064,646.547" id="mmd-23775520f539eae0-L_W2_OUT_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_W2_OUT_0" data-points="W3sieCI6MzQzLjM0Mzc1LCJ5Ijo1ODkuNDI2NzEyMDM2MTMyOH0seyJ4IjozNDMuMzQzNzUsInkiOjYxNC40MjY3MTIwMzYxMzI4fSx7IngiOjM4OS4yNjEyNTc4MTE0NjUxNiwieSI6NjQ4Ljk1MDQwNjc3NTgyMDZ9XQ==" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M568.141,589.427L568.141,593.593C568.141,597.76,568.141,606.093,561.021,615.613C553.901,625.133,539.66,635.84,532.54,641.193L525.42,646.547" id="mmd-23775520f539eae0-L_W3_OUT_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_W3_OUT_0" data-points="W3sieCI6NTY4LjE0MDYyNSwieSI6NTg5LjQyNjcxMjAzNjEzMjh9LHsieCI6NTY4LjE0MDYyNSwieSI6NjE0LjQyNjcxMjAzNjEzMjh9LHsieCI6NTIyLjIyMzExNzE4ODUzNDgsInkiOjY0OC45NTA0MDY3NzU4MjA2fV0=" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M783.852,589.427L783.852,593.593C783.852,597.76,783.852,606.093,741.345,618.188C698.839,630.282,613.827,646.138,571.321,654.066L528.815,661.994" id="mmd-23775520f539eae0-L_W4_OUT_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_W4_OUT_0" data-points="W3sieCI6NzgzLjg1MTU2MjUsInkiOjU4OS40MjY3MTIwMzYxMzI4fSx7IngiOjc4My44NTE1NjI1LCJ5Ijo2MTQuNDI2NzEyMDM2MTMyOH0seyJ4Ijo1MjQuODgyODEyNSwieSI6NjYyLjcyNzEwODQzOTMzMDF9XQ==" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M567.078,336.427L567.078,344.093C567.078,351.76,567.078,367.093,556.817,382.041C546.556,396.988,526.034,411.55,515.773,418.831L505.512,426.112" id="mmd-23775520f539eae0-L_TMP_RM_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_TMP_RM_0" data-points="W3sieCI6NTY3LjA3ODEyNSwieSI6MzM2LjQyNjcxMjAzNjEzMjh9LHsieCI6NTY3LjA3ODEyNSwieSI6MzgyLjQyNjcxMjAzNjEzMjh9LHsieCI6NTAyLjI0OTYwNDQzMDM3OTc1LCJ5Ijo0MjguNDI2NzEyMDM2MTMyOH1d" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/><path d="M455.742,711.818L455.742,715.985C455.742,720.152,455.742,728.485,455.742,736.152C455.742,743.818,455.742,750.818,455.742,754.318L455.742,757.818" id="mmd-23775520f539eae0-L_OUT_CQ_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_OUT_CQ_0" data-points="W3sieCI6NDU1Ljc0MjE4NzUsInkiOjcxMS44MTg0MTI3ODA3NjE3fSx7IngiOjQ1NS43NDIxODc1LCJ5Ijo3MzYuODE4NDEyNzgwNzYxN30seyJ4Ijo0NTUuNzQyMTg3NSwieSI6NzYxLjgxODQxMjc4MDc2MTd9XQ==" data-look="classic" marker-end="url(#mmd-23775520f539eae0_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_V_PP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_PP_TMP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_PP_DS_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_DS_RM_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RM_W1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RM_W2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RM_W3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RM_W4_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_W1_OUT_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_W2_OUT_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_W3_OUT_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_W4_OUT_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(567.078125, 382.4267120361328)"><g class="label" data-id="L_TMP_RM_0" transform="translate(-61.5078125, -21)"><foreignObject width="123.015625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>retry a failed task<br />without re-splitting</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_OUT_CQ_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-23775520f539eae0-flowchart-V-0" data-look="classic" transform="translate(455.7421875, 30.5)"><rect class="basic label-container" style="" x="-73.6015625" y="-22.5" width="147.203125" height="45"/><g class="label" style="" transform="translate(-49.6015625, -10.5)"><rect/><foreignObject width="99.203125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>uploaded video</p></span></div></foreignObject></g></g><g class="node default" id="mmd-23775520f539eae0-flowchart-PP-1" data-look="classic" transform="translate(455.7421875, 146.5)"><rect class="basic label-container" style="" x="-108.0078125" y="-43.5" width="216.015625" height="87"/><g class="label" style="" transform="translate(-84.0078125, -31.5)"><rect/><foreignObject width="168.015625" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Preprocessor<br />split on GOP boundaries<br />generate DAG from config</p></span></div></foreignObject></g></g><g class="node default" id="mmd-23775520f539eae0-flowchart-TMP-3" data-look="classic" transform="translate(567.078125, 288.2133560180664)"><path d="M0,14.142236699239957 a81.40625,14.142236699239957 0,0,0 162.8125,0 a81.40625,14.142236699239957 0,0,0 -162.8125,0 l0,68.14223669923996 a81.40625,14.142236699239957 0,0,0 162.8125,0 l0,-68.14223669923996" class="basic label-container outer-path" style="" transform="translate(-81.40625, -48.21335504885994)"/><g class="label" style="" transform="translate(-75.40625, -13)"><rect/><foreignObject width="150.8125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>temporary storage<br />chunks + intermediates</p></span></div></foreignObject></g></g><g class="node default" id="mmd-23775520f539eae0-flowchart-DS-5" data-look="classic" transform="translate(344.40625, 288.2133560180664)"><rect class="basic label-container" style="" x="-91.265625" y="-33" width="182.53125" height="66"/><g class="label" style="" transform="translate(-67.265625, -21)"><rect/><foreignObject width="134.53125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>DAG scheduler<br />split DAG into stages</p></span></div></foreignObject></g></g><g class="node default" id="mmd-23775520f539eae0-flowchart-RM-7" data-look="classic" transform="translate(455.7421875, 461.4267120361328)"><rect class="basic label-container" style="" x="-113.8046875" y="-33" width="227.609375" height="66"/><g class="label" style="" transform="translate(-89.8046875, -21)"><rect/><foreignObject width="179.609375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Resource manager<br />task q · worker q · running q</p></span></div></foreignObject></g></g><g class="node default" id="mmd-23775520f539eae0-flowchart-W1-9" data-look="classic" transform="translate(104.140625, 566.9267120361328)"><rect class="basic label-container" style="" x="-96.140625" y="-22.5" width="192.28125" height="45"/><g class="label" style="" transform="translate(-72.140625, -10.5)"><rect/><foreignObject width="144.28125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>worker: encode 1080p</p></span></div></foreignObject></g></g><g class="node default" id="mmd-23775520f539eae0-flowchart-W2-11" data-look="classic" transform="translate(343.34375, 566.9267120361328)"><rect class="basic label-container" style="" x="-93.0625" y="-22.5" width="186.125" height="45"/><g class="label" style="" transform="translate(-69.0625, -10.5)"><rect/><foreignObject width="138.125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>worker: encode 480p</p></span></div></foreignObject></g></g><g class="node default" id="mmd-23775520f539eae0-flowchart-W3-13" data-look="classic" transform="translate(568.140625, 566.9267120361328)"><rect class="basic label-container" style="" x="-81.734375" y="-22.5" width="163.46875" height="45"/><g class="label" style="" transform="translate(-57.734375, -10.5)"><rect/><foreignObject width="115.46875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>worker: thumbnail</p></span></div></foreignObject></g></g><g class="node default" id="mmd-23775520f539eae0-flowchart-W4-15" data-look="classic" transform="translate(783.8515625, 566.9267120361328)"><rect class="basic label-container" style="" x="-83.9765625" y="-22.5" width="167.953125" height="45"/><g class="label" style="" transform="translate(-59.9765625, -10.5)"><rect/><foreignObject width="119.953125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>worker: watermark</p></span></div></foreignObject></g></g><g class="node default" id="mmd-23775520f539eae0-flowchart-OUT-17" data-look="classic" transform="translate(455.7421875, 675.6225624084473)"><path d="M0,13.130563798219585 a69.140625,13.130563798219585 0,0,0 138.28125,0 a69.140625,13.130563798219585 0,0,0 -138.28125,0 l0,46.13056379821958 a69.140625,13.130563798219585 0,0,0 138.28125,0 l0,-46.13056379821958" class="basic label-container outer-path" style="" transform="translate(-69.140625, -36.195845697329375)"/><g class="label" style="" transform="translate(-63.140625, -2.5)"><rect/><foreignObject width="126.28125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>transcoded storage</p></span></div></foreignObject></g></g><g class="node default" id="mmd-23775520f539eae0-flowchart-CQ-27" data-look="classic" transform="translate(455.7421875, 784.3184127807617)"><rect class="basic label-container" style="" x="-81.8828125" y="-22.5" width="163.765625" height="45"/><g class="label" style="" transform="translate(-57.8828125, -10.5)"><rect/><foreignObject width="115.765625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>completion queue</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-23775520f539eae0-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-23775520f539eae0-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-23775520f539eae0-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p><strong>Why temporary storage is not an implementation detail.</strong> It is what makes retries cheap. A task that fails can be re-run from its persisted input chunk; without it, any failure in a hundreds-of-tasks graph would mean re-splitting and re-encoding the whole video. The cost is that intermediates are large and must be garbage-collected on a short lifetime — which is exactly the &quot;data life span&quot; consideration the bullet alludes to.</p>
+<p><strong>Tasks must be idempotent.</strong> Retries and duplicate dispatches are normal in a system with this many moving parts, so encoding chunk 42 twice must produce the same output in the same place rather than two half-written files. Writing to a content-addressed or deterministic key makes this automatic.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>the transcoding section is where depth shows. Being able to explain <em>why</em> GOP boundaries determine the split points — I-frames are self-contained, P/B frames are not — and that this is what makes transcoding parallel, is worth more than reciting the four components of the architecture.</p>
+</div>
+<hr>
+</section>
+<section id="system-optimizations">
+<h2 id="system-optimizations">System Optimizations</h2>
+<h3 id="speed-optimizations">Speed Optimizations</h3>
+<ol>
+<li>
+<p><strong>Parallel Video Uploads:</strong> Split videos into smaller chunks for faster, resumable uploads.</p>
+ <img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/video-split.png" alt="Video Split" data-width="600" style="max-width:600px">
+<p><strong>Resumability is the real benefit; parallelism is secondary.</strong> A 1 GB upload over a mobile connection will be interrupted — by a tunnel, a network handoff, a backgrounded app. As a single request, any failure loses all progress and the user retries from zero, which on a flaky connection may never succeed. Split into chunks, each acknowledged independently, a resumed upload only re-sends the chunks that did not land.</p>
+<p>This requires an <strong>upload session</strong>: a server-side record of which chunks of which video have arrived, created when the upload begins and expiring after some period. The session ID, not the file, is what the client resumes against.</p>
+</li>
+<li>
+<p><strong>Distributed Upload Centers:</strong> Use CDNs as upload hubs close to users.</p>
+<p>Upload throughput is limited by round-trip time as much as by bandwidth, so terminating the connection at a nearby edge rather than a distant region materially speeds up large uploads. The edge then moves the bytes to central storage over well-provisioned backbone links instead of the user's last mile.</p>
+</li>
+<li>
+<p><strong>Parallel Processing:</strong> Decouple modules using message queues for high parallelism.</p>
+<p>The queues also decouple <em>rate</em>. Uploads are bursty and follow daily cycles; transcoding capacity is expensive and sized for sustained throughput. A queue lets uploads be accepted instantly during a peak while transcoding drains over the following hours — the user sees &quot;processing&quot;, which is an acceptable experience, instead of a rejected upload, which is not. The visible cost is <strong>transcoding lag</strong>, and queue depth is the metric that predicts it.</p>
+ <img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/message-queue1.png" alt="Message Queue" data-width="600" style="max-width:600px">
+ <img loading="lazy" decoding="async" style="max-height:170px;max-width:500px" src="../../system-design-notes/14.%20Youtube/images/message-queue2.png" alt="Message Queue" data-height="170" data-width="500">
+</li>
+</ol>
+<h3 id="safety-optimizations">Safety Optimizations</h3>
+<ol>
+<li>
+<p><strong>Pre-Signed URLs:</strong> Restrict video uploads to authorized users.</p>
+ <img loading="lazy" decoding="async" src="../../system-design-notes/14.%20Youtube/images/pres-signed-urls.png" alt="Pre Signed" data-width="500" style="max-width:500px">
+<p>A pre-signed URL is a storage-layer capability: the API server, which <em>is</em> authenticated, asks blob storage for a time-limited token authorising a write to one specific key. The client then uploads directly to storage with no credentials of its own. This is what allows the &quot;bytes never touch the API tier&quot; property above to coexist with access control — without it you would either proxy 150 TB/day through your own servers or hand out bucket credentials.</p>
+<p>The limits are what make it safe and must be set deliberately: a <strong>short expiry</strong>, a <strong>single key</strong>, a <strong>content-length cap</strong>, and ideally a content-type restriction. A pre-signed URL with a generous expiry and no size limit is an open write endpoint to your storage bill.</p>
+</li>
+<li>
+<p><strong>Protect Videos:</strong></p>
+<ul>
+<li><strong>DRM Systems</strong> (e.g., Apple FairPlay, Google Widevine).</li>
+<li><strong>AES Encryption.</strong></li>
+<li><strong>Watermarking.</strong></li>
+</ul>
+</li>
+</ol>
+<h3 id="cost-saving-optimizations">Cost-Saving Optimizations</h3>
+<ol>
+<li>Serve only popular videos via CDN; less popular ones from high-capacity servers.</li>
+<li>Encode on-demand for rarely accessed videos.</li>
+<li>Regionalize video distribution based on popularity.</li>
+<li>Build custom CDNs and partner with ISPs to reduce bandwidth costs.</li>
+</ol>
+<p>All four are the same idea applied in different places: <strong>match the cost of the infrastructure to the value of the content.</strong> Views are distributed as a steep power law, so a uniform policy is necessarily wrong — it either overspends on the long tail or underserves the head.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Share of content</th>
+<th>Share of views</th>
+<th>Where it lives</th>
+<th>Rendition strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot</td>
+<td>Tiny</td>
+<td>Most watch time</td>
+<td>CDN edge, widely replicated</td>
+<td>Full ladder, pre-encoded</td>
+</tr>
+<tr>
+<td>Warm</td>
+<td>Moderate</td>
+<td>Meaningful</td>
+<td>Regional origin, CDN on demand</td>
+<td>Common renditions pre-encoded</td>
+</tr>
+<tr>
+<td>Cold</td>
+<td>The vast majority</td>
+<td>Negligible</td>
+<td>Cheap object storage</td>
+<td>Transcode on request, cache briefly</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Regionalisation is the same logic in space rather than popularity: a video watched almost exclusively in one country does not need to occupy edge capacity on other continents.</p>
+<hr>
+</section>
+<section id="error-handling">
+<h2 id="error-handling">Error Handling</h2>
+<h3 id="recoverable-errors">Recoverable Errors</h3>
+<ul>
+<li>Retry failed uploads, transcoding, or resource allocation tasks.</li>
+</ul>
+<h3 id="non-recoverable-errors">Non-Recoverable Errors</h3>
+<ul>
+<li>Stop malformed video processing and return error codes.</li>
+</ul>
+<p>The distinction matters most inside the transcoding DAG, where a single video is hundreds of tasks. A worker crash, a timeout, or a transient storage error should re-run one task from temporary storage. A corrupt source file, an unsupported codec, or a video that crashes the encoder is <strong>permanent</strong> — retrying it consumes a worker indefinitely and, in a shared pool, degrades everyone's transcoding latency. Bounded attempts, then fail the video and tell the uploader, is the correct behaviour; this is the same classification problem as <a href="10-notification-system.html#retries-the-part-that-is-usually-wrong">Chapter 10</a>.</p>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Egress cost dominates everything.</strong> At ~$150,000/day, a 10% improvement in bytes served is worth more than most engineering projects. Popularity tiering, ABR efficiency, and codec choice are financial decisions.</li>
+<li><strong>A newly uploaded video is not in the CDN yet.</strong> The first viewers of every video are origin misses, and that is exactly when a video is most likely to go viral. Without <strong>origin shielding</strong> (a mid-tier cache absorbing edge misses), a popular new release produces a stampede of identical origin requests — the cache stampede from <a href="01-scaling.html#section-6-caching">Chapter 1 §6</a>, at petabyte scale.</li>
+<li><strong>Transcoding backlogs silently delay publication.</strong> When upload rate exceeds transcoding capacity, nothing errors — videos just stay in &quot;processing&quot; for hours. Queue depth and oldest-pending-task age are the alarms; the user-visible symptom appears long after the cause.</li>
+<li><strong>The rendition ladder multiplies storage 2–5×.</strong> Every added resolution or codec is a permanent, recurring cost across the whole library. Adding a codec is cheap to decide and expensive forever.</li>
+<li><strong>Long videos break assumptions everywhere.</strong> A ten-hour upload exceeds request timeouts, session expiries, worker lifetimes, and memory limits chosen with a five-minute video in mind.</li>
+<li><strong>A poison video can consume the worker pool.</strong> A file that reliably crashes the encoder will be retried forever unless attempts are bounded, and in a shared pool it degrades transcoding for every other customer.</li>
+<li><strong>Chunked uploads need session expiry and garbage collection.</strong> Abandoned uploads leave orphaned chunks that nobody will ever complete and nobody is billing for deliberately.</li>
+<li><strong>Pre-signed URLs are write capabilities.</strong> Long expiries, missing size caps, or reusable keys turn them into an open upload endpoint. Scope them to one key, one size, one short window.</li>
+<li><strong>Deleting a video does not delete it from the CDN.</strong> Copies persist at edges until TTLs expire or an invalidation propagates, and invalidation is slow and only partially reliable. For takedowns driven by law or safety, that gap is the problem — which is why DRM key revocation is sometimes the faster lever than purging bytes.</li>
+<li><strong>Client-side ABR can choose badly.</strong> A player that over-estimates throughput requests a rendition it cannot sustain, then rebuffers; one that under-estimates serves needlessly poor quality. The quality of the viewing experience depends on client logic the server cannot control.</li>
+<li><strong>Metadata and blobs scale differently and must be separated.</strong> Titles, descriptions and view counts are small, queryable, frequently updated rows; video files are enormous and immutable. Putting them in one store makes both worse.</li>
+<li><strong>Moderation and copyright matching are pipelines, not checks.</strong> Fingerprint-matching every upload against a reference library is comparable in cost to transcoding it, and it sits between upload and publication — so its latency is the user's publication latency.</li>
+<li><strong>Live streaming is a different system.</strong> It cannot batch-transcode, cannot buffer for minutes, and has no complete file to split. Do not assume this design extends to it.</li>
+<li><strong>Thumbnails are small, numerous and hot.</strong> They are requested far more often than videos — every search result and recommendation shows one — so they are a high-QPS small-object workload with very different caching needs from the video itself.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>$55 M/year of bandwidth</td>
+<td>Popularity tiering, regional distribution, custom CDN and ISP peering</td>
+</tr>
+<tr>
+<td>Rarely watched videos not worth pre-encoding</td>
+<td>Transcode on demand, cache the result briefly</td>
+</tr>
+<tr>
+<td>Adapting to the viewer's network</td>
+<td>ABR (HLS/DASH): segment ladder plus manifest, client chooses per segment</td>
+</tr>
+<tr>
+<td>Video bytes overwhelming the API tier</td>
+<td>Direct-to-storage upload via pre-signed URLs</td>
+</tr>
+<tr>
+<td>Uploads failing on mobile networks</td>
+<td>Chunked, resumable upload against a server-side upload session</td>
+</tr>
+<tr>
+<td>Slow uploads over long distances</td>
+<td>Terminate at a nearby edge, move to origin over the backbone</td>
+</tr>
+<tr>
+<td>Transcoding being slow and expensive</td>
+<td>Split on GOP boundaries into independent chunks, encode in parallel</td>
+</tr>
+<tr>
+<td>Expressing per-video processing needs</td>
+<td>Configurable DAG of tasks (encode, thumbnail, watermark)</td>
+</tr>
+<tr>
+<td>Scheduling hundreds of tasks across workers</td>
+<td>Resource manager with task, worker and running queues</td>
+</tr>
+<tr>
+<td>Retrying one failed task cheaply</td>
+<td>Persist chunks and intermediates in temporary storage; idempotent tasks</td>
+</tr>
+<tr>
+<td>Upload bursts exceeding transcoding capacity</td>
+<td>Message queues absorb the burst; &quot;processing&quot; state for the user</td>
+</tr>
+<tr>
+<td>Stampede on a newly viral video</td>
+<td>Origin shielding / tiered CDN caching</td>
+</tr>
+<tr>
+<td>Unauthorised uploads</td>
+<td>Pre-signed URLs scoped to one key, size and short expiry</td>
+</tr>
+<tr>
+<td>Protecting content</td>
+<td>DRM (FairPlay, Widevine), AES encryption, watermarking</td>
+</tr>
+<tr>
+<td>Corrupt or malicious source files</td>
+<td>Classify as non-recoverable, bound attempts, fail the video</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Compare one day's CDN egress cost with the cost of storing one day's uploads for a month. What does the ratio imply about where engineering effort should go?</li>
+<li>Why does one uploaded video occupy several times its own size in storage?</li>
+<li>Who decides which video quality is played, and what does that tell you about where ABR logic lives?</li>
+<li>Why can a CDN serve video at all, given that CDNs cache small static files?</li>
+<li>Why must video be split on GOP boundaries, and what does that enable?</li>
+<li>A one-hour video finishes transcoding in four minutes. Explain how.</li>
+<li>What does temporary storage buy you in the transcoding pipeline, and what does it cost?</li>
+<li>Why do video bytes bypass the API servers, and what makes that safe?</li>
+<li>A user's 1 GB upload fails at 80%. What determines whether they have to start again?</li>
+<li>A video goes viral an hour after upload. Which cache layer is cold, and what prevents a stampede on the origin?</li>
+<li>Upload volume exceeds transcoding capacity for six hours. What do users see, and which metric would have warned you?</li>
+<li>A video must be removed for legal reasons. Why is deleting it from storage not sufficient?</li>
+<li>Which parts of this design do <em>not</em> transfer to live streaming?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Transcoding</strong></td>
+<td>Re-encoding a source video into other formats, resolutions and bitrates</td>
+</tr>
+<tr>
+<td><strong>Container / codec</strong></td>
+<td>The file format wrapping streams (MP4) vs the compression algorithm (H.264, VP9)</td>
+</tr>
+<tr>
+<td><strong>GOP (Group of Pictures)</strong></td>
+<td>A self-contained run of frames beginning with an I-frame; the only legal split point</td>
+</tr>
+<tr>
+<td><strong>I-frame / P-frame / B-frame</strong></td>
+<td>A complete image vs frames encoded as differences from other frames</td>
+</tr>
+<tr>
+<td><strong>Rendition ladder</strong></td>
+<td>The set of quality levels produced for one video</td>
+</tr>
+<tr>
+<td><strong>ABR (adaptive bitrate)</strong></td>
+<td>Client-driven per-segment quality selection, as in HLS and DASH</td>
+</tr>
+<tr>
+<td><strong>Manifest</strong></td>
+<td>The playlist describing available renditions and segments</td>
+</tr>
+<tr>
+<td><strong>DAG</strong></td>
+<td>The dependency graph of transcoding tasks for one video</td>
+</tr>
+<tr>
+<td><strong>Preprocessor</strong></td>
+<td>Splits the video on GOP boundaries and builds the DAG from configuration</td>
+</tr>
+<tr>
+<td><strong>Resource manager</strong></td>
+<td>Matches ready tasks to available workers via task/worker/running queues</td>
+</tr>
+<tr>
+<td><strong>Temporary storage</strong></td>
+<td>Persisted chunks and intermediates enabling per-task retry</td>
+</tr>
+<tr>
+<td><strong>Pre-signed URL</strong></td>
+<td>A time- and key-scoped storage credential letting a client upload directly</td>
+</tr>
+<tr>
+<td><strong>Upload session</strong></td>
+<td>Server-side record of which chunks have arrived, enabling resumable uploads</td>
+</tr>
+<tr>
+<td><strong>Origin shielding</strong></td>
+<td>A mid-tier cache absorbing edge misses so the origin sees one request, not thousands</td>
+</tr>
+<tr>
+<td><strong>Popularity tiering</strong></td>
+<td>Matching storage and delivery cost to a video's view volume</td>
+</tr>
+<tr>
+<td><strong>DRM</strong></td>
+<td>Encryption plus licence-based key delivery (FairPlay, Widevine) controlling playback</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="01-scaling.html#section-7-content-delivery-network-cdn">Chapter 1 §7 – Content Delivery Network</a> — the push/pull and invalidation mechanics this chapter depends on entirely.</li>
+<li><a href="24-s3-like-object-storage.html">Chapter 24 – S3-like Object Storage</a> — what the blob storage underneath this design actually is.</li>
+<li><a href="19-distributed-message-queue.html">Chapter 19 – Distributed Message Queue</a> — the queues decoupling upload rate from transcoding capacity.</li>
+<li><a href="15-google-drive.html">Chapter 15 – Design Google Drive</a> — the same chunked-upload and metadata/blob-split problems, with synchronisation instead of transcoding.</li>
+<li><a href="https://netflixtechblog.com/high-quality-video-encoding-at-scale-d159db052746" target="_blank" rel="noopener">Netflix: high quality video encoding at scale</a> and <a href="https://netflixtechblog.com/optimized-shot-based-encodes-now-streaming-4b9464204830" target="_blank" rel="noopener">per-shot encoding</a> — the rendition-ladder problem taken much further.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

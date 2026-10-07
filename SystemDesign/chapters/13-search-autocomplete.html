@@ -1,0 +1,639 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 13: Design a Search Autocomplete System — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="13-search-autocomplete">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 1 Systems › Chapter 13 of 28</div>
+  <h1>Chapter 13: Design a Search Autocomplete System</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understanding-the-problem">Step 1: Understanding the Problem</a></li><li><a href="#step-2-high-level-design">Step 2: High-Level Design</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#step-4-advanced-features">Step 4: Advanced Features</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>Autocomplete, also known as typeahead or incremental search, provides real-time suggestions to users as they type in search boxes. The system must efficiently deliver top-k relevant and popular suggestions based on historical query data.</p>
+<p><strong>The one-sentence version:</strong> the obvious design — walk a trie to the prefix, gather its subtree, sort by frequency — is <strong>unusable at request time</strong>, because the subtree under a prefix like <code>&quot;a&quot;</code> contains nearly every query you have ever seen. The entire chapter is the consequence of precomputing the answer for every prefix instead, at which point the trie stops being a serving structure and becomes a <strong>build-time</strong> one, and serving is just a hash map lookup.</p>
+<p>The second thing to notice early: autocomplete is the <strong>highest-QPS service in a search company</strong>, because every keystroke is a request. It handles roughly twenty times the traffic of search itself while serving results nobody explicitly asked for.</p>
+<h3 id="key-features">Key Features</h3>
+<ul>
+<li>Suggest up to <strong>5 autocomplete results</strong>.</li>
+<li>Based on <strong>query popularity</strong> (frequency).</li>
+<li>Support only <strong>lowercase English characters</strong>.</li>
+<li>Fast response time (&lt;100 ms) and scalable.</li>
+</ul>
+<hr>
+</section>
+<section id="step-1-understanding-the-problem">
+<h2 id="step-1-understanding-the-problem">Step 1: Understanding the Problem</h2>
+<h3 id="requirements">Requirements</h3>
+<ol>
+<li><strong>Real-Time Suggestions:</strong> Display relevant matches as the user types.</li>
+<li><strong>Top-k Results:</strong> Return up to 5 results sorted by popularity.</li>
+<li><strong>Scalability:</strong> Handle <strong>10 million DAU</strong> with a peak QPS of <strong>48,000</strong>.</li>
+<li><strong>High Availability:</strong> Handle failures without system downtime.</li>
+<li><strong>Data Growth:</strong> Support daily storage growth of <strong>0.4 GB</strong> for new query data.</li>
+</ol>
+<h3 id="where-48000-qps-comes-from--and-why-it-is-the-real-constraint">Where 48,000 QPS comes from — and why it is the real constraint</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Derivation</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Searches/day</td>
+<td>10 M DAU × ~10 searches</td>
+<td>100 M</td>
+</tr>
+<tr>
+<td>Keystrokes per search</td>
+<td>~20 characters typed</td>
+<td>20 requests per search</td>
+</tr>
+<tr>
+<td>Autocomplete requests/day</td>
+<td>100 M × 20</td>
+<td><strong>2 B (~24,000 QPS average)</strong></td>
+</tr>
+<tr>
+<td>Peak QPS</td>
+<td>~2 × average</td>
+<td><strong>~48,000 QPS</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>One search produces twenty autocomplete requests.</strong> That 20× amplification is the defining property of the workload, and it has two immediate consequences: the service must be absurdly cheap per request, and <em>reducing the amplification</em> is the highest-leverage optimisation available — which is exactly what client-side debouncing and browser caching do, further down.</p>
+<h3 id="the-latency-budget-is-set-by-typing-speed-not-by-the-sla">The latency budget is set by typing speed, not by the SLA</h3>
+<p>A competent typist produces a character every 150–200 ms. That gives a hard bound tighter than the stated 100 ms:</p>
+<ul>
+<li><strong>Under ~50 ms server time</strong>, suggestions appear to update as the user types.</li>
+<li><strong>Over ~200 ms</strong>, the user has already typed the next character, so your response is answering a prefix that no longer exists.</li>
+</ul>
+<p>The second case is not merely slow — it is a <strong>correctness problem on the client</strong>. Responses for <code>&quot;tw&quot;</code> and <code>&quot;twi&quot;</code> are separate in-flight requests that can return out of order, so the UI must discard any response that does not match the current input. A client that simply renders whatever arrives last will flicker between suggestion sets, which users read as the feature being broken.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>deriving 48,000 QPS from keystrokes rather than searches shows you understand the workload, and noting that the latency bound comes from human typing speed (with out-of-order responses as the consequence) is the kind of detail that distinguishes a considered answer.</p>
+</div>
+<hr>
+</section>
+<section id="step-2-high-level-design">
+<h2 id="step-2-high-level-design">Step 2: High-Level Design</h2>
+<p>At the high-level, the system is broken down into two services:</p>
+<ol>
+<li>
+<p><strong>Data Gathering Service:</strong></p>
+<ul>
+<li>Collects user queries and aggregates them for frequency analysis in real-time.</li>
+<li>Real-time processing is not practical for large data sets; however, it is a good starting point</li>
+</ul>
+</li>
+<li>
+<p><strong>Query Service:</strong> Provides the top-k suggestions based on the user’s input.</p>
+</li>
+</ol>
+<hr>
+<h3 id="data-gathering-service">Data Gathering Service</h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/13.%20Search%20Autocomplete/images/data-gathering.png" alt="Data Gathering" data-width="600" style="max-width:600px">
+</p>
+<ul>
+<li>Aggregates query data from analytics logs and updates the frequency table.</li>
+<li>Processes historical data weekly to build a <strong>trie</strong> (prefix tree).</li>
+</ul>
+<h3 id="query-service">Query Service</h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/13.%20Search%20Autocomplete/images/frequency-table.png" alt="Frequency Table" data-width="400" style="max-width:400px">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/13.%20Search%20Autocomplete/images/basic-search-suggestions.png" alt="Search Suggestions" data-width="360" style="max-width:360px">
+</p>
+<ul>
+<li>Uses the frequency table from data gathering service.</li>
+<li>Processes user input and retrieves top-k suggestions from the frequency table using a Trie.</li>
+<li>Optimized for fast lookups using caching and efficient data structures.</li>
+<li>For example when a user types “tw” in the search box, the following top 5 searched queries are displayed.</li>
+</ul>
+<p><strong>Why a frequency table alone is not enough.</strong> <code>SELECT query, freq FROM frequency_table WHERE query LIKE 'tw%' ORDER BY freq DESC LIMIT 5</code> is correct and completely impractical: it is a scan over every row matching the prefix, executed 48,000 times a second, against a table where the prefix <code>&quot;a&quot;</code> matches hundreds of millions of rows. The trie exists to make <em>finding</em> the matching set O(prefix length) instead of a scan — and the top-k cache below exists because even then, <em>ranking</em> the matching set is the expensive half.</p>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<h3 id="trie-data-structure">Trie Data Structure</h3>
+<p>The <strong>trie</strong> is a tree-like data structure used to store and retrieve query strings efficiently.</p>
+<h4 id="key-features-1">Key Features</h4>
+<ol>
+<li>
+<p><strong>Compact Storage:</strong> Represents prefixes hierarchically to minimize redundancy.</p>
+</li>
+<li>
+<p><strong>Frequency Information:</strong> Stores the popularity of queries at each node.</p>
+</li>
+<li>
+<p><strong>Steps to get top k most searched queries</strong></p>
+<p align="left">
+   <img loading="lazy" decoding="async" src="../../system-design-notes/13.%20Search%20Autocomplete/images/trie-structure.png" alt="Trie Structure" data-width="500" style="max-width:500px">
+</p>
+<ul>
+<li>Find the prefix</li>
+<li>Traverse the subtree from prefix node to get all valid children</li>
+<li>Sort the children and get top k</li>
+</ul>
+<p><strong>Count the cost of step 2 and 3 honestly.</strong> Finding the prefix node is O(length of prefix) — trivially fast. Gathering and sorting the subtree is where it falls apart:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Prefix typed</th>
+<th>Queries beneath it</th>
+<th>Work per request</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&quot;a&quot;</code></td>
+<td>Potentially <strong>hundreds of millions</strong></td>
+<td>Visit them all, then sort</td>
+</tr>
+<tr>
+<td><code>&quot;ap&quot;</code></td>
+<td>Millions</td>
+<td>Still hopeless</td>
+</tr>
+<tr>
+<td><code>&quot;apple pie recipe&quot;</code></td>
+<td>A handful</td>
+<td>Fine</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The expensive case is the <em>first keystroke</em>, which every single search performs. So the naive algorithm is slowest exactly where it is called most. At 48,000 QPS it is not a matter of optimisation — it cannot work at all, which is what makes the next section the heart of the chapter.</p>
+</li>
+<li>
+<p><strong>Optimizations:</strong></p>
+<ul>
+<li>
+<p>Cache top-k queries at each node to speed up retrieval and avoid traversing the whole trie.</p>
+   <img loading="lazy" decoding="async" src="../../system-design-notes/13.%20Search%20Autocomplete/images/cached-trie.png" alt="Cached Trie" data-width="600" style="max-width:600px">
+</li>
+<li>
+<p>Limit prefix length to reduce search space as users rarely type a loong search query (say 50).</p>
+</li>
+</ul>
+</li>
+</ol>
+<p><strong>Caching top-k at each node changes the algorithm's complexity class, not just its constant.</strong> With the answer stored on the node itself, serving a request is: walk <code>p</code> characters down the trie, return the stored list. That is <strong>O(length of prefix)</strong> with no subtree traversal and no sorting — and since prefixes are capped at ~50 characters, it is effectively O(1).</p>
+<p>The trade is memory, and it is substantial:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Traverse at query time</th>
+<th>Top-k cached at each node</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Query cost</td>
+<td>O(subtree size + sort) — up to hundreds of millions</td>
+<td><strong>O(prefix length)</strong> ≈ constant</td>
+</tr>
+<tr>
+<td>Memory</td>
+<td>Frequencies only</td>
+<td>Plus ~5 strings per node (~100 bytes)</td>
+</tr>
+<tr>
+<td>Build cost</td>
+<td>None</td>
+<td>Full bottom-up pass over the trie</td>
+</tr>
+<tr>
+<td>Updating one query's frequency</td>
+<td>Touch one node</td>
+<td>Touch <strong>every ancestor</strong> whose top-5 might change</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The last row is the one that shapes the rest of the chapter. Once answers are precomputed, an update is no longer local — bumping <code>&quot;twitter&quot;</code> can change the cached list at <code>&quot;t&quot;</code>, <code>&quot;tw&quot;</code>, <code>&quot;twi&quot;</code> and so on. <strong>That is why the trie is rebuilt in batch rather than updated live</strong>, and the &quot;weekly rebuild&quot; that looks like laziness is actually a direct consequence of the top-k cache.</p>
+<p><strong>The realisation this leads to:</strong> if every node stores its own answer and lookup never descends past the prefix, the tree structure is not being used at serving time at all. A map from <code>prefix → [top 5 queries]</code> serves requests identically, in one hash lookup instead of 50 pointer dereferences, and shards trivially. The trie is how you <em>compute</em> those entries; it is not how you serve them — which is precisely the key-value representation described under Storage Options below.</p>
+<p>Sizing it: roughly 100 M distinct prefixes worth keeping × ~100 bytes of cached suggestions ≈ <strong>~10 GB</strong>, which fits in a distributed cache and explains why the serving tier is memory-resident.</p>
+<h4 id="trie-operations">Trie Operations</h4>
+<ol>
+<li>
+<p><strong>Create:</strong></p>
+<ul>
+<li>Built weekly using aggregated query data.</li>
+<li>The source of data is from Analytics Log/DB.</li>
+</ul>
+</li>
+<li>
+<p><strong>Update:</strong> Rarely updated in real-time; weekly updates replace old data.</p>
+</li>
+<li>
+<p><strong>Delete:</strong></p>
+   <p align="left">
+      <img loading="lazy" decoding="async" src="../../system-design-notes/13.%20Search%20Autocomplete/images/delete-kv.png" alt="Delete KV" data-width="500" style="max-width:500px">
+   </p>
+<ul>
+<li>Filters remove unwanted or harmful suggestions (e.g., hate speech).</li>
+<li>Having a filter layer gives us the flexibility of removing results based on different filter rules.</li>
+<li>Unwanted suggestions are removed physically from the database asynchronically.</li>
+</ul>
+<p><strong>The filter must sit on the read path, and the reason is structural.</strong> Suggestions are precomputed and the trie is rebuilt weekly, so a suggestion banned on Tuesday remains baked into every cached node until the next build. Physical deletion being asynchronous is therefore not a performance choice — it is unavoidable, and the filter layer is what makes the system correct in the meantime.</p>
+<p>This is also the system's highest-risk surface for reasons unrelated to engineering: autocomplete puts words in users' mouths and attributes them to your product, and the suggestions are derived from whatever the public typed. Defamatory completions on a person's name, and suggestions that reveal what a small group searched for, are both well-documented incidents. A read-path filter with an operator-editable blocklist is the mechanism that lets you respond in minutes rather than at the next rebuild.</p>
+</li>
+</ol>
+<hr>
+<h3 id="query-processing-flow">Query Processing Flow</h3>
+<ol>
+<li><strong>Prefix Search:</strong>
+<ul>
+<li>Identify the prefix node corresponding to the user’s input.</li>
+<li>Traverse the subtree to collect valid suggestions.</li>
+</ul>
+</li>
+<li><strong>Top-k Sorting:</strong>
+<ul>
+<li>Cache top-k suggestions at each node to minimize sorting overhead.</li>
+</ul>
+</li>
+<li><strong>Response Construction:</strong>
+<ul>
+<li>Construct results using cached data for fast response times.</li>
+</ul>
+</li>
+</ol>
+<hr>
+<h3 id="optimizations">Optimizations</h3>
+<ol>
+<li><strong>Cache at Each Node:</strong>
+<ul>
+<li>Store the top-k queries to avoid redundant traversals.</li>
+</ul>
+</li>
+<li><strong>Limit Prefix Length:</strong>
+<ul>
+<li>Cap prefix length to a small value (e.g., 50 characters) for faster lookups.</li>
+</ul>
+</li>
+<li><strong>AJAX Requests:</strong>
+<ul>
+<li>Use lightweight asynchronous requests for real-time responses.</li>
+</ul>
+</li>
+<li><strong>Browser Caching:</strong>
+<ul>
+<li>Save autocomplete results in the browser cache for frequently searched terms.</li>
+</ul>
+</li>
+</ol>
+<hr>
+<h3 id="data-gathering-pipeline">Data Gathering Pipeline</h3>
+<p>In the high-level design, whenever a user types a search query, data is updated in real-time. This appraoch is not practical.</p>
+<ul>
+<li>Users may enter billions of queries per day. Updating the trie on every query is not feasible.</li>
+<li>Top suggestions may not change much one the trie is built.</li>
+</ul>
+<p>Both bullets are true, and the second is the justification for the first. Query popularity is dominated by a stable head — the most-searched terms are much the same this week as last — so the <em>marginal value</em> of a real-time update is near zero for almost every prefix. Spending 48,000 QPS worth of write amplification to capture it would be a poor trade.</p>
+<p>The exception is real-time events, and it is handled by exception rather than by making the whole pipeline real-time. See <strong>Trending Queries</strong> below.</p>
+<h4 id="updated-design">Updated Design</h4>
+<p align="left">
+   <img loading="lazy" decoding="async" src="../../system-design-notes/13.%20Search%20Autocomplete/images/data-gathering-flow.png" alt="Updated Data Gathering Flow" data-width="600" style="max-width:600px">
+</p>
+<ol>
+<li><strong>Analytics Logs:</strong>
+<ul>
+<li>Stores raw query data as logs for weekly aggregation.</li>
+<li>Logs are append-only and are not indexed</li>
+</ul>
+</li>
+<li><strong>Aggregators:</strong>
+<ul>
+<li>Process logs into frequency tables, suitable for trie construction.</li>
+<li>For real-time applications such as Twitter, aggregate data in a shorter time interval.</li>
+<li>For other cases, aggregating data less frequently, say once per week is good enough.</li>
+</ul>
+</li>
+<li><strong>Workers:</strong>
+<ul>
+<li>Asynchronous servers rebuild the trie and store it in persistent storage.</li>
+</ul>
+</li>
+<li><strong>Storage Options:</strong>
+<ul>
+<li><strong>Trie Cache</strong>: Trie Cache is a distributed cache system that keeps trie in memory for fast read.</li>
+<li><strong>Trie DB</strong>
+<ol>
+<li><strong>Document Store (e.g., MongoDB)</strong>: Since a new trie is built weekly, we can periodically take a snapshot of it, serialize it, and store the serialized data in the database like MongoDB</li>
+<li><strong>Key-Value Store:</strong>
+<ul>
+<li>
+<p>Maps prefixes to node data for fast access.</p>
+</li>
+<li>
+<p>Every prefix in the trie is mapped to a key in a hash table.</p>
+</li>
+<li>
+<p>Data on each trie node is mapped to a value in a hash table.</p>
+  <img loading="lazy" decoding="async" src="../../system-design-notes/13.%20Search%20Autocomplete/images/trie-db.png" alt="Trie DB" data-width="600" style="max-width:600px">
+</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+</li>
+</ol>
+<p>This is the flattened form predicted above: <strong>prefix as key, cached top-k as value.</strong> It is worth being explicit about why this is the better of the two storage options for serving. The document-store snapshot preserves the tree, which is what you want for rebuilding and for shipping a new version atomically; the key-value form abandons the tree and is what you want for reads, because a hash lookup beats a traversal and because keys shard independently with no parent-child locality to preserve.</p>
+<p>In practice both exist: build a trie, serialise a snapshot for versioning and rollback, and <em>expand</em> it into flat prefix keys in the serving cache.</p>
+<figure class="mermaid-fig">
+<svg id="mmd-507153edfc2cdc8c" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1906.89px; background-color: transparent;" viewBox="0 -0.000003814697265625 1906.890625 225.3895721435547" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-507153edfc2cdc8c{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-507153edfc2cdc8c .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-507153edfc2cdc8c .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-507153edfc2cdc8c .error-icon{fill:#f4f6f8;}#mmd-507153edfc2cdc8c .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-507153edfc2cdc8c .edge-thickness-normal{stroke-width:1px;}#mmd-507153edfc2cdc8c .edge-thickness-thick{stroke-width:3.5px;}#mmd-507153edfc2cdc8c .edge-pattern-solid{stroke-dasharray:0;}#mmd-507153edfc2cdc8c .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-507153edfc2cdc8c .edge-pattern-dashed{stroke-dasharray:3;}#mmd-507153edfc2cdc8c .edge-pattern-dotted{stroke-dasharray:2;}#mmd-507153edfc2cdc8c .marker{fill:#637381;stroke:#637381;}#mmd-507153edfc2cdc8c .marker.cross{stroke:#637381;}#mmd-507153edfc2cdc8c svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-507153edfc2cdc8c p{margin:0;}#mmd-507153edfc2cdc8c .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-507153edfc2cdc8c .cluster-label text{fill:#454f5b;}#mmd-507153edfc2cdc8c .cluster-label span{color:#454f5b;}#mmd-507153edfc2cdc8c .cluster-label span p{background-color:transparent;}#mmd-507153edfc2cdc8c .label text,#mmd-507153edfc2cdc8c span{fill:#161c24;color:#161c24;}#mmd-507153edfc2cdc8c .node rect,#mmd-507153edfc2cdc8c .node circle,#mmd-507153edfc2cdc8c .node ellipse,#mmd-507153edfc2cdc8c .node polygon,#mmd-507153edfc2cdc8c .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-507153edfc2cdc8c .rough-node .label text,#mmd-507153edfc2cdc8c .node .label text,#mmd-507153edfc2cdc8c .image-shape .label,#mmd-507153edfc2cdc8c .icon-shape .label{text-anchor:middle;}#mmd-507153edfc2cdc8c .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-507153edfc2cdc8c .rough-node .label,#mmd-507153edfc2cdc8c .node .label,#mmd-507153edfc2cdc8c .image-shape .label,#mmd-507153edfc2cdc8c .icon-shape .label{text-align:center;}#mmd-507153edfc2cdc8c .node.clickable{cursor:pointer;}#mmd-507153edfc2cdc8c .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-507153edfc2cdc8c .arrowheadPath{fill:#000000;}#mmd-507153edfc2cdc8c .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-507153edfc2cdc8c .flowchart-link{stroke:#637381;fill:none;}#mmd-507153edfc2cdc8c .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-507153edfc2cdc8c .edgeLabel p{background-color:#ffffff;}#mmd-507153edfc2cdc8c .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-507153edfc2cdc8c .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-507153edfc2cdc8c .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-507153edfc2cdc8c .cluster text{fill:#454f5b;}#mmd-507153edfc2cdc8c .cluster span{color:#454f5b;}#mmd-507153edfc2cdc8c .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-507153edfc2cdc8c .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-507153edfc2cdc8c div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-507153edfc2cdc8c .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-507153edfc2cdc8c rect.text{fill:none;stroke-width:0;}#mmd-507153edfc2cdc8c .icon-shape,#mmd-507153edfc2cdc8c .image-shape{background-color:#ffffff;text-align:center;}#mmd-507153edfc2cdc8c .icon-shape p,#mmd-507153edfc2cdc8c .image-shape p{background-color:#ffffff;padding:2px;}#mmd-507153edfc2cdc8c .icon-shape .label rect,#mmd-507153edfc2cdc8c .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-507153edfc2cdc8c .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-507153edfc2cdc8c .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-507153edfc2cdc8c .node .neo-node{stroke:#299a8d;}#mmd-507153edfc2cdc8c [data-look="neo"].node rect,#mmd-507153edfc2cdc8c [data-look="neo"].cluster rect,#mmd-507153edfc2cdc8c [data-look="neo"].node polygon{stroke:url(#mmd-507153edfc2cdc8c-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-507153edfc2cdc8c [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-507153edfc2cdc8c [data-look="neo"].node path{stroke:url(#mmd-507153edfc2cdc8c-gradient);stroke-width:1px;}#mmd-507153edfc2cdc8c [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-507153edfc2cdc8c [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-507153edfc2cdc8c [data-look="neo"].node circle{stroke:url(#mmd-507153edfc2cdc8c-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-507153edfc2cdc8c [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-507153edfc2cdc8c [data-look="neo"].icon-shape .icon{fill:url(#mmd-507153edfc2cdc8c-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-507153edfc2cdc8c [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-507153edfc2cdc8c-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-507153edfc2cdc8c :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-507153edfc2cdc8c_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-507153edfc2cdc8c_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-507153edfc2cdc8c_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-507153edfc2cdc8c_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-507153edfc2cdc8c_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-507153edfc2cdc8c_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-507153edfc2cdc8c_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-507153edfc2cdc8c_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-507153edfc2cdc8c_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-507153edfc2cdc8c_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-507153edfc2cdc8c_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-507153edfc2cdc8c_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M135.781,54.695L139.948,54.695C144.115,54.695,152.448,54.695,160.115,54.695C167.781,54.695,174.781,54.695,178.281,54.695L181.781,54.695" id="mmd-507153edfc2cdc8c-L_Q_L_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q_L_0" data-points="W3sieCI6MTM1Ljc4MTI1LCJ5Ijo1NC42OTQ3ODYwNzE3NzczNDR9LHsieCI6MTYwLjc4MTI1LCJ5Ijo1NC42OTQ3ODYwNzE3NzczNDR9LHsieCI6MTg1Ljc4MTI1LCJ5Ijo1NC42OTQ3ODYwNzE3NzczNDR9XQ==" data-look="classic" marker-end="url(#mmd-507153edfc2cdc8c_flowchart-v2-pointEnd)"/><path d="M285.766,54.695L289.932,54.695C294.099,54.695,302.432,54.695,310.099,54.695C317.766,54.695,324.766,54.695,328.266,54.695L331.766,54.695" id="mmd-507153edfc2cdc8c-L_L_AG_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_L_AG_0" data-points="W3sieCI6Mjg1Ljc2NTYyNSwieSI6NTQuNjk0Nzg2MDcxNzc3MzQ0fSx7IngiOjMxMC43NjU2MjUsInkiOjU0LjY5NDc4NjA3MTc3NzM0NH0seyJ4IjozMzUuNzY1NjI1LCJ5Ijo1NC42OTQ3ODYwNzE3NzczNDR9XQ==" data-look="classic" marker-end="url(#mmd-507153edfc2cdc8c_flowchart-v2-pointEnd)"/><path d="M533.094,54.695L537.26,54.695C541.427,54.695,549.76,54.695,557.427,54.695C565.094,54.695,572.094,54.695,575.594,54.695L579.094,54.695" id="mmd-507153edfc2cdc8c-L_AG_WK_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_AG_WK_0" data-points="W3sieCI6NTMzLjA5Mzc1LCJ5Ijo1NC42OTQ3ODYwNzE3NzczNDR9LHsieCI6NTU4LjA5Mzc1LCJ5Ijo1NC42OTQ3ODYwNzE3NzczNDR9LHsieCI6NTgzLjA5Mzc1LCJ5Ijo1NC42OTQ3ODYwNzE3NzczNDR9XQ==" data-look="classic" marker-end="url(#mmd-507153edfc2cdc8c_flowchart-v2-pointEnd)"/><path d="M800.703,54.695L804.87,54.695C809.036,54.695,817.37,54.695,826.378,54.695C835.385,54.695,845.068,54.695,849.909,54.695L854.75,54.695" id="mmd-507153edfc2cdc8c-L_WK_SNAP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_WK_SNAP_0" data-points="W3sieCI6ODAwLjcwMzEyNSwieSI6NTQuNjk0Nzg2MDcxNzc3MzQ0fSx7IngiOjgyNS43MDMxMjUsInkiOjU0LjY5NDc4NjA3MTc3NzM0NH0seyJ4Ijo4NTguNzUsInkiOjU0LjY5NDc4NjA3MTc3NzM0NH1d" data-look="classic" marker-end="url(#mmd-507153edfc2cdc8c_flowchart-v2-pointEnd)"/><path d="M997.016,54.695L1002.523,54.695C1008.031,54.695,1019.047,54.695,1028.442,59.076C1037.837,63.457,1045.612,72.22,1049.5,76.601L1053.387,80.982" id="mmd-507153edfc2cdc8c-L_SNAP_TC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SNAP_TC_0" data-points="W3sieCI6OTk3LjAxNTYyNSwieSI6NTQuNjk0Nzg2MDcxNzc3MzQ0fSx7IngiOjEwMzAuMDYyNSwieSI6NTQuNjk0Nzg2MDcxNzc3MzQ0fSx7IngiOjEwNTYuMDQxNzU4Mjk3NTk0MiwieSI6ODMuOTczODg4MDkyODMzNDV9XQ==" data-look="classic" marker-end="url(#mmd-507153edfc2cdc8c_flowchart-v2-pointEnd)"/><path d="M1184.719,119.542L1188.885,119.542C1193.052,119.542,1201.385,119.542,1209.052,119.542C1216.719,119.542,1223.719,119.542,1227.219,119.542L1230.719,119.542" id="mmd-507153edfc2cdc8c-L_TC_QS_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_TC_QS_0" data-points="W3sieCI6MTE4NC43MTg3NSwieSI6MTE5LjU0MjE3OTEwNzY2NjAyfSx7IngiOjEyMDkuNzE4NzUsInkiOjExOS41NDIxNzkxMDc2NjYwMn0seyJ4IjoxMjM0LjcxODc1LCJ5IjoxMTkuNTQyMTc5MTA3NjY2MDJ9XQ==" data-look="classic" marker-end="url(#mmd-507153edfc2cdc8c_flowchart-v2-pointEnd)"/><path d="M1005.063,184.39L1009.229,184.39C1013.396,184.39,1021.729,184.39,1029.783,180.008C1037.837,175.627,1045.612,166.865,1049.5,162.484L1053.387,158.102" id="mmd-507153edfc2cdc8c-L_RT_TC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RT_TC_0" data-points="W3sieCI6MTAwNS4wNjI1LCJ5IjoxODQuMzg5NTcyMTQzNTU0N30seyJ4IjoxMDMwLjA2MjUsInkiOjE4NC4zODk1NzIxNDM1NTQ3fSx7IngiOjEwNTYuMDQxNzU4Mjk3NTk0MiwieSI6MTU1LjExMDQ3MDEyMjQ5ODU4fV0=" data-look="classic" marker-end="url(#mmd-507153edfc2cdc8c_flowchart-v2-pointEnd)"/><path d="M1370.016,119.542L1374.182,119.542C1378.349,119.542,1386.682,119.542,1394.349,119.542C1402.016,119.542,1409.016,119.542,1412.516,119.542L1416.016,119.542" id="mmd-507153edfc2cdc8c-L_QS_FL_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_QS_FL_0" data-points="W3sieCI6MTM3MC4wMTU2MjUsInkiOjExOS41NDIxNzkxMDc2NjYwMn0seyJ4IjoxMzk1LjAxNTYyNSwieSI6MTE5LjU0MjE3OTEwNzY2NjAyfSx7IngiOjE0MjAuMDE1NjI1LCJ5IjoxMTkuNTQyMTc5MTA3NjY2MDJ9XQ==" data-look="classic" marker-end="url(#mmd-507153edfc2cdc8c_flowchart-v2-pointEnd)"/><path d="M1625.578,119.542L1629.745,119.542C1633.911,119.542,1642.245,119.542,1649.911,119.542C1657.578,119.542,1664.578,119.542,1668.078,119.542L1671.578,119.542" id="mmd-507153edfc2cdc8c-L_FL_U_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_FL_U_0" data-points="W3sieCI6MTYyNS41NzgxMjUsInkiOjExOS41NDIxNzkxMDc2NjYwMn0seyJ4IjoxNjUwLjU3ODEyNSwieSI6MTE5LjU0MjE3OTEwNzY2NjAyfSx7IngiOjE2NzUuNTc4MTI1LCJ5IjoxMTkuNTQyMTc5MTA3NjY2MDJ9XQ==" data-look="classic" marker-end="url(#mmd-507153edfc2cdc8c_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_Q_L_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_L_AG_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_AG_WK_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_WK_SNAP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_SNAP_TC_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_TC_QS_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RT_TC_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_QS_FL_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_FL_U_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-507153edfc2cdc8c-flowchart-Q-0" data-look="classic" transform="translate(71.890625, 54.694786071777344)"><rect class="basic label-container" style="" x="-63.890625" y="-22.5" width="127.78125" height="45"/><g class="label" style="" transform="translate(-39.890625, -10.5)"><rect/><foreignObject width="79.78125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>user queries</p></span></div></foreignObject></g></g><g class="node default" id="mmd-507153edfc2cdc8c-flowchart-L-1" data-look="classic" transform="translate(235.7734375, 54.694786071777344)"><path d="M0,11.110146537954025 a49.9921875,11.110146537954025 0,0,0 99.984375,0 a49.9921875,11.110146537954025 0,0,0 -99.984375,0 l0,65.11014653795402 a49.9921875,11.110146537954025 0,0,0 99.984375,0 l0,-65.11014653795402" class="basic label-container outer-path" style="" transform="translate(-49.9921875, -43.665219806931034)"/><g class="label" style="" transform="translate(-43.9921875, -13)"><rect/><foreignObject width="87.984375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>analytics logs<br />append-only</p></span></div></foreignObject></g></g><g class="node default" id="mmd-507153edfc2cdc8c-flowchart-AG-3" data-look="classic" transform="translate(434.4296875, 54.694786071777344)"><rect class="basic label-container" style="" x="-98.6640625" y="-33" width="197.328125" height="66"/><g class="label" style="" transform="translate(-74.6640625, -21)"><rect/><foreignObject width="149.328125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>aggregators<br />weekly frequency table</p></span></div></foreignObject></g></g><g class="node default" id="mmd-507153edfc2cdc8c-flowchart-WK-5" data-look="classic" transform="translate(691.8984375, 54.694786071777344)"><rect class="basic label-container" style="" x="-108.8046875" y="-33" width="217.609375" height="66"/><g class="label" style="" transform="translate(-84.8046875, -21)"><rect/><foreignObject width="169.609375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>workers<br />build trie + top-k per node</p></span></div></foreignObject></g></g><g class="node default" id="mmd-507153edfc2cdc8c-flowchart-SNAP-7" data-look="classic" transform="translate(927.8828125, 54.694786071777344)"><path d="M0,13.129859338833164 a69.1328125,13.129859338833164 0,0,0 138.265625,0 a69.1328125,13.129859338833164 0,0,0 -138.265625,0 l0,67.12985933883317 a69.1328125,13.129859338833164 0,0,0 138.265625,0 l0,-67.12985933883317" class="basic label-container outer-path" style="" transform="translate(-69.1328125, -46.69478900824975)"/><g class="label" style="" transform="translate(-63.1328125, -13)"><rect/><foreignObject width="126.265625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Trie DB<br />versioned snapshot</p></span></div></foreignObject></g></g><g class="node default" id="mmd-507153edfc2cdc8c-flowchart-TC-9" data-look="classic" transform="translate(1119.890625, 119.54217910766602)"><path d="M0,12.728555651000121 a64.828125,12.728555651000121 0,0,0 129.65625,0 a64.828125,12.728555651000121 0,0,0 -129.65625,0 l0,66.72855565100012 a64.828125,12.728555651000121 0,0,0 129.65625,0 l0,-66.72855565100012" class="basic label-container outer-path" style="" transform="translate(-64.828125, -46.09283347650018)"/><g class="label" style="" transform="translate(-58.828125, -13)"><rect/><foreignObject width="117.65625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Trie cache<br />flat prefix → top-5</p></span></div></foreignObject></g></g><g class="node default" id="mmd-507153edfc2cdc8c-flowchart-QS-11" data-look="classic" transform="translate(1302.3671875, 119.54217910766602)"><rect class="basic label-container" style="" x="-67.6484375" y="-22.5" width="135.296875" height="45"/><g class="label" style="" transform="translate(-43.6484375, -10.5)"><rect/><foreignObject width="87.296875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>query service</p></span></div></foreignObject></g></g><g class="node default" id="mmd-507153edfc2cdc8c-flowchart-RT-12" data-look="classic" transform="translate(927.8828125, 184.3895721435547)"><rect class="basic label-container" style="" x="-77.1796875" y="-33" width="154.359375" height="66"/><g class="label" style="" transform="translate(-53.1796875, -21)"><rect/><foreignObject width="106.359375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>real-time stream<br />(trending)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-507153edfc2cdc8c-flowchart-FL-15" data-look="classic" transform="translate(1522.796875, 119.54217910766602)"><rect class="basic label-container" style="" x="-102.78125" y="-33" width="205.5625" height="66"/><g class="label" style="" transform="translate(-78.78125, -21)"><rect/><foreignObject width="157.5625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>filter layer<br />blocklist applied on read</p></span></div></foreignObject></g></g><g class="node default" id="mmd-507153edfc2cdc8c-flowchart-U-17" data-look="classic" transform="translate(1787.234375, 119.54217910766602)"><rect class="basic label-container" style="" x="-111.65625" y="-33" width="223.3125" height="66"/><g class="label" style="" transform="translate(-87.65625, -21)"><rect/><foreignObject width="175.3125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>client<br />debounce + browser cache</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-507153edfc2cdc8c-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-507153edfc2cdc8c-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-507153edfc2cdc8c-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>The shape is a <strong>batch layer plus a speed layer</strong>: a slow, complete, correct rebuild, with a fast, partial, approximate overlay merged on top at serving time. The same pattern appears in <a href="21-ad-click-event-aggregation.html">Chapter 21</a>, where the batch path exists to correct the streaming path.</p>
+<hr>
+<h3 id="scalability">Scalability</h3>
+<ol>
+<li>
+<p><strong>Sharding:</strong></p>
+<ul>
+<li>Distribute trie nodes across servers based on prefix ranges (e.g., <code>a-m</code>, <code>n-z</code>).</li>
+<li>Further shard within prefixes to balance uneven distributions (e.g., <code>aa-ag</code>, <code>ah-an</code>).</li>
+</ul>
+</li>
+<li>
+<p><strong>Load Balancing:</strong></p>
+<p align="left">
+   <img loading="lazy" decoding="async" src="../../system-design-notes/13.%20Search%20Autocomplete/images/sharding.png" alt="Sharding" data-width="400" style="max-width:400px">
+</p>
+<ul>
+<li>Use a shard map manager to route requests to the appropriate server.</li>
+</ul>
+</li>
+</ol>
+<p><strong>Alphabetical ranges are the wrong shard boundaries, and the chapter's own second bullet is the admission.</strong> Query volume by first letter is nowhere near uniform — prefixes beginning with <code>s</code>, <code>t</code>, <code>a</code> and <code>c</code> carry far more traffic and far more distinct queries than <code>q</code>, <code>x</code> or <code>z</code>. Splitting <code>a-m</code> / <code>n-z</code> produces two shards with very different load.</p>
+<p>The fix is to derive boundaries from the <strong>measured distribution</strong> rather than from the alphabet: build the shard map from the historical frequency table so each shard holds a comparable share of <em>traffic</em>, and split hot ranges further (<code>sa-sg</code>, <code>sh-sn</code>, …) until they balance. That map must then be versioned and distributed to every client of the service — which is why a shard map manager is a named component rather than a configuration file, and the same ring-distribution problem as <a href="05-consistent-hashing.html#gotchas--failure-modes">Chapter 5</a>.</p>
+<p>Two things make this easier here than in most sharded systems: the data is <strong>read-only between rebuilds</strong>, so rebalancing can happen at build time with no live migration, and it is small enough (~10 GB) to <strong>replicate every shard</strong> rather than partition at all, trading memory for the elimination of the whole problem. For a service this read-heavy, full replication is often the right answer.</p>
+<hr>
+</section>
+<section id="step-4-advanced-features">
+<h2 id="step-4-advanced-features">Step 4: Advanced Features</h2>
+<h3 id="multi-language-support">Multi-Language Support</h3>
+<ol>
+<li><strong>Unicode Characters:</strong> Use Unicode to support non-English languages.</li>
+<li><strong>Country-Specific Tries:</strong> Build separate tries for different countries or regions.</li>
+</ol>
+<h3 id="trending-queries">Trending Queries</h3>
+<ul>
+<li>Handle real-time events by dynamically updating trie nodes or weighting recent queries more heavily.</li>
+</ul>
+<p>This is the speed layer. A weekly rebuild cannot know that a name became significant an hour ago, and for a news-driven product that gap is the most visible failure the system has. The standard approach is to keep the batch pipeline exactly as it is and <strong>overlay</strong> a small real-time index — computed from a streaming aggregation over the last minutes — merged with the batch answer at serve time. Keeping it separate matters: the overlay is small, approximate and disposable, and it never puts write pressure on the 10 GB precomputed structure.</p>
+<h3 id="multi-language-and-personalization-the-cache-key-problem">Multi-language and personalization: the cache-key problem</h3>
+<p>Both of the &quot;advanced features&quot; have the same hidden cost, and it is worth naming because it is the one that bites in production.</p>
+<p>The precomputed answer's key is currently just the prefix, which is why 48,000 QPS is servable from ~10 GB and why browser and CDN caching work at all — <strong>every user asking for <code>&quot;tw&quot;</code> gets the same five strings.</strong> Each dimension added to the key multiplies the number of entries and dilutes every cache:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Entries</th>
+<th>Shared across users?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>prefix</code></td>
+<td>~100 M</td>
+<td>Fully — ideal</td>
+</tr>
+<tr>
+<td><code>prefix + locale</code></td>
+<td>× number of locales</td>
+<td>Within a locale</td>
+</tr>
+<tr>
+<td><code>prefix + locale + region</code></td>
+<td>× regions</td>
+<td>Within a region</td>
+</tr>
+<tr>
+<td><code>prefix + user</code></td>
+<td><strong>× users</strong></td>
+<td><strong>Not at all</strong> — precomputation is impossible</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Per-locale tries are fine: a bounded multiplier, still shared, still precomputable. <strong>Per-user personalization breaks the model entirely</strong> — you cannot precompute an answer per user per prefix. The practical resolution is to keep the shared precomputed list and blend a handful of personal items (recent searches, held on the client) into it at render time, which preserves the cacheable core.</p>
+<p>Non-Latin input adds a different problem: with CJK languages and IME input, what the user has &quot;typed&quot; is not the prefix of the final query, so prefix matching against a trie of completed queries does not work without transliteration or phonetic indexing.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>three follow-ups carry this chapter. &quot;Why not just traverse the trie?&quot; — the <code>&quot;a&quot;</code> subtree, on the most common keystroke. &quot;Why rebuild weekly instead of updating live?&quot; — the top-k cache makes an update touch every ancestor. &quot;Why not personalize?&quot; — it destroys the shared cache key that makes 48,000 QPS affordable.</p>
+</div>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Traversing at query time fails on the first keystroke.</strong> The prefix with the largest subtree is the one every search starts with. Precompute, or the service does not work.</li>
+<li><strong>Precomputation makes updates non-local.</strong> One query's frequency change can alter the cached top-k of every ancestor prefix, which is why the structure is rebuilt rather than mutated.</li>
+<li><strong>Out-of-order responses flicker the UI.</strong> <code>&quot;tw&quot;</code> and <code>&quot;twi&quot;</code> are concurrent requests; responses can arrive in either order. The client must discard anything that does not match the current input.</li>
+<li><strong>Not debouncing wastes most of the traffic.</strong> A request per keystroke is the 20× amplification. Waiting ~50 ms of keyboard idle before firing removes much of it, and is the cheapest capacity win available.</li>
+<li><strong>Personalization destroys the cache key.</strong> Adding <code>user</code> to the key makes the answer unshareable and unprecomputable, and collapses browser, CDN and server cache hit rates together.</li>
+<li><strong>Alphabetical shard ranges are unbalanced.</strong> Letter frequency is far from uniform. Derive shard boundaries from measured traffic, or replicate the whole 10 GB and avoid the problem.</li>
+<li><strong>A banned suggestion survives until the next rebuild.</strong> Filtering must happen on the read path; relying on asynchronous physical deletion leaves harmful suggestions live for days.</li>
+<li><strong>Autocomplete attributes words to your product.</strong> Suggestions derived from public query logs can be defamatory on a person's name, or can reveal what a small population searched for. An operator-editable read-path blocklist is a requirement, not a nicety.</li>
+<li><strong>A trie supports prefixes, not typos.</strong> <code>&quot;twiter&quot;</code> matches nothing. Fuzzy matching needs edit distance, n-grams, or a separate spelling-correction stage — a plain trie cannot do it.</li>
+<li><strong>IME and CJK input break prefix matching.</strong> What has been typed is not a prefix of what is meant. Needs transliteration or phonetic keys.</li>
+<li><strong>A weekly batch is blind to today.</strong> Breaking news is invisible until the next rebuild unless a real-time overlay exists; keep it separate from the batch structure rather than making the batch structure writable.</li>
+<li><strong>Rebuilds are a memory and deployment event.</strong> Building a new trie while serving from the old one means holding both. Version the snapshot, swap atomically, and keep the previous version for rollback.</li>
+<li><strong>Rare prefixes return nothing.</strong> Long or unusual prefixes legitimately have no suggestions; the client needs a graceful empty state rather than a spinner.</li>
+<li><strong>Query logs are sensitive data.</strong> The input to this pipeline is everything everyone searched for. Aggregation thresholds (never surface a query seen fewer than N times, from fewer than N users) are a privacy control, not a quality filter.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ranking the subtree under a common prefix</td>
+<td>Precompute top-k at every node; never traverse at request time</td>
+</tr>
+<tr>
+<td>O(1) serving</td>
+<td>Flatten to <code>prefix → top-5</code> keys in an in-memory cache</td>
+</tr>
+<tr>
+<td>Updates touching every ancestor</td>
+<td>Batch rebuild on a schedule instead of live mutation</td>
+</tr>
+<tr>
+<td>48,000 QPS of keystroke traffic</td>
+<td>Client debouncing, browser caching, shared (non-personalized) answers</td>
+</tr>
+<tr>
+<td>Human-perceptible latency</td>
+<td>Under ~50 ms server time; client discards stale responses</td>
+</tr>
+<tr>
+<td>Billions of raw queries</td>
+<td>Append-only analytics logs, aggregated into a frequency table</td>
+</tr>
+<tr>
+<td>Shipping a new trie safely</td>
+<td>Versioned snapshot in a document store, atomic swap, rollback</td>
+</tr>
+<tr>
+<td>Breaking news invisible to a weekly build</td>
+<td>Small real-time overlay merged at serve time (speed layer)</td>
+</tr>
+<tr>
+<td>Harmful or defamatory suggestions</td>
+<td>Read-path filter with an operator-editable blocklist</td>
+</tr>
+<tr>
+<td>Unbalanced shards</td>
+<td>Shard boundaries from measured traffic, or replicate the whole dataset</td>
+</tr>
+<tr>
+<td>Multiple languages</td>
+<td>Per-locale tries — a bounded multiplier that stays shareable</td>
+</tr>
+<tr>
+<td>Personalization</td>
+<td>Blend client-held recent searches into the shared list at render time</td>
+</tr>
+<tr>
+<td>Privacy of query logs</td>
+<td>Minimum-frequency and minimum-user thresholds before a query can be suggested</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Derive 48,000 QPS from 10 M DAU. Which multiplier dominates, and what reduces it?</li>
+<li>What sets the latency budget, and what client-side bug does exceeding it cause?</li>
+<li>Which single keystroke is the worst case for subtree traversal, and why is that fatal rather than merely slow?</li>
+<li>Caching top-k at each node makes reads O(prefix length). What does it make <em>writes</em>?</li>
+<li>Given that, explain why the trie is rebuilt weekly rather than updated continuously.</li>
+<li>If every lookup stops at the prefix node, what does the serving tier actually need to be?</li>
+<li>Why must the safety filter run on the read path rather than at build time?</li>
+<li>What is wrong with sharding <code>a-m</code> / <code>n-z</code>, and what are the two ways out?</li>
+<li>What happens to cache hit rates when you add per-user personalization, and what is the practical compromise?</li>
+<li>A user types <code>&quot;twiter&quot;</code>. Why does a trie return nothing, and what would be needed?</li>
+<li>How do you serve a query that became popular an hour ago without making the batch structure writable?</li>
+<li>Why are minimum-frequency thresholds a privacy mechanism?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Typeahead / incremental search</strong></td>
+<td>Suggesting completions as the user types</td>
+</tr>
+<tr>
+<td><strong>Trie (prefix tree)</strong></td>
+<td>Tree keyed by character, giving O(prefix) prefix location — here a build-time structure</td>
+</tr>
+<tr>
+<td><strong>Top-k cache</strong></td>
+<td>The precomputed best suggestions stored at each node, which makes serving constant-time</td>
+</tr>
+<tr>
+<td><strong>Flattened trie</strong></td>
+<td>The <code>prefix → top-k</code> key-value form actually used for serving</td>
+</tr>
+<tr>
+<td><strong>Keystroke amplification</strong></td>
+<td>One search producing ~20 autocomplete requests</td>
+</tr>
+<tr>
+<td><strong>Debouncing</strong></td>
+<td>Waiting for a typing pause before issuing a request</td>
+</tr>
+<tr>
+<td><strong>Out-of-order responses</strong></td>
+<td>Concurrent prefix requests returning in the wrong sequence; the client must discard stale ones</td>
+</tr>
+<tr>
+<td><strong>Frequency table</strong></td>
+<td>Aggregated query → count, the input to a trie build</td>
+</tr>
+<tr>
+<td><strong>Batch layer / speed layer</strong></td>
+<td>The scheduled complete rebuild, and the real-time overlay merged on top</td>
+</tr>
+<tr>
+<td><strong>Trending overlay</strong></td>
+<td>Small short-window index covering queries the batch build cannot know about</td>
+</tr>
+<tr>
+<td><strong>Filter layer</strong></td>
+<td>Read-path suppression of blocked suggestions, independent of the rebuild cycle</td>
+</tr>
+<tr>
+<td><strong>Shard map manager</strong></td>
+<td>The versioned, distributed mapping from prefix range to serving shard</td>
+</tr>
+<tr>
+<td><strong>Cache key dimensionality</strong></td>
+<td>How many attributes an answer depends on; each one divides cache effectiveness</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="09-web-crawler.html">Chapter 9 – Design A Web Crawler</a> — where the corpus behind a search engine comes from.</li>
+<li><a href="21-ad-click-event-aggregation.html">Chapter 21 – Ad Click Event Aggregation</a> — the batch-plus-speed-layer pattern treated properly, with watermarks and reconciliation.</li>
+<li><a href="05-consistent-hashing.html#gotchas--failure-modes">Chapter 5 – Design Consistent Hashing</a> — the shard-balancing problem the shard map manager is solving.</li>
+<li><a href="01-scaling.html#section-6-caching">Chapter 1 §6 – Caching</a> — why the shared, user-independent cache key is this system's most valuable property.</li>
+<li><a href="https://medium.com/@prefixyteam/how-we-built-prefixy-a-scalable-prefix-search-service-for-powering-autocomplete-c20f98e2eff1" target="_blank" rel="noopener">How We Built Prefixy</a> — a real implementation of this exact design.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

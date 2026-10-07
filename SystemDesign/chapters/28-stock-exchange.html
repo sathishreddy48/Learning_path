@@ -1,0 +1,916 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 28: Stock Exchange — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="28-stock-exchange">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 28 of 28</div>
+  <h1>Chapter 28: Stock Exchange</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design scope</a></li><li><a href="#step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap Up</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>We'll design an <strong>electronic stock exchange</strong> in this chapter.</p>
+<p>Its basic function is to efficiently match buyers and sellers.</p>
+<p><strong>The one-sentence version:</strong> <strong>latency is the requirement that reshapes everything else.</strong> At a target of tens of microseconds, every architectural convenience the rest of this book relies on — microservices, network calls between them, message brokers, logging, locks, garbage collection, even disk — costs more than the entire latency budget. So this design runs the book's advice backwards: <strong>one machine, one thread, shared memory, no disk, no locks, no allocations.</strong></p>
+<p>That makes this chapter the collection's deliberate counter-example. Every other system here scales <em>out</em>, because its constraint is volume. This one scales <em>in</em>, because its constraint is the speed of a single decision — and the useful lesson is that &quot;distribute it&quot; is an answer to a particular kind of problem, not a universal principle.</p>
+<p>Two other threads run through it:</p>
+<ul>
+<li><strong>The matching engine is a deterministic state machine over an ordered log</strong> — the same structure as <a href="27-digital-wallet.html#event-sourcing">Chapter 27</a> and <a href="19-distributed-message-queue.html">Chapter 19</a>. Here determinism buys fault tolerance as well as auditability, because a replica fed the same sequence arrives at the same state.</li>
+<li><strong>Fairness is a functional requirement.</strong> Delivering market data to one subscriber microseconds before another hands them a tradeable advantage, so equal delivery is a regulatory obligation rather than a nicety — which is why multicast and cable-length equalisation appear in a software design.</li>
+</ul>
+<p>Major stock exchanges are <strong>NYSE</strong>, <strong>NASDAQ</strong>, among others.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/world-stock-exchanges.png" alt="world-stock-exchanges" data-width="500" style="max-width:500px" />
+</p>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-establish-design-scope">
+<h2 id="step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design scope</h2>
+<ul>
+<li>C: Which securities are we going to trade? Stocks, options or futures?</li>
+<li>I: Only stocks for simplicity</li>
+<li>C: Which order types are supported - place, cancel, replace? What about limit, market, conditional orders?</li>
+<li>I: We need to support placing and canceling an order. We need to only consider limit orders for the order type.</li>
+<li>C: Does the system need to support after hours trading?</li>
+<li>I: No, just normal trading hours</li>
+<li>C: Could you describe the exchange's basic functions?</li>
+<li>I: Clients can place or cancel limit orders and receive matched trades in real-time. They should be able to see the order book in real time.</li>
+<li>C: What's the scale of the exchange?</li>
+<li>I: Tens of thousands of users trading at the same time and ~100 symbols. Billions of orders per day. We need to also support risk checks for compliance.</li>
+<li>C: What kind of risk checks?</li>
+<li>I: Let's do simple risk checks - eg limiting a user to trade only 1mil apple stocks in a day</li>
+<li>C: How about user wallet engagement?</li>
+<li>I: We need to ensure clients have sufficient funds before placing orders. Funds meant for pending orders need to be withheld until order is finalized.</li>
+</ul>
+<h3 id="non-functional-requirements"><strong>Non-functional requirements</strong></h3>
+<p>The scale mentioned by the interviewer hints that we are to design a small to medium scale exchange.
+We need to also ensure flexibility to support more symbols and users in the future.</p>
+<p>Other non-functional requirements:</p>
+<ul>
+<li>Availability - At least 99.99%. Downtime can harm reputation</li>
+<li>Fault tolerance - fault tolerance and a fast recovery mechanism are needed to limit the impact of a production incident</li>
+<li>Latency - Round-trip latency should be in the ms level with focus on 99th percentile. Persistently high 99p latency causes a bad experience for a handful of users.</li>
+<li>Security - We should have an account management system. For legal compliance, we need to support KYC to verify user identity. We should also protect against DDoS for public resources.</li>
+</ul>
+<h3 id="back-of-the-envelope-estimation"><strong>Back-of-the-envelope estimation</strong></h3>
+<ul>
+<li>100 symbols, 1bil orders per day</li>
+<li>Normal trading hours are from 09:30 to 16:00 (6.5h)</li>
+<li>QPS = 1bil / 6.5 / 3600 = 43000</li>
+<li>Peak QPS = 5*QPS = 215000</li>
+<li>Trading volume is significantly higher when the market opens</li>
+</ul>
+<h3 id="the-number-that-rules-out-almost-every-design-in-this-book">The number that rules out almost every design in this book</h3>
+<p>43,000 orders/sec sustained and ~215,000 at peak is a middling throughput by this book's standards. <strong>The latency target is what makes it hard.</strong> At 215,000 orders/sec, orders arrive about every <strong>4.6 microseconds</strong> — so a single-threaded matching engine has roughly that long to handle one, and the end-to-end target is &quot;tens of microseconds&quot;.</p>
+<p>Now put that budget next to what operations actually cost:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Typical latency</th>
+<th>Fraction of a ~50 μs budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L1 cache reference</td>
+<td>~1 ns</td>
+<td>0.002%</td>
+</tr>
+<tr>
+<td>Main memory reference</td>
+<td>~100 ns</td>
+<td>0.2%</td>
+</tr>
+<tr>
+<td>Reading 1 MB sequentially from memory</td>
+<td>~10 μs</td>
+<td>20%</td>
+</tr>
+<tr>
+<td><strong>One network round trip inside a data centre</strong></td>
+<td><strong>~100–500 μs</strong></td>
+<td><strong>200–1000% — exceeds the entire budget</strong></td>
+</tr>
+<tr>
+<td>SSD random read</td>
+<td>~100 μs</td>
+<td>~200%</td>
+</tr>
+<tr>
+<td><strong>A single stop-the-world GC pause</strong></td>
+<td><strong>~10 ms</strong></td>
+<td><strong>~20,000%</strong></td>
+</tr>
+<tr>
+<td>Cross-country network round trip</td>
+<td>~50 ms</td>
+<td>~100,000%</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>One network hop costs more than the whole budget.</strong> That single row is the entire justification for the chapter's unusual architecture: if a service call to a risk checker, a wallet or a sequencer costs 200 μs, then <em>any</em> distributed design is disqualified before you consider its merits. There is no amount of tuning that makes a network round trip fit inside tens of microseconds.</p>
+<p>Which forces, in order:</p>
+<ol>
+<li><strong>No network on the critical path</strong> → put every hot-path component in one process or one machine.</li>
+<li><strong>No disk on the critical path</strong> → <code>mmap</code> a file in <code>/dev/shm</code>, so the &quot;event store&quot; is RAM.</li>
+<li><strong>No locks</strong> → a single pinned thread, so there is nothing to contend.</li>
+<li><strong>No garbage collection pauses</strong> → preallocate, pool objects, allocate nothing on the hot path.</li>
+</ol>
+<p><strong>And note the market-open burst.</strong> The chapter observes volume is much higher at the open, which means the 5× peak multiplier is a daily average peak, not the real worst case — the first seconds of trading are far spikier, and they are the moment the system is least warmed up.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>quote one latency number — a same-datacenter round trip at hundreds of microseconds against a budget of tens — and the whole &quot;why is this on one server?&quot; discussion resolves itself. Candidates who propose a microservice architecture here have not costed a network hop.</p>
+</div>
+</section>
+<section id="step-2-propose-high-level-design-and-get-buy-in">
+<h2 id="step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</h2>
+<h3 id="business-knowledge-101"><strong>Business Knowledge 101</strong></h3>
+<p>Let's discuss some basic concepts, related to an exchange.</p>
+<p>A broker mediates interactions between an exchange and end users - Robinhood, Fidelity, etc.</p>
+<p>Institutional clients trade in large quantities using specialized trading software. They need specialized treatment.
+Eg order splitting when trading in large volumes to avoid impacting the market.</p>
+<p>Types of orders:</p>
+<ul>
+<li>Limit - buy or sell at a fixed price. It might not find a match immediately or it might be partially matched.</li>
+<li>Market - doesn't specify a price. Executed at the current market price immediately.</li>
+</ul>
+<p>Prices:</p>
+<ul>
+<li>Bid - highest price a buyer is willing to buy a stock</li>
+<li>Ask - lowest price a seller is willing to sell a stock</li>
+</ul>
+<p>The US market has three tiers of price quotes - L1, L2, L3.</p>
+<p>L1 market data contains best bid/ask prices and quantities:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/l1-price.png" alt="l1-price" data-width="500" style="max-width:500px" />
+</p>
+<p>L2 includes more price levels:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/l2-price.png" alt="l2-price" data-width="500" style="max-width:500px" />
+</p>
+<p>L3 shows levels and queued quantity at each level:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/l3-price.png" alt="l3-price" data-width="500" style="max-width:500px" />
+</p>
+<p>A candlestick shows the market open and close price, as well as the highest and lowest prices in the given interval:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/candlestick.png" alt="candlestick" data-width="500" style="max-width:500px" />
+</p>
+<p>FIX is a protocol for exchanging securities transaction information, used by most vendors. Example securities transaction:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>8=FIX.4.2 | 9=176 | 35=8 | 49=PHLX | 56=PERS | 52=20071123-05:30:00.000 | 11=ATOMNOCCC9990900 | 20=3 | 150=E | 39=E | 55=MSFT | 167=CS | 54=1 | 38=15 | 40=2 | 44=15 | 58=PHLX EQUITY TESTING | 59=0 | 47=C | 32=0 | 31=0 | 151=15 | 14=0 | 6=0 | 10=128 |
+</code></pre></div>
+<h3 id="high-level-design"><strong>High-level design</strong></h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/high-level-design.png" alt="high-level-design" data-width="500" style="max-width:500px" />
+</p>
+<p>Trade flow:</p>
+<ul>
+<li>Client places order via trading interface</li>
+<li>Broker sends the order to the exchange</li>
+<li>Order enters exchange through client gateway, which validates, rate limits, authenticates, etc. Order is forwarded to order manager.</li>
+<li>Order manager performs risk checks based on rules set by the risk manager</li>
+<li>After passing risk checks, order manager verifies there are sufficient funds in the wallet for the order</li>
+<li>Order is sent to matching engine. When match is found, matching engine emits two executions (called fills) for buy and sell. Both orders are sequenced so that they're deterministic.</li>
+<li>Executions are returned to the client.</li>
+</ul>
+<p>Market data flow (M1-M3):</p>
+<ul>
+<li>matching engine generates a stream of executions, sent to the market data publisher</li>
+<li>Market data publisher constructs the candlestick charts and sends them to the data service</li>
+<li>Market data is stored in specialized storage for real-time analytics. Brokers connect to the data service for timely market data.</li>
+</ul>
+<p>Reporter flow (R1-R2):</p>
+<ul>
+<li>reporter collects all necessary reporting fields from orders and executions and writes them to DB</li>
+<li>reporting fields - client_id, price, quantity, order_type, filled_quantity, remaining_quantity</li>
+</ul>
+<p>Trading flow is on the critical path, whereas the rest of the flows are not, hence, latency requirements differ between them.</p>
+<h4 id="trading-flow">Trading flow</h4>
+<p>The trading flow is on the critical path, hence, it should be highly optimized for low latency.</p>
+<p>The matching engine is at its heart, also called the cross engine. Primary responsibilities:</p>
+<ul>
+<li>Maintain the order book for each symbol - a list of buy/sell orders for a symbol.</li>
+<li>Match buy and sell orders - a match results in two executions (fills), with one each for the buy and sell sides. This function must be fast and accurate</li>
+<li>Distribute the execution stream as market data</li>
+<li>Matches must be produced in a deterministic order. Foundational for high availability</li>
+</ul>
+<p>Next is the sequencer - it is the key component making the matching engine deterministic by stamping each inbound order and outbound fill with a sequence ID.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/sequencer.png" alt="sequencer" data-width="500" style="max-width:500px" />
+</p>
+<p>We stamp inbound orders and outbound fills for several reasons:</p>
+<ul>
+<li>timeliness and fairness</li>
+<li>fast recovery/replay</li>
+<li>exactly-once guarantee</li>
+</ul>
+<p>Conceptually, we could use Kafka as our sequencer since it's effectively an inbound and outbound message queue. However, we're going to implement it ourselves in order to achieve lower latency.</p>
+<p>The order manager manages the orders state. It also interacts with the matching engine - sending orders and receiving fills.</p>
+<p>The order manager's responsibilities:</p>
+<ul>
+<li>Sends orders for risk checks - eg verifying user's trade volume is less than 1mil</li>
+<li>Checks the order against the user wallet and verifies there are sufficient funds to execute it</li>
+<li>It sends the order to the sequencer and on to the matching engine. To reduce bandwidth, only necessary order information is passed to the matching engine</li>
+<li>Executions (fills) are received back from the sequencer, where they are then send to the brokers via the client gateway</li>
+</ul>
+<p>The main challenge with implementing the order manager is the state transition management. Event sourcing is one viable solution (discussed in deep dive).</p>
+<p>Finally, the client gateway receives orders from users and sends them to the order manager. Its responsibilities:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/client-gateway.png" alt="client-gateway" data-width="500" style="max-width:500px" />
+</p>
+<p>Since the client gateway is on the critical path, it should stay lightweight.</p>
+<p>There can be multiple client gateways for different clients. Eg a colo engine is a trading engine server, rented by the broker in the exchange's data center:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/client-gateways.png" alt="client-gateways" data-width="500" style="max-width:500px" />
+</p>
+<h4 id="market-data-flow">Market data flow</h4>
+<p>The market data publisher receives executions from the matching engine and builds the order book/candlestick charts from the execution stream.</p>
+<p>That data is sent to the data service, which is responsible for showing the aggregated data to subscribers:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/market-data.png" alt="market-data" data-width="500" style="max-width:500px" />
+</p>
+<h4 id="reporting-flow">Reporting flow</h4>
+<p>The reporter is not on the critical path, but it is an important component nevertheless.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/reporting-flow.png" alt="reporting-flow" data-width="500" style="max-width:500px" />
+</p>
+<p>It is responsible for trading history, tax reporting, compliance reporting, settlements, etc.
+Latency is not a critical requirement for the reporting flow. Accuracy and compliance are more important.</p>
+<h3 id="api-design"><strong>API Design</strong></h3>
+<p>Clients interact with the stock exchange via the brokers to place orders, view executions, market data, download historical data for analysis, etc.</p>
+<p>We use a RESTful API for communication between the client gateway and the brokers.</p>
+<p>For institutional clients, a proprietary protocol is used to satisfy their low-latency requirements.</p>
+<p>Create order:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>POST /v1/order
+</code></pre></div>
+<p>Parameters:</p>
+<ul>
+<li>symbol - the stock symbol. String</li>
+<li>side - buy or sell. String</li>
+<li>price - the price of the limit order. Long</li>
+<li>orderType - limit or market (we only support limit orders in our design). String</li>
+<li>quantity - the quantity of the order. Long</li>
+</ul>
+<p>Response:</p>
+<ul>
+<li>id - the ID of the order. Long</li>
+<li>creationTime - the system creation time of the order. Long</li>
+<li>filledQuantity - the quantity that has been successfully executed. Long</li>
+<li>remainingQuantity - the quantity still to be executed. Long</li>
+<li>status - new/canceled/filled. String</li>
+<li>rest of the attributes are the same as the input parameters</li>
+</ul>
+<p>Get execution:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>GET /execution?symbol={:symbol}&amp;orderId={:orderId}&amp;startTime={:startTime}&amp;endTime={:endTime}
+</code></pre></div>
+<p>Parameters:</p>
+<ul>
+<li>symbol - the stock symbol. String</li>
+<li>orderId - the ID of the order. Optional. String</li>
+<li>startTime - query start time in epoch [11]. Long</li>
+<li>endTime - query end time in epoch. Long</li>
+</ul>
+<p>Response:</p>
+<ul>
+<li>executions - array with each execution in scope (see attributes below). Array</li>
+<li>id - the ID of the execution. Long</li>
+<li>orderId - the ID of the order. Long</li>
+<li>symbol - the stock symbol. String</li>
+<li>side - buy or sell. String</li>
+<li>price - the price of the execution. Long</li>
+<li>orderType - limit or market. String</li>
+<li>quantity - the filled quantity. Long</li>
+</ul>
+<p>Get order book:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>GET /marketdata/orderBook/L2?symbol={:symbol}&amp;depth={:depth}
+</code></pre></div>
+<p>Parameters:</p>
+<ul>
+<li>symbol - the stock symbol. String</li>
+<li>depth - order book depth per side. Int</li>
+</ul>
+<p>Response:</p>
+<ul>
+<li>bids - array with price and size. Array</li>
+<li>asks - array with price and size. Array</li>
+</ul>
+<p>get candlesticks:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>GET /marketdata/candles?symbol={:symbol}&amp;resolution={:resolution}&amp;startTime={:startTime}&amp;endTime={:endTime}
+</code></pre></div>
+<p>Parameters:</p>
+<ul>
+<li>symbol - the stock symbol. String</li>
+<li>resolution - window length of the candlestick chart in seconds. Long</li>
+<li>startTime - start time of the window in epoch. Long</li>
+<li>endTime - end time of the window in epoch. Long</li>
+</ul>
+<p>Response:</p>
+<ul>
+<li>candles - array with each candlestick data (attributes listed below). Array</li>
+<li>open - open price of each candlestick. Double</li>
+<li>close - close price of each candlestick. Double</li>
+<li>high - high price of each candlestick. Double</li>
+<li>low - low price of each candlestick. Double</li>
+</ul>
+<h3 id="data-models"><strong>Data models</strong></h3>
+<p>There are three main types of data in our exchange:</p>
+<ul>
+<li>Product, order, execution</li>
+<li>order book</li>
+<li>candlestick chart</li>
+</ul>
+<h4 id="product-order-execution">Product, order, execution</h4>
+<p>Products describe the attributes of a traded symbol - product type, trading symbol, UI display symbol, etc.</p>
+<p>This data doesn't change frequently, it is primarily used for rendering in a UI.</p>
+<p>An order represents an instruction for a buy/sell order. Executions are outbound matched result.</p>
+<p>Here's the data model:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/product-order-execution-data-model.png" alt="product-order-execution-data-model" data-width="500" style="max-width:500px" />
+</p>
+<p>We encounter orders and executions in all of our three flows:</p>
+<ul>
+<li>in the critical path, they are processed in-memory for high performance. They are stored and recovered from the sequencer.</li>
+<li>The reporter writes orders and executions to the database for reporting use-cases</li>
+<li>Executions are forwarded to market data to reconstruct the order book and candlestick chart</li>
+</ul>
+<h4 id="order-book">Order book</h4>
+<p>The order book is a list of buy/sell orders for an instrument, organized by price level.</p>
+<p>An efficient data structure for this model, needs to satisfy:</p>
+<ul>
+<li>constant lookup time - getting volume at price level or between price levels</li>
+<li>fast add/execute/cancel operations</li>
+<li>query best bid/ask price</li>
+<li>iterate through price levels</li>
+</ul>
+<p>Example order book execution:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/order-book-execution.png" alt="order-book-execution" data-width="500" style="max-width:500px" />
+</p>
+<p>After fulfilling this large order, the price increases as the bid/ask spread widens.</p>
+<p>Example order book implementation in pseudo code:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>class PriceLevel{
+    private Price limitPrice;
+    private long totalVolume;
+    private List&lt;Order&gt; orders;
+}
+
+class Book&lt;Side&gt; {
+    private Side side;
+    private Map&lt;Price, PriceLevel&gt; limitMap;
+}
+
+class OrderBook {
+    private Book&lt;Buy&gt; buyBook;
+    private Book&lt;Sell&gt; sellBook;
+    private PriceLevel bestBid;
+    private PriceLevel bestOffer;
+    private Map&lt;OrderID, Order&gt; orderMap;
+}
+</code></pre></div>
+<p>For a more efficient implementation, we can use a doubly-linked list instead of a standard list:</p>
+<ul>
+<li>Placing a new order is O(1), because we're adding an order to the tail of the list.</li>
+<li>Matching an order is O(1), because we are deleting an order from the head</li>
+<li>Canceling an order means deleting an order from the order book. We utilize <code>orderMap</code> for O(1) lookup and O(1) delete (due to the <code>Order</code> having a reference to the previous element in the list).</li>
+</ul>
+<p><strong>Why this particular combination of structures, and why it is exactly the right one:</strong></p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Structure used</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Place an order</td>
+<td>Append to the tail of the price level's list</td>
+<td><strong>O(1)</strong></td>
+</tr>
+<tr>
+<td>Match an order</td>
+<td>Take from the head of the opposing level's list</td>
+<td><strong>O(1)</strong></td>
+</tr>
+<tr>
+<td>Cancel an order</td>
+<td><code>orderMap</code> lookup, then unlink via prev/next pointers</td>
+<td><strong>O(1)</strong></td>
+</tr>
+<tr>
+<td>Best bid / best ask</td>
+<td>Cached <code>bestBid</code> / <code>bestOffer</code> pointers</td>
+<td><strong>O(1)</strong></td>
+</tr>
+<tr>
+<td>Volume at a price</td>
+<td><code>totalVolume</code> maintained on the <code>PriceLevel</code></td>
+<td><strong>O(1)</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Everything on the hot path is constant time, which is what a microsecond budget requires — there is no room for an <code>O(log n)</code> tree walk, let alone a scan.</p>
+<p><strong>And the data structure is not an arbitrary optimisation; it encodes the fairness rule.</strong> Exchanges match by <strong>price-time priority</strong>: better prices first, and among orders at the same price, <em>whoever arrived first</em>. A FIFO queue per price level means insertion order <em>is</em> priority order, so the matching rule is implemented by the structure rather than by a comparison. The doubly-linked list is what makes cancellation O(1) without disturbing anyone else's position in the queue — a singly-linked list would require a scan to find the predecessor, and an array would require shifting every later order, which would also be unfair to re-sequence.</p>
+<p><strong>One simplification in the pseudo-code worth noticing:</strong> <code>match()</code> looks up <code>book.limitMap.get(order.price)</code> — only the exact price level. A real matcher walks price levels from the best available price <em>towards</em> the incoming order's limit, filling at each level until the order is exhausted or no acceptable price remains. That is how a large order &quot;walks the book&quot; and widens the spread, which is precisely the behaviour the order-book execution diagram above illustrates.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/order-book-impl.png" alt="order-book-impl" data-width="500" style="max-width:500px" />
+</p>
+<p>This data structure is also used in the market data services to reconstruct the order book.</p>
+<h4 id="candlestick-chart">Candlestick chart</h4>
+<p>The candlestick data is calculated within the market data services based on processing orders in a time interval:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>class Candlestick {
+    private long openPrice;
+    private long closePrice;
+    private long highPrice;
+    private long lowPrice;
+    private long volume;
+    private long timestamp;
+    private int interval;
+}
+
+class CandlestickChart {
+    private LinkedList&lt;Candlestick&gt; sticks;
+}
+</code></pre></div>
+<p>Some optimizations to avoid consuming too much memory:</p>
+<ul>
+<li>Use pre-allocated ring buffers to hold sticks to reduce the allocation number</li>
+<li>Limit the number of sticks in memory and persist the rest to disk</li>
+</ul>
+<p>We'll use an in-memory columnar database (eg KDB) for real-time analytics. After market close, data is persisted in historical database.</p>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<p>One interesting thing to be aware of about modern exchanges is that unlike most other software, they typically run everything on one gigantic server.</p>
+<p>Let's explore the details.</p>
+<h3 id="performance"><strong>Performance</strong></h3>
+<p>For an exchange, it is very important to have good overall latency for all percentiles.</p>
+<p>How can we reduce latency?</p>
+<ul>
+<li>Reduce the number of tasks on the critical path</li>
+<li>Shorten the time spent on each task by reducing network/disk usage and/or reducing task execution time</li>
+</ul>
+<p>To achieve the first goal, we've stripped the critical path from all extraneous responsibility, even logging is removed to achieve optimal latency.</p>
+<p>If we follow the original design, there are several bottlenecks - network latency between services and disk usage of the sequencer.</p>
+<p>With such a design we can achieve tens of milliseconds end to end latency. We want to achieve tens of microseconds instead.</p>
+<p>Hence, we'll put everything on one server and processes are going to communicate via mmap as an event store:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/mmap-bus.png" alt="mmap-bus" data-width="500" style="max-width:500px" />
+</p>
+<p>Another optimization is using an application loop (while loop executing mission-critical tasks), pinned to the same CPU to avoid context switching:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/application-loop.png" alt="application-loop" data-width="500" style="max-width:500px" />
+</p>
+<p>Another side effect of using an application loop is that there is no lock contention - multiple threads fighting for the same resource.</p>
+<p><strong>Three distinct costs disappear with a single pinned thread, and it is worth separating them:</strong></p>
+<ul>
+<li><strong>No lock contention</strong>, because there is no second thread to contend with. Not &quot;less contention&quot; — none. An uncontended lock is cheap but a contended one can cost microseconds, and worse, its cost is <em>unpredictable</em>.</li>
+<li><strong>No context switches.</strong> A thread that is descheduled loses the CPU for potentially milliseconds, and when it returns its caches are cold. Pinning to a core and never yielding keeps the working set in L1/L2.</li>
+<li><strong>No cache invalidation from migration.</strong> A thread moved to another core finds its data in the wrong cache hierarchy.</li>
+</ul>
+<p>The price is paid deliberately: <strong>a busy-spin loop consumes 100% of a core doing nothing while idle</strong>, burning power and heat to avoid the microseconds that sleeping and waking would cost. That is an explicit trade of efficiency for <em>predictability</em>, and it is characteristic of this whole domain — the goal is not the best average but the tightest distribution.</p>
+<p><strong>Garbage collection is the other predictability killer, and it is worse than everything else combined.</strong> A single stop-the-world pause of 10 ms is roughly a thousand times the end-to-end latency target, and it will land on some unlucky order. Hence: preallocate everything, pool and reuse objects, allocate nothing on the hot path, use primitive arrays rather than object graphs — or write the engine in a language without a collector. This is why the chapter's <strong>&quot;latency determinism&quot;</strong> section names GC explicitly; in a system like this a garbage collector is not a performance concern but a correctness-of-experience one.</p>
+<p>Let's now explore how mmap works - it is a UNIX syscall, which maps a file on disk to an application's memory.</p>
+<p>One trick we can use is creating the file in <code>/dev/shm</code>, which stands for &quot;shared memory&quot;. Hence, we have no disk access at all.</p>
+<p><strong>What this buys, precisely:</strong> <code>mmap</code> maps a file into a process's address space so reading and writing it are ordinary memory operations — no <code>read</code>/<code>write</code> syscalls, no kernel buffer copies. Mapping the <em>same</em> file into several processes gives them a shared memory region, so inter-process communication becomes &quot;write to a memory address&quot; rather than &quot;send a message&quot;. And because <code>/dev/shm</code> is a RAM-backed filesystem, nothing ever touches a disk.</p>
+<p>So the &quot;event store&quot; between the sequencer, matching engine and market data publisher is a region of RAM that several processes can read and write at memory speed. That is how components stay separate programs — independently deployable, independently crashable — while communicating at roughly the cost of a function call.</p>
+<p><strong>The thing to be explicit about is that this storage is not durable.</strong> <code>/dev/shm</code> does not survive a reboot or a machine failure, so the design's recovery story cannot rest on it. Durability has to come from somewhere else — writing the sequenced event stream to persistent storage <em>off</em> the critical path, and from the replicas discussed under high availability — which is the same &quot;fast path in memory, durable path asynchronous&quot; split as the commit log in <a href="06-key-value-store.html#write-and-read-paths">Chapter 6</a>.</p>
+<h3 id="event-sourcing"><strong>Event sourcing</strong></h3>
+<p>Event sourcing is discussed in-depth in the <a href="27-digital-wallet.html#event-sourcing">digital wallet chapter</a>. Reference it for all the details.</p>
+<p>In a nutshell, instead of storing current states, we store immutable state transitions:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/event-sourcing.png" alt="event-sourcing" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>On the left - traditional schema</li>
+<li>On the right - event source schema</li>
+</ul>
+<p>Here's how our design looks like thus far:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/design-so-far.png" alt="design-so-far" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>external domain interacts with our client gateway using the FIX protocol</li>
+<li>Order manager receives the new order event, validates it and adds it to its internal state. Order is then sent to matching core</li>
+<li>If order is matched, the <code>OrderFilledEvent</code> is generated and sent over mmap</li>
+<li>Other components subscribe to the event store and do their part of the processing</li>
+</ul>
+<p>One additional optimizations - all components hold a copy of the order manager, which is packaged as a library to avoid extra calls for managing orders</p>
+<p>The sequencer in this design, changes to not be an event store, but be a single writer, sequencing events before forwarding them to the event store:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/sequencer-deep-dive.png" alt="sequencer-deep-dive" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="high-availability"><strong>High availability</strong></h3>
+<p>We aim for 99.99% availability - only 8.64s of downtime per day.</p>
+<p>To achieve that, we have to identify single-point-of-failures in the exchange architecture:</p>
+<ul>
+<li>setup backup instances of critical services (eg matching engine) which are on stand-by</li>
+<li>aggressively automate failure detection and failover to the backup instance</li>
+</ul>
+<p>Stateless services such as the client gateway can easily be horizontally scaled by adding more servers.</p>
+<p>For stateful components, we can process inbound events, but not publish outbound events if we're not the leader:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/leader-election.png" alt="leader-election" data-width="500" style="max-width:500px" />
+</p>
+<p>To detect the primary replica being down, we can send heartbeats to detect that its non-functional.</p>
+<p>This mechanism only works within the boundary of a single server.
+If we want to extend it, we can setup an entire server as hot/warm replica and failover in case of failure.</p>
+<p>To replicate the event store across the replicas, we can use reliable UDP for faster communication.</p>
+<h3 id="fault-tolerance"><strong>Fault tolerance</strong></h3>
+<p>What if even the warm instances go down? It is a low probability event but we should be ready for it.</p>
+<p>Large tech companies tackle this problem by replicating core data to data centers in multiple cities to mitigate eg natural disasters.</p>
+<p>Questions to consider:</p>
+<ul>
+<li>If the primary instance is down, how and when do we failover to the backup instance?</li>
+<li>How do we choose the leader among the backup instances?</li>
+<li>What is the recovery time needed (RTO - recovery time objective)?</li>
+<li>What functionalities need to be recovered? Can our system operate under degraded conditions?</li>
+</ul>
+<p>How to address these:</p>
+<ul>
+<li>System can be down due to a bug (affecting primary and replicas), we can use chaos engineering to surface edge-cases and disastrous outcomes like these</li>
+<li>Initially though, we could perform failovers manually until we gather sufficient knowledge about the system's failure modes</li>
+<li>leader-election can be used (eg Raft) to determine which replica becomes the leader in the event of the primary going down</li>
+</ul>
+<p>Example of how replication works across different servers:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/replication-across-servers.png" alt="replication-across-servers" data-width="500" style="max-width:500px" />
+</p>
+<p>Example leader-election terms:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/leader-election-terms.png" alt="leader-election-terms" data-width="500" style="max-width:500px" />
+</p>
+<p>For details on how Raft works, <a href="https://thesecretlivesofdata.com/raft/" target="_blank" rel="noopener">check this out</a></p>
+<p>Finally, we need to also consider loss tolerance - how much data can we lose before things get critical?
+This will determine how often we backup our data.</p>
+<p>For a stock exchange, data loss is unacceptable, so we have to backup data often and rely on raft's replication to reduce probability of data loss.</p>
+<h3 id="matching-algorithms"><strong>Matching algorithms</strong></h3>
+<p>Slight detour on how matching works via pseudo code:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>Context handleOrder(OrderBook orderBook, OrderEvent orderEvent) {
+    if (orderEvent.getSequenceId() != nextSequence) {
+        return Error(OUT_OF_ORDER, nextSequence);
+    }
+
+    if (!validateOrder(symbol, price, quantity)) {
+        return ERROR(INVALID_ORDER, orderEvent);
+    }
+
+    Order order = createOrderFromEvent(orderEvent);
+    switch (msgType):
+        case NEW:
+            return handleNew(orderBook, order);
+        case CANCEL:
+            return handleCancel(orderBook, order);
+        default:
+            return ERROR(INVALID_MSG_TYPE, msgType);
+
+}
+
+Context handleNew(OrderBook orderBook, Order order) {
+    if (BUY.equals(order.side)) {
+        return match(orderBook.sellBook, order);
+    } else {
+        return match(orderBook.buyBook, order);
+    }
+}
+
+Context handleCancel(OrderBook orderBook, Order order) {
+    if (!orderBook.orderMap.contains(order.orderId)) {
+        return ERROR(CANNOT_CANCEL_ALREADY_MATCHED, order);
+    }
+
+    removeOrder(order);
+    setOrderStatus(order, CANCELED);
+    return SUCCESS(CANCEL_SUCCESS, order);
+}
+
+Context match(OrderBook book, Order order) {
+    Quantity leavesQuantity = order.quantity - order.matchedQuantity;
+    Iterator&lt;Order&gt; limitIter = book.limitMap.get(order.price).orders;
+    while (limitIter.hasNext() &amp;&amp; leavesQuantity &gt; 0) {
+        Quantity matched = min(limitIter.next.quantity, order.quantity);
+        order.matchedQuantity += matched;
+        leavesQuantity = order.quantity - order.matchedQuantity;
+        remove(limitIter.next);
+        generateMatchedFill();
+    }
+    return SUCCESS(MATCH_SUCCESS, order);
+}
+</code></pre></div>
+<p>This matching algorithm uses the FIFO algorithm for determining which orders at a price level to match.</p>
+<h3 id="determinism"><strong>Determinism</strong></h3>
+<p>Functional determinism is guaranteed via the sequencer technique we used.</p>
+<p>The actual time when the event happens doesn't matter:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/determinism.png" alt="determinism" data-width="500" style="max-width:500px" />
+</p>
+<p><strong>And functional determinism is doing more work here than audit.</strong> Because the matching engine is a pure function of the sequenced event stream, any replica fed the same sequence reaches the same state — which is what makes hot-warm standbys possible at all, and what makes recovery a replay rather than a reconciliation. The sequencer is the thing that creates that stream, so it is simultaneously the ordering authority, the fairness authority (sequence number = arrival priority), and the foundation of fault tolerance.</p>
+<p>It is worth noting what that means for the sequencer itself: it is a <strong>single point of failure and the system's throughput ceiling</strong>, because every order must pass through it to be ordered. There is no sharding it without giving up the total order that everything else depends on — the same wall as the hot account in <a href="27-digital-wallet.html">Chapter 27</a> and the hot inventory row in <a href="22-hotel-reservation-system.html">Chapter 22</a>. An exchange accepts that ceiling and makes the single path as fast as possible, which is the whole of Step 3.</p>
+<p>Latency determinism is something we have to track. We can calculate it based on monitoring 99 or 99.99 percentile latency.</p>
+<p><strong>Why the percentile matters more than the mean here</strong>, which is the chapter's point stated more sharply: a trader whose order is delayed 50 ms during a price move loses money, and averages hide that completely. A system with a 20 μs mean and a 50 ms p99.99 is processing hundreds of orders a day catastrophically badly while every dashboard looks healthy. <strong>The goal is a tight distribution, not a low average</strong> — which is why every technique in this section is about removing variance (no GC, no context switches, no locks, no disk, preallocated memory) rather than about raw speed.</p>
+<p>Things which can cause latency spikes are garbage collector events in eg Java.</p>
+<h3 id="market-data-publisher-optimizations"><strong>Market data publisher optimizations</strong></h3>
+<p>The market data publisher receives matched results from the matching engine and rebuilds the order book and candlestick charts based on them.</p>
+<p>We only keep part of the candlesticks as we don't have infinite memory. Clients can choose how much granular info they want. More granular info might require a higher price:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/28.%20Stock%20Exchange/images/market-data-publisher.png" alt="market-data-publisher" data-width="500" style="max-width:500px" />
+</p>
+<p>A ring buffer (aka circular buffer) is a fixed-size queue with the head connected to the tail. The space is preallocated to avoid allocations. The data structure is also lock-free.</p>
+<p>Another technique to optimize the ring buffer is padding, which ensures the sequence number is never in a cache line with anything else.</p>
+<p><strong>The problem padding solves is called false sharing, and it is one of the few places where cache-line mechanics show up directly in a system design.</strong> CPUs move memory between cores in <strong>64-byte cache lines</strong>, not individual variables. If a producer's sequence counter and a consumer's sequence counter happen to sit in the same 64-byte line, then every write by the producer invalidates that line in the consumer's cache and vice versa — the line ping-pongs between cores, and two variables that are logically independent become a hardware-level contention point costing tens of nanoseconds per access.</p>
+<p>Padding each counter out to its own cache line removes the interference entirely. It wastes a little memory to avoid a coherence storm, and at these latencies that is obviously the right trade.</p>
+<p><strong>The ring buffer itself is doing three jobs at once</strong>, which is why it is the standard structure for this kind of pipeline: the space is <strong>preallocated</strong> (so no allocation on the hot path, and no GC pressure), it is <strong>lock-free</strong> (producers and consumers coordinate through sequence numbers with memory barriers rather than mutexes), and it is <strong>contiguous</strong> (so access is cache- and prefetcher-friendly, unlike a linked structure). This is the design popularised as the <strong>LMAX Disruptor</strong>, which came out of exactly this problem — a financial exchange needing a low-latency inter-thread pipeline.</p>
+<h3 id="distribution-fairness-of-market-data-and-multicast"><strong>Distribution fairness of market data and multicast</strong></h3>
+<p>We need to ensure subscribers receive the data at the same time since if one receives data before another, that gives them crucial market insight, which they can use to manipulate the market.</p>
+<p>To achieve this, we can use multicast using reliable UDP when publishing data to subscribers.</p>
+<p>Data can be transported via the internet in three ways:</p>
+<ul>
+<li>Unicast - one source, one destination</li>
+<li>Broadcast - one source to entire subnetwork</li>
+<li>Multicast - one source to a set of hosts on different subnetworks</li>
+</ul>
+<p>In theory, by using multicast, all subscribers should receive the data at the same time.</p>
+<p>UDP, however, is unreliable and the data might not reach everyone. It can be enhanced with retransmissions, however.</p>
+<p><strong>Spell out why unicast is unacceptable, because it is the clearest example of fairness as a functional requirement.</strong> Sending the same update to 500 subscribers over 500 TCP connections means writing to them in <em>some</em> order, so the first recipient learns the new price microseconds before the last. At these timescales that is a tradeable advantage — the early recipient can act on information the others do not yet have — which is market manipulation enabled by an implementation detail. Multicast sends one packet that the network fabric replicates, so copies diverge only in the last hop.</p>
+<p><strong>And retransmission reintroduces exactly the unfairness multicast removed.</strong> A subscriber that drops a packet and requests it again receives that data later than everyone else, so reliable-multicast protocols (PGM and similar) have to be designed carefully — NAK-based rather than ACK-based so the normal path carries no feedback traffic, with retransmissions sent to the group rather than to one requester, so nobody gains from someone else's loss.</p>
+<p>Exchanges take this further than software: colocated servers are connected with <strong>length-equalised fibre</strong>, so a rack at the far end of the data centre is not disadvantaged by a few metres of cable. Once the software is this fast, the speed of light in glass is a measurable source of unfairness — which is a good indication of how completely latency dominates this problem.</p>
+<h3 id="colocation"><strong>Colocation</strong></h3>
+<p>Exchanges offer brokers the ability to colocate their servers in the same data center as the exchange.</p>
+<p>This reduces the latency drastically and can be considered a VIP service.</p>
+<h3 id="network-security"><strong>Network Security</strong></h3>
+<p>DDoS is a challenge for exchanges as there are some internet-facing services. Here's our options:</p>
+<ul>
+<li>Isolate public services and data from private services, so DDoS attacks don't impact the most important clients</li>
+<li>Use a caching layer to store data which is infrequently updated</li>
+<li>Harden URLs against DDoS, eg prefer <code>https://my.website.com/data/recent</code> vs. <code>https://my.website.com/data?from=123&amp;to=456</code>, because the former is more cacheable</li>
+<li>Effective allowlist/blocklist mechanism is needed.</li>
+<li>Rate limiting can be used to mitigate DDoS</li>
+</ul>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
+<p>Other interesting notes:</p>
+<ul>
+<li>not all exchanges rely on putting everything on one big server, but some still do</li>
+<li>modern exchanges rely more on cloud infrastructure and also on automatic market makers (AMM) to avoid maintaining an order book</li>
+</ul>
+<figure class="mermaid-fig">
+<svg id="mmd-a5ec55958d17b15f" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1865.48px; background-color: transparent;" viewBox="0 -0.000003814697265625 1865.484375 418.1826171875" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-a5ec55958d17b15f{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-a5ec55958d17b15f .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-a5ec55958d17b15f .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-a5ec55958d17b15f .error-icon{fill:#f4f6f8;}#mmd-a5ec55958d17b15f .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-a5ec55958d17b15f .edge-thickness-normal{stroke-width:1px;}#mmd-a5ec55958d17b15f .edge-thickness-thick{stroke-width:3.5px;}#mmd-a5ec55958d17b15f .edge-pattern-solid{stroke-dasharray:0;}#mmd-a5ec55958d17b15f .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-a5ec55958d17b15f .edge-pattern-dashed{stroke-dasharray:3;}#mmd-a5ec55958d17b15f .edge-pattern-dotted{stroke-dasharray:2;}#mmd-a5ec55958d17b15f .marker{fill:#637381;stroke:#637381;}#mmd-a5ec55958d17b15f .marker.cross{stroke:#637381;}#mmd-a5ec55958d17b15f svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-a5ec55958d17b15f p{margin:0;}#mmd-a5ec55958d17b15f .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-a5ec55958d17b15f .cluster-label text{fill:#454f5b;}#mmd-a5ec55958d17b15f .cluster-label span{color:#454f5b;}#mmd-a5ec55958d17b15f .cluster-label span p{background-color:transparent;}#mmd-a5ec55958d17b15f .label text,#mmd-a5ec55958d17b15f span{fill:#161c24;color:#161c24;}#mmd-a5ec55958d17b15f .node rect,#mmd-a5ec55958d17b15f .node circle,#mmd-a5ec55958d17b15f .node ellipse,#mmd-a5ec55958d17b15f .node polygon,#mmd-a5ec55958d17b15f .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-a5ec55958d17b15f .rough-node .label text,#mmd-a5ec55958d17b15f .node .label text,#mmd-a5ec55958d17b15f .image-shape .label,#mmd-a5ec55958d17b15f .icon-shape .label{text-anchor:middle;}#mmd-a5ec55958d17b15f .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-a5ec55958d17b15f .rough-node .label,#mmd-a5ec55958d17b15f .node .label,#mmd-a5ec55958d17b15f .image-shape .label,#mmd-a5ec55958d17b15f .icon-shape .label{text-align:center;}#mmd-a5ec55958d17b15f .node.clickable{cursor:pointer;}#mmd-a5ec55958d17b15f .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-a5ec55958d17b15f .arrowheadPath{fill:#000000;}#mmd-a5ec55958d17b15f .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-a5ec55958d17b15f .flowchart-link{stroke:#637381;fill:none;}#mmd-a5ec55958d17b15f .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-a5ec55958d17b15f .edgeLabel p{background-color:#ffffff;}#mmd-a5ec55958d17b15f .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-a5ec55958d17b15f .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-a5ec55958d17b15f .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-a5ec55958d17b15f .cluster text{fill:#454f5b;}#mmd-a5ec55958d17b15f .cluster span{color:#454f5b;}#mmd-a5ec55958d17b15f .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-a5ec55958d17b15f .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-a5ec55958d17b15f div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-a5ec55958d17b15f .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-a5ec55958d17b15f rect.text{fill:none;stroke-width:0;}#mmd-a5ec55958d17b15f .icon-shape,#mmd-a5ec55958d17b15f .image-shape{background-color:#ffffff;text-align:center;}#mmd-a5ec55958d17b15f .icon-shape p,#mmd-a5ec55958d17b15f .image-shape p{background-color:#ffffff;padding:2px;}#mmd-a5ec55958d17b15f .icon-shape .label rect,#mmd-a5ec55958d17b15f .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-a5ec55958d17b15f .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-a5ec55958d17b15f .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-a5ec55958d17b15f .node .neo-node{stroke:#299a8d;}#mmd-a5ec55958d17b15f [data-look="neo"].node rect,#mmd-a5ec55958d17b15f [data-look="neo"].cluster rect,#mmd-a5ec55958d17b15f [data-look="neo"].node polygon{stroke:url(#mmd-a5ec55958d17b15f-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-a5ec55958d17b15f [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-a5ec55958d17b15f [data-look="neo"].node path{stroke:url(#mmd-a5ec55958d17b15f-gradient);stroke-width:1px;}#mmd-a5ec55958d17b15f [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-a5ec55958d17b15f [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-a5ec55958d17b15f [data-look="neo"].node circle{stroke:url(#mmd-a5ec55958d17b15f-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-a5ec55958d17b15f [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-a5ec55958d17b15f [data-look="neo"].icon-shape .icon{fill:url(#mmd-a5ec55958d17b15f-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-a5ec55958d17b15f [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-a5ec55958d17b15f-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-a5ec55958d17b15f :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-a5ec55958d17b15f_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-a5ec55958d17b15f_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-a5ec55958d17b15f_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-a5ec55958d17b15f_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-a5ec55958d17b15f_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-a5ec55958d17b15f_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-a5ec55958d17b15f_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-a5ec55958d17b15f_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-a5ec55958d17b15f_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-a5ec55958d17b15f_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-a5ec55958d17b15f_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-a5ec55958d17b15f_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M256,187.183L260.167,187.183C264.333,187.183,272.667,187.183,280.333,187.183C288,187.183,295,187.183,298.5,187.183L302,187.183" id="mmd-a5ec55958d17b15f-L_B_GW_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_GW_0" data-points="W3sieCI6MjU2LCJ5IjoxODcuMTgyNjI0ODE2ODk0NTN9LHsieCI6MjgxLCJ5IjoxODcuMTgyNjI0ODE2ODk0NTN9LHsieCI6MzA2LCJ5IjoxODcuMTgyNjI0ODE2ODk0NTN9XQ==" data-look="classic" marker-end="url(#mmd-a5ec55958d17b15f_flowchart-v2-pointEnd)"/><path d="M496.25,187.183L500.417,187.183C504.583,187.183,512.917,187.183,520.583,187.183C528.25,187.183,535.25,187.183,538.75,187.183L542.25,187.183" id="mmd-a5ec55958d17b15f-L_GW_RISK_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_GW_RISK_0" data-points="W3sieCI6NDk2LjI1LCJ5IjoxODcuMTgyNjI0ODE2ODk0NTN9LHsieCI6NTIxLjI1LCJ5IjoxODcuMTgyNjI0ODE2ODk0NTN9LHsieCI6NTQ2LjI1LCJ5IjoxODcuMTgyNjI0ODE2ODk0NTN9XQ==" data-look="classic" marker-end="url(#mmd-a5ec55958d17b15f_flowchart-v2-pointEnd)"/><path d="M752.516,187.183L756.682,187.183C760.849,187.183,769.182,187.183,776.849,187.183C784.516,187.183,791.516,187.183,795.016,187.183L798.516,187.183" id="mmd-a5ec55958d17b15f-L_RISK_SEQ_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RISK_SEQ_0" data-points="W3sieCI6NzUyLjUxNTYyNSwieSI6MTg3LjE4MjYyNDgxNjg5NDUzfSx7IngiOjc3Ny41MTU2MjUsInkiOjE4Ny4xODI2MjQ4MTY4OTQ1M30seyJ4Ijo4MDIuNTE1NjI1LCJ5IjoxODcuMTgyNjI0ODE2ODk0NTN9XQ==" data-look="classic" marker-end="url(#mmd-a5ec55958d17b15f_flowchart-v2-pointEnd)"/><path d="M970.203,187.183L974.37,187.183C978.536,187.183,986.87,187.183,994.536,187.183C1002.203,187.183,1009.203,187.183,1012.703,187.183L1016.203,187.183" id="mmd-a5ec55958d17b15f-L_SEQ_EB_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SEQ_EB_0" data-points="W3sieCI6OTcwLjIwMzEyNSwieSI6MTg3LjE4MjYyNDgxNjg5NDUzfSx7IngiOjk5NS4yMDMxMjUsInkiOjE4Ny4xODI2MjQ4MTY4OTQ1M30seyJ4IjoxMDIwLjIwMzEyNSwieSI6MTg3LjE4MjYyNDgxNjg5NDUzfV0=" data-look="classic" marker-end="url(#mmd-a5ec55958d17b15f_flowchart-v2-pointEnd)"/><path d="M1144.544,149.544L1165.314,132.302C1186.084,115.06,1227.624,80.576,1269.401,64.197C1311.178,47.818,1353.192,49.546,1374.199,50.409L1395.207,51.273" id="mmd-a5ec55958d17b15f-L_EB_ME_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_EB_ME_0" data-points="W3sieCI6MTE0NC41NDQwODg5OTQxNzY1LCJ5IjoxNDkuNTQzOTY3MTkwNzAxODZ9LHsieCI6MTI2OS4xNjQwNjI1LCJ5Ijo0Ni4wOTEzMTI0MDg0NDcyNjZ9LHsieCI6MTM5OS4yMDMxMjUsInkiOjUxLjQzNzA0MjU2ODcwNjc2NX1d" data-look="classic" marker-end="url(#mmd-a5ec55958d17b15f_flowchart-v2-pointEnd)"/><path d="M1625.641,56.091L1631.349,56.091C1637.057,56.091,1648.474,56.091,1658.676,56.091C1668.878,56.091,1677.865,56.091,1682.358,56.091L1686.852,56.091" id="mmd-a5ec55958d17b15f-L_ME_OB_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_ME_OB_0" data-points="W3sieCI6MTYyNS42NDA2MjUsInkiOjU2LjA5MTMxMjQwODQ0NzI2Nn0seyJ4IjoxNjU5Ljg5MDYyNSwieSI6NTYuMDkxMzEyNDA4NDQ3MjY2fSx7IngiOjE2OTAuODUxNTYyNSwieSI6NTYuMDkxMzEyNDA4NDQ3MjY2fV0=" data-look="classic" marker-end="url(#mmd-a5ec55958d17b15f_flowchart-v2-pointEnd)"/><path d="M1399.203,81.944L1377.53,86.893C1355.857,91.841,1312.51,101.739,1271.323,114.662C1230.135,127.585,1191.107,143.534,1171.592,151.508L1152.078,159.482" id="mmd-a5ec55958d17b15f-L_ME_EB_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_ME_EB_0" data-points="W3sieCI6MTM5OS4yMDMxMjUsInkiOjgxLjk0Mzc1OTY0ODQzODU2fSx7IngiOjEyNjkuMTY0MDYyNSwieSI6MTExLjYzNjk2ODYxMjY3MDl9LHsieCI6MTE0OC4zNzUsInkiOjE2MC45OTUxMjQwNjI4Njk2fV0=" data-look="classic" marker-end="url(#mmd-a5ec55958d17b15f_flowchart-v2-pointEnd)"/><path d="M1148.375,187.183L1168.507,187.183C1188.638,187.183,1228.901,187.183,1273.188,187.183C1317.474,187.183,1365.784,187.183,1389.939,187.183L1414.094,187.183" id="mmd-a5ec55958d17b15f-L_EB_MDP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_EB_MDP_0" data-points="W3sieCI6MTE0OC4zNzUsInkiOjE4Ny4xODI2MjQ4MTY4OTQ1M30seyJ4IjoxMjY5LjE2NDA2MjUsInkiOjE4Ny4xODI2MjQ4MTY4OTQ1M30seyJ4IjoxNDE4LjA5Mzc1LCJ5IjoxODcuMTgyNjI0ODE2ODk0NTN9XQ==" data-look="classic" marker-end="url(#mmd-a5ec55958d17b15f_flowchart-v2-pointEnd)"/><path d="M1606.75,187.183L1615.607,187.183C1624.464,187.183,1642.177,187.183,1654.534,187.183C1666.891,187.183,1673.891,187.183,1677.391,187.183L1680.891,187.183" id="mmd-a5ec55958d17b15f-L_MDP_MC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_MDP_MC_0" data-points="W3sieCI6MTYwNi43NSwieSI6MTg3LjE4MjYyNDgxNjg5NDUzfSx7IngiOjE2NTkuODkwNjI1LCJ5IjoxODcuMTgyNjI0ODE2ODk0NTN9LHsieCI6MTY4NC44OTA2MjUsInkiOjE4Ny4xODI2MjQ4MTY4OTQ1M31d" data-look="classic" marker-end="url(#mmd-a5ec55958d17b15f_flowchart-v2-pointEnd)"/><path d="M1148.375,211.097L1168.507,224.695C1188.638,238.292,1228.901,265.487,1268.497,279.085C1308.094,292.683,1347.023,292.683,1366.488,292.683L1385.953,292.683" id="mmd-a5ec55958d17b15f-L_EB_RPT_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_EB_RPT_0" data-points="W3sieCI6MTE0OC4zNzUsInkiOjIxMS4wOTcwMzMwNTk2MzM1fSx7IngiOjEyNjkuMTY0MDYyNSwieSI6MjkyLjY4MjYyNDgxNjg5NDUzfSx7IngiOjEzODkuOTUzMTI1LCJ5IjoyOTIuNjgyNjI0ODE2ODk0NTN9XQ==" data-look="classic" marker-end="url(#mmd-a5ec55958d17b15f_flowchart-v2-pointEnd)"/><path d="M1126.69,230.001L1150.436,256.281C1174.182,282.562,1221.673,335.122,1271.566,361.402C1321.458,387.683,1373.753,387.683,1399.9,387.683L1426.047,387.683" id="mmd-a5ec55958d17b15f-L_EB_HW_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_EB_HW_0" data-points="W3sieCI6MTEyNi42OTAzNjMwODQ4ODM1LCJ5IjoyMzAuMDAxMjE5MTc1NTIzNTJ9LHsieCI6MTI2OS4xNjQwNjI1LCJ5IjozODcuNjgyNjI0ODE2ODk0NTN9LHsieCI6MTQzMC4wNDY4NzUsInkiOjM4Ny42ODI2MjQ4MTY4OTQ1M31d" data-look="classic" marker-end="url(#mmd-a5ec55958d17b15f_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_B_GW_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_GW_RISK_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RISK_SEQ_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_SEQ_EB_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_EB_ME_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_ME_OB_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_ME_EB_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_EB_MDP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_MDP_MC_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(1269.1640625, 292.68262481689453)"><g class="label" data-id="L_EB_RPT_0" transform="translate(-61.125, -10.5)"><foreignObject width="122.25" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>off the critical path</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(1269.1640625, 387.68262481689453)"><g class="label" data-id="L_EB_HW_0" transform="translate(-95.7890625, -10.5)"><foreignObject width="191.578125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>same sequence ⇒ same state</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-a5ec55958d17b15f-flowchart-B-0" data-look="classic" transform="translate(132, 187.18262481689453)"><rect class="basic label-container" style="" x="-124" y="-43.5" width="248" height="87"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>brokers / clients<br />(colocated, length-equalised fibre)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-a5ec55958d17b15f-flowchart-GW-1" data-look="classic" transform="translate(401.125, 187.18262481689453)"><rect class="basic label-container" style="" x="-95.125" y="-33" width="190.25" height="66"/><g class="label" style="" transform="translate(-71.125, -21)"><rect/><foreignObject width="142.25" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>gateway<br />auth, protocol decode</p></span></div></foreignObject></g></g><g class="node default" id="mmd-a5ec55958d17b15f-flowchart-RISK-3" data-look="classic" transform="translate(649.3828125, 187.18262481689453)"><rect class="basic label-container" style="" x="-103.1328125" y="-33" width="206.265625" height="66"/><g class="label" style="" transform="translate(-79.1328125, -21)"><rect/><foreignObject width="158.265625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>risk checks + wallet hold<br />in-memory positions</p></span></div></foreignObject></g></g><g class="node default" id="mmd-a5ec55958d17b15f-flowchart-SEQ-5" data-look="classic" transform="translate(886.359375, 187.18262481689453)"><rect class="basic label-container" style="" x="-83.84375" y="-33" width="167.6875" height="66"/><g class="label" style="" transform="translate(-59.84375, -21)"><rect/><foreignObject width="119.6875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>sequencer<br />assigns total order</p></span></div></foreignObject></g></g><g class="node default" id="mmd-a5ec55958d17b15f-flowchart-EB-7" data-look="classic" transform="translate(1084.2890625, 187.18262481689453)"><path d="M0,12.656606801209653 a64.0859375,12.656606801209653 0,0,0 128.171875,0 a64.0859375,12.656606801209653 0,0,0 -128.171875,0 l0,66.65660680120965 a64.0859375,12.656606801209653 0,0,0 128.171875,0 l0,-66.65660680120965" class="basic label-container outer-path" style="" transform="translate(-64.0859375, -45.98491020181448)"/><g class="label" style="" transform="translate(-58.0859375, -13)"><rect/><foreignObject width="116.171875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>mmap event store<br />/dev/shm — RAM</p></span></div></foreignObject></g></g><g class="node default" id="mmd-a5ec55958d17b15f-flowchart-ME-9" data-look="classic" transform="translate(1512.421875, 56.091312408447266)"><rect class="basic label-container" style="" x="-113.21875" y="-43.5" width="226.4375" height="87"/><g class="label" style="" transform="translate(-89.21875, -31.5)"><rect/><foreignObject width="178.4375" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>matching engine<br />single pinned thread<br />deterministic state machine</p></span></div></foreignObject></g></g><g class="node default" id="mmd-a5ec55958d17b15f-flowchart-OB-11" data-look="classic" transform="translate(1771.1875, 56.091312408447266)"><path d="M0,14.060876223814473 a80.3359375,14.060876223814473 0,0,0 160.671875,0 a80.3359375,14.060876223814473 0,0,0 -160.671875,0 l0,68.06087622381447 a80.3359375,14.060876223814473 0,0,0 160.671875,0 l0,-68.06087622381447" class="basic label-container outer-path" style="" transform="translate(-80.3359375, -48.09131433572171)"/><g class="label" style="" transform="translate(-74.3359375, -13)"><rect/><foreignObject width="148.671875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>order book<br />price levels + FIFO lists</p></span></div></foreignObject></g></g><g class="node default" id="mmd-a5ec55958d17b15f-flowchart-MDP-15" data-look="classic" transform="translate(1512.421875, 187.18262481689453)"><rect class="basic label-container" style="" x="-94.328125" y="-33" width="188.65625" height="66"/><g class="label" style="" transform="translate(-70.328125, -21)"><rect/><foreignObject width="140.65625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>market data publisher<br />ring buffer, padded</p></span></div></foreignObject></g></g><g class="node default" id="mmd-a5ec55958d17b15f-flowchart-MC-17" data-look="classic" transform="translate(1771.1875, 187.18262481689453)"><rect class="basic label-container" style="" x="-86.296875" y="-33" width="172.59375" height="66"/><g class="label" style="" transform="translate(-62.296875, -21)"><rect/><foreignObject width="124.59375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>reliable multicast<br />equal delivery to all</p></span></div></foreignObject></g></g><g class="node default" id="mmd-a5ec55958d17b15f-flowchart-RPT-19" data-look="classic" transform="translate(1512.421875, 292.68262481689453)"><rect class="basic label-container" style="" x="-122.46875" y="-22.5" width="244.9375" height="45"/><g class="label" style="" transform="translate(-98.46875, -10.5)"><rect/><foreignObject width="196.9375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>reporting · persistence · replay</p></span></div></foreignObject></g></g><g class="node default" id="mmd-a5ec55958d17b15f-flowchart-HW-21" data-look="classic" transform="translate(1512.421875, 387.68262481689453)"><rect class="basic label-container" style="" x="-82.375" y="-22.5" width="164.75" height="45"/><g class="label" style="" transform="translate(-58.375, -10.5)"><rect/><foreignObject width="116.75" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>hot-warm replicas</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-a5ec55958d17b15f-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-a5ec55958d17b15f-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-a5ec55958d17b15f-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p><strong>The two dotted arrows are where durability and availability come from</strong>, and both are deliberately <em>off</em> the hot path. Persistence and reporting consume the sequenced stream asynchronously, so no order ever waits for a disk. Replicas consume the same stream and — because the matching engine is deterministic — arrive at an identical order book without any state transfer. Determinism is what converts &quot;replicate a complex in-memory structure&quot; into &quot;replay the same inputs&quot;.</p>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>A single network hop blows the entire latency budget.</strong> Hundreds of microseconds against a target of tens. This is why the design is one machine, and why any proposal involving a service call on the hot path is wrong by two orders of magnitude.</li>
+<li><strong>A garbage collection pause is ~1,000× the budget.</strong> Preallocate, pool, allocate nothing on the hot path — or use a language without a collector. A single pause ruins a p99.99 target and lands on a real customer's order.</li>
+<li><strong>False sharing makes independent variables contend in hardware.</strong> Two counters in one 64-byte cache line ping-pong between cores. Pad to cache-line boundaries.</li>
+<li><strong>One machine is one failure domain.</strong> The mitigation is hot-warm replicas driven by the same sequence, plus fast failover — but the sequence, not a state copy, is what keeps them identical.</li>
+<li><strong><code>/dev/shm</code> is not durable.</strong> It does not survive a reboot, so recovery must rest on asynchronously persisted sequence data and on replicas, never on the shared-memory event store.</li>
+<li><strong>The sequencer is a single point of failure and the throughput ceiling.</strong> It cannot be sharded without abandoning the total order everything else depends on.</li>
+<li><strong>Recovery by replay takes time, and market open is the worst moment to need it.</strong> A replica must be already warm and already caught up; replaying a billion-order day from scratch is not an incident response.</li>
+<li><strong>Busy-spin loops burn a core continuously.</strong> Deliberate, but it means capacity planning is about cores reserved rather than cores utilised, and the machine runs hot while idle.</li>
+<li><strong>Determinism is fragile in the same ways as <a href="27-digital-wallet.html#gotchas--failure-modes">Chapter 27</a>.</strong> A clock read, a random value, an unordered iteration or an external call inside the matching engine breaks replica agreement and replay — and here it breaks <em>failover</em>, not just audit.</li>
+<li><strong>Unicast market data is an unfairness bug.</strong> Serial delivery to N subscribers gives the first one a tradeable head start. Multicast — and retransmit to the group, not to the requester, or recovery re-creates the advantage.</li>
+<li><strong>UDP multicast silently drops data.</strong> Subscribers must detect gaps by sequence number and recover; a subscriber that assumes delivery will reconstruct a wrong order book and act on it.</li>
+<li><strong>Market open is far spikier than a 5× average peak.</strong> The first seconds carry the day's heaviest burst, against the coldest caches.</li>
+<li><strong>Risk checks and wallet holds are on the critical path.</strong> They cannot call out to another service, so positions and available funds must be tracked in memory — with the funds-withheld mechanism of <a href="27-digital-wallet.html">Chapter 27</a> implemented locally.</li>
+<li><strong>Cancel racing a fill is a routine correctness case.</strong> A cancel arriving after the order has matched must fail cleanly rather than cancelling a trade that already happened — which is why <code>handleCancel</code> checks <code>orderMap</code> first, and why cancellation can never be assumed to succeed.</li>
+<li><strong>The pseudo-code matches only at the order's exact limit price.</strong> A real engine walks price levels from the best available. Reading it literally gives the wrong model of how a large order moves the market.</li>
+<li><strong>Timestamps are a regulatory artefact.</strong> Regimes such as MiFID II require microsecond-resolution timestamps synchronised to UTC within tight bounds, so clock synchronisation is a compliance requirement even though the matching engine orders by sequence number rather than by time.</li>
+<li><strong>Self-trade prevention, halts, auctions and market orders are all missing from this scope.</strong> Opening and closing auctions use a different matching algorithm entirely, and circuit breakers can halt a symbol mid-session; a design that only understands continuous limit-order matching is incomplete as a real exchange.</li>
+<li><strong>Public endpoints invite DDoS while the matching path must stay untouched.</strong> Isolate public market-data and account services from the trading path so an attack on the former cannot degrade the latter.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tens of microseconds end to end</td>
+<td>Everything on one machine; nothing networked on the critical path</td>
+</tr>
+<tr>
+<td>Inter-process communication at memory speed</td>
+<td><code>mmap</code> a file in <code>/dev/shm</code> as a shared event store</td>
+</tr>
+<tr>
+<td>No disk in the request path</td>
+<td>RAM-backed filesystem; persistence consumes the stream asynchronously</td>
+</tr>
+<tr>
+<td>Lock contention and context switches</td>
+<td>A single application loop pinned to one core, busy-spinning</td>
+</tr>
+<tr>
+<td>Allocation stalls and GC pauses</td>
+<td>Preallocated ring buffers, object pooling, zero allocation on the hot path</td>
+</tr>
+<tr>
+<td>Cores invalidating each other's caches</td>
+<td>Cache-line padding to eliminate false sharing</td>
+</tr>
+<tr>
+<td>A total, fair order of events</td>
+<td>Sequencer assigning monotonic sequence numbers</td>
+</tr>
+<tr>
+<td>Price-time priority</td>
+<td>Price-level map plus a FIFO doubly-linked list per level</td>
+</tr>
+<tr>
+<td>O(1) cancel without disturbing priority</td>
+<td><code>orderMap</code> for lookup, prev/next pointers for unlinking</td>
+</tr>
+<tr>
+<td>O(1) best bid/ask and level volume</td>
+<td>Cached <code>bestBid</code>/<code>bestOffer</code> pointers; running <code>totalVolume</code></td>
+</tr>
+<tr>
+<td>Auditability and reproducibility</td>
+<td>Event sourcing over the sequenced stream</td>
+</tr>
+<tr>
+<td>Fast failover without state transfer</td>
+<td>Deterministic engine plus hot-warm replicas consuming the same sequence</td>
+</tr>
+<tr>
+<td>Equal market data delivery</td>
+<td>Reliable multicast; group retransmission; length-equalised fibre</td>
+</tr>
+<tr>
+<td>Bounded candlestick memory</td>
+<td>Ring buffers with tiered retention by granularity</td>
+</tr>
+<tr>
+<td>Pre-trade risk and funds</td>
+<td>In-memory position limits and withheld balances on the hot path</td>
+</tr>
+<tr>
+<td>Protecting the trading path from the internet</td>
+<td>Isolate public services; cache; allowlists; rate limiting</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Why is this chapter the book's counter-example? What does it do that every other chapter does not?</li>
+<li>At 215,000 orders/sec, how long is the mean inter-arrival time? How does one data-centre network round trip compare with the whole latency budget?</li>
+<li>Name the four things the latency target forces out of the critical path, and what replaces each.</li>
+<li>What does <code>mmap</code> on <code>/dev/shm</code> give you, and what does it emphatically not give you?</li>
+<li>Name the three separate costs removed by a single pinned thread, and the price paid for it.</li>
+<li>Why is a garbage collector a correctness-of-experience problem here rather than a performance one?</li>
+<li>What is false sharing, what is the unit that causes it, and what is the fix?</li>
+<li>Give the complexity of place, match, cancel and best-bid in this order book, and say which structure provides each.</li>
+<li>How does the order book's data structure encode the fairness rule, and why would an array be both slower <em>and</em> unfair?</li>
+<li>Beyond auditing, what does determinism buy in this design?</li>
+<li>Why can't the sequencer be sharded?</li>
+<li>Why is unicast market data a fairness violation, and how can retransmission reintroduce the same problem?</li>
+<li>Why does a system with a 20 μs mean latency and a 50 ms p99.99 have a serious problem?</li>
+<li>A cancel arrives for an order that has just been filled. What must happen?</li>
+<li>The order book is in RAM on one machine. How does the system survive losing that machine?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Limit / market order</strong></td>
+<td>Buy or sell at a specified price or better; execute immediately at the prevailing price</td>
+</tr>
+<tr>
+<td><strong>Bid / ask / spread</strong></td>
+<td>Best buy price, best sell price, and the gap between them</td>
+</tr>
+<tr>
+<td><strong>L1 / L2 / L3 market data</strong></td>
+<td>Best prices only; several price levels; full order-by-order detail</td>
+</tr>
+<tr>
+<td><strong>Order book</strong></td>
+<td>All resting orders for a symbol, organised by price level</td>
+</tr>
+<tr>
+<td><strong>Price-time priority</strong></td>
+<td>Matching rule: better price first, then earliest arrival at that price</td>
+</tr>
+<tr>
+<td><strong>Price level</strong></td>
+<td>All orders at one price, held as a FIFO queue</td>
+</tr>
+<tr>
+<td><strong>Sequencer</strong></td>
+<td>Component assigning a total order to incoming events; the ordering and fairness authority</td>
+</tr>
+<tr>
+<td><strong>Matching engine</strong></td>
+<td>Deterministic state machine applying sequenced events to the order book</td>
+</tr>
+<tr>
+<td><strong>Event sourcing</strong></td>
+<td>Storing immutable state transitions rather than current state</td>
+</tr>
+<tr>
+<td><strong>Determinism (functional / latency)</strong></td>
+<td>Same inputs give the same state; and latency has a tight, predictable distribution</td>
+</tr>
+<tr>
+<td><strong><code>mmap</code> / <code>/dev/shm</code></strong></td>
+<td>Mapping a file into memory; a RAM-backed filesystem, so no disk is touched</td>
+</tr>
+<tr>
+<td><strong>Application loop</strong></td>
+<td>A busy-spinning thread pinned to a core, avoiding locks and context switches</td>
+</tr>
+<tr>
+<td><strong>Ring buffer</strong></td>
+<td>Preallocated, lock-free circular queue — the basis of the LMAX Disruptor design</td>
+</tr>
+<tr>
+<td><strong>False sharing</strong></td>
+<td>Independent variables sharing a 64-byte cache line and contending in hardware</td>
+</tr>
+<tr>
+<td><strong>Cache-line padding</strong></td>
+<td>Separating such variables so each occupies its own line</td>
+</tr>
+<tr>
+<td><strong>Multicast</strong></td>
+<td>One packet replicated by the network to many subscribers, for equal-time delivery</td>
+</tr>
+<tr>
+<td><strong>Colocation</strong></td>
+<td>Renting rack space beside the exchange, with length-equalised fibre</td>
+</tr>
+<tr>
+<td><strong>Candlestick</strong></td>
+<td>Open/high/low/close aggregation of trades over an interval</td>
+</tr>
+<tr>
+<td><strong>AMM</strong></td>
+<td>Automated market maker — pricing from a formula rather than an order book</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="27-digital-wallet.html#event-sourcing">Chapter 27 – Digital Wallet</a> — event sourcing, deterministic state machines and the replicated log, developed at length.</li>
+<li><a href="19-distributed-message-queue.html">Chapter 19 – Distributed Message Queue</a> — the ordered append-only log as a general-purpose system, and the sequential-I/O and zero-copy ideas behind the fast path here.</li>
+<li><a href="26-payment-system.html">Chapter 26 – Payment System</a> — the settlement and ledger side of what happens after a trade matches.</li>
+<li><a href="02-back-of-the-envelope-estimation.html">Chapter 2 – Back-of-the-envelope Estimation</a> — the latency numbers that make this chapter's architecture inevitable.</li>
+<li><a href="01-scaling.html">Chapter 1 – Scale From Zero To Millions Of Users</a> — worth re-reading against this chapter, as the clearest illustration that &quot;scale out&quot; answers one kind of constraint and not another.</li>
+<li><a href="https://lmax-exchange.github.io/disruptor/" target="_blank" rel="noopener">The LMAX Disruptor</a> — the ring buffer, cache-line padding and single-writer design, from the exchange that published it.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

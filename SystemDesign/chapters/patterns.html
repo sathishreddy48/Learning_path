@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recurring Patterns — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="patterns">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Foundations › Patterns index</div>
+  <h1>Recurring Patterns</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#1-fan-out-pay-on-write-or-pay-on-read">1. Fan-out: pay on write, or pay on read</a></li><li><a href="#2-an-immutable-log-plus-a-derived-view">2. An immutable log plus a derived view</a></li><li><a href="#3-at-least-once-delivery-plus-idempotent-processing">3. At-least-once delivery plus idempotent processing</a></li><li><a href="#4-a-hot-key-is-not-a-partitioning-problem">4. A hot key is not a partitioning problem</a></li><li><a href="#5-does-the-shard-key-contain-the-transaction">5. Does the shard key contain the transaction?</a></li><li><a href="#6-cheap-over-approximation-then-an-exact-check">6. Cheap over-approximation, then an exact check</a></li><li><a href="#7-a-cache-is-only-as-good-as-how-many-requests-share-a-key">7. A cache is only as good as how many requests share a key</a></li><li><a href="#8-time-ordered-ids-cut-both-ways">8. Time-ordered IDs cut both ways</a></li><li><a href="#9-picking-a-push-channel--the-book-decides-this-four-times">9. Picking a push channel — the book decides this four times</a></li><li><a href="#10-stateful-tiers-are-the-exception-and-they-cost">10. Stateful tiers are the exception, and they cost</a></li><li><a href="#11-sometimes-the-business-absorbs-the-inconsistency">11. Sometimes the business absorbs the inconsistency</a></li><li><a href="#12-detect-and-correct-when-you-cannot-prevent">12. Detect-and-correct, when you cannot prevent</a></li><li><a href="#13-scale-out-is-an-answer-to-one-kind-of-constraint">13. Scale out is an answer to one kind of constraint</a></li><li><a href="#using-this-page">Using this page</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<p>The 28 chapters in these notes describe 28 systems. They do not describe 28 ideas — the same dozen keep reappearing in different costumes, and a question that looks unfamiliar is usually a familiar pattern with new nouns.</p>
+<p>This page is an index of those patterns, assembled from the chapters rather than added on top of them. Each entry states the pattern, a question that tends to identify it, and the chapters where it appears — so that recognising a pattern points you at the chapters that already work through it.</p>
+<p>Nothing here is new material; it is cross-references collected in one place.</p>
+<hr>
+<section id="1-fan-out-pay-on-write-or-pay-on-read">
+<h2 id="1-fan-out-pay-on-write-or-pay-on-read">1. Fan-out: pay on write, or pay on read</h2>
+<p>One event must reach many places. You can precompute every recipient's view when the event happens (<strong>push</strong> / fan-out on write), or assemble it when each recipient asks (<strong>pull</strong> / fan-out on read).</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Push (fan-out on write)</th>
+<th>Pull (fan-out on read)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Work per <strong>event</strong></td>
+<td>O(recipients)</td>
+<td>O(1)</td>
+</tr>
+<tr>
+<td>Work per <strong>read</strong></td>
+<td>O(1)</td>
+<td>O(sources)</td>
+</tr>
+<tr>
+<td>Cost driven by</td>
+<td>Users with many <em>followers</em></td>
+<td>Users who follow many <em>sources</em></td>
+</tr>
+<tr>
+<td>Wasted work</td>
+<td>Writing for people who never look</td>
+<td>Recomputing the same view repeatedly</td>
+</tr>
+<tr>
+<td>Breaks when</td>
+<td>One source has millions of recipients</td>
+<td>Everyone has many sources and reads often</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>The question to ask:</strong> <em>how skewed is the fan-out distribution?</em> If it is uniform, pick whichever side is cheaper. If it has a long tail — one account with ten million followers — no single choice works and you need a hybrid, or a cap.</p>
+<p><strong>Where it appears</strong></p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>The fan-out</th>
+<th>Resolution</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="11-news-feed-system.html#write-amplification-versus-read-amplification">11 – News Feed</a></td>
+<td>Post → followers' feeds</td>
+<td><strong>Hybrid</strong> — push for ordinary users, pull for celebrities</td>
+</tr>
+<tr>
+<td><a href="12-chat-system.html#group-chat">12 – Chat</a></td>
+<td>Message → group members' inboxes</td>
+<td><strong>Push</strong>, made safe by the 100-member cap</td>
+</tr>
+<tr>
+<td><a href="10-notification-system.html">10 – Notifications</a></td>
+<td>Notification → a user's devices</td>
+<td>Push; the cap is devices per user</td>
+</tr>
+<tr>
+<td><a href="17-nearby-friends.html">17 – Nearby Friends</a></td>
+<td>Location update → friends</td>
+<td>Push, with a 5,000-friend cap; most of it discarded by a distance filter</td>
+</tr>
+<tr>
+<td><a href="23-distributed-email-service.html">23 – Email</a></td>
+<td>One email → recipients' mailboxes</td>
+<td><strong>Push, with no alternative</strong> — federation means you cannot ask another provider to compute a view</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>One thing the table shows: wherever these chapters choose push, a cap on fan-out appears alongside it — chapter 12's 100-member groups, chapter 17's 5,000 friends, chapter 10's devices per user. Chapter 11, which has no cap, is the one that needs a hybrid. Both chapters say so directly, and it is worth checking a requirement for an implied cap before deciding which side to pay on.</p>
+<hr>
+</section>
+<section id="2-an-immutable-log-plus-a-derived-view">
+<h2 id="2-an-immutable-log-plus-a-derived-view">2. An immutable log plus a derived view</h2>
+<p>Store what <em>happened</em> as an append-only sequence, and treat current state as a projection of it that can be thrown away and rebuilt.</p>
+<p><strong>What the chapters cite in its favour:</strong> appending is the cheapest access pattern a disk has (<a href="19-distributed-message-queue.html">Chapter 19</a> quantifies it at two to three orders of magnitude over random I/O), history is auditable because nothing is overwritten, and the view stops being precious because it can be rebuilt.</p>
+<p><strong>The question to ask:</strong> <em>which of these two things cannot be regenerated?</em> That one must be durable and replicated. Everything else is an optimisation.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>The log</th>
+<th>The derived view</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="19-distributed-message-queue.html">19 – Message Queue</a></td>
+<td>The partition log itself</td>
+<td>Consumer offsets</td>
+</tr>
+<tr>
+<td><a href="06-key-value-store.html#write-and-read-paths">6 – Key-Value Store</a></td>
+<td>Commit log, then SSTables</td>
+<td>Memtable, Bloom filters, compacted files</td>
+</tr>
+<tr>
+<td><a href="21-ad-click-event-aggregation.html">21 – Ad Clicks</a></td>
+<td>Raw click events</td>
+<td>Per-minute aggregates</td>
+</tr>
+<tr>
+<td><a href="25-real-time-gaming-leaderboard.html">25 – Leaderboard</a></td>
+<td>Durable score log</td>
+<td>Redis sorted set</td>
+</tr>
+<tr>
+<td><a href="26-payment-system.html#double-entry-ledger-system">26 – Payments</a></td>
+<td>Double-entry ledger</td>
+<td>Wallet balance</td>
+</tr>
+<tr>
+<td><a href="27-digital-wallet.html#event-sourcing">27 – Digital Wallet</a></td>
+<td>Event list</td>
+<td>Account balances, snapshots</td>
+</tr>
+<tr>
+<td><a href="28-stock-exchange.html">28 – Stock Exchange</a></td>
+<td>Sequenced event stream</td>
+<td>Order book</td>
+</tr>
+<tr>
+<td><a href="24-s3-like-object-storage.html">24 – Object Storage</a></td>
+<td>Immutable packed files</td>
+<td>Object mapping index</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Three consequences that come with the pattern every time:</p>
+<ul>
+<li><strong>Replay cost grows forever</strong>, so you need periodic <strong>snapshots</strong> — and a snapshot must never become a source of truth.</li>
+<li><strong>Replay must be deterministic</strong>, or the view you rebuild is not the view you had. Every non-deterministic input (a clock, a random value, an external call) has to be resolved <em>before</em> the entry is written and recorded inside it. <a href="27-digital-wallet.html#gotchas--failure-modes">Chapter 27</a> and <a href="28-stock-exchange.html#determinism">Chapter 28</a> both rest on this.</li>
+<li><strong>Deletion stops being deletion.</strong> With nothing mutable, an absence is recorded by appending a marker — a tombstone in <a href="06-key-value-store.html#gotchas--failure-modes">Chapter 6</a>, a delete marker in <a href="24-s3-like-object-storage.html#object-versioning">Chapter 24</a>, a reversing entry in <a href="26-payment-system.html">Chapter 26</a> — and space comes back later, via compaction or garbage collection.</li>
+</ul>
+<hr>
+</section>
+<section id="3-at-least-once-delivery-plus-idempotent-processing">
+<h2 id="3-at-least-once-delivery-plus-idempotent-processing">3. At-least-once delivery plus idempotent processing</h2>
+<p>Across these chapters, duplicate delivery is treated as something to expect rather than prevent: queues redeliver, clients retry, and an ambiguous failure is indistinguishable from a lost message. What they do instead is <strong>deliver at least once and make the processing idempotent</strong>, which yields exactly-once <em>effects</em>. <a href="19-distributed-message-queue.html#exactly-once">Chapter 19</a> sets out what true exactly-once delivery would cost and where it stops applying.</p>
+<p><strong>The question to ask:</strong> <em>what enforces the uniqueness — the storage engine, or application code?</em> A check-then-act in application code races; a unique constraint cannot.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>The idempotency key</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="26-payment-system.html#exactly-once-delivery">26 – Payments</a></td>
+<td>Client-supplied <code>idempotency-key</code></td>
+<td>Unique index, plus the stored response</td>
+</tr>
+<tr>
+<td><a href="22-hotel-reservation-system.html#concurrency-issues">22 – Hotel Reservation</a></td>
+<td><code>reservation_id</code>, created before submission</td>
+<td>Unique constraint</td>
+</tr>
+<tr>
+<td><a href="12-chat-system.html#gotchas--failure-modes">12 – Chat</a></td>
+<td><code>client_msg_id</code></td>
+<td>Server-side dedup</td>
+</tr>
+<tr>
+<td><a href="21-ad-click-event-aggregation.html#data-deduplication">21 – Ad Clicks</a></td>
+<td><code>(ad_id, minute)</code></td>
+<td>Upsert instead of increment — replay changes nothing</td>
+</tr>
+<tr>
+<td><a href="19-distributed-message-queue.html#exactly-once">19 – Message Queue</a></td>
+<td>Producer ID plus sequence number</td>
+<td>Broker-side dedup</td>
+</tr>
+<tr>
+<td><a href="10-notification-system.html#reliability">10 – Notifications</a></td>
+<td>Event ID, within a TTL window</td>
+<td>Atomic conditional write</td>
+</tr>
+<tr>
+<td><a href="23-distributed-email-service.html">23 – Email</a></td>
+<td><code>Message-Id</code></td>
+<td>Receiver-side dedup</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Four details that the chapters raise as things to get right, set out most fully in <a href="26-payment-system.html#exactly-once-delivery">Chapter 26</a>:</p>
+<ol>
+<li><strong>The key must be generated by the client, before the first attempt</strong> — a server-generated key differs per retry and deduplicates nothing.</li>
+<li><strong>Store the response, not just the key</strong>, or a retry cannot return the same answer.</li>
+<li><strong>A reused key with a different payload must error</strong>, not silently return the old result, or a genuinely different request vanishes.</li>
+<li><strong>Keys expire</strong>, and a retry after the window creates a duplicate. Pick a window longer than any realistic retry path.</li>
+</ol>
+<p>Note the wording these chapters settle on. <a href="19-distributed-message-queue.html#exactly-once">Chapter 19</a> is explicit that exactly-once <em>delivery</em> requires a transaction coordinator and still stops at the system boundary, and chapters 10, 21 and 26 all arrive at at-least-once delivery with idempotent processing instead. &quot;At-least-once plus idempotent processing&quot; is the formulation they use, and it describes what the designs actually do.</p>
+<hr>
+</section>
+<section id="4-a-hot-key-is-not-a-partitioning-problem">
+<h2 id="4-a-hot-key-is-not-a-partitioning-problem">4. A hot key is not a partitioning problem</h2>
+<p>Consistent hashing, sharding and partitioning all distribute <strong>keys</strong>. None of them distribute <strong>requests to a single key</strong>. One viral post, one dense map cell, one popular merchant, one in-demand hotel-date — each concentrates on whichever node owns that key, and adding nodes does nothing.</p>
+<p><strong>The question to ask:</strong> <em>does an invariant live in this key?</em> That decides which remedies are available.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Remedy</th>
+<th>Works when</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Replicate</strong> the hot entry</td>
+<td>It is read-heavy and immutable-ish</td>
+<td>More copies to keep consistent</td>
+</tr>
+<tr>
+<td><strong>Cache it locally</strong> on every server</td>
+<td>Reads dominate</td>
+<td>Staleness, memory on every node</td>
+</tr>
+<tr>
+<td><strong>Salt / bucket</strong> the key, aggregate in two stages</td>
+<td>The operation is associative (counting, summing)</td>
+<td>Reads become scatter-gather</td>
+</tr>
+<tr>
+<td><strong>Deliberately serialise</strong> it with a queue</td>
+<td>Writes must be ordered anyway</td>
+<td>A hard throughput ceiling, accepted knowingly</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>The hot key</th>
+<th>Why it cannot be split</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="05-consistent-hashing.html#gotchas--failure-modes">5 – Consistent Hashing</a></td>
+<td>—</td>
+<td>States the general result: it balances keys, not traffic</td>
+</tr>
+<tr>
+<td><a href="11-news-feed-system.html#gotchas--failure-modes">11 – News Feed</a></td>
+<td>A viral post in the content cache</td>
+<td>— (replicate or cache locally)</td>
+</tr>
+<tr>
+<td><a href="16-proximity-service.html#gotchas--failure-modes">16 – Proximity</a></td>
+<td>A dense geohash cell</td>
+<td>—</td>
+</tr>
+<tr>
+<td><a href="21-ad-click-event-aggregation.html#scale-the-system">21 – Ad Clicks</a></td>
+<td>A viral ad</td>
+<td>Counting is associative, so <strong>salting works</strong></td>
+</tr>
+<tr>
+<td><a href="22-hotel-reservation-system.html#scalability">22 – Hotel</a></td>
+<td>One <code>(hotel, room type, date)</code> row</td>
+<td><strong>The capacity invariant is in that row</strong></td>
+</tr>
+<tr>
+<td><a href="25-real-time-gaming-leaderboard.html#scaling-redis">25 – Leaderboard</a></td>
+<td>The whole leaderboard is one Redis key</td>
+<td>Rank requires a single ordering</td>
+</tr>
+<tr>
+<td><a href="27-digital-wallet.html">27 – Digital Wallet</a></td>
+<td>A popular merchant's account</td>
+<td><strong>The balance invariant is in that account</strong></td>
+</tr>
+<tr>
+<td><a href="28-stock-exchange.html">28 – Stock Exchange</a></td>
+<td>The sequencer</td>
+<td>A total order cannot be sharded</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>What separates the rows is whether an invariant lives in the key. Counting a viral ad is associative, so chapter 21 can salt it and sum the parts; a hotel's remaining capacity and a wallet's balance <em>are</em> the values being protected, so chapters 22 and 27 cannot split them and accept a ceiling instead.</p>
+<hr>
+</section>
+<section id="5-does-the-shard-key-contain-the-transaction">
+<h2 id="5-does-the-shard-key-contain-the-transaction">5. Does the shard key contain the transaction?</h2>
+<p>Sharding is easy when every operation touches exactly one shard, and painful the moment one operation crosses a boundary — because that is precisely what a shard boundary is designed to prevent.</p>
+<p><strong>The question to ask, before proposing any shard key:</strong> <em>name the operations, and check whether each stays inside one shard.</em></p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>Shard key</th>
+<th>Contained?</th>
+<th>Consequence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="22-hotel-reservation-system.html#scalability">22 – Hotel</a></td>
+<td><code>hotel_id</code></td>
+<td><strong>Yes</strong> — a booking never spans hotels</td>
+<td>Keeps ACID transactions while scaling out</td>
+</tr>
+<tr>
+<td><a href="23-distributed-email-service.html#metadata-database">23 – Email</a></td>
+<td><code>user_id</code></td>
+<td><strong>Yes</strong> — every mail operation is one mailbox</td>
+<td>Simple; but no shared mailboxes</td>
+</tr>
+<tr>
+<td><a href="15-google-drive.html#gotchas--failure-modes">15 – Google Drive</a></td>
+<td><code>user_id</code></td>
+<td><strong>No</strong> — a shared file spans two users</td>
+<td>Sharing is what makes the metadata store hard</td>
+</tr>
+<tr>
+<td><a href="24-s3-like-object-storage.html#listing-objects-in-a-bucket">24 – Object Storage</a></td>
+<td><code>hash(bucket, object)</code></td>
+<td>Yes for lookup, <strong>no for listing</strong></td>
+<td>A second, differently-sharded listing table</td>
+</tr>
+<tr>
+<td><a href="09-web-crawler.html#url-frontier">9 – Web Crawler</a></td>
+<td><strong>Host</strong>, not URL</td>
+<td>Politeness state is per host</td>
+<td>Sharding by URL would break the rate limit</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Chapter 9 is the case where the natural key is the wrong one: partitioning the frontier by URL would leave every node inside its own per-host rate limit while the host was collectively overwhelmed. The chapter's conclusion is that the shard key has to contain whatever is being enforced, not only the data.</p>
+<hr>
+</section>
+<section id="6-cheap-over-approximation-then-an-exact-check">
+<h2 id="6-cheap-over-approximation-then-an-exact-check">6. Cheap over-approximation, then an exact check</h2>
+<p>Narrow a huge candidate set with something fast and imprecise, then pay for precision only on the survivors. The art is being explicit about <strong>which direction the error goes</strong> — and making sure the harmless direction is the one that happens.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>Cheap filter</th>
+<th>Error direction</th>
+<th>Exact check</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="06-key-value-store.html">6 – Key-Value Store</a></td>
+<td>Bloom filter</td>
+<td>False positive = a wasted disk read</td>
+<td>Read the SSTable</td>
+</tr>
+<tr>
+<td><a href="08-url-shortener.html#2-hash--collision-resolution">8 – URL Shortener</a></td>
+<td>Bloom filter on short keys</td>
+<td>False positive = pick another key</td>
+<td>Unique index</td>
+</tr>
+<tr>
+<td><a href="09-web-crawler.html#gotchas--failure-modes">9 – Web Crawler</a></td>
+<td>Bloom filter on seen URLs</td>
+<td><strong>False positive = a page never crawled</strong></td>
+<td>— (accepted, and measured)</td>
+</tr>
+<tr>
+<td><a href="16-proximity-service.html#option-3-geohash">16 – Proximity</a></td>
+<td>9 geohash cells (a square)</td>
+<td>Over-inclusive</td>
+<td>Haversine distance filter</td>
+</tr>
+<tr>
+<td><a href="18-google-maps.html#improvement---adaptive-eta-and-rerouting">18 – Google Maps</a></td>
+<td>Coarse super-tile containment</td>
+<td>False positive = one route checked needlessly</td>
+<td>Exact route membership</td>
+</tr>
+<tr>
+<td><a href="09-web-crawler.html#avoiding-problematic-content">9 – Web Crawler</a></td>
+<td>SimHash fingerprint distance</td>
+<td>Near-duplicate threshold</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The error direction is what varies, and chapter 9's row is where it costs most: a false positive there means a page is <strong>never crawled</strong>, with nothing logged. The chapters that use these filters all state the direction explicitly and size the filter against an accepted rate.</p>
+<hr>
+</section>
+<section id="7-a-cache-is-only-as-good-as-how-many-requests-share-a-key">
+<h2 id="7-a-cache-is-only-as-good-as-how-many-requests-share-a-key">7. A cache is only as good as how many requests share a key</h2>
+<p>Cache effectiveness is governed by <strong>key cardinality</strong>, not cache size. A key nobody else will ever request is not a cache entry; it is a memory leak with a TTL.</p>
+<p><strong>The question to ask:</strong> <em>how many requests can share this key?</em> If the answer is &quot;about one&quot;, reduce the key's precision until it is more.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>Bad key</th>
+<th>Good key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="16-proximity-service.html#cache-strategy">16 – Proximity</a></td>
+<td>Raw GPS coordinates</td>
+<td><strong>Geohash cell</strong></td>
+<td>Everyone on a block shares one entry; GPS jitter stops mattering</td>
+</tr>
+<tr>
+<td><a href="13-search-autocomplete.html#multi-language-and-personalization-the-cache-key-problem">13 – Autocomplete</a></td>
+<td><code>prefix + user</code></td>
+<td><strong><code>prefix</code></strong></td>
+<td>Personalization makes the answer unshareable and unprecomputable</td>
+</tr>
+<tr>
+<td><a href="14-youtube.html">14 – YouTube</a></td>
+<td>—</td>
+<td>Tile / segment URL</td>
+<td>Immutable, so cacheable at every layer</td>
+</tr>
+<tr>
+<td><a href="20-metrics-monitoring-and-alerting-system.html#data-model">20 – Metrics</a></td>
+<td>Labels including <code>user_id</code></td>
+<td>Bounded label values</td>
+<td>Cardinality is a <em>product</em>; one unbounded label kills the system</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Chapter 20 is the same lesson pointed at storage rather than caching: series count is the product of label cardinalities, memory scales with series count, and one high-cardinality label multiplies it by millions.</p>
+<hr>
+</section>
+<section id="8-time-ordered-ids-cut-both-ways">
+<h2 id="8-time-ordered-ids-cut-both-ways">8. Time-ordered IDs cut both ways</h2>
+<p>Prefixing an identifier with a timestamp buys index locality, sortability and cursor pagination. It also makes every new write land next to every other new write.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Benefit</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Index locality — inserts append instead of scattering</td>
+<td><a href="07-unique-id-generator.html#2-uuid-universally-unique-identifier">7 – Unique ID</a></td>
+</tr>
+<tr>
+<td>Cursor pagination over a growing list</td>
+<td><a href="11-news-feed-system.html#reading-the-feed-end-to-end">11 – News Feed</a></td>
+</tr>
+<tr>
+<td>Merging two sources in time order</td>
+<td><a href="11-news-feed-system.html">11 – News Feed</a> (pushed + pulled posts)</td>
+</tr>
+<tr>
+<td>Sync cursors — &quot;everything after this&quot;</td>
+<td><a href="12-chat-system.html#message-synchronization">12 – Chat</a>, <a href="15-google-drive.html#notification-service">15 – Drive</a></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Cost</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Range-sharding sends every write to the newest shard</td>
+<td><a href="07-unique-id-generator.html#gotchas--failure-modes">7 – Unique ID</a></td>
+</tr>
+<tr>
+<td>Sequential key prefixes make a hot partition</td>
+<td><a href="24-s3-like-object-storage.html#gotchas--failure-modes">24 – Object Storage</a></td>
+</tr>
+<tr>
+<td>k-sortable is <strong>not</strong> totally ordered — ties within a millisecond are arbitrary</td>
+<td><a href="12-chat-system.html#design">12 – Chat</a></td>
+</tr>
+<tr>
+<td>The ID leaks creation time, volume, and enumerable neighbours</td>
+<td><a href="08-url-shortener.html#comparison">8 – URL Shortener</a></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Chapters 11 and 12 draw the line between the two columns. Snowflake IDs are sufficient to paginate a feed and, chapter 12 argues, insufficient to order a conversation — within one millisecond the order is arbitrary — so it uses a strictly-ordered per-channel counter. &quot;Sortable&quot; and &quot;totally ordered&quot; are different guarantees.</p>
+<hr>
+</section>
+<section id="9-picking-a-push-channel--the-book-decides-this-four-times">
+<h2 id="9-picking-a-push-channel--the-book-decides-this-four-times">9. Picking a push channel — the book decides this four times</h2>
+<p>Four chapters choose how a server reaches a client, and they choose differently, because the traffic profiles differ. The comparison is worth holding as one table.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Short polling</th>
+<th>Long polling</th>
+<th>SSE</th>
+<th>WebSocket</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Direction</td>
+<td>Client pulls</td>
+<td>Client pulls, server holds</td>
+<td>Server → client</td>
+<td><strong>Both ways</strong></td>
+</tr>
+<tr>
+<td>Overhead when idle</td>
+<td>A request per interval</td>
+<td>One held connection</td>
+<td>One held connection</td>
+<td>One held connection</td>
+</tr>
+<tr>
+<td>Server state</td>
+<td>None</td>
+<td>One connection per client</td>
+<td>One per client</td>
+<td>One per client</td>
+</tr>
+<tr>
+<td>Reconnection</td>
+<td>Trivial</td>
+<td>Built in</td>
+<td>Automatic, with <code>Last-Event-ID</code></td>
+<td><strong>You implement it</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>Traffic profile</th>
+<th>Choice</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="12-chat-system.html#choosing-the-receive-channel">12 – Chat</a></td>
+<td>Continuous, both directions</td>
+<td><strong>WebSocket</strong></td>
+</tr>
+<tr>
+<td><a href="15-google-drive.html#notification-service">15 – Google Drive</a></td>
+<td>Rare, server → client only</td>
+<td><strong>Long polling</strong></td>
+</tr>
+<tr>
+<td><a href="18-google-maps.html#delivery-protocols">18 – Google Maps</a></td>
+<td>Frequent both ways <em>while navigating</em>, nothing otherwise</td>
+<td><strong>WebSocket, session-scoped</strong></td>
+</tr>
+<tr>
+<td><a href="17-nearby-friends.html">17 – Nearby Friends</a></td>
+<td>Constant updates both ways</td>
+<td><strong>WebSocket</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>And the related choice for <em>collecting</em> data, which has the opposite answer from what you might expect:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>Direction</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="19-distributed-message-queue.html#consumer-flow">19 – Message Queue</a></td>
+<td>Consumers <strong>pull</strong></td>
+<td>Consumers set their own rate and cannot be overwhelmed</td>
+</tr>
+<tr>
+<td><a href="20-metrics-monitoring-and-alerting-system.html#metrics-collection">20 – Metrics</a></td>
+<td>Collector <strong>pulls</strong></td>
+<td><strong>Absence becomes information</strong> — a target that does not answer is down</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Chapter 20's reasoning turns on who holds the inventory: with pull, the collector knows what <em>should</em> answer, so silence identifies a dead target; with push, silence could be a dead service, a dead agent, a broken network or an intentional decommission.</p>
+<hr>
+</section>
+<section id="10-stateful-tiers-are-the-exception-and-they-cost">
+<h2 id="10-stateful-tiers-are-the-exception-and-they-cost">10. Stateful tiers are the exception, and they cost</h2>
+<p>Almost everything in these notes is stateless and therefore boring to scale. The exceptions are memorable because they are where the operational pain lives.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>What holds state</th>
+<th>What it costs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="12-chat-system.html#components">12 – Chat</a></td>
+<td>Live WebSockets per device</td>
+<td>Losing a server drops ~100k clients, who all reconnect at once</td>
+</tr>
+<tr>
+<td><a href="17-nearby-friends.html#gotchas--failure-modes">17 – Nearby Friends</a></td>
+<td>Sockets plus subscriptions</td>
+<td>Reconnection is expensive — re-fetch friends, re-subscribe to hundreds of channels</td>
+</tr>
+<tr>
+<td><a href="16-proximity-service.html#operational-considerations">16 – Proximity</a></td>
+<td>Quadtree built in-process</td>
+<td>Minutes of startup before a server can serve; staggered rollouts</td>
+</tr>
+<tr>
+<td><a href="25-real-time-gaming-leaderboard.html">25 – Leaderboard</a></td>
+<td>Redis as the system of record</td>
+<td>Persistence and replication become correctness concerns</td>
+</tr>
+<tr>
+<td><a href="27-digital-wallet.html">27 – Digital Wallet</a></td>
+<td>Local event log</td>
+<td>Node identity matters; restores take as long as replay</td>
+</tr>
+<tr>
+<td><a href="28-stock-exchange.html">28 – Stock Exchange</a></td>
+<td>Everything, on one machine</td>
+<td>One failure domain; recovery is replay</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The shared consequences: <strong>deploys become incidents</strong> (every restart is a mass reconnection), clients need <strong>jittered backoff</strong> or recovery cascades, and servers need <strong>draining</strong> rather than termination. If a design has a stateful tier, those three belong in the answer.</p>
+<hr>
+</section>
+<section id="11-sometimes-the-business-absorbs-the-inconsistency">
+<h2 id="11-sometimes-the-business-absorbs-the-inconsistency">11. Sometimes the business absorbs the inconsistency</h2>
+<p>Several chapters turn out to have softer constraints than they first appear, and the distinguishing question is <strong>what the business does today when the constraint is violated.</strong> Where there is already a procedure, the requirement is negotiable and much cheaper to meet; where there is not, it is absolute.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>The constraint</th>
+<th>Absorbable?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="22-hotel-reservation-system.html">22 – Hotel</a></td>
+<td>Never oversell rooms</td>
+<td><strong>Yes</strong> — overbook 10%, and walk the guest if it happens</td>
+</tr>
+<tr>
+<td><a href="11-news-feed-system.html">11 – News Feed</a></td>
+<td>Everyone sees the same feed</td>
+<td>Yes — eventual consistency is invisible</td>
+</tr>
+<tr>
+<td><a href="20-metrics-monitoring-and-alerting-system.html">20 – Metrics</a></td>
+<td>Exact counts</td>
+<td>Yes — approximate is fine, and cheaper</td>
+</tr>
+<tr>
+<td><a href="17-nearby-friends.html">17 – Nearby Friends</a></td>
+<td>Deliver every location update</td>
+<td><strong>Yes, explicitly</strong> — and that one sentence licenses the entire design</td>
+</tr>
+<tr>
+<td><a href="27-digital-wallet.html">27 – Digital Wallet</a></td>
+<td>Money is never created or destroyed</td>
+<td><strong>No</strong></td>
+</tr>
+<tr>
+<td><a href="26-payment-system.html">26 – Payments</a></td>
+<td>Never double-charge</td>
+<td><strong>No</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Chapter 17 is the clearest case: &quot;occasional data point loss is acceptable&quot; is what permits fire-and-forget pub/sub, no acknowledgements, no retries and TTL-based presence. Remove that sentence and the design has to become <a href="19-distributed-message-queue.html">Chapter 19</a>.</p>
+<hr>
+</section>
+<section id="12-detect-and-correct-when-you-cannot-prevent">
+<h2 id="12-detect-and-correct-when-you-cannot-prevent">12. Detect-and-correct, when you cannot prevent</h2>
+<p>When an operation spans systems that share no transaction — your database, a third-party API, a bank — you cannot make them consistent. You can guarantee that divergence is <strong>found and fixed within a bounded time</strong>, and that is a real guarantee rather than a consolation.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>What cannot be made atomic</th>
+<th>The detection mechanism</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="26-payment-system.html#reconciliation">26 – Payments</a></td>
+<td>Your DB, the PSP, the bank</td>
+<td>Nightly settlement-file reconciliation; ledger-vs-wallet checks</td>
+</tr>
+<tr>
+<td><a href="21-ad-click-event-aggregation.html#data-monitoring-and-correctness">21 – Ad Clicks</a></td>
+<td>Streaming aggregation vs reality</td>
+<td>End-of-day batch recomputation — the <strong>authoritative</strong> number</td>
+</tr>
+<tr>
+<td><a href="27-digital-wallet.html">27 – Digital Wallet</a></td>
+<td>Shards in a distributed transfer</td>
+<td>Replay from the event log; reconciliation at external boundaries</td>
+</tr>
+<tr>
+<td><a href="06-key-value-store.html#5-handling-failures">6 – Key-Value Store</a></td>
+<td>Replicas during a partition</td>
+<td>Merkle-tree anti-entropy and read repair</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>In these chapters reconciliation is load-bearing rather than remedial: chapter 26 notes that no transaction spans its database, the PSP and a bank, and chapter 21 treats its nightly batch recomputation as the authoritative figure that the streaming result is checked against. Both also treat an unclassifiable mismatch as a signal that a failure mode has not been modelled yet.</p>
+<hr>
+</section>
+<section id="13-scale-out-is-an-answer-to-one-kind-of-constraint">
+<h2 id="13-scale-out-is-an-answer-to-one-kind-of-constraint">13. Scale out is an answer to one kind of constraint</h2>
+<p>Twenty-seven chapters scale <em>out</em>, because their constraint is volume. <a href="28-stock-exchange.html">Chapter 28</a> scales <em>in</em> — one machine, one pinned thread, shared memory, no disk, no locks — because its constraint is the latency of a single decision, and <strong>one network round trip costs more than its entire budget.</strong></p>
+<p>Read against <a href="01-scaling.html">Chapter 1</a>, the contrast shows the constraint deciding the shape: chapter 1 adds servers because requests exceed one machine's capacity, and chapter 28 removes them because a single network hop exceeds its whole latency budget. Both are responses to a measured number, and chapter 28 is the reminder that distribution answers one kind of number rather than being the default.</p>
+<hr>
+</section>
+<section id="using-this-page">
+<h2 id="using-this-page">Using this page</h2>
+<p>In an interview, after gathering requirements and doing the estimation:</p>
+<ol>
+<li><strong>Name the pattern.</strong> &quot;This is a fan-out problem.&quot; &quot;This is an immutable-log-plus-projection problem.&quot; That sentence organises everything after it.</li>
+<li><strong>Ask the pattern's question.</strong> How skewed is the distribution? Which of these cannot be regenerated? Does the shard key contain the transaction? What does the business do when this is violated?</li>
+<li><strong>Expect the pattern's failure modes</strong>, because they recur too: hot keys, duplicate delivery, replay cost, cache keys that nobody shares, stateful tiers and reconnection storms.</li>
+</ol>
+<p>This is also the convention the chapters themselves are written in: each design step is paired with what it costs as well as what it buys. Carrying that into an answer — naming the price of each choice alongside its benefit — is what the &quot;what broke / what it now costs you&quot; framing throughout these notes is for.</p>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="03-system-design-framework.html">Chapter 3 – A Framework For System Design Interviews</a> — the process these patterns plug into.</li>
+<li><a href="02-back-of-the-envelope-estimation.html">Chapter 2 – Back-of-the-envelope Estimation</a> — the arithmetic that tells you which pattern you are in.</li>
+<li><a href="01-scaling.html">Chapter 1 – Scale From Zero To Millions Of Users</a> — where most of these patterns first appear, in miniature.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,695 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 23: Distributed Email Service — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="23-distributed-email-service">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 23 of 28</div>
+  <h1>Chapter 23: Distributed Email Service</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</a></li><li><a href="#step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap Up</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>We'll design a <strong>distributed email service</strong>, similar to <strong>Gmail</strong> in this chapter.</p>
+<p>In 2020, <strong>Gmail</strong> had 1.8bil active users, while <strong>Outlook</strong> had 400mil users worldwide.</p>
+<p><strong>The one-sentence version:</strong> email is the only system in this book that is <strong>federated</strong> — you do not control the protocol, the other participants, or whether your output is even accepted. Everything else here you can redesign; SMTP you must speak as it was specified in 1982, to thousands of independently operated servers run by people you will never meet.</p>
+<p>That produces an unusual split in difficulty:</p>
+<ul>
+<li><strong>The storage design is comparatively easy.</strong> Every operation — fetch, mark as read, search — concerns exactly one user, so <code>user_id</code> partitions the data perfectly and there are no cross-shard transactions. Compare the trouble sharing causes in <a href="15-google-drive.html#gotchas--failure-modes">Chapter 15</a>.</li>
+<li><strong>The scale is extreme but boring.</strong> Exabytes per year of data that is written once and read approximately once.</li>
+<li><strong>The genuinely hard part is deliverability</strong>, and it is not an engineering problem at all. It is reputation management against other companies' adaptive spam filters, and no amount of good architecture substitutes for it.</li>
+</ul>
+<p>One reframing worth carrying through the chapter: <strong>SMTP is a distributed message queue from 1982.</strong> It is store-and-forward, retries on soft failure (<code>4xx</code>), gives up permanently on hard failure (<code>5xx</code>), and reports the latter as a bounce. That is at-least-once delivery with a dead letter queue, built forty years before <a href="19-distributed-message-queue.html">Chapter 19</a> described the pattern — and it means duplicates are a normal occurrence in email, which is why <code>Message-Id</code> exists.</p>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-establish-design-scope">
+<h2 id="step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</h2>
+<ul>
+<li>C: How many users use the system?</li>
+<li>I: 1bil users</li>
+<li>C: I think following features are important - auth, send/receive email, fetch email, filter emails, search email, anti-spam protection.</li>
+<li>I: Good list. Don't worry about auth for now.</li>
+<li>C: How do users connect \w email servers?</li>
+<li>I: Typically, email clients connect via SMTP, POP, IMAP, but we'll use HTTP for this problem.</li>
+<li>C: Can emails have attachments?</li>
+<li>I: Yes</li>
+</ul>
+<h3 id="non-functional-requirements"><strong>Non-functional requirements</strong></h3>
+<ul>
+<li><strong>Reliability</strong> - we shouldn't lose data</li>
+<li><strong>Availability</strong> - We should use replication to prevent single points of failure. We should also tolerate partial system failures.</li>
+<li><strong>Scalability</strong> - As userbase grows, our system should be able to handle them.</li>
+<li><strong>Flexibility and extensibility</strong> - system should be flexible and easy to extend with new features. One of the reasons we chose HTTP over SMTP/other mail protocols.</li>
+</ul>
+<h3 id="back-of-the-envelope-estimation"><strong>Back-of-the-envelope estimation</strong></h3>
+<ul>
+<li><strong>1bil users</strong></li>
+<li>Assuming one person sends 10 emails per day -&gt; <strong>100k emails per second</strong>.</li>
+<li>Assuming one person receives 40 emails per day and each email on average has 50kb metadata -&gt; <strong>730pb storage per year</strong>.</li>
+<li>Assuming 20% of emails have attachments and average size is 500kb -&gt; <strong>1,460pb per year</strong>.</li>
+</ul>
+<h3 id="reading-those-numbers">Reading those numbers</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Derivation</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Send rate</td>
+<td>1 B × 10 / 86,400</td>
+<td><strong>~116,000 emails/sec</strong></td>
+</tr>
+<tr>
+<td>Metadata stored</td>
+<td>1 B × 40/day × 50 KB × 365</td>
+<td><strong>~730 PB/year</strong></td>
+</tr>
+<tr>
+<td>Attachment bytes</td>
+<td>1 B × 40/day × 20% × 500 KB × 365</td>
+<td><strong>~1,460 PB/year</strong></td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td></td>
+<td><strong>~2.2 exabytes/year</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Two observations the estimate invites.</p>
+<p><strong>Attachments are two thirds of the cost, and most of them are duplicates.</strong> An email with a 5 MB deck sent to 100 colleagues produces 100 copies under a naive design — the same content, stored a hundred times, because each recipient's mailbox is independent. Storing attachments <strong>content-addressed</strong> (keyed by the hash of their bytes) and having mailboxes hold references collapses that to one copy. On a 1,460 PB/year line item this is the single largest optimisation available, which is why the chapter's wrap-up lists attachment deduplication as a talking point. It is the same mechanism as <a href="15-google-drive.html#improved-design">Chapter 15</a>, with the same consequence: deletion now needs reference counting, and &quot;delete my data&quot; becomes genuinely hard.</p>
+<p><strong>Sending is fan-out on write, and it has no alternative.</strong> One send becomes N mailbox writes, because recipients are independent and many of them are on servers you do not operate. The push-versus-pull choice that dominates <a href="11-news-feed-system.html">Chapter 11</a> does not exist here — you cannot ask Yahoo to compute a mailbox view for your user at read time. Federation forces the push model.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>distinguish early between the parts that are hard and the parts that are merely large. <code>user_id</code> partitioning makes the data layer tractable; deliverability and spam are where this system actually lives, and saying so demonstrates you know what email is rather than just how to store rows.</p>
+</div>
+</section>
+<section id="step-2-propose-high-level-design-and-get-buy-in">
+<h2 id="step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</h2>
+<h3 id="email-knowledge-101"><strong>Email knowledge 101</strong></h3>
+<p>There are various protocols used for sending and receiving emails:</p>
+<ul>
+<li><strong>SMTP</strong> - standard protocol for sending emails from one server to another.</li>
+<li><strong>POP</strong> - standard protocol for receiving and downloading emails from a remote mail server to a local client. Once retrieved, emails are deleted from remote server.</li>
+<li><strong>IMAP</strong> - similar to POP, it is used for receiving and downloading emails from a remote server, but it keeps the emails on the server-side.</li>
+<li><strong>HTTPS</strong> - not technically an email protocol, but it can be used for web-based email clients.</li>
+</ul>
+<p>Apart from the mailing protocol, there are some DNS records we need to configure for our email server - the MX records:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/dns-lookup.png" alt="dns-lookup" data-width="500" style="max-width:500px" />
+</p>
+<p>Email attachments are sent base64-encoded and there is usually a size limit of 25mb on most mail services.
+This is configurable and varies from individual to corporate accounts.</p>
+<p><strong>Base64 costs 33%</strong>, which is why the limits feel arbitrary: it encodes every 3 bytes as 4 printable characters, so a 25 MB message limit admits a file of only about <strong>18.75 MB</strong>. The encoding exists because SMTP was specified for 7-bit text and cannot carry arbitrary binary, and it is a good illustration of the chapter's theme — you are paying a third of your attachment bandwidth to a 1982 assumption that you cannot unilaterally change.</p>
+<p><strong>MX records are also the mechanism that makes delivery retryable.</strong> A sending server resolves the recipient domain's MX records, which come with priorities, and tries them in order. If none answer, the message stays queued and is retried over hours or days before being bounced. Store-and-forward with prioritised fallbacks is why email tolerates the recipient being down for a weekend — and why &quot;sent&quot; never means &quot;delivered&quot;.</p>
+<h3 id="traditional-mail-servers"><strong>Traditional mail servers</strong></h3>
+<p>Traditional mail servers work well when there are a limited number of users, connected to a single server.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/traditional-mail-server.png" alt="traditional-mail-server" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Alice logs into her Outlook email and presses &quot;send&quot;. Email is sent to Outlook mail server. Communication is via SMTP.</li>
+<li>Outlook server queries DNS to find MX record for gmail.com and transfers the email to their servers. Communication is via SMTP.</li>
+<li>Bob fetches emails from his gmail server via IMAP/POP.</li>
+</ul>
+<p>In traditional mail servers, emails were stored on the local file system. Every email was a separate file.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/local-dir-storage.png" alt="local-dir-storage" data-width="500" style="max-width:500px" />
+</p>
+<p>As the scale grew, disk I/O became a bottleneck. Also, it doesn't satisfy our high availability and reliability requirements.
+Disks can be damaged and server can go down.</p>
+<h3 id="distributed-mail-servers"><strong>Distributed mail servers</strong></h3>
+<p>Distributed mail servers are designed to support modern use-cases and solve modern scalability issues.</p>
+<p>These servers can still support IMAP/POP for native email clients and SMTP for mail exchange across servers.</p>
+<p>But for rich web-based mail clients, a RESTful API over HTTP is typically used.</p>
+<p>Example APIs:</p>
+<ul>
+<li><code>POST /v1/messages</code> - sends a message to recipients in To, Cc, Bcc headers.</li>
+<li><code>GET /v1/folders</code> - returns all folders of an email account</li>
+</ul>
+<p>Example response:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>[{id: string        Unique folder identifier.
+  name: string      Name of the folder.
+                    According to RFC6154 [9], the default folders can be one of
+                    the following: All, Archive, Drafts, Flagged, Junk, Sent,
+                    and Trash.
+  user_id: string   Reference to the account owner
+}]
+</code></pre></div>
+<ul>
+<li><code>GET /v1/folders/{:folder_id}/messages</code> - returns all messages under a folder \w pagination</li>
+<li><code>GET /v1/messages/{:message_id}</code> - get all information about a particular message</li>
+</ul>
+<p>Example response:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>{
+  user_id: string                      // Reference to the account owner.
+  from: {name: string, email: string}  // &lt;name, email&gt; pair of the sender.
+  to: [{name: string, email: string}]  // A list of &lt;name, email&gt; pairs
+  subject: string                      // Subject of an email
+  body: string                         //  Message body
+  is_read: boolean                     //  Indicate if a message is read or not.
+}
+</code></pre></div>
+<p>Here's the high-level design of the distributed mail server:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/high-level-architecture.png" alt="high-level-architecture" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li><strong>Webmail</strong> - users use web browsers to send/receive emails</li>
+<li><strong>Web servers</strong> - public-facing request/response services used to manage login, signup, user profile, etc.</li>
+<li><strong>Real-time servers</strong> - Used for pushing new email updates to clients in real-time. We use websockets for real-time communication but fallback to long-polling for older browsers that don't support them.</li>
+<li><strong>Metadata db</strong> - stores email metadata such as subject, body, from, to, etc.</li>
+<li><strong>Attachment store</strong> - Object store (eg Amazon S3), suitable for storing large files.</li>
+<li><strong>Distributed cache</strong> - We can cache recent emails in Redis to improve UX.</li>
+<li><strong>Search store</strong> - distributed document store, used for supporting full-text searches.</li>
+</ul>
+<p>Here's what the email sending flow looks like:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/email-sending-flow.png" alt="email-sending-flow" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>User writes an email and presses &quot;send&quot;. Email is sent to load balancer.</li>
+<li>Load balancer rate limits excessive mail sends and routes to one of the web servers.</li>
+<li>Web servers do basic email validation (eg email size) and short-circuits outbound flow if domain is same as sender. But does spam check first.</li>
+<li>If basic validation passes, email is sent to message queue (attachment is referenced from object store)</li>
+<li>If basic validation fails, email is sent to error queue</li>
+<li>SMTP outgoing workers pull messages from outgoing queue, do spam/virus checks and route to destination mail server.</li>
+<li>Email is stored in the &quot;Sent Emails&quot; folder</li>
+</ul>
+<p>We need to also monitor size of outgoing message queue. Growing too large might indicate a problem:</p>
+<ul>
+<li>Recipient's mail server is unavailable. We can retry sending the email at a later time using exponential backoff.</li>
+<li>Not enough consumers to handle the load, we might have to scale the consumers.</li>
+</ul>
+<p>Here's the email receiving flow:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/email-receiving-flkow.png" alt="email-receiving-flow" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Incoming emails arrive at the SMTP load balancer. Mails are distributed to SMTP servers, where mail acceptance policy is done (eg invalid emails are directly discarded).</li>
+<li>If attachment of email is too large, we can put it in object store (s3).</li>
+<li>Mail processing workers do preliminary checks, after which mails are forwarded to storage, cache, object store and real-time servers.</li>
+<li>Offline users get their new emails once they come back online via HTTP API.</li>
+</ul>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<p>Let's now go deeper into some of the components.</p>
+<h3 id="metadata-database"><strong>Metadata database</strong></h3>
+<p>Here are some of the characteristics of email metadata:</p>
+<ul>
+<li>headers are usually small and frequently accessed</li>
+<li>Body size ranges from small to big, but is typically read once</li>
+<li>Most mail operations are isolated to a single user - eg fetching email, marking as read, searching.</li>
+<li>Data recency impacts data usage. Users typically read only recent emails</li>
+<li>Data has high-reliability requirements. Data loss is unacceptable.</li>
+</ul>
+<p>At gmail/outlook scale, the database is typically custom made to reduce input/output operations per second (IOPS).</p>
+<p>Let's consider what database options we have:</p>
+<ul>
+<li><strong>Relational database</strong> - we can build indexes for headers and body, but these DBs are typically optimized for small chunks of data.</li>
+<li><strong>Distributed object store</strong> - this can be a good option for backup storage, but can't efficiently support searching/marking as read/etc.</li>
+<li><strong>NoSQL</strong> - Google BigTable is used by gmail, but it's not open-sourced.</li>
+</ul>
+<p>Based on the above analysis, very few existing solutions seem to fit our needs perfectly.
+In an interview setting, it's infeasible to design a new distributed database solution, but important to mention characteristics:</p>
+<ul>
+<li>Single column can be a single-digit MB</li>
+<li>Strong data consistency</li>
+<li>Designed to reduce disk I/O</li>
+<li>Highly available and fault tolerant</li>
+<li>Should be easy to create incremental backups</li>
+</ul>
+<p>In order to partition the data, we can use the <code>user_id</code> as a partition key, so that one user's data is stored on a single shard.
+This prohibits us from sharing an email with multiple users, but this is not a requirement for this interview.</p>
+<p><strong>This is the third time in the book that the quality of a shard key comes down to one question: does it contain every transaction?</strong></p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>Shard key</th>
+<th>Does a single operation stay inside one shard?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="22-hotel-reservation-system.html#scalability">22 – Hotel</a></td>
+<td><code>hotel_id</code></td>
+<td><strong>Yes</strong> — a booking never spans hotels</td>
+</tr>
+<tr>
+<td><strong>23 – Email</strong></td>
+<td><code>user_id</code></td>
+<td><strong>Yes</strong> — every mail operation is one mailbox</td>
+</tr>
+<tr>
+<td><a href="15-google-drive.html#gotchas--failure-modes">15 – Drive</a></td>
+<td><code>user_id</code></td>
+<td><strong>No</strong> — a shared file spans two users, and that breaks it</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Email gets the easy case, and the chapter is explicit about the price: no shared mailboxes. That is a genuine product limitation (shared team inboxes are a real feature) and the honest statement is that supporting them would require either duplicating the mailbox per member — fan-out again — or a second access path that does cross shards.</p>
+<p>Let's define the tables:</p>
+<ul>
+<li>Primary key consists of partition key (data distribution) and clustering key (sorting data)</li>
+<li>Queries we need to support - get all folders for a user, display all emails for a folder, create/get/delete an email, fetch read/unread email, get conversation threads (bonus)</li>
+</ul>
+<p>Legend for tables to follow:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/legend.png" alt="legend" data-width="500" style="max-width:500px" />
+</p>
+<p>Here is the folders table:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/folders-table.png" alt="folders-table" data-width="500" style="max-width:500px" />
+</p>
+<p>emails table:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/emails-table.png" alt="emails-table" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>email_id is timeuuid which allows sorting based on timestamp when email was created</li>
+</ul>
+<p>Attachments are stored in a separate table, identified by filename:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/attachments.png" alt="attachments" data-width="500" style="max-width:500px" />
+</p>
+<p>Supporting fetching read/unread emails is easy in a traditional relational database, but not in Cassandra, since filtering on non-partition/clustering key is prohibited.
+One workaround is to fetch all emails in a folder and filter in-memory, but that doesn't work well for a big-enough application.</p>
+<p>What we can do is denormalize the emails table into read/unread emails tables:</p>
+<p>This is <strong>a secondary index built by duplication</strong>, and it is the standard move in a system where the storage engine only lets you query by partition and clustering key. The cost is on the write path and is worth stating plainly: marking an email as read becomes <em>two</em> writes — delete from <code>unread</code>, insert into <code>read</code> — and there is no transaction to make them atomic. The failure modes are an email appearing in <strong>both</strong> tables or in <strong>neither</strong>, so either the writes go in a batch that the engine will retry to completion, or the read path must tolerate and repair the discrepancy.</p>
+<p>That is the recurring shape of denormalisation: you move cost from read time to write time, and you take on responsibility for consistency that a relational database would have handled for you.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/read-unread-emails.png" alt="read-unread-emails" data-width="500" style="max-width:500px" />
+</p>
+<p>In order to support conversation threads, we can include some headers, which mail clients interpret and use to reconstruct a conversation thread:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>{
+  &quot;headers&quot; {
+     &quot;Message-Id&quot;: &quot;&lt;7BA04B2A-430C-4D12-8B57-862103C34501@gmail.com&gt;&quot;,
+     &quot;In-Reply-To&quot;: &quot;&lt;CAEWTXuPfN=LzECjDJtgY9Vu03kgFvJnJUSHTt6TW@gmail.com&gt;&quot;,
+     &quot;References&quot;: [&quot;&lt;7BA04B2A-430C-4D12-8B57-862103C34501@gmail.com&gt;&quot;]
+  }
+}
+</code></pre></div>
+<p>Finally, we'll trade availability for consistency for our distributed database, since it is a hard requirement for this problem.</p>
+<p>Hence, in the event of a failover or network partition, sync/update actions will be briefly unavailable to impacted users.</p>
+<p><strong>This is one of the few chapters that chooses CP over AP, and it is worth understanding why</strong>, since most of this book reaches for availability. The deciding factor is that email state changes are <em>user-visible and user-initiated</em>: an email you read reappearing as unread, a message you deleted returning, or a draft losing its last edit are all experienced as the product being broken rather than as momentary staleness. And unlike a like count (<a href="11-news-feed-system.html">Chapter 11</a>), there is no version of the data that is acceptably approximate.</p>
+<p>The mitigating factor is that the blast radius is tiny. Because everything is partitioned by user, a partition or failover affects only the users on that shard, and only for the duration — rather than degrading the whole service. Strong consistency is affordable here precisely because the data is so cleanly partitioned.</p>
+<h3 id="email-deliverability"><strong>Email deliverability</strong></h3>
+<p>It is easy to setup a server to send emails, but getting the email to a receiver's inbox is hard, due to spam-protection algorithms.</p>
+<p>If we just setup a new mail server and start sending mails through it, our emails will probably end up in the spam folder.</p>
+<p>Here's what we can do to prevent that:</p>
+<ul>
+<li><strong>Dedicated IPs</strong> - use dedicated IPs for sending emails, otherwise, recipient servers will not trust you.</li>
+<li><strong>Classify emails</strong> - avoid sending marketing emails from the same servers to prevent more important email to be classified as spam</li>
+<li><strong>Warm up your IP address</strong> slowly to build a good reputation with big email providers. It takes 2 to 6 weeks to warm up a new IP</li>
+<li><strong>Ban spammers</strong> quickly to not deteriorate your reputation</li>
+<li><strong>Feedback processing</strong> - setup a feedback loop with ISPs to keep track of complaint rate and ban spam accounts quickly.</li>
+<li><strong>Email authentication</strong> - use common techniques to combat phishing such as Sender Policy Framework, DomainKeys Identified Mail, etc.</li>
+</ul>
+<p>You don't need to remember all of this. Just know that building a good mail server requires a lot of domain knowledge.</p>
+<p><strong>Three of these are worth knowing by name, because they are the actual answer to &quot;how do I not land in spam&quot; and they are all just DNS records:</strong></p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Mechanism</th>
+<th>What it asserts</th>
+<th>How a receiver checks it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SPF</strong></td>
+<td>Which IP addresses are allowed to send mail for this domain</td>
+<td>DNS <code>TXT</code> lookup on the sending domain; compare with the connecting IP</td>
+</tr>
+<tr>
+<td><strong>DKIM</strong></td>
+<td>This message's headers and body were signed by the domain's private key</td>
+<td>Fetch the public key from DNS; verify the signature</td>
+</tr>
+<tr>
+<td><strong>DMARC</strong></td>
+<td>What to do when SPF or DKIM fails (none / quarantine / reject), and where to send reports</td>
+<td>DNS <code>TXT</code> policy lookup; apply the stated policy</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The division of labour matters: SPF authenticates the <em>connection</em>, DKIM authenticates the <em>message</em> (and so survives forwarding, which SPF does not), and DMARC turns two advisory checks into an enforceable policy plus a feedback channel. Publishing all three is the highest-leverage deliverability work available, and it is configuration rather than code.</p>
+<p><strong>The rest is reputation, which behaves like credit.</strong> It accrues slowly — the chapter's 2-to-6-week IP warm-up — and is destroyed quickly by a complaint rate above roughly a tenth of a percent. The operational consequences:</p>
+<ul>
+<li><strong>Process bounces and suppress the addresses</strong>, distinguishing hard (permanent: no such mailbox) from soft (temporary: mailbox full). Continuing to send to a hard-bounced address is read as spammer behaviour. This is the same failure classification as <a href="10-notification-system.html#retries-the-part-that-is-usually-wrong">Chapter 10</a>, with your sending reputation as the penalty.</li>
+<li><strong>Honour feedback loops.</strong> ISPs will report complaints in a machine-readable format (ARF) if you register; ignoring them costs you the relationship.</li>
+<li><strong>Separate transactional from marketing traffic onto different IPs and subdomains</strong>, so a campaign's complaint rate cannot sink password-reset emails.</li>
+</ul>
+<p>And note the symmetry: you must also <em>receive</em> mail and filter spam, against an adversary who adapts to whatever you deploy. Greylisting, connection rate limits, content classifiers and reputation lists all feature, and the asymmetry of errors is severe — a false positive silently discards legitimate mail, which users experience as data loss, while a false negative is merely annoying.</p>
+<h3 id="search"><strong>Search</strong></h3>
+<p>Searching includes doing a full-text search based on email contents or more advanced queries based on from, to, subject, unread, etc filters.</p>
+<p>One characteristic of email search is that it is local to the user and it has more writes than reads, because we need to re-index it on each operation, but users rarely use the search tab.</p>
+<p><strong>Both halves of that sentence make email search much easier than web search, and it is worth being explicit about why.</strong></p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Web search (<a href="09-web-crawler.html">Chapter 9</a>, <a href="13-search-autocomplete.html">13</a>)</th>
+<th>Email search</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Index scope</td>
+<td>One global index over billions of documents</td>
+<td><strong>One small index per user</strong> — thousands of documents</td>
+</tr>
+<tr>
+<td>Sharding</td>
+<td>Hard; a query must consult many shards</td>
+<td><strong>Trivial</strong> — the query goes to the user's shard only</td>
+</tr>
+<tr>
+<td>Ranking</td>
+<td>Relevance, the entire problem</td>
+<td>Sort by date; relevance barely matters</td>
+</tr>
+<tr>
+<td>Read:write ratio</td>
+<td>Reads dominate overwhelmingly</td>
+<td><strong>Writes dominate</strong> — every email is indexed, few are searched</td>
+</tr>
+<tr>
+<td>Freshness</td>
+<td>Minutes to days is fine</td>
+<td>An email must be findable immediately</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>So the per-user index is small enough to be cheap to query and to rebuild, and no global inverted index is needed at all. What is unusual is the <strong>write amplification</strong>: the index is maintained continuously for a feature most users invoke rarely, which means the dominant cost is indexing work that is never read. That inverted ratio is exactly the argument for an LSM-tree — optimise writes, accept more work at read time — and it is the same storage structure as <a href="06-key-value-store.html">Chapter 6</a>.</p>
+<p>Let's compare google search with email search:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Scope</th>
+<th>Sorting</th>
+<th>Accuracy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Google search</td>
+<td>The whole internet</td>
+<td>Sort by relevance</td>
+<td>Indexing takes some time, so not instant results.</td>
+</tr>
+<tr>
+<td>Email search</td>
+<td>User's own email box</td>
+<td>Sort by attributes eg time, date, etc</td>
+<td>Indexing should be quick and results accurate.</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>To achieve this search functionality, one option is to use an Elasticsearch cluster. We can use <code>user_id</code> as the partition key to group data under the same node:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/elasticsearch.png" alt="elasticsearch" data-width="500" style="max-width:500px" />
+</p>
+<p>Mutating operations are async via Kafka in order to decouple services from the reindexing flow.
+Actually searching for data happens synchronously.</p>
+<p>Elasticsearch is one of the most popular search-engine databases and supports full-text search for emails very well.</p>
+<p>Alternatively, we can attempt to develop our own custom search solution to meet our specific requirements.</p>
+<p>Designing such a system is out of scope. One of the core challenges when building it is to optimize it for write-heavy workloads.</p>
+<p>To achieve that, we can use Log-Structured Merge-Trees (LSM) to structure the index data on disk. Write path is optimized for sequential writes only.
+This technique is used in Cassandra, BigTable and RocksDB.</p>
+<p>Its core idea is to store data in-memory until a predefined threshold is reached, after which it is merged in the next layer (disk):</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/lsm-tree.png" alt="lsm-tree" data-width="500" style="max-width:500px" />
+</p>
+<p>Main trade-offs between the two approaches:</p>
+<ul>
+<li>Elasticsearch scales to some extent, whereas a custom search engine can be fine-tuned for the email use-case, allowing it to scale further.</li>
+<li>Elasticsearch is a separate service we need to maintain, alongside the metadata store. A custom solution can be the datastore itself.</li>
+<li>Elasticsearch is an off-the-shelf solution, whereas the custom search engine would require significant engineering effort to build.</li>
+</ul>
+<h3 id="scalability-and-availability"><strong>Scalability and availability</strong></h3>
+<p>Since individual user operations don't collide with other users, most components can be independently scaled.</p>
+<p>To ensure high availability, we can also use a multi-DC setup with leader-follower failover in case of failures:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/23.%20Distributed%20Email%20Service/images/multi-dc-example.png" alt="multi-dc-example" data-width="500" style="max-width:500px" />
+</p>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
+<p>Additional talking points:</p>
+<ul>
+<li><strong>Fault tolerance</strong> - Many parts of the system could fail. It is worthwhile considering how we'd handle node failures.</li>
+<li><strong>Compliance</strong> - PII needs to be stored in a reasonable way, given Europe's GDPR laws.</li>
+<li><strong>Security</strong> - email encryption, phishing protection, safe browsing, etc.</li>
+<li><strong>Optimizations</strong> - eg preventing duplication of the same attachments, sent multiple times by different users.</li>
+</ul>
+<figure class="mermaid-fig">
+<svg id="mmd-b8b9ef3d09d53ac9" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" style="max-width: 1986px; background-color: transparent;" viewBox="-50 -10 1986 611" role="graphics-document document" aria-roledescription="sequence"><g><rect x="1658" y="525" fill="#eaeaea" stroke="#666" width="228" height="65" name="OBJ" rx="3" ry="3" class="actor actor-bottom"/><text x="1772" y="557.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="1772" dy="0">Object store (content-addressed)</tspan></text></g><g><rect x="1449" y="525" fill="#eaeaea" stroke="#666" width="169" height="65" name="ES" rx="3" ry="3" class="actor actor-bottom"/><text x="1533.5" y="557.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="1533.5" dy="0">Search index (per user)</tspan></text></g><g><rect x="1168" y="525" fill="#eaeaea" stroke="#666" width="241" height="65" name="MD" rx="3" ry="3" class="actor actor-bottom"/><text x="1288.5" y="557.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="1288.5" dy="0">Metadata DB (sharded by user_id)</tspan></text></g><g><rect x="974" y="525" fill="#eaeaea" stroke="#666" width="154" height="65" name="MX" rx="3" ry="3" class="actor actor-bottom"/><text x="1051" y="557.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="1051" dy="0">Recipient MX server</tspan></text></g><g><rect x="662" y="525" fill="#eaeaea" stroke="#666" width="222" height="65" name="OUT" rx="3" ry="3" class="actor actor-bottom"/><text x="773" y="557.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="773" dy="0">Outgoing queue / SMTP sender</tspan></text></g><g><rect x="457" y="525" fill="#eaeaea" stroke="#666" width="150" height="65" name="Q" rx="3" ry="3" class="actor actor-bottom"/><text x="532" y="557.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="532" dy="0">Kafka</tspan></text></g><g><rect x="265" y="525" fill="#eaeaea" stroke="#666" width="150" height="65" name="API" rx="3" ry="3" class="actor actor-bottom"/><text x="340" y="557.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="340" dy="0">API servers (HTTP)</tspan></text></g><g><rect x="0" y="525" fill="#eaeaea" stroke="#666" width="150" height="65" name="A" rx="3" ry="3" class="actor actor-bottom"/><text x="75" y="557.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="75" dy="0">Alice (web client)</tspan></text></g><g><line id="actor7" x1="1772" y1="65" x2="1772" y2="525" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="OBJ" data-et="life-line" data-id="OBJ"/><g id="root-7" data-et="participant" data-type="participant" data-id="OBJ"><rect x="1658" y="0" fill="#eaeaea" stroke="#666" width="228" height="65" name="OBJ" rx="3" ry="3" class="actor actor-top"/><text x="1772" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="1772" dy="0">Object store (content-addressed)</tspan></text></g></g><g><line id="actor6" x1="1533.5" y1="65" x2="1533.5" y2="525" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="ES" data-et="life-line" data-id="ES"/><g id="root-6" data-et="participant" data-type="participant" data-id="ES"><rect x="1449" y="0" fill="#eaeaea" stroke="#666" width="169" height="65" name="ES" rx="3" ry="3" class="actor actor-top"/><text x="1533.5" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="1533.5" dy="0">Search index (per user)</tspan></text></g></g><g><line id="actor5" x1="1288.5" y1="65" x2="1288.5" y2="525" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="MD" data-et="life-line" data-id="MD"/><g id="root-5" data-et="participant" data-type="participant" data-id="MD"><rect x="1168" y="0" fill="#eaeaea" stroke="#666" width="241" height="65" name="MD" rx="3" ry="3" class="actor actor-top"/><text x="1288.5" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="1288.5" dy="0">Metadata DB (sharded by user_id)</tspan></text></g></g><g><line id="actor4" x1="1051" y1="65" x2="1051" y2="525" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="MX" data-et="life-line" data-id="MX"/><g id="root-4" data-et="participant" data-type="participant" data-id="MX"><rect x="974" y="0" fill="#eaeaea" stroke="#666" width="154" height="65" name="MX" rx="3" ry="3" class="actor actor-top"/><text x="1051" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="1051" dy="0">Recipient MX server</tspan></text></g></g><g><line id="actor3" x1="773" y1="65" x2="773" y2="525" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="OUT" data-et="life-line" data-id="OUT"/><g id="root-3" data-et="participant" data-type="participant" data-id="OUT"><rect x="662" y="0" fill="#eaeaea" stroke="#666" width="222" height="65" name="OUT" rx="3" ry="3" class="actor actor-top"/><text x="773" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="773" dy="0">Outgoing queue / SMTP sender</tspan></text></g></g><g><line id="actor2" x1="532" y1="65" x2="532" y2="525" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="Q" data-et="life-line" data-id="Q"/><g id="root-2" data-et="participant" data-type="participant" data-id="Q"><rect x="457" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="Q" rx="3" ry="3" class="actor actor-top"/><text x="532" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="532" dy="0">Kafka</tspan></text></g></g><g><line id="actor1" x1="340" y1="65" x2="340" y2="525" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="API" data-et="life-line" data-id="API"/><g id="root-1" data-et="participant" data-type="participant" data-id="API"><rect x="265" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="API" rx="3" ry="3" class="actor actor-top"/><text x="340" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="340" dy="0">API servers (HTTP)</tspan></text></g></g><g><line id="actor0" x1="75" y1="65" x2="75" y2="525" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="A" data-et="life-line" data-id="A"/><g id="root-0" data-et="participant" data-type="participant" data-id="A"><rect x="0" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="A" rx="3" ry="3" class="actor actor-top"/><text x="75" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="75" dy="0">Alice (web client)</tspan></text></g></g><style>#mmd-b8b9ef3d09d53ac9{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-b8b9ef3d09d53ac9 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-b8b9ef3d09d53ac9 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-b8b9ef3d09d53ac9 .error-icon{fill:#f4f6f8;}#mmd-b8b9ef3d09d53ac9 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-b8b9ef3d09d53ac9 .edge-thickness-normal{stroke-width:1px;}#mmd-b8b9ef3d09d53ac9 .edge-thickness-thick{stroke-width:3.5px;}#mmd-b8b9ef3d09d53ac9 .edge-pattern-solid{stroke-dasharray:0;}#mmd-b8b9ef3d09d53ac9 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-b8b9ef3d09d53ac9 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-b8b9ef3d09d53ac9 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-b8b9ef3d09d53ac9 .marker{fill:#637381;stroke:#637381;}#mmd-b8b9ef3d09d53ac9 .marker.cross{stroke:#637381;}#mmd-b8b9ef3d09d53ac9 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-b8b9ef3d09d53ac9 p{margin:0;}#mmd-b8b9ef3d09d53ac9 .actor{stroke:#299a8d;fill:#f1f7f6;stroke-width:1;}#mmd-b8b9ef3d09d53ac9 rect.actor.outer-path[data-look="neo"]{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8b9ef3d09d53ac9 rect.note[data-look="neo"]{stroke:#e76f51;fill:#fcf4f2;filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8b9ef3d09d53ac9 text.actor&gt;tspan{fill:#161c24;stroke:none;}#mmd-b8b9ef3d09d53ac9 .actor-line{stroke:#299a8d;}#mmd-b8b9ef3d09d53ac9 .innerArc{stroke-width:1.5;stroke-dasharray:none;}#mmd-b8b9ef3d09d53ac9 .messageLine0{stroke-width:1.5;stroke-dasharray:none;stroke:#454f5b;}#mmd-b8b9ef3d09d53ac9 .messageLine1{stroke-width:1.5;stroke-dasharray:2,2;stroke:#454f5b;}#mmd-b8b9ef3d09d53ac9 [id$="-arrowhead"] path{fill:#454f5b;stroke:#454f5b;}#mmd-b8b9ef3d09d53ac9 .sequenceNumber{fill:#ffffff;}#mmd-b8b9ef3d09d53ac9 [id$="-sequencenumber"]{fill:#454f5b;}#mmd-b8b9ef3d09d53ac9 [id$="-crosshead"] path{fill:#454f5b;stroke:#454f5b;}#mmd-b8b9ef3d09d53ac9 .messageText{fill:#161c24;stroke:none;}#mmd-b8b9ef3d09d53ac9 .labelBox{stroke:#299a8d;fill:#f1f7f6;filter:none;}#mmd-b8b9ef3d09d53ac9 .labelText,#mmd-b8b9ef3d09d53ac9 .labelText&gt;tspan{fill:#161c24;stroke:none;}#mmd-b8b9ef3d09d53ac9 .loopText,#mmd-b8b9ef3d09d53ac9 .loopText&gt;tspan{fill:#161c24;stroke:none;}#mmd-b8b9ef3d09d53ac9 .sectionTitle,#mmd-b8b9ef3d09d53ac9 .sectionTitle&gt;tspan{fill:#161c24;stroke:none;}#mmd-b8b9ef3d09d53ac9 .loopLine{stroke-width:2px;stroke-dasharray:2,2;stroke:#299a8d;fill:#299a8d;}#mmd-b8b9ef3d09d53ac9 .note{stroke:#e76f51;fill:#fcf4f2;}#mmd-b8b9ef3d09d53ac9 .noteText,#mmd-b8b9ef3d09d53ac9 .noteText&gt;tspan{fill:#161c24;stroke:none;font-weight:normal;}#mmd-b8b9ef3d09d53ac9 .activation0{fill:#b5e0dd;stroke:hsl(12, 62.5%, 86.862745098%);}#mmd-b8b9ef3d09d53ac9 .activation1{fill:#b5e0dd;stroke:hsl(12, 62.5%, 86.862745098%);}#mmd-b8b9ef3d09d53ac9 .activation2{fill:#b5e0dd;stroke:hsl(12, 62.5%, 86.862745098%);}#mmd-b8b9ef3d09d53ac9 .actorPopupMenu{position:absolute;}#mmd-b8b9ef3d09d53ac9 .actorPopupMenuPanel{position:absolute;fill:#f1f7f6;box-shadow:0px 8px 16px 0px rgba(0,0,0,0.2);filter:drop-shadow(3px 5px 2px rgb(0 0 0 / 0.4));}#mmd-b8b9ef3d09d53ac9 .actor-man circle,#mmd-b8b9ef3d09d53ac9 line{fill:#f1f7f6;stroke-width:2px;}#mmd-b8b9ef3d09d53ac9 g rect.rect{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));stroke:#299a8d;}#mmd-b8b9ef3d09d53ac9 .node .neo-node{stroke:#299a8d;}#mmd-b8b9ef3d09d53ac9 [data-look="neo"].node rect,#mmd-b8b9ef3d09d53ac9 [data-look="neo"].cluster rect,#mmd-b8b9ef3d09d53ac9 [data-look="neo"].node polygon{stroke:url(#mmd-b8b9ef3d09d53ac9-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8b9ef3d09d53ac9 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-b8b9ef3d09d53ac9 [data-look="neo"].node path{stroke:url(#mmd-b8b9ef3d09d53ac9-gradient);stroke-width:1px;}#mmd-b8b9ef3d09d53ac9 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8b9ef3d09d53ac9 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-b8b9ef3d09d53ac9 [data-look="neo"].node circle{stroke:url(#mmd-b8b9ef3d09d53ac9-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8b9ef3d09d53ac9 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-b8b9ef3d09d53ac9 [data-look="neo"].icon-shape .icon{fill:url(#mmd-b8b9ef3d09d53ac9-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8b9ef3d09d53ac9 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-b8b9ef3d09d53ac9-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8b9ef3d09d53ac9 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g/><defs><symbol id="mmd-b8b9ef3d09d53ac9-computer" width="24" height="24"><path transform="scale(.5)" d="M2 2v13h20v-13h-20zm18 11h-16v-9h16v9zm-10.228 6l.466-1h3.524l.467 1h-4.457zm14.228 3h-24l2-6h2.104l-1.33 4h18.45l-1.297-4h2.073l2 6zm-5-10h-14v-7h14v7z"/></symbol></defs><defs><symbol id="mmd-b8b9ef3d09d53ac9-database" fill-rule="evenodd" clip-rule="evenodd"><path transform="scale(.5)" d="M12.258.001l.256.004.255.005.253.008.251.01.249.012.247.015.246.016.242.019.241.02.239.023.236.024.233.027.231.028.229.031.225.032.223.034.22.036.217.038.214.04.211.041.208.043.205.045.201.046.198.048.194.05.191.051.187.053.183.054.18.056.175.057.172.059.168.06.163.061.16.063.155.064.15.066.074.033.073.033.071.034.07.034.069.035.068.035.067.035.066.035.064.036.064.036.062.036.06.036.06.037.058.037.058.037.055.038.055.038.053.038.052.038.051.039.05.039.048.039.047.039.045.04.044.04.043.04.041.04.04.041.039.041.037.041.036.041.034.041.033.042.032.042.03.042.029.042.027.042.026.043.024.043.023.043.021.043.02.043.018.044.017.043.015.044.013.044.012.044.011.045.009.044.007.045.006.045.004.045.002.045.001.045v17l-.001.045-.002.045-.004.045-.006.045-.007.045-.009.044-.011.045-.012.044-.013.044-.015.044-.017.043-.018.044-.02.043-.021.043-.023.043-.024.043-.026.043-.027.042-.029.042-.03.042-.032.042-.033.042-.034.041-.036.041-.037.041-.039.041-.04.041-.041.04-.043.04-.044.04-.045.04-.047.039-.048.039-.05.039-.051.039-.052.038-.053.038-.055.038-.055.038-.058.037-.058.037-.06.037-.06.036-.062.036-.064.036-.064.036-.066.035-.067.035-.068.035-.069.035-.07.034-.071.034-.073.033-.074.033-.15.066-.155.064-.16.063-.163.061-.168.06-.172.059-.175.057-.18.056-.183.054-.187.053-.191.051-.194.05-.198.048-.201.046-.205.045-.208.043-.211.041-.214.04-.217.038-.22.036-.223.034-.225.032-.229.031-.231.028-.233.027-.236.024-.239.023-.241.02-.242.019-.246.016-.247.015-.249.012-.251.01-.253.008-.255.005-.256.004-.258.001-.258-.001-.256-.004-.255-.005-.253-.008-.251-.01-.249-.012-.247-.015-.245-.016-.243-.019-.241-.02-.238-.023-.236-.024-.234-.027-.231-.028-.228-.031-.226-.032-.223-.034-.22-.036-.217-.038-.214-.04-.211-.041-.208-.043-.204-.045-.201-.046-.198-.048-.195-.05-.19-.051-.187-.053-.184-.054-.179-.056-.176-.057-.172-.059-.167-.06-.164-.061-.159-.063-.155-.064-.151-.066-.074-.033-.072-.033-.072-.034-.07-.034-.069-.035-.068-.035-.067-.035-.066-.035-.064-.036-.063-.036-.062-.036-.061-.036-.06-.037-.058-.037-.057-.037-.056-.038-.055-.038-.053-.038-.052-.038-.051-.039-.049-.039-.049-.039-.046-.039-.046-.04-.044-.04-.043-.04-.041-.04-.04-.041-.039-.041-.037-.041-.036-.041-.034-.041-.033-.042-.032-.042-.03-.042-.029-.042-.027-.042-.026-.043-.024-.043-.023-.043-.021-.043-.02-.043-.018-.044-.017-.043-.015-.044-.013-.044-.012-.044-.011-.045-.009-.044-.007-.045-.006-.045-.004-.045-.002-.045-.001-.045v-17l.001-.045.002-.045.004-.045.006-.045.007-.045.009-.044.011-.045.012-.044.013-.044.015-.044.017-.043.018-.044.02-.043.021-.043.023-.043.024-.043.026-.043.027-.042.029-.042.03-.042.032-.042.033-.042.034-.041.036-.041.037-.041.039-.041.04-.041.041-.04.043-.04.044-.04.046-.04.046-.039.049-.039.049-.039.051-.039.052-.038.053-.038.055-.038.056-.038.057-.037.058-.037.06-.037.061-.036.062-.036.063-.036.064-.036.066-.035.067-.035.068-.035.069-.035.07-.034.072-.034.072-.033.074-.033.151-.066.155-.064.159-.063.164-.061.167-.06.172-.059.176-.057.179-.056.184-.054.187-.053.19-.051.195-.05.198-.048.201-.046.204-.045.208-.043.211-.041.214-.04.217-.038.22-.036.223-.034.226-.032.228-.031.231-.028.234-.027.236-.024.238-.023.241-.02.243-.019.245-.016.247-.015.249-.012.251-.01.253-.008.255-.005.256-.004.258-.001.258.001zm-9.258 20.499v.01l.001.021.003.021.004.022.005.021.006.022.007.022.009.023.01.022.011.023.012.023.013.023.015.023.016.024.017.023.018.024.019.024.021.024.022.025.023.024.024.025.052.049.056.05.061.051.066.051.07.051.075.051.079.052.084.052.088.052.092.052.097.052.102.051.105.052.11.052.114.051.119.051.123.051.127.05.131.05.135.05.139.048.144.049.147.047.152.047.155.047.16.045.163.045.167.043.171.043.176.041.178.041.183.039.187.039.19.037.194.035.197.035.202.033.204.031.209.03.212.029.216.027.219.025.222.024.226.021.23.02.233.018.236.016.24.015.243.012.246.01.249.008.253.005.256.004.259.001.26-.001.257-.004.254-.005.25-.008.247-.011.244-.012.241-.014.237-.016.233-.018.231-.021.226-.021.224-.024.22-.026.216-.027.212-.028.21-.031.205-.031.202-.034.198-.034.194-.036.191-.037.187-.039.183-.04.179-.04.175-.042.172-.043.168-.044.163-.045.16-.046.155-.046.152-.047.148-.048.143-.049.139-.049.136-.05.131-.05.126-.05.123-.051.118-.052.114-.051.11-.052.106-.052.101-.052.096-.052.092-.052.088-.053.083-.051.079-.052.074-.052.07-.051.065-.051.06-.051.056-.05.051-.05.023-.024.023-.025.021-.024.02-.024.019-.024.018-.024.017-.024.015-.023.014-.024.013-.023.012-.023.01-.023.01-.022.008-.022.006-.022.006-.022.004-.022.004-.021.001-.021.001-.021v-4.127l-.077.055-.08.053-.083.054-.085.053-.087.052-.09.052-.093.051-.095.05-.097.05-.1.049-.102.049-.105.048-.106.047-.109.047-.111.046-.114.045-.115.045-.118.044-.12.043-.122.042-.124.042-.126.041-.128.04-.13.04-.132.038-.134.038-.135.037-.138.037-.139.035-.142.035-.143.034-.144.033-.147.032-.148.031-.15.03-.151.03-.153.029-.154.027-.156.027-.158.026-.159.025-.161.024-.162.023-.163.022-.165.021-.166.02-.167.019-.169.018-.169.017-.171.016-.173.015-.173.014-.175.013-.175.012-.177.011-.178.01-.179.008-.179.008-.181.006-.182.005-.182.004-.184.003-.184.002h-.37l-.184-.002-.184-.003-.182-.004-.182-.005-.181-.006-.179-.008-.179-.008-.178-.01-.176-.011-.176-.012-.175-.013-.173-.014-.172-.015-.171-.016-.17-.017-.169-.018-.167-.019-.166-.02-.165-.021-.163-.022-.162-.023-.161-.024-.159-.025-.157-.026-.156-.027-.155-.027-.153-.029-.151-.03-.15-.03-.148-.031-.146-.032-.145-.033-.143-.034-.141-.035-.14-.035-.137-.037-.136-.037-.134-.038-.132-.038-.13-.04-.128-.04-.126-.041-.124-.042-.122-.042-.12-.044-.117-.043-.116-.045-.113-.045-.112-.046-.109-.047-.106-.047-.105-.048-.102-.049-.1-.049-.097-.05-.095-.05-.093-.052-.09-.051-.087-.052-.085-.053-.083-.054-.08-.054-.077-.054v4.127zm0-5.654v.011l.001.021.003.021.004.021.005.022.006.022.007.022.009.022.01.022.011.023.012.023.013.023.015.024.016.023.017.024.018.024.019.024.021.024.022.024.023.025.024.024.052.05.056.05.061.05.066.051.07.051.075.052.079.051.084.052.088.052.092.052.097.052.102.052.105.052.11.051.114.051.119.052.123.05.127.051.131.05.135.049.139.049.144.048.147.048.152.047.155.046.16.045.163.045.167.044.171.042.176.042.178.04.183.04.187.038.19.037.194.036.197.034.202.033.204.032.209.03.212.028.216.027.219.025.222.024.226.022.23.02.233.018.236.016.24.014.243.012.246.01.249.008.253.006.256.003.259.001.26-.001.257-.003.254-.006.25-.008.247-.01.244-.012.241-.015.237-.016.233-.018.231-.02.226-.022.224-.024.22-.025.216-.027.212-.029.21-.03.205-.032.202-.033.198-.035.194-.036.191-.037.187-.039.183-.039.179-.041.175-.042.172-.043.168-.044.163-.045.16-.045.155-.047.152-.047.148-.048.143-.048.139-.05.136-.049.131-.05.126-.051.123-.051.118-.051.114-.052.11-.052.106-.052.101-.052.096-.052.092-.052.088-.052.083-.052.079-.052.074-.051.07-.052.065-.051.06-.05.056-.051.051-.049.023-.025.023-.024.021-.025.02-.024.019-.024.018-.024.017-.024.015-.023.014-.023.013-.024.012-.022.01-.023.01-.023.008-.022.006-.022.006-.022.004-.021.004-.022.001-.021.001-.021v-4.139l-.077.054-.08.054-.083.054-.085.052-.087.053-.09.051-.093.051-.095.051-.097.05-.1.049-.102.049-.105.048-.106.047-.109.047-.111.046-.114.045-.115.044-.118.044-.12.044-.122.042-.124.042-.126.041-.128.04-.13.039-.132.039-.134.038-.135.037-.138.036-.139.036-.142.035-.143.033-.144.033-.147.033-.148.031-.15.03-.151.03-.153.028-.154.028-.156.027-.158.026-.159.025-.161.024-.162.023-.163.022-.165.021-.166.02-.167.019-.169.018-.169.017-.171.016-.173.015-.173.014-.175.013-.175.012-.177.011-.178.009-.179.009-.179.007-.181.007-.182.005-.182.004-.184.003-.184.002h-.37l-.184-.002-.184-.003-.182-.004-.182-.005-.181-.007-.179-.007-.179-.009-.178-.009-.176-.011-.176-.012-.175-.013-.173-.014-.172-.015-.171-.016-.17-.017-.169-.018-.167-.019-.166-.02-.165-.021-.163-.022-.162-.023-.161-.024-.159-.025-.157-.026-.156-.027-.155-.028-.153-.028-.151-.03-.15-.03-.148-.031-.146-.033-.145-.033-.143-.033-.141-.035-.14-.036-.137-.036-.136-.037-.134-.038-.132-.039-.13-.039-.128-.04-.126-.041-.124-.042-.122-.043-.12-.043-.117-.044-.116-.044-.113-.046-.112-.046-.109-.046-.106-.047-.105-.048-.102-.049-.1-.049-.097-.05-.095-.051-.093-.051-.09-.051-.087-.053-.085-.052-.083-.054-.08-.054-.077-.054v4.139zm0-5.666v.011l.001.02.003.022.004.021.005.022.006.021.007.022.009.023.01.022.011.023.012.023.013.023.015.023.016.024.017.024.018.023.019.024.021.025.022.024.023.024.024.025.052.05.056.05.061.05.066.051.07.051.075.052.079.051.084.052.088.052.092.052.097.052.102.052.105.051.11.052.114.051.119.051.123.051.127.05.131.05.135.05.139.049.144.048.147.048.152.047.155.046.16.045.163.045.167.043.171.043.176.042.178.04.183.04.187.038.19.037.194.036.197.034.202.033.204.032.209.03.212.028.216.027.219.025.222.024.226.021.23.02.233.018.236.017.24.014.243.012.246.01.249.008.253.006.256.003.259.001.26-.001.257-.003.254-.006.25-.008.247-.01.244-.013.241-.014.237-.016.233-.018.231-.02.226-.022.224-.024.22-.025.216-.027.212-.029.21-.03.205-.032.202-.033.198-.035.194-.036.191-.037.187-.039.183-.039.179-.041.175-.042.172-.043.168-.044.163-.045.16-.045.155-.047.152-.047.148-.048.143-.049.139-.049.136-.049.131-.051.126-.05.123-.051.118-.052.114-.051.11-.052.106-.052.101-.052.096-.052.092-.052.088-.052.083-.052.079-.052.074-.052.07-.051.065-.051.06-.051.056-.05.051-.049.023-.025.023-.025.021-.024.02-.024.019-.024.018-.024.017-.024.015-.023.014-.024.013-.023.012-.023.01-.022.01-.023.008-.022.006-.022.006-.022.004-.022.004-.021.001-.021.001-.021v-4.153l-.077.054-.08.054-.083.053-.085.053-.087.053-.09.051-.093.051-.095.051-.097.05-.1.049-.102.048-.105.048-.106.048-.109.046-.111.046-.114.046-.115.044-.118.044-.12.043-.122.043-.124.042-.126.041-.128.04-.13.039-.132.039-.134.038-.135.037-.138.036-.139.036-.142.034-.143.034-.144.033-.147.032-.148.032-.15.03-.151.03-.153.028-.154.028-.156.027-.158.026-.159.024-.161.024-.162.023-.163.023-.165.021-.166.02-.167.019-.169.018-.169.017-.171.016-.173.015-.173.014-.175.013-.175.012-.177.01-.178.01-.179.009-.179.007-.181.006-.182.006-.182.004-.184.003-.184.001-.185.001-.185-.001-.184-.001-.184-.003-.182-.004-.182-.006-.181-.006-.179-.007-.179-.009-.178-.01-.176-.01-.176-.012-.175-.013-.173-.014-.172-.015-.171-.016-.17-.017-.169-.018-.167-.019-.166-.02-.165-.021-.163-.023-.162-.023-.161-.024-.159-.024-.157-.026-.156-.027-.155-.028-.153-.028-.151-.03-.15-.03-.148-.032-.146-.032-.145-.033-.143-.034-.141-.034-.14-.036-.137-.036-.136-.037-.134-.038-.132-.039-.13-.039-.128-.041-.126-.041-.124-.041-.122-.043-.12-.043-.117-.044-.116-.044-.113-.046-.112-.046-.109-.046-.106-.048-.105-.048-.102-.048-.1-.05-.097-.049-.095-.051-.093-.051-.09-.052-.087-.052-.085-.053-.083-.053-.08-.054-.077-.054v4.153zm8.74-8.179l-.257.004-.254.005-.25.008-.247.011-.244.012-.241.014-.237.016-.233.018-.231.021-.226.022-.224.023-.22.026-.216.027-.212.028-.21.031-.205.032-.202.033-.198.034-.194.036-.191.038-.187.038-.183.04-.179.041-.175.042-.172.043-.168.043-.163.045-.16.046-.155.046-.152.048-.148.048-.143.048-.139.049-.136.05-.131.05-.126.051-.123.051-.118.051-.114.052-.11.052-.106.052-.101.052-.096.052-.092.052-.088.052-.083.052-.079.052-.074.051-.07.052-.065.051-.06.05-.056.05-.051.05-.023.025-.023.024-.021.024-.02.025-.019.024-.018.024-.017.023-.015.024-.014.023-.013.023-.012.023-.01.023-.01.022-.008.022-.006.023-.006.021-.004.022-.004.021-.001.021-.001.021.001.021.001.021.004.021.004.022.006.021.006.023.008.022.01.022.01.023.012.023.013.023.014.023.015.024.017.023.018.024.019.024.02.025.021.024.023.024.023.025.051.05.056.05.06.05.065.051.07.052.074.051.079.052.083.052.088.052.092.052.096.052.101.052.106.052.11.052.114.052.118.051.123.051.126.051.131.05.136.05.139.049.143.048.148.048.152.048.155.046.16.046.163.045.168.043.172.043.175.042.179.041.183.04.187.038.191.038.194.036.198.034.202.033.205.032.21.031.212.028.216.027.22.026.224.023.226.022.231.021.233.018.237.016.241.014.244.012.247.011.25.008.254.005.257.004.26.001.26-.001.257-.004.254-.005.25-.008.247-.011.244-.012.241-.014.237-.016.233-.018.231-.021.226-.022.224-.023.22-.026.216-.027.212-.028.21-.031.205-.032.202-.033.198-.034.194-.036.191-.038.187-.038.183-.04.179-.041.175-.042.172-.043.168-.043.163-.045.16-.046.155-.046.152-.048.148-.048.143-.048.139-.049.136-.05.131-.05.126-.051.123-.051.118-.051.114-.052.11-.052.106-.052.101-.052.096-.052.092-.052.088-.052.083-.052.079-.052.074-.051.07-.052.065-.051.06-.05.056-.05.051-.05.023-.025.023-.024.021-.024.02-.025.019-.024.018-.024.017-.023.015-.024.014-.023.013-.023.012-.023.01-.023.01-.022.008-.022.006-.023.006-.021.004-.022.004-.021.001-.021.001-.021-.001-.021-.001-.021-.004-.021-.004-.022-.006-.021-.006-.023-.008-.022-.01-.022-.01-.023-.012-.023-.013-.023-.014-.023-.015-.024-.017-.023-.018-.024-.019-.024-.02-.025-.021-.024-.023-.024-.023-.025-.051-.05-.056-.05-.06-.05-.065-.051-.07-.052-.074-.051-.079-.052-.083-.052-.088-.052-.092-.052-.096-.052-.101-.052-.106-.052-.11-.052-.114-.052-.118-.051-.123-.051-.126-.051-.131-.05-.136-.05-.139-.049-.143-.048-.148-.048-.152-.048-.155-.046-.16-.046-.163-.045-.168-.043-.172-.043-.175-.042-.179-.041-.183-.04-.187-.038-.191-.038-.194-.036-.198-.034-.202-.033-.205-.032-.21-.031-.212-.028-.216-.027-.22-.026-.224-.023-.226-.022-.231-.021-.233-.018-.237-.016-.241-.014-.244-.012-.247-.011-.25-.008-.254-.005-.257-.004-.26-.001-.26.001z"/></symbol></defs><defs><symbol id="mmd-b8b9ef3d09d53ac9-clock" width="24" height="24"><path transform="scale(.5)" d="M12 2c5.514 0 10 4.486 10 10s-4.486 10-10 10-10-4.486-10-10 4.486-10 10-10zm0-2c-6.627 0-12 5.373-12 12s5.373 12 12 12 12-5.373 12-12-5.373-12-12-12zm5.848 12.459c.202.038.202.333.001.372-1.907.361-6.045 1.111-6.547 1.111-.719 0-1.301-.582-1.301-1.301 0-.512.77-5.447 1.125-7.445.034-.192.312-.181.343.014l.985 6.238 5.394 1.011z"/></symbol></defs><defs><marker id="mmd-b8b9ef3d09d53ac9-arrowhead" refX="7.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M -1 0 L 10 5 L 0 10 z"/></marker></defs><defs><marker id="mmd-b8b9ef3d09d53ac9-crosshead" markerWidth="15" markerHeight="8" orient="auto" refX="4" refY="4.5"><path fill="none" stroke="#000000" stroke-width="1pt" d="M 1,2 L 6,7 M 6,2 L 1,7" style="stroke-dasharray: 0, 0;"/></marker></defs><defs><marker id="mmd-b8b9ef3d09d53ac9-filled-head" refX="15.5" refY="7" markerWidth="20" markerHeight="28" orient="auto"><path d="M 18,7 L9,13 L14,7 L9,1 Z"/></marker></defs><defs><marker id="mmd-b8b9ef3d09d53ac9-sequencenumber" refX="15" refY="15" markerWidth="60" markerHeight="40" orient="auto"><circle cx="15" cy="15" r="6"/></marker></defs><defs><marker id="mmd-b8b9ef3d09d53ac9-solidTopArrowHead" refX="7.9" refY="7.25" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 10 8 L 0 8 z"/></marker></defs><defs><marker id="mmd-b8b9ef3d09d53ac9-solidBottomArrowHead" refX="7.9" refY="0.75" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 10 0 L 0 8 z"/></marker></defs><defs><marker id="mmd-b8b9ef3d09d53ac9-stickTopArrowHead" refX="7.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 7 7" stroke="black" stroke-width="1.5" fill="none"/></marker></defs><defs><marker id="mmd-b8b9ef3d09d53ac9-stickBottomArrowHead" refX="7.5" refY="0" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 7 L 7 0" stroke="black" stroke-width="1.5" fill="none"/></marker></defs><text x="206" y="80" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">POST /v1/messages</text><line x1="76" y1="109" x2="336" y2="109" class="messageLine0" data-et="message" data-id="i0" data-from="A" data-to="API" stroke-width="2" stroke="none" marker-end="url(#mmd-b8b9ef3d09d53ac9-arrowhead)" style="fill: none;"/><text x="1055" y="124" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">store attachment by content hash (dedup)</text><line x1="341" y1="153" x2="1768" y2="153" class="messageLine0" data-et="message" data-id="i1" data-from="API" data-to="OBJ" stroke-width="2" stroke="none" marker-end="url(#mmd-b8b9ef3d09d53ac9-arrowhead)" style="fill: none;"/><text x="813" y="168" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">write to Alice's Sent folder</text><line x1="341" y1="197" x2="1284.5" y2="197" class="messageLine0" data-et="message" data-id="i2" data-from="API" data-to="MD" stroke-width="2" stroke="none" marker-end="url(#mmd-b8b9ef3d09d53ac9-arrowhead)" style="fill: none;"/><text x="435" y="212" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">enqueue for delivery</text><line x1="341" y1="241" x2="528" y2="241" class="messageLine0" data-et="message" data-id="i3" data-from="API" data-to="Q" stroke-width="2" stroke="none" marker-end="url(#mmd-b8b9ef3d09d53ac9-arrowhead)" style="fill: none;"/><text x="209" y="256" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">202 accepted — not "delivered"</text><line x1="339" y1="285" x2="79" y2="285" class="messageLine1" data-et="message" data-id="i4" data-from="API" data-to="A" stroke-width="2" stroke="none" marker-end="url(#mmd-b8b9ef3d09d53ac9-arrowhead)" style="stroke-dasharray: 3, 3; fill: none;"/><text x="651" y="300" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">deliver per recipient domain</text><line x1="533" y1="329" x2="769" y2="329" class="messageLine0" data-et="message" data-id="i5" data-from="Q" data-to="OUT" stroke-width="2" stroke="none" marker-end="url(#mmd-b8b9ef3d09d53ac9-arrowhead)" style="fill: none;"/><text x="911" y="344" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">SMTP (resolve MX, retry on 4xx)</text><line x1="774" y1="373" x2="1047" y2="373" class="messageLine0" data-et="message" data-id="i6" data-from="OUT" data-to="MX" stroke-width="2" stroke="none" marker-end="url(#mmd-b8b9ef3d09d53ac9-arrowhead)" style="fill: none;"/><text x="914" y="388" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">250 ok / 4xx retry / 5xx bounce</text><line x1="1050" y1="417" x2="777" y2="417" class="messageLine1" data-et="message" data-id="i7" data-from="MX" data-to="OUT" stroke-width="2" stroke="none" marker-end="url(#mmd-b8b9ef3d09d53ac9-arrowhead)" style="stroke-dasharray: 3, 3; fill: none;"/><text x="909" y="432" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">write to local recipients' Inbox (fan-out)</text><line x1="533" y1="461" x2="1284.5" y2="461" class="messageLine0" data-et="message" data-id="i8" data-from="Q" data-to="MD" stroke-width="2" stroke="none" marker-end="url(#mmd-b8b9ef3d09d53ac9-arrowhead)" style="fill: none;"/><text x="1410" y="476" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">async reindex</text><line x1="1289.5" y1="505" x2="1529.5" y2="505" class="messageLine0" data-et="message" data-id="i9" data-from="MD" data-to="ES" stroke-width="2" stroke="none" marker-end="url(#mmd-b8b9ef3d09d53ac9-arrowhead)" style="fill: none;"/></svg>
+</figure>
+<p><strong>The one thing to notice in this diagram is the <code>202 accepted</code>.</strong> The API cannot report delivery, because delivery involves other people's servers, retries over hours, and spam filters whose verdict is never communicated. Everything downstream of the queue is best-effort with a bounce as the only negative signal — and a message silently filed in a recipient's spam folder produces no signal at all.</p>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>&quot;Sent&quot; does not mean delivered, and nothing in the protocol will tell you.</strong> A <code>250 OK</code> from the recipient's MX means accepted for processing, after which it may be spam-filed with no notification. Deliverability is therefore measured statistically (engagement, complaint rates, seed lists), not per message.</li>
+<li><strong>Deliverability is reputation, and reputation is slow to build and fast to lose.</strong> A complaint rate above ~0.1% degrades delivery for everything you send. Publish SPF, DKIM and DMARC, warm IPs over weeks, and separate transactional from marketing traffic.</li>
+<li><strong>Not processing bounces is read as spammer behaviour.</strong> Hard bounces must suppress the address permanently; soft bounces may be retried. Continuing to send to dead addresses is one of the fastest ways to lose reputation.</li>
+<li><strong>Attachment dedup makes deletion and compliance hard.</strong> Content-addressed storage means a GDPR erasure request cannot simply delete the bytes — another user's mailbox may reference them. Reference counting, plus the uncomfortable truth that &quot;delete&quot; means &quot;unlink and wait for collection&quot;.</li>
+<li><strong>Base64 inflates attachments by 33%.</strong> A 25 MB message limit is an ~18.75 MB file, and the overhead is paid on every hop.</li>
+<li><strong>The read/unread denormalisation can leave an email in both tables or neither.</strong> Two writes with no transaction. Use a batch the engine retries, and make the read path repair what it finds.</li>
+<li><strong><code>user_id</code> partitioning prohibits shared mailboxes.</strong> A real product requirement that this schema cannot express without fan-out or a second cross-shard access path.</li>
+<li><strong>A single enormous mailbox is a hot partition.</strong> A user with a million messages, or a mailing-list address receiving thousands an hour, concentrates on one shard — and <code>user_id</code> partitioning gives you no way to split them, because every query assumes one mailbox lives in one place.</li>
+<li><strong>Thread reconstruction depends on headers that clients get wrong.</strong> <code>In-Reply-To</code> and <code>References</code> are set by the sending client; many set them incorrectly or not at all, and subject-line heuristics then have to paper over it. Threads are therefore a best-effort presentation, not a data structure you can trust.</li>
+<li><strong>Sorting by date means sorting by a header the sender controls.</strong> The <code>Date</code> header can be wrong, absent, or deliberately set in the future to pin a message to the top of the inbox. Keep your own receive timestamp and sort by that.</li>
+<li><strong>Duplicate delivery is normal.</strong> SMTP retries after an ambiguous failure, so the same message can arrive twice. <code>Message-Id</code> is the deduplication key — the idempotency key of <a href="19-distributed-message-queue.html">Chapter 19</a> under an older name.</li>
+<li><strong>Spam false positives are worse than false negatives.</strong> Discarding legitimate mail is indistinguishable from losing it, against a stated requirement that data loss is unacceptable. Quarantine rather than delete, and make the quarantine visible.</li>
+<li><strong>The search index is write-amplified for a rarely used feature.</strong> Every received message is indexed; few users search. Worth measuring before optimising anything else about search.</li>
+<li><strong>Forwarding rules create loops.</strong> Two accounts forwarding to each other, or a filter that re-delivers into the same mailbox, will amplify without bound. Hop counts and loop detection headers exist for this.</li>
+<li><strong>Mail is the most phished channel in existence.</strong> Display-name spoofing, lookalike domains and attachment-borne malware are routine, so link rewriting, attachment scanning and prominent authentication indicators are product features rather than extras.</li>
+<li><strong>A custom storage engine is the realistic answer at this scale and an unrealistic interview answer.</strong> Gmail runs on BigTable; the chapter is right that the useful move is to state the required <em>characteristics</em> rather than to design a database.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Interoperating with every other mail server</td>
+<td>SMTP for transfer, MX records for routing, store-and-forward with retry</td>
+</tr>
+<tr>
+<td>Rich web clients</td>
+<td>HTTP/REST API instead of IMAP/POP, while still supporting both for native clients</td>
+</tr>
+<tr>
+<td>Every operation concerning one mailbox</td>
+<td>Partition metadata by <code>user_id</code>; no cross-shard transactions</td>
+</tr>
+<tr>
+<td>Reading an email must stay read</td>
+<td>Choose consistency over availability; blast radius limited to one shard</td>
+</tr>
+<tr>
+<td>Querying by read/unread in a partition-key store</td>
+<td>Denormalised <code>read</code> and <code>unread</code> tables, written together</td>
+</tr>
+<tr>
+<td>Sorting a folder by time</td>
+<td><code>timeuuid</code> message IDs, used as the clustering key</td>
+</tr>
+<tr>
+<td>1,460 PB/year of attachments, mostly duplicated</td>
+<td>Content-addressed attachment storage with reference counting</td>
+</tr>
+<tr>
+<td>One email to many recipients</td>
+<td>Fan-out on write — unavoidable under federation</td>
+</tr>
+<tr>
+<td>Full-text search</td>
+<td>Small per-user index, sharded by <code>user_id</code>; async reindex via Kafka</td>
+</tr>
+<tr>
+<td>Write-heavy index maintenance</td>
+<td>LSM-tree storage optimised for sequential writes</td>
+</tr>
+<tr>
+<td>Landing in the inbox rather than spam</td>
+<td>SPF, DKIM and DMARC; dedicated warmed IPs; traffic separation</td>
+</tr>
+<tr>
+<td>Protecting sender reputation</td>
+<td>Bounce classification and suppression; ISP feedback loops; fast spammer bans</td>
+</tr>
+<tr>
+<td>Duplicate deliveries from SMTP retries</td>
+<td>Deduplicate on <code>Message-Id</code></td>
+</tr>
+<tr>
+<td>Conversation threads</td>
+<td><code>Message-Id</code> / <code>In-Reply-To</code> / <code>References</code> headers, interpreted best-effort</td>
+</tr>
+<tr>
+<td>Surviving a data centre loss</td>
+<td>Multi-DC replication with leader-follower failover</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>What makes this system structurally different from every other chapter in the book?</li>
+<li>In what sense is SMTP a message queue, and which two of its behaviours correspond to retry and dead-lettering?</li>
+<li>Which line item dominates storage, and what is the single largest optimisation available against it?</li>
+<li>Why is the push-versus-pull fan-out question from Chapter 11 not available here?</li>
+<li>Why does <code>user_id</code> work so well as a shard key, and which earlier chapter shows the same key failing?</li>
+<li>What product feature does that partitioning prohibit?</li>
+<li>Marking an email as read requires two writes. What are the two failure modes, and how are they handled?</li>
+<li>Why does this chapter choose consistency over availability, and what makes that affordable?</li>
+<li>Give three reasons email search is easier than web search, and the one way it is harder.</li>
+<li>What do SPF, DKIM and DMARC each assert, and why does DKIM survive forwarding when SPF does not?</li>
+<li>Why does failing to process hard bounces damage deliverability?</li>
+<li>A 25 MB attachment limit admits a file of what size, and why?</li>
+<li>Why can't you trust the <code>Date</code> header for sorting, or <code>In-Reply-To</code> for threading?</li>
+<li>Why is a spam false positive worse than a false negative here?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SMTP / POP / IMAP</strong></td>
+<td>Server-to-server transfer; download-and-delete retrieval; server-side retrieval</td>
+</tr>
+<tr>
+<td><strong>MX record</strong></td>
+<td>DNS record naming a domain's mail servers, with priorities for fallback</td>
+</tr>
+<tr>
+<td><strong>Store-and-forward</strong></td>
+<td>Queueing a message and retrying delivery over hours before bouncing</td>
+</tr>
+<tr>
+<td><strong>Hard / soft bounce</strong></td>
+<td>Permanent (<code>5xx</code>) vs temporary (<code>4xx</code>) delivery failure</td>
+</tr>
+<tr>
+<td><strong>SPF</strong></td>
+<td>DNS record listing IPs permitted to send for a domain</td>
+</tr>
+<tr>
+<td><strong>DKIM</strong></td>
+<td>Domain signature over a message, verifiable via a DNS-published public key</td>
+</tr>
+<tr>
+<td><strong>DMARC</strong></td>
+<td>Policy and reporting layer telling receivers what to do when SPF/DKIM fail</td>
+</tr>
+<tr>
+<td><strong>IP warm-up</strong></td>
+<td>Gradually increasing send volume on a new IP to build reputation</td>
+</tr>
+<tr>
+<td><strong>Feedback loop (ARF)</strong></td>
+<td>Machine-readable complaint reports from ISPs</td>
+</tr>
+<tr>
+<td><strong>Complaint rate</strong></td>
+<td>Fraction of recipients marking mail as spam; ~0.1% is the danger threshold</td>
+</tr>
+<tr>
+<td><strong>Content-addressed storage</strong></td>
+<td>Storing attachments keyed by the hash of their bytes, so duplicates collapse</td>
+</tr>
+<tr>
+<td><strong><code>timeuuid</code></strong></td>
+<td>Time-ordered UUID used as a clustering key so folders sort chronologically</td>
+</tr>
+<tr>
+<td><strong>Denormalised index</strong></td>
+<td>Duplicate tables (<code>read</code> / <code>unread</code>) standing in for a secondary index</td>
+</tr>
+<tr>
+<td><strong><code>Message-Id</code> / <code>In-Reply-To</code> / <code>References</code></strong></td>
+<td>Headers used for deduplication and thread reconstruction</td>
+</tr>
+<tr>
+<td><strong>Greylisting</strong></td>
+<td>Temporarily rejecting an unknown sender, since real servers retry and many spammers do not</td>
+</tr>
+<tr>
+<td><strong>LSM-tree</strong></td>
+<td>Write-optimised storage structure suited to the index's write-heavy profile</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="15-google-drive.html#improved-design">Chapter 15 – Design Google Drive</a> — content-addressed storage and dedup, including why deletion becomes reference counting.</li>
+<li><a href="06-key-value-store.html">Chapter 6 – Design A Key-Value Store</a> — the LSM-tree storage and the CAP trade-off this chapter resolves the other way.</li>
+<li><a href="19-distributed-message-queue.html">Chapter 19 – Distributed Message Queue</a> — the modern description of what SMTP has been doing since 1982.</li>
+<li><a href="10-notification-system.html#retries-the-part-that-is-usually-wrong">Chapter 10 – Design A Notification System</a> — bounce classification and the third-party deliverability boundary, from the sender's side.</li>
+<li><a href="13-search-autocomplete.html">Chapter 13 – Design A Search Autocomplete System</a> — search where the index is global and reads dominate; the mirror image of this one.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

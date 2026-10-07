@@ -1,0 +1,21 @@
+{
+  "_comment": "Where each animated explainer is injected. Keyed by output page slug. 'afterSection' is the GitHub anchor slug of the H2 section the figure is appended to; the markdown is never edited. If afterSection does not match a real section the build fails loudly rather than silently dropping the animation.",
+  "05-consistent-hashing": [
+    {
+      "afterSection": "affected-keys",
+      "module": "anim-consistent-hashing.js",
+      "mount": "anim-consistent-hashing",
+      "title": "Try it: how many keys actually move?",
+      "caption": "Add and remove servers and watch the share of keys that get remapped. Switch between plain <code>hash(key) % N</code> and the hash ring to see the difference the chapter is describing."
+    }
+  ],
+  "04-rate-limiter": [
+    {
+      "afterSection": "step-3-rate-limiting-algorithms",
+      "module": "anim-rate-limiter.js",
+      "mount": "anim-rate-limiter",
+      "title": "Try it: the five algorithms on one traffic stream",
+      "caption": "Every panel sees exactly the same requests. Send a steady trickle, then a burst, then a burst that straddles a window boundary, and watch where each algorithm accepts and where it rejects."
+    }
+  ]
+}

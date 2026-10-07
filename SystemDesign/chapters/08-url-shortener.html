@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 8: Design a URL Shortener — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="08-url-shortener">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 1 Systems › Chapter 8 of 28</div>
+  <h1>Chapter 8: Design a URL Shortener</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-high-level-design">Step 1: High-Level Design</a></li><li><a href="#step-2-deep-dive-into-design">Step 2: Deep Dive into Design</a></li><li><a href="#additional-considerations">Additional Considerations</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>This chapter discusses the design of a URL shortening service like TinyURL. The system's main goals include <strong>URL shortening</strong>, <strong>redirecting</strong>, and <strong>high scalability</strong> to handle large traffic volumes.</p>
+<p><strong>The one-sentence version:</strong> a URL shortener is a very large, very read-heavy <strong>key-value store</strong> with one interesting question in front of it — how to mint a short, unique key — and one interesting question behind it: how to serve a redirect fast enough that nobody notices the extra hop.</p>
+<p>Almost nothing here is novel; that is the point. The chapter is a good one precisely because it forces you to assemble pieces from earlier chapters — the ID generator from <a href="07-unique-id-generator.html">Chapter 7</a>, the cache and CDN from <a href="01-scaling.html#section-6-caching">Chapter 1</a>, the key-value store from <a href="06-key-value-store.html">Chapter 6</a> — and the interesting parts are the trade-offs between them.</p>
+<h3 id="requirements">Requirements</h3>
+<ul>
+<li>Shortened URLs must be <strong>unique</strong> and as <strong>short as possible</strong>.</li>
+<li>Handle <strong>100 million URL generations per day</strong> with a 10-year support capacity.</li>
+<li>Support <strong>efficient read operations</strong> with a 10:1 read-to-write ratio.</li>
+<li>Store 365 billion records, requiring approximately <strong>365 TB</strong> of storage over 10 years.</li>
+</ul>
+<h3 id="where-those-numbers-come-from">Where those numbers come from</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Derivation</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Write QPS</td>
+<td>100 M / 86,400 s</td>
+<td><strong>~1,160 writes/sec</strong></td>
+</tr>
+<tr>
+<td>Read QPS</td>
+<td>10 × write QPS</td>
+<td><strong>~11,600 reads/sec</strong></td>
+</tr>
+<tr>
+<td>Records in 10 years</td>
+<td>100 M/day × 365 × 10</td>
+<td><strong>365 billion</strong></td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>365 B × ~500 bytes per record</td>
+<td><strong>~365 TB</strong></td>
+</tr>
+<tr>
+<td>Short key length</td>
+<td>smallest <code>n</code> with <code>62^n ≥ 365 B</code></td>
+<td><strong>7 characters</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Two conclusions fall straight out of this table and should shape everything that follows.</p>
+<p>First, <strong>1,160 writes/sec is not a hard problem</strong> — a single well-provisioned database can do that. 365 TB <em>is</em> a hard problem, so the pressure is on storage volume, not write throughput.</p>
+<p>Second, <strong>the read path is the product</strong>. A redirect sits between a user's click and the page they wanted, so its latency is pure added cost. Everything on that path should be cache-shaped.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>doing this estimation out loud buys you the rest of the interview. It tells you to shard for capacity rather than for write throughput, to put a cache in front of reads, and that 7 characters is the answer to &quot;how short can it be?&quot; — all before drawing a box.</p>
+</div>
+<hr>
+</section>
+<section id="step-1-high-level-design">
+<h2 id="step-1-high-level-design">Step 1: High-Level Design</h2>
+<h3 id="api-endpoints">API Endpoints</h3>
+<ol>
+<li>
+<p><strong>URL Shortening:</strong></p>
+<ul>
+<li>Endpoint: <code>POST api/v1/data/shorten</code></li>
+<li>Parameters: <code>{longUrl: longURLString}</code></li>
+<li>Returns: <code>shortURL</code></li>
+</ul>
+</li>
+<li>
+<p><strong>URL Redirecting:</strong></p>
+<ul>
+<li>Endpoint: <code>GET api/v1/shortUrl</code></li>
+<li>Returns: <code>longURL</code> for redirection.</li>
+</ul>
+ <p align="center">
+ <img loading="lazy" decoding="async" src="../../system-design-notes/08.%20URL%20Shortener/images/url-redirection.png" alt="URL Redirection" data-width="600" style="max-width:600px">
+ </p>
+</li>
+</ol>
+<h3 id="url-redirection">URL Redirection</h3>
+<ul>
+<li><strong>301 Redirect:</strong>  A 301 redirect shows that the requested URL is “permanently” moved to the long URL. The browser caches the response, and
+subsequent requests for the same URL will not be sent to the URL shortening service.</li>
+<li><strong>302 Redirect:</strong> Temporary; useful for analytics like tracking clicks.</li>
+</ul>
+<p>This is the first real trade-off in the chapter, and it is a trade between <strong>your server load</strong> and <strong>your control over the link</strong>:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>301 Moved Permanently</th>
+<th>302 Found</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Browser caches the mapping</td>
+<td>Yes, often indefinitely</td>
+<td>No (or only per <code>Cache-Control</code>)</td>
+</tr>
+<tr>
+<td>Load on your servers</td>
+<td>Much lower — repeat clicks never reach you</td>
+<td>Full — every click is a request</td>
+</tr>
+<tr>
+<td>Click analytics</td>
+<td>Lost after the first click per browser</td>
+<td>Complete</td>
+</tr>
+<tr>
+<td>Can you change the destination later?</td>
+<td><strong>Effectively no</strong> for anyone who has the cached copy</td>
+<td>Yes, immediately</td>
+</tr>
+<tr>
+<td>Can you revoke a malicious link?</td>
+<td><strong>No</strong> — the browser never asks again</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>SEO link equity</td>
+<td>Passed to the target</td>
+<td>Not reliably passed</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>In practice commercial shorteners choose <strong>302</strong>, because analytics is the business model and revocation is a legal necessity. A 301 is the right choice only when the link is a permanent alias you will never need to retarget or take down — and &quot;never&quot; is a strong claim. Note that the choice is not binary: a 302 with a modest <code>Cache-Control: max-age</code> recovers some of the load reduction while keeping the ability to change course within the TTL.</p>
+<h3 id="url-shortening">URL Shortening</h3>
+<p align="center">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/08.%20URL%20Shortener/images/url-shortening.png" alt="URL Shortening" data-width="400" style="max-width:400px">
+</p>
+<ul>
+<li>Use a <strong>hash function</strong> to generate a short URL, mapping long URLs to unique shortened versions.</li>
+<li>The hash function must satisfy the following requirements:
+<ul>
+<li>Each longURL must be hashed to one hashValue.</li>
+<li>Each hashValue can be mapped back to the longURL.</li>
+</ul>
+</li>
+</ul>
+<p>The second requirement is worth reading carefully: &quot;each hashValue can be mapped back to the longURL&quot; does <strong>not</strong> mean the function is mathematically invertible. It means you store the mapping. The short key is a <em>name</em> for a database row, not a compressed form of the URL — 7 characters cannot possibly encode an arbitrary 200-character URL, so the only mechanism available is a lookup table.</p>
+<hr>
+</section>
+<section id="step-2-deep-dive-into-design">
+<h2 id="step-2-deep-dive-into-design">Step 2: Deep Dive into Design</h2>
+<h3 id="data-model">Data Model</h3>
+<p>Store <code>&lt;shortURL, longURL&gt;</code> mappings in a relational database to optimize memory usage. The table schema includes:</p>
+<ul>
+<li>
+<p><code>id</code> (primary key),</p>
+</li>
+<li>
+<p><code>shortURL</code>,</p>
+</li>
+<li>
+<p><code>longURL</code>.</p>
+  <img loading="lazy" decoding="async" src="../../system-design-notes/08.%20URL%20Shortener/images/table-schema.png" alt="Table Schema" data-width="300" style="max-width:300px">
+</li>
+</ul>
+<p>In practice the row grows a few more columns, and each one exists for a reason established above:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Why it is there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>shortURL</code> (unique)</td>
+<td>The lookup key for the read path; must be indexed, and it is the real primary key of the workload</td>
+</tr>
+<tr>
+<td><code>longURL</code></td>
+<td>The redirect target</td>
+</tr>
+<tr>
+<td><code>createdAt</code></td>
+<td>Expiry, auditing, and abuse investigation</td>
+</tr>
+<tr>
+<td><code>expiresAt</code></td>
+<td>Link rot and storage reclamation — see the gotchas</td>
+</tr>
+<tr>
+<td><code>userId</code></td>
+<td>Ownership, so a link can be revoked, rate-limited, or reported on</td>
+</tr>
+<tr>
+<td><code>longURLHash</code> (indexed)</td>
+<td>Deduplication without indexing a long, variable-length string</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The relational model is chosen here for simplicity, but nothing about the workload needs it: there are no joins, no transactions spanning rows, and the access pattern is a single-key lookup. This is the canonical shape for the key-value store of <a href="06-key-value-store.html">Chapter 6</a>, and at 365 TB that is the more honest answer.</p>
+<h3 id="hash-function">Hash Function</h3>
+<h4 id="1-base-62-conversion">1. Base 62 Conversion:</h4>
+<ul>
+<li>Encodes numbers using characters <code>[0-9, a-z, A-Z]</code>, providing <strong>62 possible characters</strong>.</li>
+<li>Base conversion is another approach commonly used for URL shorteners.</li>
+<li>A unique id can be assigned to the short url and ID can be base 62 converted to get the short URL.</li>
+<li>A 7-character hash supports up to <strong>3.5 trillion unique URLs</strong>, enough for 365 billion URLs.</li>
+</ul>
+<p><strong>Example:</strong><br>
+Convert ID <code>2009215674938</code> to Base 62:</p>
+<ul>
+<li><code>2009215674938</code> → <code>zn9edcu</code>.</li>
+</ul>
+<p><strong>Why exactly 7.</strong> The length is not a guess; it is the smallest <code>n</code> that covers the 365 billion from the estimation:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Length</th>
+<th><code>62^n</code></th>
+<th>Enough for 365 B?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>5</td>
+<td>916 million</td>
+<td>No</td>
+</tr>
+<tr>
+<td>6</td>
+<td>56.8 billion</td>
+<td>No</td>
+</tr>
+<tr>
+<td>7</td>
+<td><strong>3.52 trillion</strong></td>
+<td><strong>Yes, ~10× headroom</strong></td>
+</tr>
+<tr>
+<td>8</td>
+<td>218 trillion</td>
+<td>Yes, but a wasted character</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>62 is itself a choice: it is the alphanumeric characters, which survive being typed, printed, read aloud, and embedded in a URL without encoding. Base 64 would need <code>+</code> and <code>/</code>, which require percent-encoding in a path and defeat the purpose.</p>
+<h4 id="2-hash--collision-resolution">2. Hash + Collision Resolution:</h4>
+<ul>
+<li>
+<p>Use hash functions like CRC32, MD5, or SHA-1.</p>
+  <img loading="lazy" decoding="async" src="../../system-design-notes/08.%20URL%20Shortener/images/hash-function.png" alt="Hash Function" data-width="500" style="max-width:500px">
+</li>
+<li>
+<p>One approach is to collect the first 7 characters of a hash value; however, this method can lead to hash collisions.</p>
+</li>
+<li>
+<p>To resolve collisions,recursively append a new predefined string until no more collision but this can be expensive.</p>
+</li>
+<li>
+<p>Resolve collisions with <strong>Bloom Filters</strong> for efficient lookup.</p>
+  <p align="center">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/08.%20URL%20Shortener/images/url-lookup.png" alt="URL Lookup" data-width="500" style="max-width:500px">
+  </p>
+</li>
+</ul>
+<p><strong>How often do collisions actually happen?</strong> Seven base-62 characters is about 41.7 bits of space. By the birthday bound, a 50% chance of <em>some</em> collision arrives after roughly <code>sqrt(2^41.7) ≈ 1.9 million</code> URLs — which this system generates in under half an hour. Collisions are therefore not an edge case to be handled defensively; they are a <strong>routine, continuous event</strong>, and every insert must check.</p>
+<p>That check is the expensive part: a lookup against a 365-billion-row table on the write path. The Bloom filter is what makes it affordable — it answers &quot;is this key definitely free?&quot; from memory, with no false negatives, so the overwhelming majority of inserts skip the database read entirely and only the rare &quot;possibly taken&quot; answer pays for a real lookup. This is the same Bloom filter as the read path in <a href="06-key-value-store.html">Chapter 6</a>, used for the same reason: avoid a disk access to prove a negative.</p>
+<h3 id="comparison">Comparison</h3>
+<ul>
+<li>
+<p><strong>Hash + Collision Resolution:</strong></p>
+<ul>
+<li>Fixed short URL length</li>
+<li>Does not need a unique ID generator</li>
+<li>Collision is possbile and needs resolution</li>
+<li>Not possible to find the next available short URL because it does not depend on ID</li>
+</ul>
+</li>
+<li>
+<p><strong>Base 62 Conversion</strong></p>
+<ul>
+<li>The length is not fixed and goes up with ID</li>
+<li>It needs a unique ID generator</li>
+<li>Collision is not possbile</li>
+<li>Easy to find the next short URL if ID increments by 1 (Can be a security concern)</li>
+</ul>
+</li>
+</ul>
+<p>The last bullet deserves more than a parenthesis. If <code>shortURL = base62(auto_increment_id)</code>, then anyone holding one of your links can <strong>enumerate every link in your system</strong> by decrementing, and can measure your total volume by decoding their own key. For a public shortener that is both a privacy breach — short links are routinely used for private documents — and a competitive intelligence leak. It is the ID-enumeration problem from <a href="07-unique-id-generator.html#gotchas--failure-modes">Chapter 7</a>, arriving with real consequences.</p>
+<p>Two fixes, neither exotic:</p>
+<ul>
+<li><strong>Obfuscate the ID</strong> before encoding — multiply by a constant coprime to <code>62^7</code> modulo <code>62^7</code>, or run a small Feistel permutation. The mapping stays bijective (so still no collisions) but the sequence looks random.</li>
+<li><strong>Pick the key at random</strong> and rely on the collision check. This spends a Bloom-filter lookup per insert to buy unguessable keys.</li>
+</ul>
+<p><strong>Choosing between the two approaches, in one line:</strong> base-62 of a generated ID if you control the namespace and can obfuscate it; random-key-with-collision-check if keys are public and guessability matters. The truncated-hash variant is the weakest of the three — it has the collision cost of random keys without their uniform distribution.</p>
+<hr>
+<h3 id="url-shortening-flow">URL Shortening Flow</h3>
+<p align="center">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/08.%20URL%20Shortener/images/url-shortening-flow.png" alt="URL Shortening" data-width="500" style="max-width:500px">
+</p>
+<ol>
+<li>Check if <code>longURL</code> exists in the database.</li>
+<li>If found, return the existing <code>shortURL</code>.</li>
+<li>Otherwise:
+<ul>
+<li>Generate a unique ID using a <strong>distributed ID generator</strong>.</li>
+<li>Convert the ID to <code>shortURL</code> using Base 62.</li>
+<li>Store the <code>&lt;id, shortURL, longURL&gt;</code> mapping in the database.</li>
+</ul>
+</li>
+</ol>
+<figure class="mermaid-fig">
+<svg id="mmd-464f6a5f8bbd6df5" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 475.414px; background-color: transparent;" viewBox="0 0 475.4140625 740.421875" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-464f6a5f8bbd6df5{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-464f6a5f8bbd6df5 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-464f6a5f8bbd6df5 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-464f6a5f8bbd6df5 .error-icon{fill:#f4f6f8;}#mmd-464f6a5f8bbd6df5 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-464f6a5f8bbd6df5 .edge-thickness-normal{stroke-width:1px;}#mmd-464f6a5f8bbd6df5 .edge-thickness-thick{stroke-width:3.5px;}#mmd-464f6a5f8bbd6df5 .edge-pattern-solid{stroke-dasharray:0;}#mmd-464f6a5f8bbd6df5 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-464f6a5f8bbd6df5 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-464f6a5f8bbd6df5 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-464f6a5f8bbd6df5 .marker{fill:#637381;stroke:#637381;}#mmd-464f6a5f8bbd6df5 .marker.cross{stroke:#637381;}#mmd-464f6a5f8bbd6df5 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-464f6a5f8bbd6df5 p{margin:0;}#mmd-464f6a5f8bbd6df5 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-464f6a5f8bbd6df5 .cluster-label text{fill:#454f5b;}#mmd-464f6a5f8bbd6df5 .cluster-label span{color:#454f5b;}#mmd-464f6a5f8bbd6df5 .cluster-label span p{background-color:transparent;}#mmd-464f6a5f8bbd6df5 .label text,#mmd-464f6a5f8bbd6df5 span{fill:#161c24;color:#161c24;}#mmd-464f6a5f8bbd6df5 .node rect,#mmd-464f6a5f8bbd6df5 .node circle,#mmd-464f6a5f8bbd6df5 .node ellipse,#mmd-464f6a5f8bbd6df5 .node polygon,#mmd-464f6a5f8bbd6df5 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-464f6a5f8bbd6df5 .rough-node .label text,#mmd-464f6a5f8bbd6df5 .node .label text,#mmd-464f6a5f8bbd6df5 .image-shape .label,#mmd-464f6a5f8bbd6df5 .icon-shape .label{text-anchor:middle;}#mmd-464f6a5f8bbd6df5 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-464f6a5f8bbd6df5 .rough-node .label,#mmd-464f6a5f8bbd6df5 .node .label,#mmd-464f6a5f8bbd6df5 .image-shape .label,#mmd-464f6a5f8bbd6df5 .icon-shape .label{text-align:center;}#mmd-464f6a5f8bbd6df5 .node.clickable{cursor:pointer;}#mmd-464f6a5f8bbd6df5 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-464f6a5f8bbd6df5 .arrowheadPath{fill:#000000;}#mmd-464f6a5f8bbd6df5 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-464f6a5f8bbd6df5 .flowchart-link{stroke:#637381;fill:none;}#mmd-464f6a5f8bbd6df5 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-464f6a5f8bbd6df5 .edgeLabel p{background-color:#ffffff;}#mmd-464f6a5f8bbd6df5 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-464f6a5f8bbd6df5 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-464f6a5f8bbd6df5 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-464f6a5f8bbd6df5 .cluster text{fill:#454f5b;}#mmd-464f6a5f8bbd6df5 .cluster span{color:#454f5b;}#mmd-464f6a5f8bbd6df5 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-464f6a5f8bbd6df5 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-464f6a5f8bbd6df5 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-464f6a5f8bbd6df5 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-464f6a5f8bbd6df5 rect.text{fill:none;stroke-width:0;}#mmd-464f6a5f8bbd6df5 .icon-shape,#mmd-464f6a5f8bbd6df5 .image-shape{background-color:#ffffff;text-align:center;}#mmd-464f6a5f8bbd6df5 .icon-shape p,#mmd-464f6a5f8bbd6df5 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-464f6a5f8bbd6df5 .icon-shape .label rect,#mmd-464f6a5f8bbd6df5 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-464f6a5f8bbd6df5 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-464f6a5f8bbd6df5 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-464f6a5f8bbd6df5 .node .neo-node{stroke:#299a8d;}#mmd-464f6a5f8bbd6df5 [data-look="neo"].node rect,#mmd-464f6a5f8bbd6df5 [data-look="neo"].cluster rect,#mmd-464f6a5f8bbd6df5 [data-look="neo"].node polygon{stroke:url(#mmd-464f6a5f8bbd6df5-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-464f6a5f8bbd6df5 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-464f6a5f8bbd6df5 [data-look="neo"].node path{stroke:url(#mmd-464f6a5f8bbd6df5-gradient);stroke-width:1px;}#mmd-464f6a5f8bbd6df5 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-464f6a5f8bbd6df5 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-464f6a5f8bbd6df5 [data-look="neo"].node circle{stroke:url(#mmd-464f6a5f8bbd6df5-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-464f6a5f8bbd6df5 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-464f6a5f8bbd6df5 [data-look="neo"].icon-shape .icon{fill:url(#mmd-464f6a5f8bbd6df5-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-464f6a5f8bbd6df5 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-464f6a5f8bbd6df5-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-464f6a5f8bbd6df5 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-464f6a5f8bbd6df5_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-464f6a5f8bbd6df5_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-464f6a5f8bbd6df5_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-464f6a5f8bbd6df5_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-464f6a5f8bbd6df5_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-464f6a5f8bbd6df5_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-464f6a5f8bbd6df5_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-464f6a5f8bbd6df5_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-464f6a5f8bbd6df5_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-464f6a5f8bbd6df5_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-464f6a5f8bbd6df5_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-464f6a5f8bbd6df5_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M218.941,53L218.941,57.167C218.941,61.333,218.941,69.667,218.941,77.333C218.941,85,218.941,92,218.941,95.5L218.941,99" id="mmd-464f6a5f8bbd6df5-L_A_B_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_B_0" data-points="W3sieCI6MjE4Ljk0MTQwNjI1LCJ5Ijo1M30seyJ4IjoyMTguOTQxNDA2MjUsInkiOjc4fSx7IngiOjIxOC45NDE0MDYyNSwieSI6MTAzfV0=" data-look="classic" marker-end="url(#mmd-464f6a5f8bbd6df5_flowchart-v2-pointEnd)"/><path d="M179.38,228.861L167.911,241.371C156.441,253.881,133.502,278.902,122.032,298.412C110.563,317.922,110.563,331.922,110.563,338.922L110.563,345.922" id="mmd-464f6a5f8bbd6df5-L_B_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_C_0" data-points="W3sieCI6MTc5LjM4MDQwNTY2NDk0MTMsInkiOjIyOC44NjA4NzQ0MTQ5NDEzfSx7IngiOjExMC41NjI1LCJ5IjozMDMuOTIxODc1fSx7IngiOjExMC41NjI1LCJ5IjozNDkuOTIxODc1fV0=" data-look="classic" marker-end="url(#mmd-464f6a5f8bbd6df5_flowchart-v2-pointEnd)"/><path d="M258.502,228.861L269.972,241.371C281.442,253.881,304.381,278.902,315.851,296.662C327.32,314.422,327.32,324.922,327.32,330.172L327.32,335.422" id="mmd-464f6a5f8bbd6df5-L_B_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_D_0" data-points="W3sieCI6MjU4LjUwMjQwNjgzNTA1ODcsInkiOjIyOC44NjA4NzQ0MTQ5NDEzfSx7IngiOjMyNy4zMjAzMTI1LCJ5IjozMDMuOTIxODc1fSx7IngiOjMyNy4zMjAzMTI1LCJ5IjozMzkuNDIxODc1fV0=" data-look="classic" marker-end="url(#mmd-464f6a5f8bbd6df5_flowchart-v2-pointEnd)"/><path d="M276.518,405.422L270.103,409.589C263.689,413.755,250.86,422.089,244.446,429.755C238.031,437.422,238.031,444.422,238.031,447.922L238.031,451.422" id="mmd-464f6a5f8bbd6df5-L_D_E_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_E_0" data-points="W3sieCI6Mjc2LjUxNzkxNDg3MDY4OTY1LCJ5Ijo0MDUuNDIxODc1fSx7IngiOjIzOC4wMzEyNSwieSI6NDMwLjQyMTg3NX0seyJ4IjoyMzguMDMxMjUsInkiOjQ1NS40MjE4NzV9XQ==" data-look="classic" marker-end="url(#mmd-464f6a5f8bbd6df5_flowchart-v2-pointEnd)"/><path d="M238.031,500.422L238.031,504.589C238.031,508.755,238.031,517.089,243.887,525.059C249.742,533.029,261.453,540.636,267.308,544.439L273.163,548.243" id="mmd-464f6a5f8bbd6df5-L_E_F_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_E_F_0" data-points="W3sieCI6MjM4LjAzMTI1LCJ5Ijo1MDAuNDIxODc1fSx7IngiOjIzOC4wMzEyNSwieSI6NTI1LjQyMTg3NX0seyJ4IjoyNzYuNTE3OTE0ODcwNjg5NjUsInkiOjU1MC40MjE4NzV9XQ==" data-look="classic" marker-end="url(#mmd-464f6a5f8bbd6df5_flowchart-v2-pointEnd)"/><path d="M378.123,550.422L384.537,546.255C390.952,542.089,403.78,533.755,410.195,521.672C416.609,509.589,416.609,493.755,416.609,477.922C416.609,462.089,416.609,446.255,410.754,434.535C404.899,422.815,393.188,415.208,387.333,411.404L381.477,407.601" id="mmd-464f6a5f8bbd6df5-L_F_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_F_D_0" data-points="W3sieCI6Mzc4LjEyMjcxMDEyOTMxMDM1LCJ5Ijo1NTAuNDIxODc1fSx7IngiOjQxNi42MDkzNzUsInkiOjUyNS40MjE4NzV9LHsieCI6NDE2LjYwOTM3NSwieSI6NDc3LjkyMTg3NX0seyJ4Ijo0MTYuNjA5Mzc1LCJ5Ijo0MzAuNDIxODc1fSx7IngiOjM3OC4xMjI3MTAxMjkzMTAzNSwieSI6NDA1LjQyMTg3NX1d" data-look="classic" marker-end="url(#mmd-464f6a5f8bbd6df5_flowchart-v2-pointEnd)"/><path d="M327.32,616.422L327.32,622.339C327.32,628.255,327.32,640.089,327.32,651.255C327.32,662.422,327.32,672.922,327.32,678.172L327.32,683.422" id="mmd-464f6a5f8bbd6df5-L_F_G_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_F_G_0" data-points="W3sieCI6MzI3LjMyMDMxMjUsInkiOjYxNi40MjE4NzV9LHsieCI6MzI3LjMyMDMxMjUsInkiOjY1MS45MjE4NzV9LHsieCI6MzI3LjMyMDMxMjUsInkiOjY4Ny40MjE4NzV9XQ==" data-look="classic" marker-end="url(#mmd-464f6a5f8bbd6df5_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_A_B_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(110.5625, 303.921875)"><g class="label" data-id="L_B_C_0" transform="translate(-11.1015625, -10.5)"><foreignObject width="22.203125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>yes</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(327.3203125, 303.921875)"><g class="label" data-id="L_B_D_0" transform="translate(-8.0703125, -10.5)"><foreignObject width="16.140625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>no</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_D_E_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_E_F_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(416.609375, 477.921875)"><g class="label" data-id="L_F_D_0" transform="translate(-50.8046875, -10.5)"><foreignObject width="101.609375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>unique violation</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(327.3203125, 651.921875)"><g class="label" data-id="L_F_G_0" transform="translate(-7.7890625, -10.5)"><foreignObject width="15.578125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>ok</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-464f6a5f8bbd6df5-flowchart-A-0" data-look="classic" transform="translate(218.94140625, 30.5)"><rect class="basic label-container" style="" x="-101.515625" y="-22.5" width="203.03125" height="45"/><g class="label" style="" transform="translate(-77.515625, -10.5)"><rect/><foreignObject width="155.03125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>POST /shorten {longUrl}</p></span></div></foreignObject></g></g><g class="node default" id="mmd-464f6a5f8bbd6df5-flowchart-B-1" data-look="classic" transform="translate(218.94140625, 185.7109375)"><polygon points="82.7109375,0 165.421875,-82.7109375 82.7109375,-165.421875 0,-82.7109375" class="label-container" transform="translate(-82.2109375, 82.7109375)"/><g class="label" style="" transform="translate(-49.7109375, -21)"><rect/><foreignObject width="99.421875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>longURLHash<br />already stored?</p></span></div></foreignObject></g></g><g class="node default" id="mmd-464f6a5f8bbd6df5-flowchart-C-3" data-look="classic" transform="translate(110.5625, 372.421875)"><rect class="basic label-container" style="" x="-102.5625" y="-22.5" width="205.125" height="45"/><g class="label" style="" transform="translate(-78.5625, -10.5)"><rect/><foreignObject width="157.125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>return existing shortURL</p></span></div></foreignObject></g></g><g class="node default" id="mmd-464f6a5f8bbd6df5-flowchart-D-5" data-look="classic" transform="translate(327.3203125, 372.421875)"><rect class="basic label-container" style="" x="-64.1953125" y="-33" width="128.390625" height="66"/><g class="label" style="" transform="translate(-40.1953125, -21)"><rect/><foreignObject width="80.390625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>ID generator<br />(Chapter 7)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-464f6a5f8bbd6df5-flowchart-E-7" data-look="classic" transform="translate(238.03125, 477.921875)"><rect class="basic label-container" style="" x="-92.7734375" y="-22.5" width="185.546875" height="45"/><g class="label" style="" transform="translate(-68.7734375, -10.5)"><rect/><foreignObject width="137.546875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>base62(id) → 7 chars</p></span></div></foreignObject></g></g><g class="node default" id="mmd-464f6a5f8bbd6df5-flowchart-F-9" data-look="classic" transform="translate(327.3203125, 583.421875)"><rect class="basic label-container" style="" x="-106.5234375" y="-33" width="213.046875" height="66"/><g class="label" style="" transform="translate(-82.5234375, -21)"><rect/><foreignObject width="165.046875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>INSERT with unique index<br />on shortURL</p></span></div></foreignObject></g></g><g class="node default" id="mmd-464f6a5f8bbd6df5-flowchart-G-13" data-look="classic" transform="translate(327.3203125, 709.921875)"><rect class="basic label-container" style="" x="-75.7578125" y="-22.5" width="151.515625" height="45"/><g class="label" style="" transform="translate(-51.7578125, -10.5)"><rect/><foreignObject width="103.515625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>return shortURL</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-464f6a5f8bbd6df5-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-464f6a5f8bbd6df5-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-464f6a5f8bbd6df5-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p><strong>Step 1 is not free, and it is not obviously correct.</strong> Deduplicating by long URL means an indexed lookup on a variable-length string in a 365 TB table — hence the <code>longURLHash</code> column, which turns it into a fixed-width index probe. But the deeper question is whether to dedupe at all:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Dedupe (one short URL per long URL)</th>
+<th>Always mint a new key</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Storage</td>
+<td>Lower</td>
+<td>Higher, by the duplicate rate</td>
+</tr>
+<tr>
+<td>Per-campaign analytics</td>
+<td><strong>Impossible</strong> — two marketers sharing a destination share a counter</td>
+<td>Clean separation</td>
+</tr>
+<tr>
+<td>Per-link expiry or revocation</td>
+<td>Impossible — one link, two owners</td>
+<td>Independent</td>
+</tr>
+<tr>
+<td>Write path</td>
+<td>Extra index lookup</td>
+<td>Straight insert</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Commercial shorteners mint a new key every time, because distinguishing <em>who shared what</em> is the entire value of the product. The book's dedupe step is the simpler design, not the better one.</p>
+<p><strong>The race nobody mentions.</strong> Two concurrent requests for the same long URL both miss the check in step 1 and both insert — producing two short URLs for one destination. If dedupe actually matters, it has to be enforced by a <strong>unique index on <code>longURLHash</code></strong>, not by a read-then-write. The same applies to the short key itself: the unique index on <code>shortURL</code> is the real guarantee, and the Bloom filter is only an optimisation that keeps you from hitting it.</p>
+<hr>
+<h3 id="url-redirecting-flow">URL Redirecting Flow</h3>
+<p align="center">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/08.%20URL%20Shortener/images/url-redirecting-flow.png" alt="URL Shortening" data-width="600" style="max-width:600px">
+</p>
+<ol>
+<li>User clicks a <code>shortURL</code>.</li>
+<li>Query <code>&lt;shortURL, longURL&gt;</code> mapping:
+<ul>
+<li>Check the <strong>cache</strong> first for faster access.</li>
+<li>If not in the cache, query the database.</li>
+</ul>
+</li>
+<li>Redirect the user to <code>longURL</code>.</li>
+</ol>
+<figure class="mermaid-fig">
+<svg id="mmd-e886bbd18cb01459" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" style="max-width: 1042px; background-color: transparent;" viewBox="-50 -10 1042 707" role="graphics-document document" aria-roledescription="sequence"><g><rect x="792" y="621" fill="#eaeaea" stroke="#666" width="150" height="65" name="DB" rx="3" ry="3" class="actor actor-bottom"/><text x="867" y="653.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="867" dy="0">Datastore</tspan></text></g><g><rect x="602" y="621" fill="#eaeaea" stroke="#666" width="150" height="65" name="C" rx="3" ry="3" class="actor actor-bottom"/><text x="677" y="653.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="677" dy="0">Cache</tspan></text></g><g><rect x="380" y="621" fill="#eaeaea" stroke="#666" width="150" height="65" name="W" rx="3" ry="3" class="actor actor-bottom"/><text x="455" y="653.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="455" dy="0">Web server</tspan></text></g><g><rect x="190" y="621" fill="#eaeaea" stroke="#666" width="150" height="65" name="LB" rx="3" ry="3" class="actor actor-bottom"/><text x="265" y="653.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="265" dy="0">Load balancer</tspan></text></g><g><rect x="0" y="621" fill="#eaeaea" stroke="#666" width="150" height="65" name="U" rx="3" ry="3" class="actor actor-bottom"/><text x="75" y="653.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="75" dy="0">Browser</tspan></text></g><g><line id="actor4" x1="867" y1="65" x2="867" y2="621" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="DB" data-et="life-line" data-id="DB"/><g id="root-4" data-et="participant" data-type="participant" data-id="DB"><rect x="792" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="DB" rx="3" ry="3" class="actor actor-top"/><text x="867" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="867" dy="0">Datastore</tspan></text></g></g><g><line id="actor3" x1="677" y1="65" x2="677" y2="621" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="C" data-et="life-line" data-id="C"/><g id="root-3" data-et="participant" data-type="participant" data-id="C"><rect x="602" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="C" rx="3" ry="3" class="actor actor-top"/><text x="677" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="677" dy="0">Cache</tspan></text></g></g><g><line id="actor2" x1="455" y1="65" x2="455" y2="621" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="W" data-et="life-line" data-id="W"/><g id="root-2" data-et="participant" data-type="participant" data-id="W"><rect x="380" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="W" rx="3" ry="3" class="actor actor-top"/><text x="455" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="455" dy="0">Web server</tspan></text></g></g><g><line id="actor1" x1="265" y1="65" x2="265" y2="621" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="LB" data-et="life-line" data-id="LB"/><g id="root-1" data-et="participant" data-type="participant" data-id="LB"><rect x="190" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="LB" rx="3" ry="3" class="actor actor-top"/><text x="265" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="265" dy="0">Load balancer</tspan></text></g></g><g><line id="actor0" x1="75" y1="65" x2="75" y2="621" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="U" data-et="life-line" data-id="U"/><g id="root-0" data-et="participant" data-type="participant" data-id="U"><rect x="0" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="U" rx="3" ry="3" class="actor actor-top"/><text x="75" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="75" dy="0">Browser</tspan></text></g></g><style>#mmd-e886bbd18cb01459{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-e886bbd18cb01459 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-e886bbd18cb01459 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-e886bbd18cb01459 .error-icon{fill:#f4f6f8;}#mmd-e886bbd18cb01459 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-e886bbd18cb01459 .edge-thickness-normal{stroke-width:1px;}#mmd-e886bbd18cb01459 .edge-thickness-thick{stroke-width:3.5px;}#mmd-e886bbd18cb01459 .edge-pattern-solid{stroke-dasharray:0;}#mmd-e886bbd18cb01459 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-e886bbd18cb01459 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-e886bbd18cb01459 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-e886bbd18cb01459 .marker{fill:#637381;stroke:#637381;}#mmd-e886bbd18cb01459 .marker.cross{stroke:#637381;}#mmd-e886bbd18cb01459 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-e886bbd18cb01459 p{margin:0;}#mmd-e886bbd18cb01459 .actor{stroke:#299a8d;fill:#f1f7f6;stroke-width:1;}#mmd-e886bbd18cb01459 rect.actor.outer-path[data-look="neo"]{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e886bbd18cb01459 rect.note[data-look="neo"]{stroke:#e76f51;fill:#fcf4f2;filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e886bbd18cb01459 text.actor&gt;tspan{fill:#161c24;stroke:none;}#mmd-e886bbd18cb01459 .actor-line{stroke:#299a8d;}#mmd-e886bbd18cb01459 .innerArc{stroke-width:1.5;stroke-dasharray:none;}#mmd-e886bbd18cb01459 .messageLine0{stroke-width:1.5;stroke-dasharray:none;stroke:#454f5b;}#mmd-e886bbd18cb01459 .messageLine1{stroke-width:1.5;stroke-dasharray:2,2;stroke:#454f5b;}#mmd-e886bbd18cb01459 [id$="-arrowhead"] path{fill:#454f5b;stroke:#454f5b;}#mmd-e886bbd18cb01459 .sequenceNumber{fill:#ffffff;}#mmd-e886bbd18cb01459 [id$="-sequencenumber"]{fill:#454f5b;}#mmd-e886bbd18cb01459 [id$="-crosshead"] path{fill:#454f5b;stroke:#454f5b;}#mmd-e886bbd18cb01459 .messageText{fill:#161c24;stroke:none;}#mmd-e886bbd18cb01459 .labelBox{stroke:#299a8d;fill:#f1f7f6;filter:none;}#mmd-e886bbd18cb01459 .labelText,#mmd-e886bbd18cb01459 .labelText&gt;tspan{fill:#161c24;stroke:none;}#mmd-e886bbd18cb01459 .loopText,#mmd-e886bbd18cb01459 .loopText&gt;tspan{fill:#161c24;stroke:none;}#mmd-e886bbd18cb01459 .sectionTitle,#mmd-e886bbd18cb01459 .sectionTitle&gt;tspan{fill:#161c24;stroke:none;}#mmd-e886bbd18cb01459 .loopLine{stroke-width:2px;stroke-dasharray:2,2;stroke:#299a8d;fill:#299a8d;}#mmd-e886bbd18cb01459 .note{stroke:#e76f51;fill:#fcf4f2;}#mmd-e886bbd18cb01459 .noteText,#mmd-e886bbd18cb01459 .noteText&gt;tspan{fill:#161c24;stroke:none;font-weight:normal;}#mmd-e886bbd18cb01459 .activation0{fill:#b5e0dd;stroke:hsl(12, 62.5%, 86.862745098%);}#mmd-e886bbd18cb01459 .activation1{fill:#b5e0dd;stroke:hsl(12, 62.5%, 86.862745098%);}#mmd-e886bbd18cb01459 .activation2{fill:#b5e0dd;stroke:hsl(12, 62.5%, 86.862745098%);}#mmd-e886bbd18cb01459 .actorPopupMenu{position:absolute;}#mmd-e886bbd18cb01459 .actorPopupMenuPanel{position:absolute;fill:#f1f7f6;box-shadow:0px 8px 16px 0px rgba(0,0,0,0.2);filter:drop-shadow(3px 5px 2px rgb(0 0 0 / 0.4));}#mmd-e886bbd18cb01459 .actor-man circle,#mmd-e886bbd18cb01459 line{fill:#f1f7f6;stroke-width:2px;}#mmd-e886bbd18cb01459 g rect.rect{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));stroke:#299a8d;}#mmd-e886bbd18cb01459 .node .neo-node{stroke:#299a8d;}#mmd-e886bbd18cb01459 [data-look="neo"].node rect,#mmd-e886bbd18cb01459 [data-look="neo"].cluster rect,#mmd-e886bbd18cb01459 [data-look="neo"].node polygon{stroke:url(#mmd-e886bbd18cb01459-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e886bbd18cb01459 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-e886bbd18cb01459 [data-look="neo"].node path{stroke:url(#mmd-e886bbd18cb01459-gradient);stroke-width:1px;}#mmd-e886bbd18cb01459 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e886bbd18cb01459 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-e886bbd18cb01459 [data-look="neo"].node circle{stroke:url(#mmd-e886bbd18cb01459-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e886bbd18cb01459 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-e886bbd18cb01459 [data-look="neo"].icon-shape .icon{fill:url(#mmd-e886bbd18cb01459-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e886bbd18cb01459 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-e886bbd18cb01459-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e886bbd18cb01459 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g/><defs><symbol id="mmd-e886bbd18cb01459-computer" width="24" height="24"><path transform="scale(.5)" d="M2 2v13h20v-13h-20zm18 11h-16v-9h16v9zm-10.228 6l.466-1h3.524l.467 1h-4.457zm14.228 3h-24l2-6h2.104l-1.33 4h18.45l-1.297-4h2.073l2 6zm-5-10h-14v-7h14v7z"/></symbol></defs><defs><symbol id="mmd-e886bbd18cb01459-database" fill-rule="evenodd" clip-rule="evenodd"><path transform="scale(.5)" d="M12.258.001l.256.004.255.005.253.008.251.01.249.012.247.015.246.016.242.019.241.02.239.023.236.024.233.027.231.028.229.031.225.032.223.034.22.036.217.038.214.04.211.041.208.043.205.045.201.046.198.048.194.05.191.051.187.053.183.054.18.056.175.057.172.059.168.06.163.061.16.063.155.064.15.066.074.033.073.033.071.034.07.034.069.035.068.035.067.035.066.035.064.036.064.036.062.036.06.036.06.037.058.037.058.037.055.038.055.038.053.038.052.038.051.039.05.039.048.039.047.039.045.04.044.04.043.04.041.04.04.041.039.041.037.041.036.041.034.041.033.042.032.042.03.042.029.042.027.042.026.043.024.043.023.043.021.043.02.043.018.044.017.043.015.044.013.044.012.044.011.045.009.044.007.045.006.045.004.045.002.045.001.045v17l-.001.045-.002.045-.004.045-.006.045-.007.045-.009.044-.011.045-.012.044-.013.044-.015.044-.017.043-.018.044-.02.043-.021.043-.023.043-.024.043-.026.043-.027.042-.029.042-.03.042-.032.042-.033.042-.034.041-.036.041-.037.041-.039.041-.04.041-.041.04-.043.04-.044.04-.045.04-.047.039-.048.039-.05.039-.051.039-.052.038-.053.038-.055.038-.055.038-.058.037-.058.037-.06.037-.06.036-.062.036-.064.036-.064.036-.066.035-.067.035-.068.035-.069.035-.07.034-.071.034-.073.033-.074.033-.15.066-.155.064-.16.063-.163.061-.168.06-.172.059-.175.057-.18.056-.183.054-.187.053-.191.051-.194.05-.198.048-.201.046-.205.045-.208.043-.211.041-.214.04-.217.038-.22.036-.223.034-.225.032-.229.031-.231.028-.233.027-.236.024-.239.023-.241.02-.242.019-.246.016-.247.015-.249.012-.251.01-.253.008-.255.005-.256.004-.258.001-.258-.001-.256-.004-.255-.005-.253-.008-.251-.01-.249-.012-.247-.015-.245-.016-.243-.019-.241-.02-.238-.023-.236-.024-.234-.027-.231-.028-.228-.031-.226-.032-.223-.034-.22-.036-.217-.038-.214-.04-.211-.041-.208-.043-.204-.045-.201-.046-.198-.048-.195-.05-.19-.051-.187-.053-.184-.054-.179-.056-.176-.057-.172-.059-.167-.06-.164-.061-.159-.063-.155-.064-.151-.066-.074-.033-.072-.033-.072-.034-.07-.034-.069-.035-.068-.035-.067-.035-.066-.035-.064-.036-.063-.036-.062-.036-.061-.036-.06-.037-.058-.037-.057-.037-.056-.038-.055-.038-.053-.038-.052-.038-.051-.039-.049-.039-.049-.039-.046-.039-.046-.04-.044-.04-.043-.04-.041-.04-.04-.041-.039-.041-.037-.041-.036-.041-.034-.041-.033-.042-.032-.042-.03-.042-.029-.042-.027-.042-.026-.043-.024-.043-.023-.043-.021-.043-.02-.043-.018-.044-.017-.043-.015-.044-.013-.044-.012-.044-.011-.045-.009-.044-.007-.045-.006-.045-.004-.045-.002-.045-.001-.045v-17l.001-.045.002-.045.004-.045.006-.045.007-.045.009-.044.011-.045.012-.044.013-.044.015-.044.017-.043.018-.044.02-.043.021-.043.023-.043.024-.043.026-.043.027-.042.029-.042.03-.042.032-.042.033-.042.034-.041.036-.041.037-.041.039-.041.04-.041.041-.04.043-.04.044-.04.046-.04.046-.039.049-.039.049-.039.051-.039.052-.038.053-.038.055-.038.056-.038.057-.037.058-.037.06-.037.061-.036.062-.036.063-.036.064-.036.066-.035.067-.035.068-.035.069-.035.07-.034.072-.034.072-.033.074-.033.151-.066.155-.064.159-.063.164-.061.167-.06.172-.059.176-.057.179-.056.184-.054.187-.053.19-.051.195-.05.198-.048.201-.046.204-.045.208-.043.211-.041.214-.04.217-.038.22-.036.223-.034.226-.032.228-.031.231-.028.234-.027.236-.024.238-.023.241-.02.243-.019.245-.016.247-.015.249-.012.251-.01.253-.008.255-.005.256-.004.258-.001.258.001zm-9.258 20.499v.01l.001.021.003.021.004.022.005.021.006.022.007.022.009.023.01.022.011.023.012.023.013.023.015.023.016.024.017.023.018.024.019.024.021.024.022.025.023.024.024.025.052.049.056.05.061.051.066.051.07.051.075.051.079.052.084.052.088.052.092.052.097.052.102.051.105.052.11.052.114.051.119.051.123.051.127.05.131.05.135.05.139.048.144.049.147.047.152.047.155.047.16.045.163.045.167.043.171.043.176.041.178.041.183.039.187.039.19.037.194.035.197.035.202.033.204.031.209.03.212.029.216.027.219.025.222.024.226.021.23.02.233.018.236.016.24.015.243.012.246.01.249.008.253.005.256.004.259.001.26-.001.257-.004.254-.005.25-.008.247-.011.244-.012.241-.014.237-.016.233-.018.231-.021.226-.021.224-.024.22-.026.216-.027.212-.028.21-.031.205-.031.202-.034.198-.034.194-.036.191-.037.187-.039.183-.04.179-.04.175-.042.172-.043.168-.044.163-.045.16-.046.155-.046.152-.047.148-.048.143-.049.139-.049.136-.05.131-.05.126-.05.123-.051.118-.052.114-.051.11-.052.106-.052.101-.052.096-.052.092-.052.088-.053.083-.051.079-.052.074-.052.07-.051.065-.051.06-.051.056-.05.051-.05.023-.024.023-.025.021-.024.02-.024.019-.024.018-.024.017-.024.015-.023.014-.024.013-.023.012-.023.01-.023.01-.022.008-.022.006-.022.006-.022.004-.022.004-.021.001-.021.001-.021v-4.127l-.077.055-.08.053-.083.054-.085.053-.087.052-.09.052-.093.051-.095.05-.097.05-.1.049-.102.049-.105.048-.106.047-.109.047-.111.046-.114.045-.115.045-.118.044-.12.043-.122.042-.124.042-.126.041-.128.04-.13.04-.132.038-.134.038-.135.037-.138.037-.139.035-.142.035-.143.034-.144.033-.147.032-.148.031-.15.03-.151.03-.153.029-.154.027-.156.027-.158.026-.159.025-.161.024-.162.023-.163.022-.165.021-.166.02-.167.019-.169.018-.169.017-.171.016-.173.015-.173.014-.175.013-.175.012-.177.011-.178.01-.179.008-.179.008-.181.006-.182.005-.182.004-.184.003-.184.002h-.37l-.184-.002-.184-.003-.182-.004-.182-.005-.181-.006-.179-.008-.179-.008-.178-.01-.176-.011-.176-.012-.175-.013-.173-.014-.172-.015-.171-.016-.17-.017-.169-.018-.167-.019-.166-.02-.165-.021-.163-.022-.162-.023-.161-.024-.159-.025-.157-.026-.156-.027-.155-.027-.153-.029-.151-.03-.15-.03-.148-.031-.146-.032-.145-.033-.143-.034-.141-.035-.14-.035-.137-.037-.136-.037-.134-.038-.132-.038-.13-.04-.128-.04-.126-.041-.124-.042-.122-.042-.12-.044-.117-.043-.116-.045-.113-.045-.112-.046-.109-.047-.106-.047-.105-.048-.102-.049-.1-.049-.097-.05-.095-.05-.093-.052-.09-.051-.087-.052-.085-.053-.083-.054-.08-.054-.077-.054v4.127zm0-5.654v.011l.001.021.003.021.004.021.005.022.006.022.007.022.009.022.01.022.011.023.012.023.013.023.015.024.016.023.017.024.018.024.019.024.021.024.022.024.023.025.024.024.052.05.056.05.061.05.066.051.07.051.075.052.079.051.084.052.088.052.092.052.097.052.102.052.105.052.11.051.114.051.119.052.123.05.127.051.131.05.135.049.139.049.144.048.147.048.152.047.155.046.16.045.163.045.167.044.171.042.176.042.178.04.183.04.187.038.19.037.194.036.197.034.202.033.204.032.209.03.212.028.216.027.219.025.222.024.226.022.23.02.233.018.236.016.24.014.243.012.246.01.249.008.253.006.256.003.259.001.26-.001.257-.003.254-.006.25-.008.247-.01.244-.012.241-.015.237-.016.233-.018.231-.02.226-.022.224-.024.22-.025.216-.027.212-.029.21-.03.205-.032.202-.033.198-.035.194-.036.191-.037.187-.039.183-.039.179-.041.175-.042.172-.043.168-.044.163-.045.16-.045.155-.047.152-.047.148-.048.143-.048.139-.05.136-.049.131-.05.126-.051.123-.051.118-.051.114-.052.11-.052.106-.052.101-.052.096-.052.092-.052.088-.052.083-.052.079-.052.074-.051.07-.052.065-.051.06-.05.056-.051.051-.049.023-.025.023-.024.021-.025.02-.024.019-.024.018-.024.017-.024.015-.023.014-.023.013-.024.012-.022.01-.023.01-.023.008-.022.006-.022.006-.022.004-.021.004-.022.001-.021.001-.021v-4.139l-.077.054-.08.054-.083.054-.085.052-.087.053-.09.051-.093.051-.095.051-.097.05-.1.049-.102.049-.105.048-.106.047-.109.047-.111.046-.114.045-.115.044-.118.044-.12.044-.122.042-.124.042-.126.041-.128.04-.13.039-.132.039-.134.038-.135.037-.138.036-.139.036-.142.035-.143.033-.144.033-.147.033-.148.031-.15.03-.151.03-.153.028-.154.028-.156.027-.158.026-.159.025-.161.024-.162.023-.163.022-.165.021-.166.02-.167.019-.169.018-.169.017-.171.016-.173.015-.173.014-.175.013-.175.012-.177.011-.178.009-.179.009-.179.007-.181.007-.182.005-.182.004-.184.003-.184.002h-.37l-.184-.002-.184-.003-.182-.004-.182-.005-.181-.007-.179-.007-.179-.009-.178-.009-.176-.011-.176-.012-.175-.013-.173-.014-.172-.015-.171-.016-.17-.017-.169-.018-.167-.019-.166-.02-.165-.021-.163-.022-.162-.023-.161-.024-.159-.025-.157-.026-.156-.027-.155-.028-.153-.028-.151-.03-.15-.03-.148-.031-.146-.033-.145-.033-.143-.033-.141-.035-.14-.036-.137-.036-.136-.037-.134-.038-.132-.039-.13-.039-.128-.04-.126-.041-.124-.042-.122-.043-.12-.043-.117-.044-.116-.044-.113-.046-.112-.046-.109-.046-.106-.047-.105-.048-.102-.049-.1-.049-.097-.05-.095-.051-.093-.051-.09-.051-.087-.053-.085-.052-.083-.054-.08-.054-.077-.054v4.139zm0-5.666v.011l.001.02.003.022.004.021.005.022.006.021.007.022.009.023.01.022.011.023.012.023.013.023.015.023.016.024.017.024.018.023.019.024.021.025.022.024.023.024.024.025.052.05.056.05.061.05.066.051.07.051.075.052.079.051.084.052.088.052.092.052.097.052.102.052.105.051.11.052.114.051.119.051.123.051.127.05.131.05.135.05.139.049.144.048.147.048.152.047.155.046.16.045.163.045.167.043.171.043.176.042.178.04.183.04.187.038.19.037.194.036.197.034.202.033.204.032.209.03.212.028.216.027.219.025.222.024.226.021.23.02.233.018.236.017.24.014.243.012.246.01.249.008.253.006.256.003.259.001.26-.001.257-.003.254-.006.25-.008.247-.01.244-.013.241-.014.237-.016.233-.018.231-.02.226-.022.224-.024.22-.025.216-.027.212-.029.21-.03.205-.032.202-.033.198-.035.194-.036.191-.037.187-.039.183-.039.179-.041.175-.042.172-.043.168-.044.163-.045.16-.045.155-.047.152-.047.148-.048.143-.049.139-.049.136-.049.131-.051.126-.05.123-.051.118-.052.114-.051.11-.052.106-.052.101-.052.096-.052.092-.052.088-.052.083-.052.079-.052.074-.052.07-.051.065-.051.06-.051.056-.05.051-.049.023-.025.023-.025.021-.024.02-.024.019-.024.018-.024.017-.024.015-.023.014-.024.013-.023.012-.023.01-.022.01-.023.008-.022.006-.022.006-.022.004-.022.004-.021.001-.021.001-.021v-4.153l-.077.054-.08.054-.083.053-.085.053-.087.053-.09.051-.093.051-.095.051-.097.05-.1.049-.102.048-.105.048-.106.048-.109.046-.111.046-.114.046-.115.044-.118.044-.12.043-.122.043-.124.042-.126.041-.128.04-.13.039-.132.039-.134.038-.135.037-.138.036-.139.036-.142.034-.143.034-.144.033-.147.032-.148.032-.15.03-.151.03-.153.028-.154.028-.156.027-.158.026-.159.024-.161.024-.162.023-.163.023-.165.021-.166.02-.167.019-.169.018-.169.017-.171.016-.173.015-.173.014-.175.013-.175.012-.177.01-.178.01-.179.009-.179.007-.181.006-.182.006-.182.004-.184.003-.184.001-.185.001-.185-.001-.184-.001-.184-.003-.182-.004-.182-.006-.181-.006-.179-.007-.179-.009-.178-.01-.176-.01-.176-.012-.175-.013-.173-.014-.172-.015-.171-.016-.17-.017-.169-.018-.167-.019-.166-.02-.165-.021-.163-.023-.162-.023-.161-.024-.159-.024-.157-.026-.156-.027-.155-.028-.153-.028-.151-.03-.15-.03-.148-.032-.146-.032-.145-.033-.143-.034-.141-.034-.14-.036-.137-.036-.136-.037-.134-.038-.132-.039-.13-.039-.128-.041-.126-.041-.124-.041-.122-.043-.12-.043-.117-.044-.116-.044-.113-.046-.112-.046-.109-.046-.106-.048-.105-.048-.102-.048-.1-.05-.097-.049-.095-.051-.093-.051-.09-.052-.087-.052-.085-.053-.083-.053-.08-.054-.077-.054v4.153zm8.74-8.179l-.257.004-.254.005-.25.008-.247.011-.244.012-.241.014-.237.016-.233.018-.231.021-.226.022-.224.023-.22.026-.216.027-.212.028-.21.031-.205.032-.202.033-.198.034-.194.036-.191.038-.187.038-.183.04-.179.041-.175.042-.172.043-.168.043-.163.045-.16.046-.155.046-.152.048-.148.048-.143.048-.139.049-.136.05-.131.05-.126.051-.123.051-.118.051-.114.052-.11.052-.106.052-.101.052-.096.052-.092.052-.088.052-.083.052-.079.052-.074.051-.07.052-.065.051-.06.05-.056.05-.051.05-.023.025-.023.024-.021.024-.02.025-.019.024-.018.024-.017.023-.015.024-.014.023-.013.023-.012.023-.01.023-.01.022-.008.022-.006.023-.006.021-.004.022-.004.021-.001.021-.001.021.001.021.001.021.004.021.004.022.006.021.006.023.008.022.01.022.01.023.012.023.013.023.014.023.015.024.017.023.018.024.019.024.02.025.021.024.023.024.023.025.051.05.056.05.06.05.065.051.07.052.074.051.079.052.083.052.088.052.092.052.096.052.101.052.106.052.11.052.114.052.118.051.123.051.126.051.131.05.136.05.139.049.143.048.148.048.152.048.155.046.16.046.163.045.168.043.172.043.175.042.179.041.183.04.187.038.191.038.194.036.198.034.202.033.205.032.21.031.212.028.216.027.22.026.224.023.226.022.231.021.233.018.237.016.241.014.244.012.247.011.25.008.254.005.257.004.26.001.26-.001.257-.004.254-.005.25-.008.247-.011.244-.012.241-.014.237-.016.233-.018.231-.021.226-.022.224-.023.22-.026.216-.027.212-.028.21-.031.205-.032.202-.033.198-.034.194-.036.191-.038.187-.038.183-.04.179-.041.175-.042.172-.043.168-.043.163-.045.16-.046.155-.046.152-.048.148-.048.143-.048.139-.049.136-.05.131-.05.126-.051.123-.051.118-.051.114-.052.11-.052.106-.052.101-.052.096-.052.092-.052.088-.052.083-.052.079-.052.074-.051.07-.052.065-.051.06-.05.056-.05.051-.05.023-.025.023-.024.021-.024.02-.025.019-.024.018-.024.017-.023.015-.024.014-.023.013-.023.012-.023.01-.023.01-.022.008-.022.006-.023.006-.021.004-.022.004-.021.001-.021.001-.021-.001-.021-.001-.021-.004-.021-.004-.022-.006-.021-.006-.023-.008-.022-.01-.022-.01-.023-.012-.023-.013-.023-.014-.023-.015-.024-.017-.023-.018-.024-.019-.024-.02-.025-.021-.024-.023-.024-.023-.025-.051-.05-.056-.05-.06-.05-.065-.051-.07-.052-.074-.051-.079-.052-.083-.052-.088-.052-.092-.052-.096-.052-.101-.052-.106-.052-.11-.052-.114-.052-.118-.051-.123-.051-.126-.051-.131-.05-.136-.05-.139-.049-.143-.048-.148-.048-.152-.048-.155-.046-.16-.046-.163-.045-.168-.043-.172-.043-.175-.042-.179-.041-.183-.04-.187-.038-.191-.038-.194-.036-.198-.034-.202-.033-.205-.032-.21-.031-.212-.028-.216-.027-.22-.026-.224-.023-.226-.022-.231-.021-.233-.018-.237-.016-.241-.014-.244-.012-.247-.011-.25-.008-.254-.005-.257-.004-.26-.001-.26.001z"/></symbol></defs><defs><symbol id="mmd-e886bbd18cb01459-clock" width="24" height="24"><path transform="scale(.5)" d="M12 2c5.514 0 10 4.486 10 10s-4.486 10-10 10-10-4.486-10-10 4.486-10 10-10zm0-2c-6.627 0-12 5.373-12 12s5.373 12 12 12 12-5.373 12-12-5.373-12-12-12zm5.848 12.459c.202.038.202.333.001.372-1.907.361-6.045 1.111-6.547 1.111-.719 0-1.301-.582-1.301-1.301 0-.512.77-5.447 1.125-7.445.034-.192.312-.181.343.014l.985 6.238 5.394 1.011z"/></symbol></defs><defs><marker id="mmd-e886bbd18cb01459-arrowhead" refX="7.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M -1 0 L 10 5 L 0 10 z"/></marker></defs><defs><marker id="mmd-e886bbd18cb01459-crosshead" markerWidth="15" markerHeight="8" orient="auto" refX="4" refY="4.5"><path fill="none" stroke="#000000" stroke-width="1pt" d="M 1,2 L 6,7 M 6,2 L 1,7" style="stroke-dasharray: 0, 0;"/></marker></defs><defs><marker id="mmd-e886bbd18cb01459-filled-head" refX="15.5" refY="7" markerWidth="20" markerHeight="28" orient="auto"><path d="M 18,7 L9,13 L14,7 L9,1 Z"/></marker></defs><defs><marker id="mmd-e886bbd18cb01459-sequencenumber" refX="15" refY="15" markerWidth="60" markerHeight="40" orient="auto"><circle cx="15" cy="15" r="6"/></marker></defs><defs><marker id="mmd-e886bbd18cb01459-solidTopArrowHead" refX="7.9" refY="7.25" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 10 8 L 0 8 z"/></marker></defs><defs><marker id="mmd-e886bbd18cb01459-solidBottomArrowHead" refX="7.9" refY="0.75" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 10 0 L 0 8 z"/></marker></defs><defs><marker id="mmd-e886bbd18cb01459-stickTopArrowHead" refX="7.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 7 7" stroke="black" stroke-width="1.5" fill="none"/></marker></defs><defs><marker id="mmd-e886bbd18cb01459-stickBottomArrowHead" refX="7.5" refY="0" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 7 L 7 0" stroke="black" stroke-width="1.5" fill="none"/></marker></defs><g data-et="control-structure" data-id="i9"><line x1="444" y1="207" x2="878" y2="207" class="loopLine"/><line x1="878" y1="207" x2="878" y2="473" class="loopLine"/><line x1="444" y1="473" x2="878" y2="473" class="loopLine"/><line x1="444" y1="207" x2="444" y2="473" class="loopLine"/><line x1="444" y1="301" x2="878" y2="301" class="loopLine" style="stroke-dasharray: 3, 3;"/><polygon points="444,207 494,207 494,220 485.6,227 444,227" class="labelBox"/><text x="469" y="220" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="labelText" style="font-size: 16px; font-weight: 400;">alt</text><text x="686" y="225" text-anchor="middle" class="loopText" style="font-size: 16px; font-weight: 400;"><tspan x="686">[cache hit (the common case)]</tspan></text><text x="661" y="319" text-anchor="middle" class="sectionTitle" style="font-size: 16px; font-weight: 400;">[cache miss]</text></g><g data-et="note" data-id="i11"><rect x="375" y="527" fill="#EDF2AE" stroke="#666" width="160" height="74" class="note"/><text x="455" y="532" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="noteText" dy="1em" style="font-size: 16px; font-weight: 400;"><tspan x="455">click event published</tspan></text><text x="455" y="550" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="noteText" dy="1em" style="font-size: 16px; font-weight: 400;"><tspan x="455">asynchronously to the</tspan></text><text x="455" y="568" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="noteText" dy="1em" style="font-size: 16px; font-weight: 400;"><tspan x="455">analytics pipeline</tspan></text></g><text x="169" y="80" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">GET /zn9edcu</text><line x1="76" y1="109" x2="261" y2="109" class="messageLine0" data-et="message" data-id="i0" data-from="U" data-to="LB" stroke-width="2" stroke="none" marker-end="url(#mmd-e886bbd18cb01459-arrowhead)" style="fill: none;"/><text x="359" y="124" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">forward</text><line x1="266" y1="153" x2="451" y2="153" class="messageLine0" data-et="message" data-id="i1" data-from="LB" data-to="W" stroke-width="2" stroke="none" marker-end="url(#mmd-e886bbd18cb01459-arrowhead)" style="fill: none;"/><text x="565" y="168" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">GET zn9edcu</text><line x1="456" y1="197" x2="673" y2="197" class="messageLine0" data-et="message" data-id="i2" data-from="W" data-to="C" stroke-width="2" stroke="none" marker-end="url(#mmd-e886bbd18cb01459-arrowhead)" style="fill: none;"/><text x="568" y="257" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">longURL</text><line x1="676" y1="286" x2="459" y2="286" class="messageLine1" data-et="message" data-id="i4" data-from="C" data-to="W" stroke-width="2" stroke="none" marker-end="url(#mmd-e886bbd18cb01459-arrowhead)" style="stroke-dasharray: 3, 3; fill: none;"/><text x="660" y="346" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">SELECT longURL WHERE shortURL = ?</text><line x1="456" y1="375" x2="863" y2="375" class="messageLine0" data-et="message" data-id="i6" data-from="W" data-to="DB" stroke-width="2" stroke="none" marker-end="url(#mmd-e886bbd18cb01459-arrowhead)" style="fill: none;"/><text x="663" y="390" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">longURL</text><line x1="866" y1="419" x2="459" y2="419" class="messageLine1" data-et="message" data-id="i7" data-from="DB" data-to="W" stroke-width="2" stroke="none" marker-end="url(#mmd-e886bbd18cb01459-arrowhead)" style="stroke-dasharray: 3, 3; fill: none;"/><text x="565" y="434" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">SET zn9edcu (with TTL)</text><line x1="456" y1="463" x2="673" y2="463" class="messageLine0" data-et="message" data-id="i8" data-from="W" data-to="C" stroke-width="2" stroke="none" marker-end="url(#mmd-e886bbd18cb01459-arrowhead)" style="fill: none;"/><text x="267" y="488" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">302 Location: longURL</text><line x1="454" y1="517" x2="79" y2="517" class="messageLine1" data-et="message" data-id="i10" data-from="W" data-to="U" stroke-width="2" stroke="none" marker-end="url(#mmd-e886bbd18cb01459-arrowhead)" style="stroke-dasharray: 3, 3; fill: none;"/></svg>
+</figure>
+<p><strong>Why the cache works so well here.</strong> Link popularity is extremely skewed — a small number of links take the great majority of clicks, and a link's traffic is concentrated in the hours after it is shared. That makes the working set small and recency-biased, which is exactly the profile LRU handles well. A cache sized to a few per cent of the key space can serve well over 90% of reads, so the 365 TB datastore only sees the long tail.</p>
+<p><strong>The click event must not be on the critical path.</strong> At 11,600 reads/sec, logging each click synchronously would add a write to every redirect — and the analytics write load (one per click) is an order of magnitude larger than the link-creation write load (one per shorten). Publish the event to a queue and let the redirect return immediately; this is the decoupling argument from <a href="01-scaling.html#section-10-message-queue">Chapter 1 §10</a>, and the pipeline behind it is <a href="21-ad-click-event-aggregation.html">Chapter 21</a>.</p>
+<hr>
+</section>
+<section id="additional-considerations">
+<h2 id="additional-considerations">Additional Considerations</h2>
+<h3 id="rate-limiter">Rate Limiter</h3>
+<ul>
+<li>Prevent abuse by setting limits on requests per IP.</li>
+</ul>
+<p>IP-based limiting is the weakest version of this. Shorteners are a favourite tool for phishing and malware distribution because they hide the destination, so the write path attracts automated abuse from distributed sources. Limit per authenticated account as well as per IP (<a href="04-rate-limiter.html">Chapter 4</a>), and treat the limiter as one layer among several — domain blocklists, reputation scoring, and scanning the destination at creation time.</p>
+<h3 id="scalability">Scalability</h3>
+<ol>
+<li><strong>Web Tier:</strong> Stateless, scalable by adding/removing web servers.</li>
+<li><strong>Database Tier:</strong> Use replication and sharding.</li>
+</ol>
+<p>Sharding is unusually easy here, and for a reason worth stating: the short key is <strong>already uniformly distributed</strong> (it is either random or an obfuscated counter), so hashing it spreads data and traffic evenly with no hot shards from the key distribution itself. Contrast with <a href="07-unique-id-generator.html#gotchas--failure-modes">Chapter 7</a>, where time-ordered IDs make range sharding send every write to one shard. Shard on <code>shortURL</code>, never on <code>id</code>.</p>
+<p>Replication serves a second purpose beyond availability: redirects are read-only, so read replicas (or geographically distributed caches) let a click be served near the user, which is where the latency actually lives.</p>
+<h3 id="analytics">Analytics</h3>
+<ul>
+<li>Collect data like click rates, source, and timestamps for business insights.</li>
+</ul>
+<h3 id="high-availability-and-reliability">High Availability and Reliability</h3>
+<ul>
+<li>Ensure consistent and reliable services using database replication and fault-tolerant design.</li>
+</ul>
+<p>The asymmetry is worth making explicit: <strong>a failed shorten is an inconvenience; a failed redirect is a broken link in someone else's published content.</strong> Every link ever created is a permanent promise, embedded in emails, printed material, and other people's databases. That argues for prioritising read-path availability above everything else — serve stale cache entries rather than erroring, and prefer an AP design for reads (<a href="06-key-value-store.html#cap-theorem">Chapter 6</a>), because a slightly out-of-date destination beats a dead link.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>the three follow-ups that separate a real answer from a recited one are &quot;301 or 302, and why?&quot;, &quot;how often do collisions happen and what does that cost you?&quot;, and &quot;what stops me enumerating all your links?&quot;. Each has a concrete, quantitative answer in this chapter.</p>
+</div>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>A 301 is permanent in a way you will regret.</strong> Once browsers cache it, you cannot retarget the link, cannot revoke it when it turns out to point at malware, and cannot count clicks. There is no cache invalidation protocol for &quot;the whole internet's browsers&quot;. Default to 302.</li>
+<li><strong>Collisions are continuous, not rare.</strong> 7 base-62 characters collide with 50% probability within about 1.9 million keys. The write path <em>must</em> enforce uniqueness with a constraint; the Bloom filter only makes checking cheap.</li>
+<li><strong>Sequential keys leak everything.</strong> <code>base62(auto_increment)</code> lets anyone enumerate every link and measure your volume. Obfuscate the ID or use random keys.</li>
+<li><strong>Deduplicating by long URL destroys per-link analytics.</strong> Two unrelated users sharing a destination end up sharing a counter, an owner, and an expiry. Decide deliberately rather than inheriting it from the diagram.</li>
+<li><strong>The read-then-write dedupe check races.</strong> Two concurrent shortens of the same URL both miss and both insert. Only a unique index actually prevents it.</li>
+<li><strong>Custom aliases collide with generated keys.</strong> If users can claim <code>/launch</code>, the generator must never mint <code>launch</code>. Keep the namespaces separate (a reserved prefix, a separate table, or a blocklist checked at generation), and expect squatting of valuable short names.</li>
+<li><strong>Generated keys can spell words you do not want on your domain.</strong> With 3.5 trillion keys, some will be slurs or obscenities. Filter the generated key against a wordlist before issuing it — this is a known embarrassment for every shortener.</li>
+<li><strong>Hand-typed links hit character ambiguity.</strong> <code>0</code>/<code>O</code> and <code>1</code>/<code>l</code> are indistinguishable in many fonts. If links are meant to be read off a poster or spoken aloud, use a reduced alphabet (losing some key space) rather than the full 62.</li>
+<li><strong>Open redirect is a security feature request, not a bug report.</strong> Your service exists to redirect to arbitrary destinations, so it will be used in phishing, and your domain's reputation is the collateral. Scan destinations, honour blocklists, support takedown, and consider an interstitial warning page for untrusted targets.</li>
+<li><strong>Viral links are hot keys.</strong> One link taking a large share of traffic saturates whichever cache node owns it. Consistent hashing does not help — it balances keys, not requests (<a href="05-consistent-hashing.html#gotchas--failure-modes">Chapter 5</a>). Replicate hot entries, or cache them locally on each web server.</li>
+<li><strong>Storage grows forever unless links expire.</strong> 365 TB assumes nothing is ever deleted. Most links are clicked within days and never again, so a TTL plus background reclamation is the difference between bounded and unbounded cost — but deleting a link breaks it permanently for anyone who still has it, and any 301 you issued makes the deletion invisible to them.</li>
+<li><strong>Analytics writes dwarf link-creation writes.</strong> 11,600 clicks/sec against 1,160 creations/sec means the analytics pipeline, not the mapping store, is the larger write system. Size it accordingly and keep it off the redirect's critical path.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Keys as short as possible</td>
+<td>Base-62 alphabet; 7 characters covers 3.5 trillion</td>
+</tr>
+<tr>
+<td>Unique keys without coordination</td>
+<td>Distributed ID generator (<a href="07-unique-id-generator.html">Chapter 7</a>) plus base-62 encoding</td>
+</tr>
+<tr>
+<td>Unique keys that are unguessable</td>
+<td>Random keys, or an obfuscating permutation of the ID</td>
+</tr>
+<tr>
+<td>Detecting collisions cheaply</td>
+<td>Bloom filter on the write path, unique index as the guarantee</td>
+</tr>
+<tr>
+<td>Serving 11,600 redirects/sec</td>
+<td>Cache in front of the datastore; skewed popularity makes hit rates high</td>
+</tr>
+<tr>
+<td>365 TB of mappings</td>
+<td>Hash-shard on the short key, which is already uniformly distributed</td>
+</tr>
+<tr>
+<td>Click analytics without slowing redirects</td>
+<td>Publish events to a queue; aggregate asynchronously</td>
+</tr>
+<tr>
+<td>Keeping control of a published link</td>
+<td>302 rather than 301, so the destination stays changeable and revocable</td>
+</tr>
+<tr>
+<td>Abuse and phishing</td>
+<td>Rate limiting, destination scanning, blocklists, takedown path</td>
+</tr>
+<tr>
+<td>Bounded storage growth</td>
+<td>Expiry with background reclamation</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Derive the write and read QPS from 100 M shortens/day at a 10:1 read ratio. Which one is the hard problem, and which is storage?</li>
+<li>Why 7 characters and not 6? Why base 62 and not base 64?</li>
+<li>Give two reasons a commercial shortener uses 302 even though 301 would cut its server load dramatically.</li>
+<li>Roughly how many URLs can you mint before a 7-character collision becomes likely? What does that imply for the write path?</li>
+<li>What does the Bloom filter actually save you, and what still guarantees uniqueness?</li>
+<li><code>shortURL = base62(id)</code> with an auto-increment <code>id</code>. What can a stranger learn, and how do you fix it while keeping zero collisions?</li>
+<li>What breaks if you return an existing short URL for a long URL that has been shortened before?</li>
+<li>Two requests shorten the same URL simultaneously. What happens, and what prevents it?</li>
+<li>Why is this system unusually easy to shard, and what would you shard on?</li>
+<li>A single link goes viral and takes 30% of all clicks. Which component suffers, and why does consistent hashing not help?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Short key / short code</strong></td>
+<td>The 7-character identifier that names a stored mapping</td>
+</tr>
+<tr>
+<td><strong>Base 62</strong></td>
+<td>Encoding in <code>[0-9a-zA-Z]</code> — URL-safe without percent-encoding</td>
+</tr>
+<tr>
+<td><strong>301 vs 302</strong></td>
+<td>Permanent (browser-cached) vs temporary (always re-requested) redirect</td>
+</tr>
+<tr>
+<td><strong>Birthday bound</strong></td>
+<td>The <code>sqrt</code> rule that makes collisions likely far sooner than exhausting the space</td>
+</tr>
+<tr>
+<td><strong>Bloom filter</strong></td>
+<td>Probabilistic set membership with no false negatives; used to skip existence lookups</td>
+</tr>
+<tr>
+<td><strong>Collision resolution</strong></td>
+<td>Minting a different key when the chosen one is already taken</td>
+</tr>
+<tr>
+<td><strong>ID obfuscation</strong></td>
+<td>A bijective scramble of a counter, giving unguessable keys with no collisions</td>
+</tr>
+<tr>
+<td><strong>Deduplication</strong></td>
+<td>Returning an existing short key for a previously shortened long URL</td>
+</tr>
+<tr>
+<td><strong>Custom alias / vanity link</strong></td>
+<td>A user-chosen short key, which must not collide with generated ones</td>
+</tr>
+<tr>
+<td><strong>Link rot</strong></td>
+<td>Links outliving their usefulness, or their destinations disappearing</td>
+</tr>
+<tr>
+<td><strong>Open redirect</strong></td>
+<td>Being used to disguise a hostile destination behind a trusted domain</td>
+</tr>
+<tr>
+<td><strong>Hot key</strong></td>
+<td>One key taking a disproportionate share of traffic, saturating a single node</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="07-unique-id-generator.html">Chapter 7 – Design A Unique ID Generator</a> — where the IDs behind the short keys come from, and why sequential ones leak.</li>
+<li><a href="06-key-value-store.html">Chapter 6 – Design A Key-Value Store</a> — the datastore this system really wants, including the same Bloom filter trick.</li>
+<li><a href="01-scaling.html#section-6-caching">Chapter 1 §6 – Caching</a> — the read path, and the cache failure modes that apply directly here.</li>
+<li><a href="21-ad-click-event-aggregation.html">Chapter 21 – Ad Click Event Aggregation</a> — the click analytics pipeline, done properly.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

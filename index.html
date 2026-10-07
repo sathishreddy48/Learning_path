@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Learning Path</title>
+<link rel="stylesheet" href="SystemDesign/assets/css/site.css">
+<style>
+  .layout { display: block; }
+  .main { max-width: 56rem; margin: 0 auto; padding: 3rem 1.5rem 4rem; }
+  .path-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1.25rem; margin: 2rem 0; }
+  .path-card { display: flex; flex-direction: column; border: 1px solid var(--border); border-top: 3px solid var(--primary);
+    border-radius: var(--radius); padding: 1.25rem; background: var(--surface); text-decoration: none; color: inherit; }
+  .path-card:hover { border-color: var(--border-strong); box-shadow: 0 2px 10px rgba(22,28,36,.07); }
+  .path-card.sd { border-top-color: var(--accent); }
+  .path-card h2 { margin: 0 0 .4rem; font-size: 1.15rem; }
+  .path-card p { margin: 0 0 .9rem; font-size: .9rem; color: var(--text-muted); }
+  .path-card .meta { margin-top: auto; font-size: .78rem; color: var(--text-faint); }
+</style>
+</head>
+<body data-root="">
+<div class="layout">
+<main class="main">
+  <h1>Learning Path</h1>
+  <p class="lede">Two self-paced study sites, both offline-first and both storing their progress separately in this browser.</p>
+
+  <div class="path-cards">
+    <a class="path-card" href="DotNet/index.html">
+      <h2>C# &amp; .NET →</h2>
+      <p>The language core through threading, Web API, security, data access and patterns, then the Azure platform and the DevOps practice that ships it. Every sample paired with Python.</p>
+      <span class="meta">23 topics · C# | Python tabs</span>
+    </a>
+    <a class="path-card sd" href="SystemDesign/index.html">
+      <h2>System Design →</h2>
+      <p>Alex Xu's Insider's Guide, Volumes 1 and 2 — the scaling story, the recurring building blocks, and 28 end-to-end designs from URL shorteners to stock exchanges.</p>
+      <span class="meta">28 chapters · 274 sections · 2 interactive explainers</span>
+    </a>
+  </div>
+
+  <p class="footer-note">Both sites are static and work offline over <code>file://</code>. The System Design site is generated from
+  <code>system-design-notes/</code> by <code>tools/build-system-design.mjs</code>; the markdown stays the source of truth.</p>
+</main>
+</div>
+</body>
+</html>

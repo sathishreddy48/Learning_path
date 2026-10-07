@@ -1,0 +1,1120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 21: Ad Click Event Aggregation — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="21-ad-click-event-aggregation">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 21 of 28</div>
+  <h1>Chapter 21: Ad Click Event Aggregation</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</a></li><li><a href="#step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap up</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p><strong>Digital advertising</strong> is a big industry with the rise of Facebook, YouTube, TikTok, etc.</p>
+<p>Hence, tracking ad click events is important. In this chapter, we explore how to design an <strong>ad click event aggregation</strong> system at Facebook/Google scale.</p>
+<p>Digital advertising has a process called <strong>real-time bidding (RTB)</strong>, where digital advertising inventory is bought and sold:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/digital-advertising-example.png" alt="digital-advertising-example" data-width="500" style="max-width:500px" />
+</p>
+<p>Speed of RTB is important as it usually occurs within a second.
+Data accuracy is also very important as it impacts how much money advertisers pay.</p>
+<p>Based on ad click event aggregations, advertisers can make decisions such as adjust target audience and keywords.</p>
+<p><strong>The one-sentence version:</strong> the output of this system is <strong>money</strong> — it is what advertisers are billed from — and that single fact reorders every priority in the book. Elsewhere you trade correctness for latency and cost without much hesitation; here a 0.1% error on a billion events a day is a material financial discrepancy and a legal problem.</p>
+<p>Everything unusual about this design follows from that:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Unusual choice</th>
+<th>Because the output is money</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Event time, not processing time</td>
+<td>A click's value belongs to the minute it happened, not the minute you processed it</td>
+</tr>
+<tr>
+<td>Watermarks</td>
+<td>Late events must still be counted, so the window waits</td>
+</tr>
+<tr>
+<td>Exactly-once rather than at-least-once</td>
+<td>Double-counted clicks mean over-billing</td>
+</tr>
+<tr>
+<td>Raw events retained, not just aggregates</td>
+<td>So any number can be recomputed and audited</td>
+</tr>
+<tr>
+<td>End-of-day reconciliation</td>
+<td>The streaming result is fast; the batch result is <strong>authoritative</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>That last row is the real architecture of this chapter: <strong>the fast answer and the correct answer are produced by different paths, and the correct one wins.</strong> A streaming system alone cannot promise accuracy in the presence of late events, duplicates, and partial failures — so it does not try to. It promises speed, and a batch job promises truth.</p>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-establish-design-scope">
+<h2 id="step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</h2>
+<ul>
+<li>C: What is the format of the input data?</li>
+<li>I: 1bil ad clicks per day and 2mil ads in total. Number of ad-click events grows 30% year-over-year.</li>
+<li>C: What are some of the most important queries our system needs to support?</li>
+<li>I: Top queries to take into consideration:
+<ul>
+<li>Return number of click events for ad X in last Y minutes</li>
+<li>Return top 100 most clicked ads in the past 1min. Both parameters should be configurable. Aggregation occurs every minute.</li>
+<li>Support data filtering by <code>ip</code>, <code>user_id</code>, <code>country</code> for the above queries</li>
+</ul>
+</li>
+<li>C: Do we need to worry about edge cases? Some of the ones I can think of:
+<ul>
+<li>There might be events that arrive later than expected</li>
+<li>There might be duplicate events</li>
+<li>Different parts of the system might be down, so we need to consider system recovery</li>
+</ul>
+</li>
+<li>I: That's a good list, take those into consideration</li>
+<li>C: What is the latency requirement?</li>
+<li>I: A few minutes of e2e latency for ad click aggregation. For RTB, it is less than a second. It is ok to have that latency for ad click aggregation as those are usually used for billing and reporting.</li>
+</ul>
+<h3 id="functional-requirements"><strong>Functional requirements</strong></h3>
+<ul>
+<li>Aggregate the number of clicks of <code>ad_id</code> in the last Y minutes</li>
+<li>Return top 100 most clicked <code>ad_id</code> every minute</li>
+<li>Support aggregation filtering by different attributes</li>
+<li>Dataset volume is at Facebook or Google scale</li>
+</ul>
+<h3 id="non-functional-requirements"><strong>Non-functional requirements</strong></h3>
+<ul>
+<li>Correctness of the aggregation result is important as it's used for RTB and ads billing</li>
+<li>Properly handle delayed or duplicate events</li>
+<li>Robustness - system should be resilient to partial failures</li>
+<li>Latency - a few minutes of e2e latency at most</li>
+</ul>
+<h3 id="back-of-the-envelope-estimation"><strong>Back-of-the-envelope estimation</strong></h3>
+<ul>
+<li>1bil DAU</li>
+<li>Assuming user clicks 1 ad per day -&gt; 1bil ad clicks per day</li>
+<li>Ad click QPS = 10,000</li>
+<li>Peak QPS is 5 times the number = 50,000</li>
+<li>A single ad click occupies 0.1KB storage. Daily storage requirement is 100gb</li>
+<li>Monthly storage = 3tb</li>
+</ul>
+<h3 id="input-versus-output-and-why-you-keep-both">Input versus output, and why you keep both</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Derivation</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Click QPS</td>
+<td>1 B / 86,400</td>
+<td><strong>~11,600/sec</strong> (the chapter rounds to 10,000)</td>
+</tr>
+<tr>
+<td>Peak QPS</td>
+<td>~5×</td>
+<td><strong>~50,000/sec</strong></td>
+</tr>
+<tr>
+<td>Raw storage</td>
+<td>1 B × 0.1 KB</td>
+<td><strong>100 GB/day, ~36 TB/year</strong></td>
+</tr>
+<tr>
+<td>Aggregated cells/day</td>
+<td>2 M ads × 1,440 minutes</td>
+<td>≤ 2.9 B, mostly empty in practice</td>
+</tr>
+<tr>
+<td>Aggregated size</td>
+<td>A few tens of bytes per non-empty cell</td>
+<td><strong>Orders of magnitude smaller than raw</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The aggregated output is tiny compared with the input — and <strong>you must keep the raw input anyway.</strong> That is worth stating explicitly because it looks redundant: if nobody queries raw events, why store 36 TB a year of them?</p>
+<p>Three reasons, all consequences of the money framing:</p>
+<ol>
+<li><strong>Recomputation.</strong> A bug in aggregation logic is not hypothetical, and without raw events the wrong numbers are permanent.</li>
+<li><strong>Reconciliation.</strong> The end-of-day batch job needs an independent source of truth to compare against.</li>
+<li><strong>Audit.</strong> &quot;Why was I charged for 40,312 clicks?&quot; must be answerable from evidence, not from a derived counter.</li>
+</ol>
+<p><strong>One estimate the chapter omits: the cost of filters.</strong> The requirement is to filter by <code>ip</code>, <code>user_id</code> and <code>country</code>. Pre-aggregating every combination of <code>k</code> filter dimensions means up to <code>2^k</code> aggregates per ad per minute, and <code>user_id</code> alone has a billion distinct values — the cardinality explosion from <a href="20-metrics-monitoring-and-alerting-system.html#data-model">Chapter 20</a> in a different costume. This is exactly why the API takes a <strong>filter identifier</strong> (<code>filter=001</code> meaning &quot;non-US clicks&quot;) rather than arbitrary predicates: a small set of useful filter combinations is pre-declared and pre-aggregated, and anything else is a query against raw data, not a served aggregate. Noticing that the opaque filter ID is a <em>cardinality control</em> rather than an API shortcut is the sort of detail worth pointing out in an interview.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>say early that the output is billing data, and that this makes correctness dominate latency. Then propose the two-path structure — streaming for minutes-fresh numbers, batch reconciliation for the authoritative ones — because it pre-answers the interviewer's entire line of questioning about duplicates, late events and recovery.</p>
+</div>
+<hr>
+</section>
+<section id="step-2-propose-high-level-design-and-get-buy-in">
+<h2 id="step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</h2>
+<p>In this section, we discuss query API design, data model and high-level design.</p>
+<h3 id="query-api-design"><strong>Query API Design</strong></h3>
+<p>The API is a contract between the client and the server. In our case, the client is the dashboard user - data scientist/analyst, advertiser, etc.</p>
+<p>Here's our functional requirements:</p>
+<ul>
+<li>Aggregate the number of clicks of <code>ad_id</code> in the last Y minutes</li>
+<li>Return top N most clicked <code>ad_id</code> in the last M minutes</li>
+<li>Support aggregation filtering by different attributes</li>
+</ul>
+<p>We need two endpoints to achieve those requirements. Filtering can be done via query parameters on one of them.</p>
+<p><strong>Aggregate number of clicks of ad_id in the last M minutes</strong>:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>GET /v1/ads/{:ad_id}/aggregated_count
+</code></pre></div>
+<p>Query parameters:</p>
+<ul>
+<li>from - start minute. Default is now - 1 min</li>
+<li>to - end minute. Default is now</li>
+<li>filter - identifier for different filtering strategies. Eg 001 means &quot;non-US clicks&quot;.</li>
+</ul>
+<p>Response:</p>
+<ul>
+<li>ad_id - ad identifier</li>
+<li>count - aggregated count between start and end minutes</li>
+</ul>
+<p><strong>Return top N most clicked ad_ids in the last M minutes</strong></p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>GET /v1/ads/popular_ads
+</code></pre></div>
+<p>Query parameters:</p>
+<ul>
+<li>count - top N most clicked ads</li>
+<li>window - aggregation window size in minutes</li>
+<li>filter - identifier for different filtering strategies</li>
+</ul>
+<p>Response:</p>
+<ul>
+<li>list of ad_ids</li>
+</ul>
+<h3 id="data-model"><strong>Data model</strong></h3>
+<p>In our system, we have raw and aggregated data.</p>
+<p>Raw data looks like this:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>[AdClickEvent] ad001, 2021-01-01 00:00:01, user 1, 207.148.22.22, USA
+</code></pre></div>
+<p>Here's an example in a structured format:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>ad_id</th>
+<th>click_timestamp</th>
+<th>user</th>
+<th>ip</th>
+<th>country</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ad001</td>
+<td>2021-01-01 00:00:01</td>
+<td>user1</td>
+<td>207.148.22.22</td>
+<td>USA</td>
+</tr>
+<tr>
+<td>ad001</td>
+<td>2021-01-01 00:00:02</td>
+<td>user1</td>
+<td>207.148.22.22</td>
+<td>USA</td>
+</tr>
+<tr>
+<td>ad002</td>
+<td>2021-01-01 00:00:02</td>
+<td>user2</td>
+<td>209.153.56.11</td>
+<td>USA</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Here's the aggregated version:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>ad_id</th>
+<th>click_minute</th>
+<th>filter_id</th>
+<th>count</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ad001</td>
+<td>202101010000</td>
+<td>0012</td>
+<td>2</td>
+</tr>
+<tr>
+<td>ad001</td>
+<td>202101010000</td>
+<td>0023</td>
+<td>3</td>
+</tr>
+<tr>
+<td>ad001</td>
+<td>202101010001</td>
+<td>0012</td>
+<td>1</td>
+</tr>
+<tr>
+<td>ad001</td>
+<td>202101010001</td>
+<td>0023</td>
+<td>6</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The <code>filter_id</code> helps us achieve our filtering requirements.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>filter_id</th>
+<th>region</th>
+<th>IP</th>
+<th>user_id</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0012</td>
+<td>US</td>
+<td>*</td>
+<td>*</td>
+</tr>
+<tr>
+<td>0013</td>
+<td>*</td>
+<td>123.1.2.3</td>
+<td>*</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>To support quickly returning top N most clicked ads in the last M minutes, we'll also maintain this structure:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>most_clicked_ads</th>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>window_size</td>
+<td>integer</td>
+<td>The aggregation window size (M) in minutes</td>
+</tr>
+<tr>
+<td>update_time_minute</td>
+<td>timestamp</td>
+<td>Last updated timestamp (in 1-minute granularity)</td>
+</tr>
+<tr>
+<td>most_clicked_ads</td>
+<td>array</td>
+<td>List of ad IDs in JSON format.</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>What are some pros and cons between storing raw data and storing aggregated data?</p>
+<ul>
+<li>Raw data enables using the full data set and supports data filtering and recalculation</li>
+<li>On the other hand, aggregated data allows us to have a smaller data set and a faster query</li>
+<li>Raw data means having a larger data store and a slower query</li>
+<li>Aggregated data, however, is derived data, hence there is some data loss.</li>
+</ul>
+<p>In our design, we'll use a combination of both approaches:</p>
+<ul>
+<li>It's a good idea to keep the raw data around for debugging. If there is some bug in aggregation, we can discover the bug and backfill.</li>
+<li>Aggregated data should be stored as well for faster query performance.</li>
+<li>Raw data can be stored in cold storage to avoid extra storage costs.</li>
+</ul>
+<p>When it comes to the database, there are several factors to take into consideration:</p>
+<ul>
+<li>What does the data look like? Is it relational, document or blob?</li>
+<li>Is the workload read-heavy, write-heavy or both?</li>
+<li>Are transactions needed?</li>
+<li>Do the queries rely on OLAP functions like SUM and COUNT?</li>
+</ul>
+<p>For the raw data, we can see that the average QPS is 10k and peak QPS is 50k, so the system is write-heavy.
+On the other hand, read traffic is low as raw data is mostly used as backup if anything goes wrong.</p>
+<p>Relational databases can do the job, but it can be challenging to scale the writes.
+Alternatively, we can use Cassandra or InfluxDB which have better native support for heavy write loads.</p>
+<p>Another option is to use Amazon S3 with a columnar data format like ORC, Parquet or AVRO. Since this setup is unfamiliar, we'll stick to Cassandra.</p>
+<p>For aggregated data, the workload is both read and write heavy as aggregated data is constantly queried for dashboards and alerts.
+It is also write-heavy as data is aggregated and written every minute by the aggregation service.
+Hence, we'll use the same data store (Cassandra) here as well.</p>
+<h3 id="high-level-design"><strong>High-level design</strong></h3>
+<p>Here's how our system looks like:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/high-level-design-1.png" alt="high-level-design-1" data-width="500" style="max-width:500px" />
+</p>
+<p>Data flows as an unbounded data stream on both inputs and outputs.</p>
+<p>In order to avoid having a synchronous sink, where a consumer crashing can cause the whole system to stall,
+we'll leverage asynchronous processing using message queues (Kafka) to decouple consumers and producers.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/high-level-design-2.png" alt="high-level-design-2" data-width="500" style="max-width:500px" />
+</p>
+<p>The first message queue stores ad click event data:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>ad_id</th>
+<th>click_timestamp</th>
+<th>user_id</th>
+<th>ip</th>
+<th>country</th>
+</tr>
+</thead>
+</table>
+</div>
+<p>The second message queue contains ad click counts, aggregated per-minute:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>ad_id</th>
+<th>click_minute</th>
+<th>count</th>
+</tr>
+</thead>
+</table>
+</div>
+<p>As well as top N clicked ads aggregated per minute:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>update_time_minute</th>
+<th>most_clicked_ads</th>
+</tr>
+</thead>
+</table>
+</div>
+<p>The second message queue is there in order to achieve end to end exactly-once atomic commit semantics:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/atomic-commit.png" alt="atomic-commit" data-width="500" style="max-width:500px" />
+</p>
+<p>For the aggregation service, using the MapReduce framework is a good option:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/ad-count-map-reduce.png" alt="ad-count-map-reduce" data-width="500" style="max-width:500px" />
+</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/top-100-map-reduce.png" alt="top-100-map-reduce" data-width="500" style="max-width:500px" />
+</p>
+<p>Each node is responsible for one single task and it sends the processing result to the downstream node.</p>
+<p>The map node is responsible for reading from the data source, then filtering and transforming the data.</p>
+<p>For example, the map node can allocate data across different aggregation nodes based on the <code>ad_id</code>:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/map-node.png" alt="map-node" data-width="500" style="max-width:500px" />
+</p>
+<p>Alternatively, we can distribute ads across Kafka partitions and let the aggregation nodes subscribe directly within a consumer group.
+However, the mapping node enables us to sanitize or transform the data before subsequent processing.</p>
+<p>Another reason might be that we don't have control over how data is produced,
+so events related to the same <code>ad_id</code> might go on different partitions.</p>
+<p>The aggregate node counts ad click events by <code>ad_id</code> in-memory every minute.</p>
+<p>The reduce node collects aggregated results from aggregate node and produces the final result:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/reduce-node.png" alt="reduce-node" data-width="500" style="max-width:500px" />
+</p>
+<p>This DAG model uses the MapReduce paradigm. It takes big data and leverages parallel distributed computing to turn it into regular-sized data.</p>
+<p>In the DAG model, intermediate data is stored in-memory and different nodes communicate with each other using TCP or shared memory.</p>
+<p>Let's explore how this model can now help us to achieve our various use-cases.</p>
+<p><strong>Use-case 1 - aggregate the number of clicks</strong>:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/use-case-1.png" alt="use-case-1" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Ads are partitioned using <code>ad_id % 3</code></li>
+</ul>
+<p><strong>Use-case 2 - return top N most clicked ads</strong>:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/use-case-2.png" alt="use-case-2" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>In this case, we're aggregating the top 3 ads, but this can be extended to top N ads easily</li>
+<li>Each node maintains a heap data structure for fast retrieval of top N ads</li>
+</ul>
+<p><strong>Use-case 3 - data filtering</strong>:
+To support fast data filtering, we can predefine filtering criterias and pre-aggregate based on it:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>ad_id</th>
+<th>click_minute</th>
+<th>country</th>
+<th>count</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ad001</td>
+<td>202101010001</td>
+<td>USA</td>
+<td>100</td>
+</tr>
+<tr>
+<td>ad001</td>
+<td>202101010001</td>
+<td>GPB</td>
+<td>200</td>
+</tr>
+<tr>
+<td>ad001</td>
+<td>202101010001</td>
+<td>others</td>
+<td>3000</td>
+</tr>
+<tr>
+<td>ad002</td>
+<td>202101010001</td>
+<td>USA</td>
+<td>10</td>
+</tr>
+<tr>
+<td>ad002</td>
+<td>202101010001</td>
+<td>GPB</td>
+<td>25</td>
+</tr>
+<tr>
+<td>ad002</td>
+<td>202101010001</td>
+<td>others</td>
+<td>12</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>This technique is called the <strong>star schema</strong> and is widely used in data warehouses.
+The filtering fields are called <strong>dimensions</strong>.</p>
+<p>This approach has the following benefits:</p>
+<ul>
+<li>Simple to undertand and build</li>
+<li>Current aggregation service can be reused to create more dimensions in the star schema.</li>
+<li>Accessing data based on filtering criteria is fast as results are pre-calculated</li>
+</ul>
+<p>A limitation of this approach is that it creates many more buckets and records, especially when we have lots of filtering criterias.</p>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<p>Let's dive deeper into some of the more interesting topics.</p>
+<h3 id="streaming-vs-batching"><strong>Streaming vs. Batching</strong></h3>
+<p>The high-level architecture we proposed is a type of stream processing system.
+Here's a comparison between three types of systems:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Services (Online system)</th>
+<th>Batch system (offline system)</th>
+<th>Streaming system (near real-time system)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Responsiveness</td>
+<td>Respond to the client quickly</td>
+<td>No response to the client needed</td>
+<td>No response to the client needed</td>
+</tr>
+<tr>
+<td>Input</td>
+<td>User requests</td>
+<td>Bounded input with finite size. A large amount of data</td>
+<td>Input has no boundary (infinite streams)</td>
+</tr>
+<tr>
+<td>Output</td>
+<td>Responses to clients</td>
+<td>Materialized views, aggregated metrics, etc.</td>
+<td>Materialized views, aggregated metrics, etc.</td>
+</tr>
+<tr>
+<td>Performance measurement</td>
+<td>Availability, latency</td>
+<td>Throughput</td>
+<td>Throughput, latency</td>
+</tr>
+<tr>
+<td>Example</td>
+<td>Online shopping</td>
+<td>MapReduce</td>
+<td>Flink [13]</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>In our design, we used a mixture of batching and streaming.</p>
+<p>We used streaming for processing data as it arrives and generates aggregated results in near real-time.
+We used batching, on the other hand, for historical data backup.</p>
+<p>A system which contains two processing paths — batch and streaming — simultaneously is called a lambda architecture.
+A disadvantage is that you have two processing paths with two different codebases to maintain.</p>
+<p>Kappa is an alternative architecture, which combines batch and stream processing in one processing path.
+The key idea is to use a single stream processing engine.</p>
+<p>Lambda architecture:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/lambda-architecture.png" alt="lambda-architecture" data-width="500" style="max-width:500px" />
+</p>
+<p>Kappa architecture:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/kappa-architecture.png" alt="kappa-architecture" data-width="500" style="max-width:500px" />
+</p>
+<p>Our high-level design uses Kappa architecture as reprocessing of historical data also goes through the aggregation service.</p>
+<p>Whenever we have to recalculate aggregated data due to eg a major bug in aggregation logic, we can recalculate the aggregation from the raw data we store.</p>
+<ul>
+<li>Recalculation service retrieves data from raw storage. This is a batch job.</li>
+<li>Retrieved data is sent to a dedicated aggregation service, so that the real-time processing aggregation service is not impacted.</li>
+<li>Aggregated results are sent to the second message queue, after which we update the results in the aggregation database.</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/recalculation-example.png" alt="recalculation-example" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="time"><strong>Time</strong></h3>
+<p>We need a timestamp to perform aggregation. It can be generated in two places:</p>
+<ul>
+<li>event time - when ad click occurs</li>
+<li>Processing time - system time when the server processes the event</li>
+</ul>
+<p>Due to the usage of async processing (message queues) and network delays, there can be significant difference between event time and processing time.</p>
+<ul>
+<li>If we use processing time, aggregation results can be inaccurate</li>
+<li>If we use event time, we have to deal with delayed events</li>
+</ul>
+<p>There is no perfect solution, we need to consider trade-offs:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Pros</th>
+<th>Cons</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Event time</td>
+<td>Aggregation results are more accurate</td>
+<td>Clients might have the wrong time or timestamp might be generated by malicious users</td>
+</tr>
+<tr>
+<td>Processing time</td>
+<td>Server timestamp is more reliable</td>
+<td>The timestamp is not accurate if event is late</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Since data accuracy is important, we'll use the event time for aggregation.</p>
+<p><strong>How late can &quot;late&quot; be?</strong> This is worth bounding, because it determines how long windows must stay open and how much state the aggregation nodes must hold:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Source of lateness</th>
+<th>Typical delay</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Network and queue latency</td>
+<td>Milliseconds to seconds</td>
+</tr>
+<tr>
+<td>Consumer lag during a traffic spike</td>
+<td>Seconds to minutes</td>
+</tr>
+<tr>
+<td>A failed aggregation node being replaced</td>
+<td>Minutes</td>
+</tr>
+<tr>
+<td><strong>A mobile client that was offline</strong></td>
+<td><strong>Hours — possibly days</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The last row is the one that breaks naive designs. A phone with buffered events in a tunnel, on a plane, or with the app backgrounded will eventually upload clicks whose event time is hours old. No watermark is wide enough for that, and extending the window to cover it would delay every number by the same amount. Those events have to be handled by the reconciliation path, not the streaming path — which is another way of saying the batch job is not a safety net bolted on afterwards, it is the mechanism for a category of events the stream structurally cannot handle.</p>
+<p><strong>And since clients supply the event time, clients can lie.</strong> Timestamps far in the future, or far in the past, are either broken clocks or fraud. The practical defence is to <strong>bound acceptable event time</strong> — reject or quarantine anything outside a plausible window relative to server time — and to keep the server's receive timestamp alongside the client's claim so the two can be compared during reconciliation and fraud analysis.</p>
+<p>To mitigate the issue of delayed events, a technique called &quot;watermark&quot; can be leveraged.</p>
+<p>In the example below, event 2 misses the window where it needs to be aggregated:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/watermark-technique.png" alt="watermark-technique" data-width="500" style="max-width:500px" />
+</p>
+<p>However, if we purposefully extend the aggregation window, we can reduce the likelihood of missed events.
+The extended part of a window is called a &quot;watermark&quot;:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/watermark-2.png" alt="watermark-2" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Short watermark increases likelihood of missed events, but reduces latency</li>
+<li>Longer watermark reduces likelihood of missed events, but increases latency</li>
+</ul>
+<p>There is always likelihood of missed events, regardless of the watermark's size. But there is no use in optimizing for such low-probability events.</p>
+<p>We can instead resolve such inconsistencies by doing end-of-day reconciliation.</p>
+<p><strong>A note on terminology, because the chapter's usage is loose.</strong> In stream processing, a <em>watermark</em> is not the extended part of a window — it is an <strong>assertion about event-time progress</strong>: &quot;no events with event time earlier than T will arrive from here on&quot;. The stream engine advances the watermark based on the timestamps it has observed, and a window is closed and emitted only when the watermark passes its end. The visible effect is the one the chapter describes — windows stay open longer than their nominal end, and results arrive later — but framing it as an assertion is what makes the behaviour predictable:</p>
+<ul>
+<li>Events arriving <strong>before</strong> the watermark passes their window are counted normally.</li>
+<li>Events arriving <strong>after</strong> are <em>late</em>. The engine can drop them, route them to a side output, or re-open the window and emit a correction — and which of the three you choose is a design decision, not a default.</li>
+</ul>
+<p>For billing, &quot;drop&quot; is unacceptable and &quot;re-emit a correction&quot; means downstream must handle restatements, so the usual answer is a side output feeding the reconciliation path.</p>
+<h3 id="aggregation-window"><strong>Aggregation window</strong></h3>
+<p>There are four types of window functions:</p>
+<ul>
+<li>Tumbling (fixed) window</li>
+<li>Hopping window</li>
+<li>Sliding window</li>
+<li>Session window</li>
+</ul>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Window type</th>
+<th>Shape</th>
+<th>Each event belongs to</th>
+<th>Used here for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Tumbling (fixed)</strong></td>
+<td>Fixed size, no overlap</td>
+<td><strong>Exactly one window</strong></td>
+<td>Per-minute click counts</td>
+</tr>
+<tr>
+<td><strong>Hopping</strong></td>
+<td>Fixed size, fixed advance, may overlap</td>
+<td>Several windows</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>Sliding</strong></td>
+<td>Continuously moving window of the last M minutes</td>
+<td>Many windows</td>
+<td>Top-N over the last M minutes</td>
+</tr>
+<tr>
+<td><strong>Session</strong></td>
+<td>Bounded by a gap in activity, variable length</td>
+<td>One session</td>
+<td>User-behaviour analysis, not counting</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Why tumbling for counts and sliding for top-N</strong>, which is the substantive point:</p>
+<p>A tumbling window's defining property is that windows <strong>do not overlap</strong>, so every event is counted exactly once. That makes the per-minute counts <strong>additive</strong>: the count for an hour is the sum of its sixty minutes, and any range query can be answered by summing stored cells. For billing, where numbers must add up, non-overlapping windows are not a stylistic preference — they are what makes the stored aggregates composable and auditable.</p>
+<p>&quot;Top 100 ads in the last M minutes&quot;, by contrast, is a question about <em>now</em> that must be answerable continuously, not only at minute boundaries — hence a sliding window. The cost is that an event contributes to many overlapping windows, so the state is larger and the result is not additive.</p>
+<p>In our design, we leverage a tumbling window for ad click aggregations:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/tumbling-window.png" alt="tumbling-window" data-width="500" style="max-width:500px" />
+</p>
+<p>As well as a sliding window for the top N clicked ads in M minutes aggregation:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/sliding-window.png" alt="sliding-window" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="delivery-guarantees"><strong>Delivery guarantees</strong></h3>
+<p>Since the data we're aggregating is going to be used for billing, data accuracy is a priority.</p>
+<p>Hence, we need to discuss:</p>
+<ul>
+<li>How to avoid processing duplicate events</li>
+<li>How to ensure all events are processed</li>
+</ul>
+<p>There are three delivery guarantees we can use - at-most-once, at-least-once and exactly once.</p>
+<p>In most circumstances, at-least-once is sufficient when a small amount of duplicates is acceptable.
+This is not the case for our system, though, as a difference in small percent can result in millions of dollars of discrepancy.
+Hence, we'll need to use exactly-once delivery semantics.</p>
+<h3 id="data-deduplication"><strong>Data deduplication</strong></h3>
+<p>One of the most common data quality issues is duplicated data.</p>
+<p>It can come from a wide range of sources:</p>
+<ul>
+<li>Client-side - a client might resend the same event multiple times. Duplicated events sent with malicious intent are best handled by a risk engine.</li>
+<li>Server outage - An aggregation service node goes down in the middle of aggregation and the upstream service hasn't received an acknowledgment so event is resent.</li>
+</ul>
+<p>Here's an example of data duplication occurring due to failure to acknowledge an event on the last hop:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/data-duplication-example.png" alt="data-duplication-example" data-width="500" style="max-width:500px" />
+</p>
+<p>In this example, offset 100 will be processed and sent downstream multiple times.</p>
+<p>One option to try and mitigate this is to store the last seen offset in HDFS/S3, but this risks the result never reaching downstream:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/data-duplication-example-2.png" alt="data-duplication-example-2" data-width="500" style="max-width:500px" />
+</p>
+<p>Finally, we can store the offset while interacting with downstream atomically. To achieve this, we need to implement a distributed transaction:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/data-duplication-example-3.png" alt="data-duplication-example-3" data-width="500" style="max-width:500px" />
+</p>
+<p><strong>Personal side-note</strong>: Alternatively, if the downstream system handles the aggregation result idempotently, there is no need for a distributed transaction.</p>
+<p><strong>That side-note is the better answer, and it is worth making central.</strong> A distributed transaction spanning a message queue and a database is expensive, operationally fragile, and reduces throughput. An idempotent sink avoids the need for one entirely, and the trick is to make the write an <strong>overwrite rather than an increment</strong>:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>-- not this: replay double-counts
+UPDATE counts SET clicks = clicks + 42 WHERE ad_id = ? AND minute = ?
+
+-- this: replay is harmless, the result is the same
+UPSERT INTO counts (ad_id, minute, clicks) VALUES (?, ?, 42)
+</code></pre></div>
+<p>Because a tumbling window produces one final value per <code>(ad_id, minute)</code> cell, re-processing that window from the same input yields the same value, and writing it again changes nothing. Replay becomes safe, recovery becomes trivial, and the exactly-once requirement is satisfied by <strong>idempotence rather than coordination</strong>. This is the same lesson as <a href="19-distributed-message-queue.html#exactly-once">Chapter 19</a> and <a href="10-notification-system.html#reliability">Chapter 10</a>: at-least-once delivery plus idempotent processing beats exactly-once delivery almost every time, and here the aggregation's own structure hands you idempotence for free.</p>
+<p>Note the one duplicate this does <em>not</em> fix: a client that genuinely sends the same click event twice with a distinct event ID is indistinguishable from two real clicks. That is click fraud detection, a separate system with a separate adversary — which is why the chapter mentions a risk engine rather than trying to solve it here.</p>
+<h3 id="scale-the-system"><strong>Scale the system</strong></h3>
+<p>Let's discuss how we scale the system as it grows.</p>
+<p>We have three independent components - message queue, aggregation service and database.
+Since they are decoupled, we can scale them independently.</p>
+<p>How do we scale the message queue:</p>
+<ul>
+<li>We don't put a limit on producers, so they can be scaled easily</li>
+<li>Consumers can be scaled by assigning them to consumer groups and increasing the number of consumers.</li>
+<li>For this to work, we also need to ensure there are enough partitions created preemptively</li>
+<li>Also, consumer rebalancing can take a while when there are thousands of consumers so it is recommended to do it off peak hours</li>
+<li>We could also consider partitioning the topic by geography, eg <code>topic_na</code>, <code>topic_eu</code>, etc.</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/scale-consumers.png" alt="scale-consumers" data-width="500" style="max-width:500px" />
+</p>
+<p>How do we scale the aggregation service:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/aggregation-service-scaling.png" alt="aggregation-service-scaling" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>The map-reduce nodes can easily be scaled by adding more nodes</li>
+<li>The throughput of the aggregation service can be scaled by utilising multi-threading</li>
+<li>Alternatively, we can leverage resource providers such as Apache YARN to utilize multi-processing</li>
+<li>Option 1 is easier, but option 2 is more widely used in practice as it's more scalable</li>
+<li>Here's the multi-threading example:</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/multi-threading-example.png" alt="multi-threading-example" data-width="500" style="max-width:500px" />
+</p>
+<p>How do we scale the database:</p>
+<ul>
+<li>If we use Cassandra, it natively supports horizontal scaling utilizing consistent hashing</li>
+<li>If a new node is added to the cluster, data automatically gets rebalanced across all (virtual) nodes</li>
+<li>With this approach, no manual (re)sharding is required</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/cassandra-scalability.png" alt="cassandra-scalability" data-width="500" style="max-width:500px" />
+</p>
+<p>Another scalability issue to consider is the hotspot issue - what if an ad is more popular and gets more attention than others?</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/hotspot-issue.png" alt="hotspot-issue" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>In the above example, aggregation service nodes can apply for extra resources via the resource manager</li>
+<li>The resource manager allocates more resources, so the original node isn't overloaded</li>
+<li>The original node splits the events into 3 groups and each of the aggregation nodes handles 100 events</li>
+<li>Result is written back to the original aggregation node</li>
+</ul>
+<p>Alternatively, more sophisticated ways to handle the hotspot problem:</p>
+<ul>
+<li>Global-Local Aggregation</li>
+<li>Split Distinct Aggregation</li>
+</ul>
+<p><strong>These two are named without explanation, and both are simple ideas worth knowing.</strong></p>
+<p><strong>Global-local aggregation</strong> solves the hot key directly. Aggregation must partition by <code>ad_id</code> so that each ad's total lives in one place — which means a single viral ad sends all its traffic to one node, and no amount of extra nodes helps. The fix is to <strong>salt the key</strong>: aggregate on <code>(ad_id, random 0..N)</code> in a first stage, spreading one hot ad across N nodes, then strip the salt and sum the N partial counts in a second stage.</p>
+<figure class="mermaid-fig">
+<svg id="mmd-e2d491cd6f0bd563" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1045.38px; background-color: transparent;" viewBox="0 0 1045.375 251" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-e2d491cd6f0bd563{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-e2d491cd6f0bd563 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-e2d491cd6f0bd563 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-e2d491cd6f0bd563 .error-icon{fill:#f4f6f8;}#mmd-e2d491cd6f0bd563 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-e2d491cd6f0bd563 .edge-thickness-normal{stroke-width:1px;}#mmd-e2d491cd6f0bd563 .edge-thickness-thick{stroke-width:3.5px;}#mmd-e2d491cd6f0bd563 .edge-pattern-solid{stroke-dasharray:0;}#mmd-e2d491cd6f0bd563 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-e2d491cd6f0bd563 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-e2d491cd6f0bd563 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-e2d491cd6f0bd563 .marker{fill:#637381;stroke:#637381;}#mmd-e2d491cd6f0bd563 .marker.cross{stroke:#637381;}#mmd-e2d491cd6f0bd563 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-e2d491cd6f0bd563 p{margin:0;}#mmd-e2d491cd6f0bd563 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-e2d491cd6f0bd563 .cluster-label text{fill:#454f5b;}#mmd-e2d491cd6f0bd563 .cluster-label span{color:#454f5b;}#mmd-e2d491cd6f0bd563 .cluster-label span p{background-color:transparent;}#mmd-e2d491cd6f0bd563 .label text,#mmd-e2d491cd6f0bd563 span{fill:#161c24;color:#161c24;}#mmd-e2d491cd6f0bd563 .node rect,#mmd-e2d491cd6f0bd563 .node circle,#mmd-e2d491cd6f0bd563 .node ellipse,#mmd-e2d491cd6f0bd563 .node polygon,#mmd-e2d491cd6f0bd563 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-e2d491cd6f0bd563 .rough-node .label text,#mmd-e2d491cd6f0bd563 .node .label text,#mmd-e2d491cd6f0bd563 .image-shape .label,#mmd-e2d491cd6f0bd563 .icon-shape .label{text-anchor:middle;}#mmd-e2d491cd6f0bd563 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-e2d491cd6f0bd563 .rough-node .label,#mmd-e2d491cd6f0bd563 .node .label,#mmd-e2d491cd6f0bd563 .image-shape .label,#mmd-e2d491cd6f0bd563 .icon-shape .label{text-align:center;}#mmd-e2d491cd6f0bd563 .node.clickable{cursor:pointer;}#mmd-e2d491cd6f0bd563 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-e2d491cd6f0bd563 .arrowheadPath{fill:#000000;}#mmd-e2d491cd6f0bd563 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-e2d491cd6f0bd563 .flowchart-link{stroke:#637381;fill:none;}#mmd-e2d491cd6f0bd563 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-e2d491cd6f0bd563 .edgeLabel p{background-color:#ffffff;}#mmd-e2d491cd6f0bd563 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-e2d491cd6f0bd563 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-e2d491cd6f0bd563 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-e2d491cd6f0bd563 .cluster text{fill:#454f5b;}#mmd-e2d491cd6f0bd563 .cluster span{color:#454f5b;}#mmd-e2d491cd6f0bd563 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-e2d491cd6f0bd563 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-e2d491cd6f0bd563 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-e2d491cd6f0bd563 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-e2d491cd6f0bd563 rect.text{fill:none;stroke-width:0;}#mmd-e2d491cd6f0bd563 .icon-shape,#mmd-e2d491cd6f0bd563 .image-shape{background-color:#ffffff;text-align:center;}#mmd-e2d491cd6f0bd563 .icon-shape p,#mmd-e2d491cd6f0bd563 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-e2d491cd6f0bd563 .icon-shape .label rect,#mmd-e2d491cd6f0bd563 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-e2d491cd6f0bd563 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-e2d491cd6f0bd563 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-e2d491cd6f0bd563 .node .neo-node{stroke:#299a8d;}#mmd-e2d491cd6f0bd563 [data-look="neo"].node rect,#mmd-e2d491cd6f0bd563 [data-look="neo"].cluster rect,#mmd-e2d491cd6f0bd563 [data-look="neo"].node polygon{stroke:url(#mmd-e2d491cd6f0bd563-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e2d491cd6f0bd563 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-e2d491cd6f0bd563 [data-look="neo"].node path{stroke:url(#mmd-e2d491cd6f0bd563-gradient);stroke-width:1px;}#mmd-e2d491cd6f0bd563 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e2d491cd6f0bd563 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-e2d491cd6f0bd563 [data-look="neo"].node circle{stroke:url(#mmd-e2d491cd6f0bd563-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e2d491cd6f0bd563 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-e2d491cd6f0bd563 [data-look="neo"].icon-shape .icon{fill:url(#mmd-e2d491cd6f0bd563-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e2d491cd6f0bd563 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-e2d491cd6f0bd563-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-e2d491cd6f0bd563 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-e2d491cd6f0bd563_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e2d491cd6f0bd563_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e2d491cd6f0bd563_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e2d491cd6f0bd563_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e2d491cd6f0bd563_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e2d491cd6f0bd563_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e2d491cd6f0bd563_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e2d491cd6f0bd563_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e2d491cd6f0bd563_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e2d491cd6f0bd563_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-e2d491cd6f0bd563_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-e2d491cd6f0bd563_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M195.906,125.5L200.073,125.5C204.24,125.5,212.573,125.5,220.24,125.5C227.906,125.5,234.906,125.5,238.406,125.5L241.906,125.5" id="mmd-e2d491cd6f0bd563-L_E_S_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_E_S_0" data-points="W3sieCI6MTk1LjkwNjI1LCJ5IjoxMjUuNX0seyJ4IjoyMjAuOTA2MjUsInkiOjEyNS41fSx7IngiOjI0NS45MDYyNSwieSI6MTI1LjV9XQ==" data-look="classic" marker-end="url(#mmd-e2d491cd6f0bd563_flowchart-v2-pointEnd)"/><path d="M343.228,103L355.807,90.917C368.386,78.833,393.545,54.667,409.903,42.583C426.26,30.5,433.818,30.5,437.596,30.5L441.375,30.5" id="mmd-e2d491cd6f0bd563-L_S_L1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_L1_0" data-points="W3sieCI6MzQzLjIyODAwMTY0NDczNjgsInkiOjEwM30seyJ4Ijo0MTguNzAzMTI1LCJ5IjozMC41fSx7IngiOjQ0NS4zNzUsInkiOjMwLjV9XQ==" data-look="classic" marker-end="url(#mmd-e2d491cd6f0bd563_flowchart-v2-pointEnd)"/><path d="M393.703,125.5L397.87,125.5C402.036,125.5,410.37,125.5,418.036,125.5C425.703,125.5,432.703,125.5,436.203,125.5L439.703,125.5" id="mmd-e2d491cd6f0bd563-L_S_L2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_L2_0" data-points="W3sieCI6MzkzLjcwMzEyNSwieSI6MTI1LjV9LHsieCI6NDE4LjcwMzEyNSwieSI6MTI1LjV9LHsieCI6NDQzLjcwMzEyNSwieSI6MTI1LjV9XQ==" data-look="classic" marker-end="url(#mmd-e2d491cd6f0bd563_flowchart-v2-pointEnd)"/><path d="M343.228,148L355.807,160.083C368.386,172.167,393.545,196.333,409.895,208.417C426.245,220.5,433.786,220.5,437.557,220.5L441.328,220.5" id="mmd-e2d491cd6f0bd563-L_S_L3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_L3_0" data-points="W3sieCI6MzQzLjIyODAwMTY0NDczNjgsInkiOjE0OH0seyJ4Ijo0MTguNzAzMTI1LCJ5IjoyMjAuNX0seyJ4Ijo0NDUuMzI4MTI1LCJ5IjoyMjAuNX1d" data-look="classic" marker-end="url(#mmd-e2d491cd6f0bd563_flowchart-v2-pointEnd)"/><path d="M582.078,30.5L586.523,30.5C590.969,30.5,599.859,30.5,616.85,40.42C633.84,50.34,658.93,70.179,671.475,80.099L684.02,90.019" id="mmd-e2d491cd6f0bd563-L_L1_G_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_L1_G_0" data-points="W3sieCI6NTgyLjA3ODEyNSwieSI6MzAuNX0seyJ4Ijo2MDguNzUsInkiOjMwLjV9LHsieCI6Njg3LjE1NzU2NTc4OTQ3MzcsInkiOjkyLjV9XQ==" data-look="classic" marker-end="url(#mmd-e2d491cd6f0bd563_flowchart-v2-pointEnd)"/><path d="M583.75,125.5L587.917,125.5C592.083,125.5,600.417,125.5,608.083,125.5C615.75,125.5,622.75,125.5,626.25,125.5L629.75,125.5" id="mmd-e2d491cd6f0bd563-L_L2_G_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_L2_G_0" data-points="W3sieCI6NTgzLjc1LCJ5IjoxMjUuNX0seyJ4Ijo2MDguNzUsInkiOjEyNS41fSx7IngiOjYzMy43NSwieSI6MTI1LjV9XQ==" data-look="classic" marker-end="url(#mmd-e2d491cd6f0bd563_flowchart-v2-pointEnd)"/><path d="M582.125,220.5L586.563,220.5C591,220.5,599.875,220.5,616.857,210.58C633.84,200.66,658.93,180.821,671.475,170.901L684.02,160.981" id="mmd-e2d491cd6f0bd563-L_L3_G_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_L3_G_0" data-points="W3sieCI6NTgyLjEyNSwieSI6MjIwLjV9LHsieCI6NjA4Ljc1LCJ5IjoyMjAuNX0seyJ4Ijo2ODcuMTU3NTY1Nzg5NDczNywieSI6MTU4LjV9XQ==" data-look="classic" marker-end="url(#mmd-e2d491cd6f0bd563_flowchart-v2-pointEnd)"/><path d="M824.031,125.5L828.198,125.5C832.365,125.5,840.698,125.5,848.365,125.5C856.031,125.5,863.031,125.5,866.531,125.5L870.031,125.5" id="mmd-e2d491cd6f0bd563-L_G_R_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_G_R_0" data-points="W3sieCI6ODI0LjAzMTI1LCJ5IjoxMjUuNX0seyJ4Ijo4NDkuMDMxMjUsInkiOjEyNS41fSx7IngiOjg3NC4wMzEyNSwieSI6MTI1LjV9XQ==" data-look="classic" marker-end="url(#mmd-e2d491cd6f0bd563_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_E_S_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_S_L1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_S_L2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_S_L3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_L1_G_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_L2_G_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_L3_G_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_G_R_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-e2d491cd6f0bd563-flowchart-E-0" data-look="classic" transform="translate(101.953125, 125.5)"><rect class="basic label-container" style="" x="-93.953125" y="-33" width="187.90625" height="66"/><g class="label" style="" transform="translate(-69.953125, -21)"><rect/><foreignObject width="139.90625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>clicks for hot ad_id=A<br />50,000/sec</p></span></div></foreignObject></g></g><g class="node default" id="mmd-e2d491cd6f0bd563-flowchart-S-1" data-look="classic" transform="translate(319.8046875, 125.5)"><rect class="basic label-container" style="" x="-73.8984375" y="-22.5" width="147.796875" height="45"/><g class="label" style="" transform="translate(-49.8984375, -10.5)"><rect/><foreignObject width="99.796875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>salt: A#0 .. A#9</p></span></div></foreignObject></g></g><g class="node default" id="mmd-e2d491cd6f0bd563-flowchart-L1-3" data-look="classic" transform="translate(513.7265625, 30.5)"><rect class="basic label-container" style="" x="-68.3515625" y="-22.5" width="136.703125" height="45"/><g class="label" style="" transform="translate(-44.3515625, -10.5)"><rect/><foreignObject width="88.703125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>local agg A#0</p></span></div></foreignObject></g></g><g class="node default" id="mmd-e2d491cd6f0bd563-flowchart-L2-5" data-look="classic" transform="translate(513.7265625, 125.5)"><rect class="basic label-container" style="" x="-70.0234375" y="-22.5" width="140.046875" height="45"/><g class="label" style="" transform="translate(-46.0234375, -10.5)"><rect/><foreignObject width="92.046875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>local agg A#...</p></span></div></foreignObject></g></g><g class="node default" id="mmd-e2d491cd6f0bd563-flowchart-L3-7" data-look="classic" transform="translate(513.7265625, 220.5)"><rect class="basic label-container" style="" x="-68.3984375" y="-22.5" width="136.796875" height="45"/><g class="label" style="" transform="translate(-44.3984375, -10.5)"><rect/><foreignObject width="88.796875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>local agg A#9</p></span></div></foreignObject></g></g><g class="node default" id="mmd-e2d491cd6f0bd563-flowchart-G-9" data-look="classic" transform="translate(728.890625, 125.5)"><rect class="basic label-container" style="" x="-95.140625" y="-33" width="190.28125" height="66"/><g class="label" style="" transform="translate(-71.140625, -21)"><rect/><foreignObject width="142.28125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>global agg<br />strip salt, sum partials</p></span></div></foreignObject></g></g><g class="node default" id="mmd-e2d491cd6f0bd563-flowchart-R-15" data-look="classic" transform="translate(955.703125, 125.5)"><rect class="basic label-container" style="" x="-81.671875" y="-22.5" width="163.34375" height="45"/><g class="label" style="" transform="translate(-57.671875, -10.5)"><rect/><foreignObject width="115.34375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>count for ad_id=A</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-e2d491cd6f0bd563-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-e2d491cd6f0bd563-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-e2d491cd6f0bd563-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>The first stage reduces 50,000 events/sec into 10 partial counts per window, so the second stage handles a trivial volume. It works because <strong>count is associative and commutative</strong> — summing partial sums gives the true sum — and that is the condition for the technique generally.</p>
+<p><strong>Split distinct aggregation</strong> is the version for <code>COUNT(DISTINCT user_id)</code>, where that condition fails: you cannot sum partial distinct-counts, because the same user may appear in several partials. The fix is to make the first stage partition by the <em>distinct</em> field as well — <code>(ad_id, hash(user_id) % N)</code> — so each user lands deterministically in one partial and the second stage can safely add the partial distinct counts. Partitioning by the thing being counted is what restores additivity.</p>
+<h3 id="fault-tolerance"><strong>Fault Tolerance</strong></h3>
+<p>Within the aggregation nodes, we are processing data in-memory. If a node goes down, the processed data is lost.</p>
+<p>We can leverage consumer offsets in kafka to continue from where we left off once another node picks up the slack.
+However, there is additional intermediary state we need to maintain, as we're aggregating the top N ads in M minutes.</p>
+<p>We can make snapshots at a particular minute for the on-going aggregation:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/fault-tolerance-example.png" alt="fault-tolerance-example" data-width="500" style="max-width:500px" />
+</p>
+<p>If a node goes down, the new node can read the latest committed consumer offset, as well as the latest snapshot to continue the job:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/fault-tolerance-recovery-example.png" alt="fault-tolerance-recovery-example" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="data-monitoring-and-correctness"><strong>Data monitoring and correctness</strong></h3>
+<p>As the data we're aggregating is critical as it's used for billing, it is very important to have rigorous monitoring in place in order to ensure correctness.</p>
+<p>Some metrics we might want to monitor:</p>
+<ul>
+<li><strong>Latency</strong>: Timestamps of different events can be tracked in order to understand the e2e latency of the system</li>
+<li><strong>Message queue size</strong>: If there is a sudden increase in queue size, we need to add more aggregation nodes. As Kafka is implemented via a distributed commit log, we need to keep track of records-lag metrics instead.</li>
+<li><strong>System resources on aggregation nodes</strong>: CPU, disk, JVM, etc.</li>
+</ul>
+<p>We also need to implement a reconciliation flow which is a batch job, running at the end of the day.
+It calculates the aggregated results from the raw data and compares them against the actual data stored in the aggregation database:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/reconciliation-flow.png" alt="reconciliation-flow" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="alternative-design"><strong>Alternative design</strong></h3>
+<p>In a generalist system design interview, you are not expected to know the internals of specialized software used in big data processing.</p>
+<p>Explaining the thought process and discussing trade-offs is more important than knowing specific tools, which is why the chapter covers a generic solution.</p>
+<p>An alternative design, which leverages off-the-shelf tooling, is to store ad click data in Hive with an ElasticSearch layer on top built for faster queries.</p>
+<p>Aggregation is typically done in OLAP databases such as ClickHouse or Druid.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/21.%20Ad%20Click%20Event%20Aggregation/images/alternative-design.png" alt="alternative-design" data-width="500" style="max-width:500px" />
+</p>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap up</h2>
+<p>Things we covered:</p>
+<ul>
+<li>Data model and API Design</li>
+<li>Using MapReduce to aggregate ad click events</li>
+<li>Scaling the message queue, aggregation service and database</li>
+<li>Mitigating the hotspot issue</li>
+<li>Monitoring the system continuously</li>
+<li>Using reconciliation to ensure correctness</li>
+<li>Fault tolerance</li>
+</ul>
+<p>The ad click event aggregation is a typical big data processing system.</p>
+<p>It would be easier to understand and design it if you have prior knowledge of related technologies:</p>
+<ul>
+<li>Apache Kafka</li>
+<li>Apache Spark</li>
+<li>Apache Flink</li>
+</ul>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>&quot;Exactly once&quot; is achieved by idempotence, not by coordination.</strong> Making the sink an upsert of <code>(ad_id, minute) → count</code> makes replay harmless and removes the need for a distributed transaction. Reach for transactions only when the output genuinely cannot be made idempotent.</li>
+<li><strong>Replay into an incrementing counter double-counts.</strong> The most expensive bug available in this design, because the output is billing data and the error is invisible — the numbers look plausible, just wrong.</li>
+<li><strong>Hours-late mobile events cannot be handled by any watermark.</strong> A client offline for a day will upload events whose window closed long ago. They belong to the reconciliation path; stretching the watermark to cover them would delay every number instead.</li>
+<li><strong>Client-supplied event time is attacker-controlled.</strong> Bound acceptable timestamps against server time, keep the server receive time alongside, and treat the difference as a fraud signal.</li>
+<li><strong>Late events arriving after billing has closed need a stated policy.</strong> Credit them to the original day and restate the invoice, or count them in the current period? Both are defensible; having no answer is not, and the reconciliation job forces the question.</li>
+<li><strong>Reconciliation mismatches need a resolution rule, not just an alert.</strong> When the batch total and the streaming total disagree, which one is billed, who is notified, and what happens to invoices already sent? A reconciliation job that only reports a discrepancy has moved the problem rather than solved it.</li>
+<li><strong>A hot ad cannot be fixed by scaling.</strong> Partitioning by <code>ad_id</code> is required for correct totals, so all of one ad's traffic lands on one node by design. Salt the key and aggregate in two stages.</li>
+<li><strong><code>COUNT(DISTINCT)</code> does not decompose.</strong> Summing partial distinct counts over-counts. Partition by the distinct field itself, or use a mergeable sketch (HyperLogLog) and accept approximation — which for <em>billing</em> numbers you cannot.</li>
+<li><strong>Pre-aggregating every filter combination explodes.</strong> <code>2^k</code> aggregates per ad per minute, and a <code>user_id</code> dimension is unbounded. Pre-declare a small set of filter IDs; serve anything else from raw data.</li>
+<li><strong>Window boundaries need a declared timezone.</strong> &quot;Daily&quot; billing is ambiguous across timezones, and so is the day a click at 23:59:58 UTC belongs to. Pick one timezone for billing periods and never compute boundaries in local time.</li>
+<li><strong>In-memory aggregation state is lost on node failure.</strong> Consumer offsets alone are insufficient because sliding-window top-N state is not reconstructible from the offset. Periodic snapshots plus offsets are what make recovery possible — and snapshot size grows with window width and key count.</li>
+<li><strong>Consumer rebalancing pauses aggregation.</strong> With thousands of consumers a rebalance takes a while and nobody is processing during it; the chapter's advice to rescale off-peak is the real mitigation. See <a href="19-distributed-message-queue.html#gotchas--failure-modes">Chapter 19</a>.</li>
+<li><strong>Queue lag is the leading indicator.</strong> For a log-based queue, queue &quot;size&quot; is not the metric — <strong>consumer lag</strong> is. Rising lag means event time is falling further behind processing time, which widens the late-event problem before it shows up anywhere else.</li>
+<li><strong>Raw retention is a real cost with a real justification.</strong> 36 TB/year exists for recomputation, reconciliation and audit, not for queries. Tier it to cheap storage, but do not let anyone delete it to save money without understanding what it is for.</li>
+<li><strong>Kappa with a recalculation path is lambda wearing a different name.</strong> The chapter claims Kappa because reprocessing flows through the same aggregation service, which is true and valuable — one codebase, one set of semantics. But there are still two paths with different latency and authority, and the batch one is the source of truth. That is fine; it is just worth being precise about.</li>
+<li><strong>The dashboard shows a number that may change.</strong> Streaming results are provisional until watermarks close and reconciliation runs. Exposing that — a &quot;finalised&quot; flag, or a timestamp of last reconciliation — prevents advertisers treating an in-flight count as a bill.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Billing accuracy at 50,000 events/sec</td>
+<td>Streaming aggregation for freshness, batch reconciliation for authority</td>
+</tr>
+<tr>
+<td>Attributing a click to when it happened</td>
+<td>Event time, not processing time</td>
+</tr>
+<tr>
+<td>Events arriving after their window</td>
+<td>Watermarks holding windows open; late events to a side output</td>
+</tr>
+<tr>
+<td>Events arriving hours late</td>
+<td>Reconciliation path, not the stream</td>
+</tr>
+<tr>
+<td>Malicious or broken client clocks</td>
+<td>Bound acceptable event time; retain server receive time</td>
+</tr>
+<tr>
+<td>Duplicate events from retries and failures</td>
+<td>Idempotent upsert of <code>(ad_id, minute) → count</code>, making replay safe</td>
+</tr>
+<tr>
+<td>Additive, auditable counts</td>
+<td>Tumbling (non-overlapping) windows</td>
+</tr>
+<tr>
+<td>&quot;Top N in the last M minutes&quot;</td>
+<td>Sliding window with per-window top-N state</td>
+</tr>
+<tr>
+<td>A viral ad overloading one node</td>
+<td>Global-local aggregation: salt the key, aggregate in two stages</td>
+</tr>
+<tr>
+<td>Distinct counts that do not decompose</td>
+<td>Split distinct aggregation — partition by the distinct field</td>
+</tr>
+<tr>
+<td>Unbounded filter combinations</td>
+<td>Pre-declared filter IDs, pre-aggregated; everything else from raw</td>
+</tr>
+<tr>
+<td>Recovering in-flight aggregation state</td>
+<td>Periodic snapshots plus committed consumer offsets</td>
+</tr>
+<tr>
+<td>Fixing a bug in aggregation logic</td>
+<td>Retain raw events; recalculation service replays through a separate aggregator</td>
+</tr>
+<tr>
+<td>Scaling the three tiers independently</td>
+<td>Queue, aggregation service and database decoupled</td>
+</tr>
+<tr>
+<td>Knowing the system is healthy</td>
+<td>End-to-end latency, consumer lag, and a daily reconciliation comparison</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>What makes this system different from every other aggregation pipeline in the book, and which requirement does that promote above the rest?</li>
+<li>The aggregated output is far smaller than the raw input. Give three reasons the raw events are still kept.</li>
+<li>Why does the query API take an opaque <code>filter</code> identifier rather than arbitrary filter predicates?</li>
+<li>Give the trade-off between event time and processing time, and say which is chosen and why.</li>
+<li>What is a watermark, stated precisely? What are the three things an engine can do with a late event?</li>
+<li>Why can no watermark handle a mobile client that was offline for a day, and where do those events go?</li>
+<li>Why are tumbling windows used for counts? What property do they give the stored aggregates?</li>
+<li>Why is a sliding window needed for top-N but not for per-minute counts?</li>
+<li>Rewrite an incrementing counter update so that replaying a window is harmless. Why does that remove the need for a distributed transaction?</li>
+<li>Which kind of duplicate does idempotent aggregation <em>not</em> solve?</li>
+<li>One ad receives 50,000 clicks/sec. Why doesn't adding aggregation nodes help, and what does?</li>
+<li>Why can't you sum partial <code>COUNT(DISTINCT user_id)</code> results, and what fixes it?</li>
+<li>An aggregation node dies mid-window. Why is the consumer offset not enough to recover?</li>
+<li>The daily reconciliation finds a 0.3% discrepancy. What questions must the design already have answers to?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>RTB (real-time bidding)</strong></td>
+<td>Sub-second ad auction; the latency-critical sibling of this batch-tolerant system</td>
+</tr>
+<tr>
+<td><strong>Event time vs processing time</strong></td>
+<td>When the click happened vs when the system handled it</td>
+</tr>
+<tr>
+<td><strong>Watermark</strong></td>
+<td>An assertion that no events older than T will arrive; it gates window emission</td>
+</tr>
+<tr>
+<td><strong>Late event</strong></td>
+<td>One arriving after its window's watermark has passed</td>
+</tr>
+<tr>
+<td><strong>Tumbling window</strong></td>
+<td>Fixed, non-overlapping window — each event counted once, counts additive</td>
+</tr>
+<tr>
+<td><strong>Hopping / sliding / session window</strong></td>
+<td>Overlapping fixed windows; a continuously moving window; a gap-delimited window</td>
+</tr>
+<tr>
+<td><strong>Lambda architecture</strong></td>
+<td>Separate batch and streaming paths, with separate codebases</td>
+</tr>
+<tr>
+<td><strong>Kappa architecture</strong></td>
+<td>One stream-processing path, with reprocessing replayed through it</td>
+</tr>
+<tr>
+<td><strong>Recalculation service</strong></td>
+<td>Batch replay of raw events through a dedicated aggregator after a logic change</td>
+</tr>
+<tr>
+<td><strong>Reconciliation</strong></td>
+<td>End-of-day batch recomputation compared against stored aggregates — the source of truth</td>
+</tr>
+<tr>
+<td><strong>Idempotent sink</strong></td>
+<td>A write whose repetition changes nothing, typically an upsert rather than an increment</td>
+</tr>
+<tr>
+<td><strong>Global-local aggregation</strong></td>
+<td>Salting a hot key to aggregate in two stages</td>
+</tr>
+<tr>
+<td><strong>Split distinct aggregation</strong></td>
+<td>Partitioning by the distinct field so partial distinct counts can be summed</td>
+</tr>
+<tr>
+<td><strong>Hotspot</strong></td>
+<td>A single key receiving disproportionate traffic, unfixable by adding nodes</td>
+</tr>
+<tr>
+<td><strong>Consumer lag</strong></td>
+<td>How far aggregation is behind the event stream — the leading health indicator</td>
+</tr>
+<tr>
+<td><strong>Snapshot / checkpoint</strong></td>
+<td>Persisted in-flight aggregation state enabling recovery with the offset</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="19-distributed-message-queue.html#exactly-once">Chapter 19 – Distributed Message Queue</a> — what exactly-once costs at the transport layer, and why idempotent processing is the usual answer.</li>
+<li><a href="20-metrics-monitoring-and-alerting-system.html">Chapter 20 – Metrics Monitoring and Alerting System</a> — the same ingest-and-aggregate shape where approximation is acceptable; compare what changes when the output is not money.</li>
+<li><a href="26-payment-system.html">Chapter 26 – Payment System</a> — reconciliation and idempotency as first-class concerns, where the money is moved rather than counted.</li>
+<li><a href="13-search-autocomplete.html#updated-design">Chapter 13 – Design A Search Autocomplete System</a> — the batch-plus-speed-layer pattern in a simpler setting.</li>
+<li><a href="05-consistent-hashing.html#gotchas--failure-modes">Chapter 5 – Design Consistent Hashing</a> — why a hot key is not a partitioning problem.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

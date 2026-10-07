@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 20: Metrics Monitoring and Alerting System — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="20-metrics-monitoring-and-alerting-system">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 20 of 28</div>
+  <h1>Chapter 20: Metrics Monitoring and Alerting System</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</a></li><li><a href="#step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap up</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>This chapter focuses on designing a highly scalable <strong>metrics monitoring and alerting system</strong>, which is critical for ensuring high availability and reliability.</p>
+<p><strong>The one-sentence version:</strong> the workload is an enormous, relentless stream of <strong>tiny, highly compressible, almost never read</strong> data points, whose reads are overwhelmingly about the last few hours. That specific shape is what a time-series database <em>is</em> — and the thing that actually destroys these systems in production is not the volume of data points but the <strong>number of distinct time series</strong>, which a careless one-line code change can multiply by a million.</p>
+<p>Two more framings worth carrying through the chapter:</p>
+<ul>
+<li><strong>This system must be more reliable than everything it watches</strong>, and it cannot use itself to discover that it is broken. That asymmetry shapes the alerting design and is the reason for the dead-man's-switch in the gotchas.</li>
+<li><strong>An alert nobody acts on is worse than no alert.</strong> Most of the engineering here is about data; most of the <em>failure</em> is about humans ignoring pages. Both matter.</li>
+</ul>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-establish-design-scope">
+<h2 id="step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</h2>
+<p>A metrics monitoring system can mean a lot of different things - eg you don't want to design a logs aggregation system, when the interviewer is interested in infra metrics only.</p>
+<p>Let's try to understand the problem first:</p>
+<ul>
+<li>C: Who are we building the system for? An in-house monitoring system for a big tech company or a SaaS like DataDog?</li>
+<li>I: We are building for internal use only.</li>
+<li>C: Which metrics do we want to collect?</li>
+<li>I: Operational system metrics - CPU load, Memory, Data disk space. But also high-level metrics like requests per second. Business metrics are not in scope.</li>
+<li>C: What is the scale of the infrastructure we're monitoring?</li>
+<li>I: 100mil daily active users, 1000 server pools, 100 machines per pool</li>
+<li>C: How long should we keep the data?</li>
+<li>I: Let's assume 1y retention.</li>
+<li>C: May we reduce metrics data resolution for long-term storage?</li>
+<li>I: Keep newly received metrics for 7 days. Roll them up to 1m resolution for next 30 days. Further roll them up to 1h resolution after 30 days.</li>
+<li>C: What are the supported alert channels?</li>
+<li>I: Email, phone, PagerDuty or webhooks.</li>
+<li>C: Do we need to collect logs such as error or access logs?</li>
+<li>I: No</li>
+<li>C: Do we need to support distributed system tracing?</li>
+<li>I: No</li>
+</ul>
+<h3 id="high-level-requirements-and-assumptions"><strong>High-level requirements and assumptions</strong></h3>
+<p>The infrastructure being monitored is large-scale:</p>
+<ul>
+<li>100mil DAU</li>
+<li>1000 server pools * 100 machines * ~100 metrics per machine -&gt; ~10mil metrics</li>
+<li>1-year data retention</li>
+<li>Data retention policy - raw for 7d, 1-minute resolution for 30d, 1h resolution for 1y</li>
+</ul>
+<h3 id="what-10-million-metrics-actually-costs">What 10 million metrics actually costs</h3>
+<p>Assume a 10-second scrape interval, which is typical:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Derivation</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Time series</td>
+<td>1,000 pools × 100 machines × 100 metrics</td>
+<td><strong>10 million</strong></td>
+</tr>
+<tr>
+<td><strong>Write rate</strong></td>
+<td>10 M / 10 s</td>
+<td><strong>~1 million data points/sec</strong></td>
+</tr>
+<tr>
+<td>Points/day</td>
+<td>1 M × 86,400</td>
+<td>~86 billion</td>
+</tr>
+<tr>
+<td>Raw points retained (7 d)</td>
+<td>86 B × 7</td>
+<td>~605 billion</td>
+</tr>
+<tr>
+<td>1-minute points (30 d)</td>
+<td>10 M × 1,440 × 30</td>
+<td>~432 billion</td>
+</tr>
+<tr>
+<td>1-hour points (1 y)</td>
+<td>10 M × 24 × 365</td>
+<td>~88 billion</td>
+</tr>
+<tr>
+<td><strong>Total points stored</strong></td>
+<td></td>
+<td><strong>~1.1 trillion</strong></td>
+</tr>
+<tr>
+<td>At a naive 50 bytes/point</td>
+<td></td>
+<td>~55 TB</td>
+</tr>
+<tr>
+<td><strong>At ~2 bytes/point compressed</strong></td>
+<td></td>
+<td><strong>~2.2 TB</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Two conclusions, both load-bearing.</p>
+<p><strong>One million writes per second sets the cluster size.</strong> The chapter notes InfluxDB sustaining ~250 K writes/sec on 8 cores and 32 GB. That is four such nodes at the theoretical limit — so realistically 8–12 with headroom, replication and room for growth. Doing this division out loud is what turns &quot;use a time-series database&quot; into a capacity plan.</p>
+<p><strong>Compression is a 25× effect, not a nicety.</strong> A data point is a timestamp and a float — 16 bytes before you add any identifying information — yet these systems routinely achieve under 2 bytes per point. The reason is that consecutive points in a series are <em>extremely</em> predictable: timestamps arrive at a fixed interval, so <strong>delta-of-delta</strong> encoding usually stores zero, and values change slowly, so XOR-ing a float against its predecessor leaves mostly zero bits. Facebook's Gorilla paper reports ~1.37 bytes per point from exactly these two tricks. This is the difference between 55 TB and 2 TB, and it is why a general-purpose database is the wrong tool even before you consider query patterns.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>derive 1 M writes/sec from the metric count and scrape interval, then divide by a realistic per-node write rate. That one calculation justifies a purpose-built time-series store, a buffering queue in front of it, and the entire down-sampling policy — all from the requirements.</p>
+</div>
+<p>A variety of metrics can be monitored:</p>
+<ul>
+<li>CPU load</li>
+<li>Request count</li>
+<li>Memory usage</li>
+<li>Message count in message queues</li>
+</ul>
+<h3 id="non-functional-requirements"><strong>Non-functional requirements</strong></h3>
+<ul>
+<li><strong>Scalability</strong>: System should be scalable to accommodate more metrics and alerts</li>
+<li><strong>Low latency</strong>: System needs to have low query latency for dashboards and alerts</li>
+<li><strong>Reliability</strong>: System should be highly reliable to avoid missing critical alerts</li>
+<li><strong>Flexibility</strong>: System should be able to easily integrate new technologies in the future</li>
+</ul>
+<p>What requirements are out of scope?</p>
+<ul>
+<li><strong>Log monitoring</strong>: the ELK stack is very popular for this use-case</li>
+<li><strong>Distributed system tracing</strong>: this refers to collecting data about a request lifecycle as it flows through multiple services within the system</li>
+</ul>
+<hr>
+</section>
+<section id="step-2-propose-high-level-design-and-get-buy-in">
+<h2 id="step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</h2>
+<h3 id="fundamentals"><strong>Fundamentals</strong></h3>
+<p>There are five core components involved in a metrics monitoring and alerting system:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/metrics-monitoring-core-components.png" alt="metrics-monitoring-core-components" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li><strong>Data collection</strong>: collect metrics data from different sources</li>
+<li><strong>Data transmission</strong>: transfer data from sources to the metrics monitoring system</li>
+<li><strong>Data storage</strong>: organize and store incoming data</li>
+<li><strong>Alerting</strong>: Analyze incoming data, detect anomalies and generate alerts</li>
+<li><strong>Visualization</strong>: Present data in graphs, charts, etc</li>
+</ul>
+<h3 id="data-model"><strong>Data model</strong></h3>
+<p>Metrics data is usually recorded as a time-series, which contains a set of values with timestamps.
+The series can be identified by name and an optional set of tags.</p>
+<p>Example 1 - What is the CPU load on production server instance i631 at 20:00?</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/metrics-example-1.png" alt="metrics-example-1" data-width="500" style="max-width:500px" />
+</p>
+<p>The data can be identified by the following table:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/metrics-example-1-data.png" alt="metrics-example-1-data" data-width="500" style="max-width:500px" />
+</p>
+<p>The time series is identified by the metric name, labels and a single point in at a specific time.</p>
+<p>Example 2 - What is the average CPU load across all web servers in the us-west region for the last 10min?</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>CPU.load host=webserver01,region=us-west 1613707265 50
+
+CPU.load host=webserver01,region=us-west 1613707265 62
+
+CPU.load host=webserver02,region=us-west 1613707265 43
+
+CPU.load host=webserver02,region=us-west 1613707265 53
+
+...
+
+CPU.load host=webserver01,region=us-west 1613707265 76
+
+CPU.load host=webserver01,region=us-west 1613707265 83
+</code></pre></div>
+<p>This is an example data we might pull from storage to answer that question.
+The average CPU load can be calculated by averaging the values in the last column of the rows.</p>
+<p>The format shown above is called the line protocol and is used by many popular monitoring software in the market - eg Prometheus, OpenTSDB.</p>
+<p>What every time series consists of:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/time-series-data-example.png" alt="time-series-data-example" data-width="500" style="max-width:500px" />
+</p>
+<p>A good way to visualize how data looks like:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/time-series-data-viz.png" alt="time-series-data-viz" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>The x axis is the time</li>
+<li>the y axis is the dimension you're querying - eg metric name, tag, etc.</li>
+</ul>
+<p>The data access pattern is write-heavy and spiky reads as we collect a lot of metrics, but they are infrequently accessed, although in bursts when eg there are ongoing incidents.</p>
+<p>The data storage system is the heart of this design.</p>
+<ul>
+<li>It is not recommended to use a general-purpose database for this problem, although you could achieve good scale \w expert-level tuning.</li>
+<li>Using a NoSQL database can work in theory, but it is hard to devise a scalable schema for effectively storing and querying time-series data.</li>
+</ul>
+<p>There are many databases, specifically tailored for storing time-series data. Many of them support custom query interfaces which allow for effective querying of time-series data.</p>
+<ul>
+<li>OpenTSDB is a distributed time-series database, but it is based on Hadoop and HBase. If you don't have that infrastructure provisioned, it would be hard to use this tech.</li>
+<li>Twitter uses MetricsDB, while Amazon offers Timestream.</li>
+<li>The two most popular time-series databases are InfluxDB and Prometheus.</li>
+<li>They are designed to store large volumes of time-series data. Both of them are based on in-memory cache + on-disk storage.</li>
+</ul>
+<p>Example scale of InfluxDB - more than 250k writes per second when provisioned with 8 cores and 32gb RAM:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/influxdb-scale.png" alt="influxdb-scale" data-width="500" style="max-width:500px" />
+</p>
+<p>It is not expected for you to understand the internals of a metrics database as it is niche knowledge. You might be asked only if you've mentioned it on your resume.</p>
+<p>For the purposes of the interview, it is sufficient to understand that metrics are time-series data and to be aware of popular time-series databases, like InfluxDB.</p>
+<p>One nice feature of time-series databases is the efficient aggregation and analysis of large amounts of time-series data by labels.
+InfluxDB, for example, builds indexes for each label.</p>
+<p>It is critical, however, to keep the cardinality of labels low - ie, not using too many unique labels.</p>
+<p><strong>This one sentence is the most important operational warning in the chapter, and it deserves unpacking, because cardinality explosion is how essentially every metrics system actually falls over.</strong></p>
+<p>The number of time series is the <strong>product</strong> of the distinct values of every label, not the sum:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>series = metric_name × host × region × status_code × endpoint × ...
+</code></pre></div>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Labels on <code>http_requests_total</code></th>
+<th>Distinct series</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>host</code> (100 K)</td>
+<td>100,000</td>
+</tr>
+<tr>
+<td><code>host</code>, <code>status_code</code> (10)</td>
+<td>1,000,000</td>
+</tr>
+<tr>
+<td><code>host</code>, <code>status_code</code>, <code>endpoint</code> (200)</td>
+<td><strong>200,000,000</strong></td>
+</tr>
+<tr>
+<td><code>host</code>, <code>status_code</code>, <code>endpoint</code>, <code>user_id</code> (100 M)</td>
+<td><strong>effectively unbounded</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Each series needs its own index entry, its own in-memory buffer accumulating points before flush, and its own compression state. Memory therefore scales with <strong>series count</strong>, not with data point volume — so a metrics system comfortably handling a million writes per second can be killed outright by a developer adding one innocuous-looking label.</p>
+<p>The labels that cause this are always the same kind: anything unbounded or per-request. <code>user_id</code>, <code>request_id</code>, <code>trace_id</code>, <code>session_id</code>, raw URL paths (including the ones with IDs in them), container IDs in an autoscaling fleet, error messages used as labels, email addresses. They look like useful context and they are catastrophic as labels.</p>
+<p>The discipline is: <strong>labels must have a small, bounded, slowly-changing set of values.</strong> Normalise <code>/user/12345/profile</code> to <code>/user/:id/profile</code>. Per-request detail belongs in logs or traces — which is exactly why the requirements declared both out of scope, and why they are separate systems rather than more labels on a metric.</p>
+<p>Worth noting too: this is a <em>write-time</em> decision that is expensive to undo. The series already created persist until retention expires, so the recovery from a cardinality incident is partly just waiting.</p>
+<h3 id="high-level-design"><strong>High-level Design</strong></h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/high-level-design.png" alt="high-level-design" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li><strong>Metrics source</strong>: can be application servers, SQL databases, message queues, etc.</li>
+<li><strong>Metrics collector</strong>: Gathers metrics data and writes to time-series database</li>
+<li><strong>Time-series database</strong>: stores metrics as time-series. Provides a custom query interface for analyzing large amounts of metrics.</li>
+<li><strong>Query service</strong>: Makes it easy to query and retrieve data from the time-series DB. Could be replaced entirely by the DB's interface if it's sufficiently powerful.</li>
+<li><strong>Alerting system</strong>: Sends alert notifications to various alerting destinations.</li>
+<li><strong>Visualization system</strong>: Shows metrics in the form of graphs/charts.</li>
+</ul>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<p>Let's deep dive into several of the more interesting parts of the system.</p>
+<h3 id="metrics-collection"><strong>Metrics collection</strong></h3>
+<p>For metrics collection, occasional data loss is not critical. It's acceptable for clients to fire and forget.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/metrics-collection.png" alt="metrics-collection" data-width="500" style="max-width:500px" />
+</p>
+<p>There are two ways to implement metrics collection - pull or push.</p>
+<p>Here's how the pull model might look like:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/pull-model-example.png" alt="pull-model-example" data-width="500" style="max-width:500px" />
+</p>
+<p>For this solution, the metrics collector needs to maintain an up-to-date list of services and metrics endpoints.
+We can use Zookeeper or etcd for that purpose - service discovery.</p>
+<p>Service discovery contains configuration rules about when and where to collect metrics from:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/service-discovery-example.png" alt="service-discovery-example" data-width="500" style="max-width:500px" />
+</p>
+<p>Here's a detailed explanation of the metrics collection flow:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/metrics-collection-flow.png" alt="metrics-collection-flow" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Metrics collector fetches configuration metadata from service discovery. This includes pulling interval, IP addresses, timeout &amp; retry params.</li>
+<li>Metrics collector pulls metrics data via a pre-defined http endpoint (eg <code>/metrics</code>). This is typically done by a client library.</li>
+<li>Alternatively, the metrics collector can register a change event notification with the service discovery to be notified once the service endpoint changes.</li>
+<li>Another option is for the metrics collector to periodically poll for metrics endpoint configuration changes.</li>
+</ul>
+<p>At our scale, a single metrics collector is not enough. There must be multiple instances.
+However, there must also be some kind of synchronization among them so that two collectors don't collect the same metrics twice.</p>
+<p>One solution for this is to position collectors and servers on a consistent hash ring and associate a set of servers with a single collector only:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/consistent-hash-ring.png" alt="consistent-hash-ring" data-width="500" style="max-width:500px" />
+</p>
+<p>With the push model, on the other hand, services push their metrics to the metrics collector proactively:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/push-model-example.png" alt="push-model-example" data-width="500" style="max-width:500px" />
+</p>
+<p>In this approach, typically a collection agent is installed alongside service instances.
+The agent collects metrics from the server and pushes them to the metrics collector.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/metrics-collector-agent.png" alt="metrics-collector-agent" data-width="500" style="max-width:500px" />
+</p>
+<p>With this model, we can potentially aggregate metrics before sending them to the collector, which reduces the volume of data processed by the collector.</p>
+<p>On the flip side, metrics collector can reject push requests as it can't handle the load.
+It is important, hence, to add the collector to an auto-scaling group behind a load balancer.</p>
+<p>So which one is better? There are trade-offs between both approaches and different systems use different approaches:</p>
+<ul>
+<li>Prometheus uses a pull architecture</li>
+<li>Amazon Cloud Watch and Graphite use a push architecture</li>
+</ul>
+<p>Here are some of the main differences between push and pull:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Pull</th>
+<th>Push</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Easy debugging</td>
+<td>The /metrics endpoint on application servers used for pulling metrics can be used to view metrics at any time. You can even do this on your laptop. Pull wins.</td>
+<td>If the metrics collector doesn't receive metrics, the problem might be caused by network issues.</td>
+</tr>
+<tr>
+<td>Health check</td>
+<td>If an application server doesn't respond to the pull, you can quickly figure out if an application server is down. Pull wins.</td>
+<td>If the metrics collector doesn't receive metrics, the problem might be caused by network issues.</td>
+</tr>
+<tr>
+<td>Short-lived jobs</td>
+<td></td>
+<td>Some of the batch jobs might be short-lived and don't last long enough to be pulled. Push wins. This can be fixed by introducing push gateways for the pull model [22].</td>
+</tr>
+<tr>
+<td>Firewall or complicated network setups</td>
+<td>Having servers pulling metrics requires all metric endpoints to be reachable. This is potentially problematic in multiple data center setups. It might require a more elaborate network infrastructure.</td>
+<td>If the metrics collector is set up with a load balancer and an auto-scaling group, it is possible to receive data from anywhere. Push wins.</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>Pull methods typically use TCP.</td>
+<td>Push methods typically use UDP. This means the push method provides lower-latency transports of metrics. The counterargument here is that the effort of establishing a TCP connection is small compared to sending the metrics payload.</td>
+</tr>
+<tr>
+<td>Data authenticity</td>
+<td>Application servers to collect metrics from are defined in config files in advance. Metrics gathered from those servers are guaranteed to be authentic.</td>
+<td>Any kind of client can push metrics to the metrics collector. This can be fixed by whitelisting servers from which to accept metrics, or by requiring authentication.</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>There is no clear winner. A large organization probably needs to support both. There might not be a way to install a push agent in the first place.</p>
+<p><strong>The asymmetry underneath the whole table is about who holds the list of what should exist.</strong></p>
+<p>With <strong>pull</strong>, the collector has an authoritative inventory from service discovery, so <em>absence of data is itself information</em>: a target that does not answer is down, and you can alert on it. With <strong>push</strong>, the collector only knows what arrived. Silence is ambiguous — the service may be down, the agent may have crashed, the network may be broken, or the service may simply have been decommissioned on purpose. You cannot distinguish &quot;dead&quot; from &quot;never existed&quot; without maintaining a separate inventory, at which point you have rebuilt service discovery anyway.</p>
+<p>That is why <code>up == 0</code> is a trivially expressible alert in a pull system and an awkward one in a push system, and it is the single strongest argument for pull.</p>
+<p>The counter-argument is equally structural: <strong>pull requires the collector to reach every target</strong>, which is a problem across firewalls, NAT, and multiple data centres, and it is simply impossible for things that do not live long enough to be scraped — batch jobs, serverless functions, CI steps. The standard patch is a <strong>push gateway</strong>: short-lived jobs push to an intermediary that the collector then pulls. It works, and it inherits push's weakness, because a stale entry in a push gateway looks exactly like a healthy one.</p>
+<p>The practical answer for a large organisation is pull as the default (because of the health-check property) plus a push path for the cases pull cannot reach.</p>
+<h3 id="scale-the-metrics-transmission-pipeline"><strong>Scale the metrics transmission pipeline</strong></h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/metrics-transmission-pipeline.png" alt="metrics-transmission-pipeline" data-width="500" style="max-width:500px" />
+</p>
+<p>The metrics collector is provisioned in an auto-scaling group, regardless if we use the push or pull model.</p>
+<p>There is a chance of data loss if the time-series DB is down, however. To mitigate this, we'll provision a queuing mechanism:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/queuing-mechanism.png" alt="queuing-mechanism" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Metrics collectors push metrics data into kafka</li>
+<li>Consumers or stream processing services such as Apache Storm, Flink or Spark process the data and push it to the time-series DB</li>
+</ul>
+<p>This approach has several advantages:</p>
+<ul>
+<li>Kafka is used as a highly-reliable and scalable distributed message platform</li>
+<li>It decouples data collection and data processing from one another</li>
+<li>It can prevent data loss by retaining the data in Kafka</li>
+</ul>
+<p>Kafka can be configured with one partition per metric name, so that consumers can aggregate data by metric names.
+To scale this, we can further partition by tags/labels and categorize/prioritize metrics to be collected first.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/metrics-collection-kafka.png" alt="metrics-collection-kafka" data-width="500" style="max-width:500px" />
+</p>
+<p>The main downside of using Kafka for this problem is the maintenance/operation overhead.
+An alternative is to use a large-scale ingestion system like <a href="https://www.vldb.org/pvldb/vol8/p1816-teller.pdf" target="_blank" rel="noopener">Gorilla</a>.
+It can be argued that using that would be as scalable as using Kafka for queuing.</p>
+<h3 id="where-aggregations-can-happen"><strong>Where aggregations can happen</strong></h3>
+<p>Metrics can be aggregated at several places. There are trade-offs between different choices:</p>
+<ul>
+<li><strong>Collection agent</strong>: client-side collection agent only supports simple aggregation logic. Eg collect a counter for 1m and send it to the metrics collector.</li>
+<li><strong>Ingestion pipeline</strong>: To aggregate data before writing to the DB, we need a stream processing engine like Flink. This reduces write volume, but we lose data precision as we don't store raw data.</li>
+<li><strong>Query side</strong>: We can aggregate data when we run queries via our visualization system. There is no data loss, but queries can be slow due to a lot of data processing.</li>
+</ul>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Where</th>
+<th>Write volume</th>
+<th>Query speed</th>
+<th>What you lose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Collection agent</td>
+<td>Reduced at the source</td>
+<td>Fast</td>
+<td>Sub-interval detail; agent-side complexity and memory</td>
+</tr>
+<tr>
+<td>Ingestion pipeline (Flink)</td>
+<td><strong>Greatly reduced</strong></td>
+<td>Fast</td>
+<td><strong>Raw data — permanently.</strong> Questions you did not anticipate become unanswerable</td>
+</tr>
+<tr>
+<td>Query time</td>
+<td>Unchanged (highest)</td>
+<td>Slow on wide ranges</td>
+<td>Nothing</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The decision is really about <strong>which questions you are willing to foreclose.</strong> Pre-aggregation is irreversible: once only the 1-minute average is stored, nobody can ever ask about the 5-second spike, or re-slice the data by a dimension that was aggregated away. Query-time aggregation keeps every question open and pays for it on every dashboard load. Most systems do both — aggregate at query time for recent raw data, and pre-aggregate as data ages, which is exactly what the down-sampling policy below is.</p>
+<p><strong>One aggregation that is mathematically invalid, and is attempted constantly:</strong> you cannot average percentiles. The mean of each host's p99 latency is <strong>not</strong> the fleet's p99, and there is no arithmetic that recovers it from the per-host percentiles — the information required is simply not there. A host serving 10 requests and one serving 10 million contribute equally to the average, and a genuine tail concentrated on one host disappears.</p>
+<p>The correct approach is to aggregate the <em>distribution</em>, not the summary: store a <strong>histogram</strong> (bucket counts, which add correctly across hosts) or a mergeable sketch such as t-digest or HDR histogram, and compute the percentile after merging. This is the single most common correctness bug in metrics dashboards, and it reliably hides exactly the latency problems the dashboard exists to reveal.</p>
+<h3 id="query-service"><strong>Query Service</strong></h3>
+<p>Having a separate query service from the time-series DB decouples the visualization and alerting system from the database, which enables us to decouple the DB from clients and change it at will.</p>
+<p>We can add a Cache layer here to reduce the load to the time-series database:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/cache-layer-query-service.png" alt="cache-layer-query-service" data-width="500" style="max-width:500px" />
+</p>
+<p>We can also avoid adding a query service altogether as most visualization and alerting systems have powerful plugins to integrate with most time-series databases.
+With a well-chosen time-series DB, we might not need to introduce our own caching layer as well.</p>
+<p>Most time-series DBs don't support SQL simply because it is ineffective for querying time-series data. Here's an example SQL query for computing an exponential moving average:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>select id,
+       temp,
+       avg(temp) over (partition by group_nr order by time_read) as rolling_avg
+from (
+  select id,
+         temp,
+         time_read,
+         interval_group,
+         id - row_number() over (partition by interval_group order by time_read) as group_nr
+  from (
+    select id,
+    time_read,
+    &quot;epoch&quot;::timestamp + &quot;900 seconds&quot;::interval * (extract(epoch from time_read)::int4 / 900) as interval_group,
+    temp
+    from readings
+  ) t1
+) t2
+order by time_read;
+</code></pre></div>
+<p>Here's the same query in Flux - query language used in InfluxDB:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>from(db:&quot;telegraf&quot;)
+  |&gt; range(start:-1h)
+  |&gt; filter(fn: (r) =&gt; r._measurement == &quot;foo&quot;)
+  |&gt; exponentialMovingAverage(size:-10s)
+</code></pre></div>
+<h3 id="storage-layer"><strong>Storage layer</strong></h3>
+<p>It is important to choose the time-series database carefully.</p>
+<p>According to research published by Facebook, ~85% of queries to the operational store were for data from the past 26h.</p>
+<p>If we choose a database, which harnesses this property, it could have significant impact on system performance. InfluxDB is one such option.</p>
+<p>Regardless of the database we choose, there are some optimizations we might employ.</p>
+<p>Data encoding and compression can significantly reduce the size of data. Those features are usually built into a good time-series database.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/double-delta-encoding.png" alt="double-delta-encoding" data-width="500" style="max-width:500px" />
+</p>
+<p>In the above example, instead of storing full timestamps, we can store timestamp deltas.</p>
+<p>Another technique we can employ is down-sampling - converting high-resolution data to low-resolution in order to reduce disk usage.</p>
+<p>Down-sampling works because of the access pattern noted just above — Facebook found ~85% of queries touched the last 26 hours. <strong>Data loses value with age far faster than it loses volume</strong>, so paying full resolution for a year is paying for data nobody will query. The policy encodes a judgement about what questions survive at what age: debugging an incident needs seconds of resolution and a window of hours; capacity planning needs hours of resolution and a window of a year. Neither needs what the other has.</p>
+<p>Note the one real trap: down-sampling must preserve the <em>right</em> aggregate. Averaging an average is fine; averaging a maximum destroys exactly the spikes you were watching for. Store min, max, sum, count and the bucket counts rather than a single mean, or a down-sampled series will quietly stop being able to answer the question it was created for.</p>
+<p>We can use that for old data and make the rules configurable by data scientists, eg:</p>
+<ul>
+<li>7d - no down-sampling</li>
+<li>30d - down-sample to 1min</li>
+<li>1y - down-sample to 1h</li>
+</ul>
+<p>For example, here's a 10-second resolution metrics table:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>metric</th>
+<th>timestamp</th>
+<th>hostname</th>
+<th>Metric_value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>cpu</td>
+<td>2021-10-24T19:00:00Z</td>
+<td>host-a</td>
+<td>10</td>
+</tr>
+<tr>
+<td>cpu</td>
+<td>2021-10-24T19:00:10Z</td>
+<td>host-a</td>
+<td>16</td>
+</tr>
+<tr>
+<td>cpu</td>
+<td>2021-10-24T19:00:20Z</td>
+<td>host-a</td>
+<td>20</td>
+</tr>
+<tr>
+<td>cpu</td>
+<td>2021-10-24T19:00:30Z</td>
+<td>host-a</td>
+<td>30</td>
+</tr>
+<tr>
+<td>cpu</td>
+<td>2021-10-24T19:00:40Z</td>
+<td>host-a</td>
+<td>20</td>
+</tr>
+<tr>
+<td>cpu</td>
+<td>2021-10-24T19:00:50Z</td>
+<td>host-a</td>
+<td>30</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>down-sampled to 30-second resolution:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>metric</th>
+<th>timestamp</th>
+<th>hostname</th>
+<th>Metric_value (avg)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>cpu</td>
+<td>2021-10-24T19:00:00Z</td>
+<td>host-a</td>
+<td>19</td>
+</tr>
+<tr>
+<td>cpu</td>
+<td>2021-10-24T19:00:30Z</td>
+<td>host-a</td>
+<td>25</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Finally, we can also use cold storage for old data, which is no longer actively queried. The financial cost for cold storage is much lower.</p>
+<h3 id="alerting-system"><strong>Alerting system</strong></h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/alerting-system.png" alt="alerting-system" data-width="500" style="max-width:500px" />
+</p>
+<p>Configuration is loaded to cache servers. Rules are typically defined in YAML format. Here's an example:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>- name: instance_down
+  rules:
+
+  # Alert for any instance that is unreachable for &gt;5 minutes.
+  - alert: instance_down
+    expr: up == 0
+    for: 5m
+    labels:
+      severity: page
+</code></pre></div>
+<p>The alert manager fetches alert configurations from cache. Based on configuration rules, it also calls the query service at a predefined interval.
+If a rule is met, an alert event is created.</p>
+<p>Other responsibilities of the alert manager are:</p>
+<ul>
+<li>Filtering, merging and deduplicating alerts. Eg if an alert of a single instance is triggered multiple times, only one alert event is generated.</li>
+<li>Access control - it is important to restrict alert-management operations to certain individuals only</li>
+<li>Retry - the manager ensures that the alert is propagated at least once.</li>
+</ul>
+<p><strong>The <code>for: 5m</code> clause is doing more work than it looks.</strong> Without it, any metric crossing the threshold for a single scrape pages someone — and real metrics are noisy, so an alert on <code>up == 0</code> without a duration will fire on every transient scrape failure, every deploy, every garbage-collection pause. Requiring the condition to hold <em>continuously</em> for a period is the anti-flapping mechanism, and tuning it is a direct trade: shorter means faster detection and more false pages, longer means fewer false pages and slower detection.</p>
+<p>Grouping and deduplication serve the same goal from the other side. A rack losing power trips 100 instance-down rules; sending 100 pages makes the actual problem <em>harder</em> to see. Collapsing related alerts into one notification, and suppressing downstream alerts when an upstream cause is already firing, is what keeps a real incident legible.</p>
+<p><strong>And the part no architecture diagram shows: alert fatigue is a system failure.</strong> An on-call engineer who has been woken three times this week by alerts that resolved themselves will start ignoring the fourth, which will be the real one. The design consequences are concrete:</p>
+<ul>
+<li><strong>Alert on symptoms, not causes.</strong> &quot;p99 latency exceeds 2 s&quot; is actionable and user-facing; &quot;CPU is at 80%&quot; may be entirely normal. One high-CPU host in a healthy fleet is not worth a human.</li>
+<li><strong>Every page needs a plausible action.</strong> If the response is &quot;look, confirm it recovered, go back to sleep&quot;, it should have been a dashboard, not a page.</li>
+<li><strong>Severity must be real.</strong> If everything is a page, nothing is.</li>
+</ul>
+<p>The alert store is a key-value database, like Cassandra, which keeps the state of all alerts. It ensures a notification is sent at least once.
+Once an alert is triggered, it is published to Kafka.</p>
+<p>Finally, alert consumers pull alerts data from Kafka and send notifications over to different channels - Email, text message, PagerDuty, webhooks.</p>
+<p>In the real-world, there are many off-the-shelf solutions for alerting systems. It is difficult to justify building your own system in-house.</p>
+<h3 id="visualization-system"><strong>Visualization system</strong></h3>
+<p>The visualization system shows metrics and alerts over a time period. Here's a dashboard built with Grafana:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/grafana-dashboard.png" alt="grafana-dashboard" data-width="500" style="max-width:500px" />
+</p>
+<p>A high-quality visualization system is very hard to build. It is hard to justify not using an off-the-shelf solution like Grafana.</p>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap up</h2>
+<p>Here's our final design:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/final-design.png" alt="final-design" data-width="500" style="max-width:500px" />
+</p>
+<figure class="mermaid-fig">
+<svg id="mmd-be71f31963807a88" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 2520.98px; background-color: transparent;" viewBox="0 -0.000003814697265625 2520.984375 294.66534423828125" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-be71f31963807a88{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-be71f31963807a88 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-be71f31963807a88 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-be71f31963807a88 .error-icon{fill:#f4f6f8;}#mmd-be71f31963807a88 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-be71f31963807a88 .edge-thickness-normal{stroke-width:1px;}#mmd-be71f31963807a88 .edge-thickness-thick{stroke-width:3.5px;}#mmd-be71f31963807a88 .edge-pattern-solid{stroke-dasharray:0;}#mmd-be71f31963807a88 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-be71f31963807a88 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-be71f31963807a88 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-be71f31963807a88 .marker{fill:#637381;stroke:#637381;}#mmd-be71f31963807a88 .marker.cross{stroke:#637381;}#mmd-be71f31963807a88 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-be71f31963807a88 p{margin:0;}#mmd-be71f31963807a88 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-be71f31963807a88 .cluster-label text{fill:#454f5b;}#mmd-be71f31963807a88 .cluster-label span{color:#454f5b;}#mmd-be71f31963807a88 .cluster-label span p{background-color:transparent;}#mmd-be71f31963807a88 .label text,#mmd-be71f31963807a88 span{fill:#161c24;color:#161c24;}#mmd-be71f31963807a88 .node rect,#mmd-be71f31963807a88 .node circle,#mmd-be71f31963807a88 .node ellipse,#mmd-be71f31963807a88 .node polygon,#mmd-be71f31963807a88 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-be71f31963807a88 .rough-node .label text,#mmd-be71f31963807a88 .node .label text,#mmd-be71f31963807a88 .image-shape .label,#mmd-be71f31963807a88 .icon-shape .label{text-anchor:middle;}#mmd-be71f31963807a88 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-be71f31963807a88 .rough-node .label,#mmd-be71f31963807a88 .node .label,#mmd-be71f31963807a88 .image-shape .label,#mmd-be71f31963807a88 .icon-shape .label{text-align:center;}#mmd-be71f31963807a88 .node.clickable{cursor:pointer;}#mmd-be71f31963807a88 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-be71f31963807a88 .arrowheadPath{fill:#000000;}#mmd-be71f31963807a88 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-be71f31963807a88 .flowchart-link{stroke:#637381;fill:none;}#mmd-be71f31963807a88 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-be71f31963807a88 .edgeLabel p{background-color:#ffffff;}#mmd-be71f31963807a88 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-be71f31963807a88 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-be71f31963807a88 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-be71f31963807a88 .cluster text{fill:#454f5b;}#mmd-be71f31963807a88 .cluster span{color:#454f5b;}#mmd-be71f31963807a88 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-be71f31963807a88 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-be71f31963807a88 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-be71f31963807a88 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-be71f31963807a88 rect.text{fill:none;stroke-width:0;}#mmd-be71f31963807a88 .icon-shape,#mmd-be71f31963807a88 .image-shape{background-color:#ffffff;text-align:center;}#mmd-be71f31963807a88 .icon-shape p,#mmd-be71f31963807a88 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-be71f31963807a88 .icon-shape .label rect,#mmd-be71f31963807a88 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-be71f31963807a88 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-be71f31963807a88 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-be71f31963807a88 .node .neo-node{stroke:#299a8d;}#mmd-be71f31963807a88 [data-look="neo"].node rect,#mmd-be71f31963807a88 [data-look="neo"].cluster rect,#mmd-be71f31963807a88 [data-look="neo"].node polygon{stroke:url(#mmd-be71f31963807a88-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-be71f31963807a88 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-be71f31963807a88 [data-look="neo"].node path{stroke:url(#mmd-be71f31963807a88-gradient);stroke-width:1px;}#mmd-be71f31963807a88 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-be71f31963807a88 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-be71f31963807a88 [data-look="neo"].node circle{stroke:url(#mmd-be71f31963807a88-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-be71f31963807a88 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-be71f31963807a88 [data-look="neo"].icon-shape .icon{fill:url(#mmd-be71f31963807a88-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-be71f31963807a88 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-be71f31963807a88-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-be71f31963807a88 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-be71f31963807a88_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-be71f31963807a88_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-be71f31963807a88_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-be71f31963807a88_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-be71f31963807a88_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-be71f31963807a88_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-be71f31963807a88_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-be71f31963807a88_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-be71f31963807a88_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-be71f31963807a88_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-be71f31963807a88_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-be71f31963807a88_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M228.375,216.171L232.542,217.381C236.708,218.591,245.042,221.01,252.708,222.22C260.375,223.43,267.375,223.43,270.875,223.43L274.375,223.43" id="mmd-be71f31963807a88-L_SRC_AG_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SRC_AG_0" data-points="W3sieCI6MjI4LjM3NSwieSI6MjE2LjE3MTExMjgxNTM3Mzd9LHsieCI6MjUzLjM3NSwieSI6MjIzLjQyOTU1MDE3MDg5ODQ0fSx7IngiOjI3OC4zNzUsInkiOjIyMy40Mjk1NTAxNzA4OTg0NH1d" data-look="classic" marker-end="url(#mmd-be71f31963807a88_flowchart-v2-pointEnd)"/><path d="M416.234,53.715L422.622,53.715C429.01,53.715,441.786,53.715,461.988,63.417C482.19,73.12,509.818,92.525,523.632,102.227L537.446,111.93" id="mmd-be71f31963807a88-L_SD_MC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SD_MC_0" data-points="W3sieCI6NDE2LjIzNDM3NSwieSI6NTMuNzE0Nzc1MDg1NDQ5MjJ9LHsieCI6NDU0LjU2MjUsInkiOjUzLjcxNDc3NTA4NTQ0OTIyfSx7IngiOjUzNy40NDU4ODI2OTk4OTc1LCJ5IjoxMTEuOTI5NTUwMTcwODk4NDR9XQ==" data-look="classic"/><path d="M228.375,152.188L232.542,150.978C236.708,149.769,245.042,147.349,265.974,146.139C286.906,144.93,320.438,144.93,353.969,144.93C387.5,144.93,421.031,144.93,441.964,144.93C462.896,144.93,471.229,144.93,475.396,144.93L479.563,144.93" id="mmd-be71f31963807a88-L_SRC_MC_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SRC_MC_0" data-points="W3sieCI6MjI4LjM3NSwieSI6MTUyLjE4Nzk4NzUyNjQyMzE3fSx7IngiOjI1My4zNzUsInkiOjE0NC45Mjk1NTAxNzA4OTg0NH0seyJ4IjozNTMuOTY4NzUsInkiOjE0NC45Mjk1NTAxNzA4OTg0NH0seyJ4Ijo0NTQuNTYyNSwieSI6MTQ0LjkyOTU1MDE3MDg5ODQ0fSx7IngiOjQ3OS41NjI1LCJ5IjoxNDQuOTI5NTUwMTcwODk4NDR9XQ==" data-look="classic"/><path d="M429.563,223.43L433.729,223.43C437.896,223.43,446.229,223.43,462.371,216.191C478.513,208.953,502.463,194.476,514.438,187.237L526.413,179.999" id="mmd-be71f31963807a88-L_AG_MC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_AG_MC_0" data-points="W3sieCI6NDI5LjU2MjUsInkiOjIyMy40Mjk1NTAxNzA4OTg0NH0seyJ4Ijo0NTQuNTYyNSwieSI6MjIzLjQyOTU1MDE3MDg5ODQ0fSx7IngiOjUyOS44MzU4Mzc5Nzc3MDcsInkiOjE3Ny45Mjk1NTAxNzA4OTg0NH1d" data-look="classic" marker-end="url(#mmd-be71f31963807a88_flowchart-v2-pointEnd)"/><path d="M689.297,144.93L693.464,144.93C697.63,144.93,705.964,144.93,713.63,144.93C721.297,144.93,728.297,144.93,731.797,144.93L735.297,144.93" id="mmd-be71f31963807a88-L_MC_Q_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_MC_Q_0" data-points="W3sieCI6Njg5LjI5Njg3NSwieSI6MTQ0LjkyOTU1MDE3MDg5ODQ0fSx7IngiOjcxNC4yOTY4NzUsInkiOjE0NC45Mjk1NTAxNzA4OTg0NH0seyJ4Ijo3MzkuMjk2ODc1LCJ5IjoxNDQuOTI5NTUwMTcwODk4NDR9XQ==" data-look="classic" marker-end="url(#mmd-be71f31963807a88_flowchart-v2-pointEnd)"/><path d="M914.391,144.93L918.557,144.93C922.724,144.93,931.057,144.93,938.724,144.93C946.391,144.93,953.391,144.93,956.891,144.93L960.391,144.93" id="mmd-be71f31963807a88-L_Q_SP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q_SP_0" data-points="W3sieCI6OTE0LjM5MDYyNSwieSI6MTQ0LjkyOTU1MDE3MDg5ODQ0fSx7IngiOjkzOS4zOTA2MjUsInkiOjE0NC45Mjk1NTAxNzA4OTg0NH0seyJ4Ijo5NjQuMzkwNjI1LCJ5IjoxNDQuOTI5NTUwMTcwODk4NDR9XQ==" data-look="classic" marker-end="url(#mmd-be71f31963807a88_flowchart-v2-pointEnd)"/><path d="M1173.219,144.93L1177.385,144.93C1181.552,144.93,1189.885,144.93,1197.552,144.93C1205.219,144.93,1212.219,144.93,1215.719,144.93L1219.219,144.93" id="mmd-be71f31963807a88-L_SP_TSDB_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SP_TSDB_0" data-points="W3sieCI6MTE3My4yMTg3NSwieSI6MTQ0LjkyOTU1MDE3MDg5ODQ0fSx7IngiOjExOTguMjE4NzUsInkiOjE0NC45Mjk1NTAxNzA4OTg0NH0seyJ4IjoxMjIzLjIxODc1LCJ5IjoxNDQuOTI5NTUwMTcwODk4NDR9XQ==" data-look="classic" marker-end="url(#mmd-be71f31963807a88_flowchart-v2-pointEnd)"/><path d="M1395.453,144.93L1399.62,144.93C1403.786,144.93,1412.12,144.93,1419.786,144.93C1427.453,144.93,1434.453,144.93,1437.953,144.93L1441.453,144.93" id="mmd-be71f31963807a88-L_TSDB_QS_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_TSDB_QS_0" data-points="W3sieCI6MTM5NS40NTMxMjUsInkiOjE0NC45Mjk1NTAxNzA4OTg0NH0seyJ4IjoxNDIwLjQ1MzEyNSwieSI6MTQ0LjkyOTU1MDE3MDg5ODQ0fSx7IngiOjE0NDUuNDUzMTI1LCJ5IjoxNDQuOTI5NTUwMTcwODk4NDR9XQ==" data-look="classic" marker-end="url(#mmd-be71f31963807a88_flowchart-v2-pointEnd)"/><path d="M1560.608,111.93L1568.132,106.703C1575.655,101.477,1590.703,91.025,1614.148,85.798C1637.594,80.572,1669.438,80.572,1685.359,80.572L1701.281,80.572" id="mmd-be71f31963807a88-L_QS_VIS_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_QS_VIS_0" data-points="W3sieCI6MTU2MC42MDgxMjc4NTY5MzQzLCJ5IjoxMTEuOTI5NTUwMTcwODk4NDR9LHsieCI6MTYwNS43NSwieSI6ODAuNTcyMTYyNjI4MTczODN9LHsieCI6MTcwNS4yODEyNSwieSI6ODAuNTcyMTYyNjI4MTczODN9XQ==" data-look="classic" marker-end="url(#mmd-be71f31963807a88_flowchart-v2-pointEnd)"/><path d="M1572.305,177.93L1577.879,181.037C1583.453,184.144,1594.602,190.358,1603.676,193.465C1612.75,196.572,1619.75,196.572,1623.25,196.572L1626.75,196.572" id="mmd-be71f31963807a88-L_QS_AM_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_QS_AM_0" data-points="W3sieCI6MTU3Mi4zMDQ1NzkwMDE3MiwieSI6MTc3LjkyOTU1MDE3MDg5ODQ0fSx7IngiOjE2MDUuNzUsInkiOjE5Ni41NzIxNjI2MjgxNzM4M30seyJ4IjoxNjMwLjc1LCJ5IjoxOTYuNTcyMTYyNjI4MTczODN9XQ==" data-look="classic" marker-end="url(#mmd-be71f31963807a88_flowchart-v2-pointEnd)"/><path d="M1868.275,153.072L1874.187,150.807C1880.1,148.541,1891.925,144.01,1901.653,141.745C1911.38,139.479,1919.01,139.479,1922.826,139.479L1926.641,139.479" id="mmd-be71f31963807a88-L_AM_AS_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_AM_AS_0" data-points="W3sieCI6MTg2OC4yNzQ5ODUyMTg3ODI0LCJ5IjoxNTMuMDcyMTYyNjI4MTczODN9LHsieCI6MTkwMy43NSwieSI6MTM5LjQ3OTAwMzkwNjI1fSx7IngiOjE5MzAuNjQwNjI1LCJ5IjoxMzkuNDc5MDAzOTA2MjV9XQ==" data-look="classic" marker-end="url(#mmd-be71f31963807a88_flowchart-v2-pointEnd)"/><path d="M1868.275,240.072L1874.187,242.338C1880.1,244.603,1891.925,249.134,1901.337,251.4C1910.75,253.665,1917.75,253.665,1921.25,253.665L1924.75,253.665" id="mmd-be71f31963807a88-L_AM_AQ_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_AM_AQ_0" data-points="W3sieCI6MTg2OC4yNzQ5ODUyMTg3ODI0LCJ5IjoyNDAuMDcyMTYyNjI4MTczODN9LHsieCI6MTkwMy43NSwieSI6MjUzLjY2NTMyMTM1MDA5NzY2fSx7IngiOjE5MjguNzUsInkiOjI1My42NjUzMjEzNTAwOTc2Nn1d" data-look="classic" marker-end="url(#mmd-be71f31963807a88_flowchart-v2-pointEnd)"/><path d="M2013,253.665L2017.167,253.665C2021.333,253.665,2029.667,253.665,2037.333,253.665C2045,253.665,2052,253.665,2055.5,253.665L2059,253.665" id="mmd-be71f31963807a88-L_AQ_AC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_AQ_AC_0" data-points="W3sieCI6MjAxMywieSI6MjUzLjY2NTMyMTM1MDA5NzY2fSx7IngiOjIwMzgsInkiOjI1My42NjUzMjEzNTAwOTc2Nn0seyJ4IjoyMDYzLCJ5IjoyNTMuNjY1MzIxMzUwMDk3NjZ9XQ==" data-look="classic" marker-end="url(#mmd-be71f31963807a88_flowchart-v2-pointEnd)"/><path d="M2214.984,253.665L2219.151,253.665C2223.318,253.665,2231.651,253.665,2239.318,253.665C2246.984,253.665,2253.984,253.665,2257.484,253.665L2260.984,253.665" id="mmd-be71f31963807a88-L_AC_CH_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_AC_CH_0" data-points="W3sieCI6MjIxNC45ODQzNzUsInkiOjI1My42NjUzMjEzNTAwOTc2Nn0seyJ4IjoyMjM5Ljk4NDM3NSwieSI6MjUzLjY2NTMyMTM1MDA5NzY2fSx7IngiOjIyNjQuOTg0Mzc1LCJ5IjoyNTMuNjY1MzIxMzUwMDk3NjZ9XQ==" data-look="classic" marker-end="url(#mmd-be71f31963807a88_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_SRC_AG_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_SD_MC_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(353.96875, 144.92955017089844)"><g class="label" data-id="L_SRC_MC_0" transform="translate(-60.328125, -10.5)"><foreignObject width="120.65625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>GET /metrics (pull)</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_AG_MC_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_MC_Q_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_Q_SP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_SP_TSDB_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_TSDB_QS_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_QS_VIS_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_QS_AM_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_AM_AS_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_AM_AQ_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_AQ_AC_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_AC_CH_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-be71f31963807a88-flowchart-SRC-0" data-look="classic" transform="translate(118.1875, 184.17955017089844)"><rect class="basic label-container" style="" x="-110.1875" y="-33" width="220.375" height="66"/><g class="label" style="" transform="translate(-86.1875, -21)"><rect/><foreignObject width="172.375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>targets<br />app servers · DBs · queues</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-AG-1" data-look="classic" transform="translate(353.96875, 223.42955017089844)"><rect class="basic label-container" style="" x="-75.59375" y="-33" width="151.1875" height="66"/><g class="label" style="" transform="translate(-51.59375, -21)"><rect/><foreignObject width="103.1875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>collection agent<br />(push)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-SD-2" data-look="classic" transform="translate(353.96875, 53.71477508544922)"><path d="M0,12.476518472135254 a62.265625,12.476518472135254 0,0,0 124.53125,0 a62.265625,12.476518472135254 0,0,0 -124.53125,0 l0,66.47651847213525 a62.265625,12.476518472135254 0,0,0 124.53125,0 l0,-66.47651847213525" class="basic label-container outer-path" style="" transform="translate(-62.265625, -45.71477770820288)"/><g class="label" style="" transform="translate(-56.265625, -13)"><rect/><foreignObject width="112.53125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>service discovery<br />ZooKeeper / etcd</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-MC-3" data-look="classic" transform="translate(584.4296875, 144.92955017089844)"><rect class="basic label-container" style="" x="-104.8671875" y="-33" width="209.734375" height="66"/><g class="label" style="" transform="translate(-80.8671875, -21)"><rect/><foreignObject width="161.734375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>metrics collectors<br />on a consistent hash ring</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-Q-9" data-look="classic" transform="translate(826.84375, 144.92955017089844)"><rect class="basic label-container" style="" x="-87.546875" y="-33" width="175.09375" height="66"/><g class="label" style="" transform="translate(-63.546875, -21)"><rect/><foreignObject width="127.09375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Kafka<br />buffer + decoupling</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-SP-11" data-look="classic" transform="translate(1068.8046875, 144.92955017089844)"><rect class="basic label-container" style="" x="-104.4140625" y="-33" width="208.828125" height="66"/><g class="label" style="" transform="translate(-80.4140625, -21)"><rect/><foreignObject width="160.828125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>stream processing<br />optional pre-aggregation</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-TSDB-13" data-look="classic" transform="translate(1309.3359375, 144.92955017089844)"><path d="M0,14.486411186458497 a86.1171875,14.486411186458497 0,0,0 172.234375,0 a86.1171875,14.486411186458497 0,0,0 -172.234375,0 l0,89.4864111864585 a86.1171875,14.486411186458497 0,0,0 172.234375,0 l0,-89.4864111864585" class="basic label-container outer-path" style="" transform="translate(-86.1171875, -59.229616779687746)"/><g class="label" style="" transform="translate(-80.1171875, -23.5)"><rect/><foreignObject width="160.234375" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>time-series DB<br />delta-of-delta + XOR,<br />down-sampling, cold tier</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-QS-15" data-look="classic" transform="translate(1513.1015625, 144.92955017089844)"><rect class="basic label-container" style="" x="-67.6484375" y="-33" width="135.296875" height="66"/><g class="label" style="" transform="translate(-43.6484375, -21)"><rect/><foreignObject width="87.296875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>query service<br />+ cache</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-VIS-17" data-look="classic" transform="translate(1754.75, 80.57216262817383)"><rect class="basic label-container" style="" x="-49.46875" y="-22.5" width="98.9375" height="45"/><g class="label" style="" transform="translate(-25.46875, -10.5)"><rect/><foreignObject width="50.9375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Grafana</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-AM-19" data-look="classic" transform="translate(1754.75, 196.57216262817383)"><rect class="basic label-container" style="" x="-124" y="-43.5" width="248" height="87"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>alert manager<br />rules · for: 5m · dedup · grouping</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-AS-21" data-look="classic" transform="translate(1970.875, 139.47900390625)"><path d="M0,9.790874524714829 a40.234375,9.790874524714829 0,0,0 80.46875,0 a40.234375,9.790874524714829 0,0,0 -80.46875,0 l0,63.79087452471483 a40.234375,9.790874524714829 0,0,0 80.46875,0 l0,-63.79087452471483" class="basic label-container outer-path" style="" transform="translate(-40.234375, -41.68631178707224)"/><g class="label" style="" transform="translate(-34.234375, -13)"><rect/><foreignObject width="68.46875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>alert store<br />Cassandra</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-AQ-23" data-look="classic" transform="translate(1970.875, 253.66532135009766)"><rect class="basic label-container" style="" x="-42.125" y="-22.5" width="84.25" height="45"/><g class="label" style="" transform="translate(-18.125, -10.5)"><rect/><foreignObject width="36.25" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Kafka</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-AC-25" data-look="classic" transform="translate(2138.9921875, 253.66532135009766)"><rect class="basic label-container" style="" x="-75.9921875" y="-22.5" width="151.984375" height="45"/><g class="label" style="" transform="translate(-51.9921875, -10.5)"><rect/><foreignObject width="103.984375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>alert consumers</p></span></div></foreignObject></g></g><g class="node default" id="mmd-be71f31963807a88-flowchart-CH-27" data-look="classic" transform="translate(2388.984375, 253.66532135009766)"><rect class="basic label-container" style="" x="-124" y="-33" width="248" height="66"/><g class="label" style="" transform="translate(-100, -21)"><rect/><foreignObject width="200" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>email · SMS · PagerDuty · webhook</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-be71f31963807a88-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-be71f31963807a88-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-be71f31963807a88-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p><strong>Why the queue in the middle earns its place</strong>, beyond the chapter's point about surviving a database outage: it decouples two components with completely different scaling behaviour and failure modes. Collectors are stateless and autoscale freely; the time-series database is stateful, carefully sized, and occasionally needs maintenance. Without the buffer, every write-path hiccup propagates straight back to the collectors and metrics are lost precisely during the incident you most need to observe. This is <a href="19-distributed-message-queue.html">Chapter 19</a> doing the job it exists for.</p>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Cardinality explosion is the dominant failure mode.</strong> Memory scales with the number of series, not the number of points, so one high-cardinality label (<code>user_id</code>, <code>request_id</code>, an un-normalised URL) can multiply series count by millions and take the cluster down. It is usually introduced by a one-line application change, and the created series persist until retention expires.</li>
+<li><strong>The monitoring system cannot report its own death.</strong> If ingestion stops, every dashboard goes flat and every threshold alert goes quiet — which looks exactly like a perfectly healthy system. The remedy is a <strong>dead-man's-switch</strong>: a heartbeat that fires continuously, watched by something <em>outside</em> this system, which alerts when it stops arriving. Alerting on absence rather than on threshold is the only construction that catches this.</li>
+<li><strong>Averaging percentiles is mathematically wrong</strong> and hides the tail latency you are looking for. Aggregate histograms or mergeable sketches, then compute the percentile.</li>
+<li><strong>Pre-aggregation is irreversible.</strong> Raw data discarded in the ingestion pipeline forecloses every question you did not think to ask in advance, and those are the questions incidents generate.</li>
+<li><strong>Down-sampling the wrong aggregate destroys the signal.</strong> Averaging maxima smooths away spikes. Keep min/max/sum/count, not just a mean.</li>
+<li><strong>In push mode, silence is ambiguous.</strong> Dead service, dead agent, broken network and intentional decommission are indistinguishable without a separate inventory.</li>
+<li><strong>Short-lived jobs are invisible to pull.</strong> Batch jobs and serverless functions finish before a scrape. A push gateway fixes it and inherits push's staleness problem — an old entry looks healthy.</li>
+<li><strong>Scrape intervals and alert windows interact.</strong> A <code>for: 1m</code> rule on a 60-second scrape interval has one sample to work with. Alert windows need to be several scrape intervals wide, or they fire on single missed samples.</li>
+<li><strong>An alert storm buries the actual cause.</strong> A rack losing power trips every instance rule it hosts. Grouping and inhibition (suppressing downstream alerts when an upstream cause is firing) are what keep an incident readable.</li>
+<li><strong>Alert fatigue is a real failure of the system, not of the engineer.</strong> Pages that are routinely self-resolving train people to ignore the one that matters. Alert on user-visible symptoms, and ensure every page has an action.</li>
+<li><strong>Metrics collection must degrade gracefully, never block.</strong> An agent that blocks the application thread when the collector is unreachable turns a monitoring outage into a production outage. Fire-and-forget, bounded buffers, and drop on overflow.</li>
+<li><strong>Timestamps come from the sources.</strong> Clock skew across a fleet puts points in the wrong buckets and can produce out-of-order writes that a time-series database handles poorly or rejects outright.</li>
+<li><strong>Collector rebalancing double-counts or drops.</strong> With collectors on a consistent hash ring, a membership change reassigns targets — briefly two collectors scrape the same target, or none does. <a href="05-consistent-hashing.html">Chapter 5</a> limits the churn; it does not eliminate the window.</li>
+<li><strong>Incidents invert the read pattern.</strong> Reads are rare and then suddenly enormous, as everyone opens dashboards over the same window at once — a thundering herd on the query path at the worst possible time. The query cache exists for this.</li>
+<li><strong>Observing a system changes it.</strong> 100 metrics per machine scraped every 10 seconds consumes CPU, memory and network on the machine being measured. At fine intervals this becomes a measurable tax on the fleet.</li>
+<li><strong>Building this is rarely justified.</strong> The chapter says so twice, about alerting and visualisation, and it is right — the interview value is in understanding the trade-offs, not in the implementation.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 M writes/sec of tiny points</td>
+<td>Purpose-built time-series database, not a general-purpose one</td>
+</tr>
+<tr>
+<td>55 TB of data points</td>
+<td>Delta-of-delta timestamps and XOR-encoded values — ~25× compression</td>
+</tr>
+<tr>
+<td>A year of retention nobody queries at full resolution</td>
+<td>Tiered down-sampling (raw 7 d → 1 min 30 d → 1 h 1 y), then cold storage</td>
+</tr>
+<tr>
+<td>Most queries touching the last 26 hours</td>
+<td>A store that keeps recent data in memory; query-layer cache</td>
+</tr>
+<tr>
+<td>Knowing a target is down</td>
+<td>Pull model with service discovery, so absence is meaningful</td>
+</tr>
+<tr>
+<td>Targets pull cannot reach</td>
+<td>Push path with agents, plus a push gateway for short-lived jobs</td>
+</tr>
+<tr>
+<td>Two collectors scraping the same target</td>
+<td>Collectors and targets on a consistent hash ring</td>
+</tr>
+<tr>
+<td>Database outage losing metrics</td>
+<td>Kafka between collectors and storage</td>
+</tr>
+<tr>
+<td>Reducing write volume</td>
+<td>Aggregation at the agent or in a stream processor, accepting lost precision</td>
+</tr>
+<tr>
+<td>Correct fleet-wide percentiles</td>
+<td>Aggregate histograms or sketches, never averages of percentiles</td>
+</tr>
+<tr>
+<td>Noisy metrics causing false pages</td>
+<td><code>for:</code> duration on rules; grouping, deduplication and inhibition</td>
+</tr>
+<tr>
+<td>At-least-once alert delivery</td>
+<td>Alert state in a durable KV store; Kafka to the notification channels</td>
+</tr>
+<tr>
+<td>Detecting that monitoring itself has stopped</td>
+<td>External dead-man's-switch alerting on the absence of a heartbeat</td>
+</tr>
+<tr>
+<td>Changing the database later</td>
+<td>Query service decoupling clients from the store</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Derive the write rate from 10 M metrics at a 10-second interval. How many nodes does that imply at ~250 K writes/sec each?</li>
+<li>Why does a data point cost under 2 bytes when a timestamp and a float are 16? Name both mechanisms.</li>
+<li>Does memory usage scale with data points or with time series? What follows from that?</li>
+<li>A developer adds <code>endpoint</code> and <code>user_id</code> labels to a request counter. Estimate the new series count and describe what happens.</li>
+<li>Why is <code>up == 0</code> natural in a pull system and awkward in a push system?</li>
+<li>What cannot be monitored by pull at all, and what is the patch — including what the patch inherits?</li>
+<li>You have each host's p99 latency. How do you get the fleet's p99? What must you have stored instead?</li>
+<li>Which aggregation choice is irreversible, and what does it cost you during an incident?</li>
+<li>Down-sampling a <code>max</code> series by averaging — what breaks?</li>
+<li>Ingestion stops entirely. What do the dashboards show, which alerts fire, and what construction catches it?</li>
+<li>A rack loses power and 100 instances go down. What does a naive alert configuration do, and why is that harmful?</li>
+<li>Why must a collection agent never block the application it is measuring?</li>
+<li>Reads are described as rare but spiky. When do the spikes happen, and why is that the worst time?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Time series</strong></td>
+<td>A named, labelled sequence of timestamped values</td>
+</tr>
+<tr>
+<td><strong>Label / tag</strong></td>
+<td>A key-value dimension on a metric; their product determines series count</td>
+</tr>
+<tr>
+<td><strong>Cardinality</strong></td>
+<td>The number of distinct time series — the resource that actually constrains the system</td>
+</tr>
+<tr>
+<td><strong>Line protocol</strong></td>
+<td>The <code>name tags timestamp value</code> text format used by Prometheus, OpenTSDB and others</td>
+</tr>
+<tr>
+<td><strong>Pull vs push</strong></td>
+<td>Collector scrapes targets vs targets send to the collector</td>
+</tr>
+<tr>
+<td><strong>Push gateway</strong></td>
+<td>An intermediary letting short-lived jobs be scraped after they exit</td>
+</tr>
+<tr>
+<td><strong>Delta-of-delta encoding</strong></td>
+<td>Storing the change in the interval between timestamps — usually zero</td>
+</tr>
+<tr>
+<td><strong>XOR float compression</strong></td>
+<td>Storing a value XOR-ed with its predecessor, leaving mostly zero bits</td>
+</tr>
+<tr>
+<td><strong>Down-sampling</strong></td>
+<td>Reducing resolution as data ages</td>
+</tr>
+<tr>
+<td><strong>Rollup</strong></td>
+<td>The aggregate stored when down-sampling (avg, min, max, sum, count)</td>
+</tr>
+<tr>
+<td><strong>Histogram / sketch</strong></td>
+<td>Bucketed or mergeable distribution, so percentiles survive aggregation</td>
+</tr>
+<tr>
+<td><strong><code>for:</code> duration</strong></td>
+<td>How long a rule's condition must hold before alerting — the anti-flapping control</td>
+</tr>
+<tr>
+<td><strong>Grouping / inhibition</strong></td>
+<td>Collapsing related alerts, and suppressing downstream ones when a cause is firing</td>
+</tr>
+<tr>
+<td><strong>Dead-man's-switch</strong></td>
+<td>An external alert on the <em>absence</em> of a heartbeat, which catches monitoring failure</td>
+</tr>
+<tr>
+<td><strong>Alert fatigue</strong></td>
+<td>Degraded human response caused by too many low-value pages</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="19-distributed-message-queue.html">Chapter 19 – Distributed Message Queue</a> — the buffer between collectors and storage, and the log-structured ideas the time-series store reuses.</li>
+<li><a href="21-ad-click-event-aggregation.html">Chapter 21 – Ad Click Event Aggregation</a> — the same ingest-and-aggregate shape where correctness matters, so watermarks and reconciliation appear.</li>
+<li><a href="01-scaling.html#section-11-logging-metrics-and-automation">Chapter 1 §11 – Logging, Metrics, and Automation</a> — where metrics sit among the three pillars of observability.</li>
+<li><a href="05-consistent-hashing.html">Chapter 5 – Design Consistent Hashing</a> — the collector ring, and the churn window a membership change opens.</li>
+<li><a href="10-notification-system.html">Chapter 10 – Design A Notification System</a> — the delivery path the alert consumers hand off to.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

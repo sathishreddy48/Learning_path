@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard — System Design</title>
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body data-root="">
+<div class="layout">
+<main class="main">
+
+  <h1>System Design</h1>
+  <p class="lede">A self-paced study site built from the <strong>System Design Interview — An Insider's Guide (Vol 1 &amp; 2)</strong>
+  notes in this repository. 28 chapters plus a patterns index, 274 sections,
+  388 diagrams and 40 rendered flow diagrams — all generated straight from the
+  markdown, so the notes stay the single source of truth. Pages you have opened turn
+  <span class="badge badge-visited">✓ visited</span>.</p>
+
+  <div class="storage-banner"></div>
+
+  <div class="stats-row">
+    <div class="progress">
+      <span>Visited</span>
+      <span class="progress-bar"><span class="progress-fill" data-progress-fill></span></span>
+      <span class="progress-num" data-progress-num>0 / 0</span>
+    </div>
+    <button type="button" class="btn btn-danger btn-sm" data-reset-visited>Reset visited chapters</button>
+  </div>
+
+  <div class="callout callout-note">
+    <span class="callout-title">How to use this site</span>
+    <ul>
+      <li><strong>Start with the Patterns index</strong> — it names the dozen ideas that recur across all 28 chapters and links to the chapters that work each one through. Recognising a pattern is most of the job in an interview.</li>
+      <li>Then <strong>Foundations</strong> (chapters 1–3) and <strong>Building Blocks</strong> (4–7) in order; the system chapters assume both.</li>
+      <li><strong>Interview angle</strong> callouts flag what an interviewer is actually probing for. <strong>Gotchas &amp; failure modes</strong> sections are the things that bite in production.</li>
+      <li>Every chapter ends with <strong>Self-check</strong> questions and a glossary. Answer them out loud before moving on.</li>
+      <li>Two chapters — <a href="chapters/04-rate-limiter.html#anim-rate-limiter">Rate Limiter</a> and <a href="chapters/05-consistent-hashing.html#anim-consistent-hashing">Consistent Hashing</a> — have interactive explainers you can drive yourself.</li>
+      <li>Visited state lives in your browser only, separate from the C# path's.</li>
+    </ul>
+  </div>
+
+  <h2 id="chapters">Chapters</h2>
+  <div data-topic-groups></div>
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> by <code>tools/build-system-design.mjs</code> ·
+  Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="assets/js/curriculum.js"></script>
+<script src="assets/js/visited.js"></script>
+<script src="assets/js/nav.js"></script>
+<script src="assets/js/code-tabs.js"></script>
+<script>
+/* Dashboard: chapter cards + progress, kept in sync with visited state */
+(function () {
+  'use strict';
+  var C = window.CURRICULUM, V = window.VISITED;
+  if (!C || !V) return;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
+    });
+  }
+
+  function cardHtml(t) {
+    var i = C.topics.indexOf(t);
+    var visited = V.isVisited(t.id);
+    return '<div class="card' + (visited ? ' visited' : '') + '">' +
+      '<h3><span class="card-num">' + (visited ? '✓' : (i + 1)) + '</span><a href="' + t.href + '">' + esc(t.label) + '</a></h3>' +
+      '<p>' + esc(t.blurb) + '</p>' +
+      '<div class="card-foot"><span>' + t.sections.length + ' sections</span>' +
+      (visited ? '<span class="badge badge-visited">Visited</span>' : (i === 0 ? '<span class="badge badge-start">Start here</span>' : '')) +
+      '</div></div>';
+  }
+
+  function render() {
+    var host = document.querySelector('[data-topic-groups]');
+    if (host) {
+      host.innerHTML = C.groups.map(function (g) {
+        var done = g.topics.filter(function (t) { return V.isVisited(t.id); }).length;
+        return '<div class="group-head" id="group-' + esc(g.id) + '"><h3>' + esc(g.label) + '</h3>' +
+          '<span class="group-count">' + done + ' / ' + g.topics.length + ' visited</span></div>' +
+          '<p class="group-blurb">' + esc(g.blurb) + '</p>' +
+          '<div class="cards">' + g.topics.map(cardHtml).join('') + '</div>';
+      }).join('');
+    }
+    var n = V.count(), total = C.topics.length;
+    var fill = document.querySelector('[data-progress-fill]');
+    var num = document.querySelector('[data-progress-num]');
+    if (fill) fill.style.width = (total ? Math.round(n / total * 100) : 0) + '%';
+    if (num) num.textContent = n + ' / ' + total;
+  }
+
+  document.addEventListener('DOMContentLoaded', render);
+  document.addEventListener('visited:change', render);
+})();
+</script>
+</body>
+</html>

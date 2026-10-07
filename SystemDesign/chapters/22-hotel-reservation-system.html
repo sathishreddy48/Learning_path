@@ -1,0 +1,932 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 22: Hotel Reservation System — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="22-hotel-reservation-system">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 22 of 28</div>
+  <h1>Chapter 22: Hotel Reservation System</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</a></li><li><a href="#step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap Up</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>In this chapter, we're designing a <strong>hotel reservation system</strong>, similar to Marriott International.</p>
+<p>Applicable to other types of systems as well - Airbnb, flight reservation, movie ticket booking.</p>
+<p><strong>The one-sentence version:</strong> this is a <strong>concurrency</strong> problem wearing a CRUD costume. The dataset is tiny (73 million rows, comfortably one server), the write rate is about <strong>3 reservations per second</strong>, and every service is stateless — by the standards of this book it is trivially small. It is nonetheless one of the harder chapters, because the system has exactly one invariant that must never be violated — <em>do not sell the same room twice</em> — and correctness under concurrency is the one thing distributed systems do not hand you for free.</p>
+<p><strong>And then the requirements quietly dissolve the hardest part of the problem.</strong> Overbooking by 10% is permitted, which means the invariant is not &quot;never exceed inventory&quot; but &quot;never exceed 110% of inventory&quot; — a <em>soft</em> limit, deliberately set above the real one. That is only acceptable because the business already has a procedure for the failure case: when a hotel is genuinely oversold, the guest is walked to another property at the hotel's expense. <strong>The business absorbs the inconsistency.</strong></p>
+<p>This is worth noticing as a general technique, not a quirk of hotels. Asking &quot;what does the business do when this constraint is violated?&quot; sometimes reveals that an apparently absolute technical requirement is a negotiable one — and negotiable constraints are enormously cheaper to enforce. Airline seats work the same way; a bank balance does not (<a href="27-digital-wallet.html">Chapter 27</a>).</p>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-establish-design-scope">
+<h2 id="step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</h2>
+<p>Before diving into designing the system, we should ask the interviewer questions to clarify the scope:</p>
+<ul>
+<li>C: What is the scale of the system?</li>
+<li>I: We're building a website for a hotel chain \w 5000 hotels and 1mil rooms</li>
+<li>C: Do customers pay when they make a reservation or when they arrive at the hotel?</li>
+<li>I: They pay in full when making reservations.</li>
+<li>C: Do customers book hotel rooms through the website only? Do we have to support other reservation options such as phone calls?</li>
+<li>I: They make bookings through the website or app only.</li>
+<li>C: Can customers cancel reservations?</li>
+<li>I: Yes</li>
+<li>C: Other things to consider?</li>
+<li>I: Yes, we allow overbooking by 10%. Hotel will sell more rooms than there actually are. Hotels do this in anticipation that clients will cancel bookings.</li>
+<li>C: Since not much time, we'll focus on - show hotel-related page, hotel-room details page, reserve a room, admin panel, support overbooking.</li>
+<li>I: Sounds good.</li>
+<li>I: One more thing - hotel prices change all the time. Assume a hotel room's price changes every day.</li>
+<li>C: OK.</li>
+</ul>
+<h3 id="non-functional-requirements"><strong>Non-functional requirements</strong></h3>
+<ul>
+<li>Support high concurrency - there might be a lot of customers trying to book the same hotel during peak season.</li>
+<li>Moderate latency - it's ideal to have low latency when a user makes a reservation, but it's acceptable if the system takes a few seconds to process it.</li>
+</ul>
+<h3 id="back-of-the-envelope-estimation"><strong>Back-of-the-envelope estimation</strong></h3>
+<ul>
+<li>5000 hotels and 1mil rooms in total</li>
+<li>Assume 70% of rooms are occupied and average stay duration is 3 days</li>
+<li>Estimated daily reservations - 1mil * 0.7 / 3 = ~240k reservations per day</li>
+<li>Reservations per second - 240k / 10^5 seconds in a day = ~3. Average reservation TPS is low.</li>
+</ul>
+<p><strong>Hold on to the number 3</strong>, because it decides the rest of the chapter. At three writes per second:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Implication</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sharding</td>
+<td>Unnecessary — 73 M rows and 3 TPS fit one server with replicas</td>
+</tr>
+<tr>
+<td>Caching the write path</td>
+<td>Unnecessary, and actively dangerous (see the gotchas)</td>
+</tr>
+<tr>
+<td>Pessimistic locking</td>
+<td>Would be <em>perfectly adequate</em> on throughput grounds</td>
+</tr>
+<tr>
+<td>Optimistic locking</td>
+<td>Preferred — conflicts are rare, so retries are rare</td>
+</tr>
+<tr>
+<td>Eventual consistency</td>
+<td>Not needed, and not wanted; a single ACID transaction is available</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The low write rate is what licenses the chapter's most important architectural decision: <strong>keep reservation and inventory in one service on one relational database, and use a transaction.</strong> You are allowed the simple, strongly-consistent answer precisely because the volume never forces you off it.</p>
+<p>But note the asymmetry the estimation reveals: <strong>reads are ~100× writes</strong> (300 detail-page views per 3 reservations), and reads are of static, cacheable hotel data. So the read path is a caching problem and the write path is a concurrency problem, and they share almost nothing. Treating them as one system is what makes this design look confusing.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>compute 3 TPS early and say what it buys you — no sharding, no eventual consistency, a real transaction. Candidates who reflexively shard and introduce sagas here are solving a problem the requirements do not contain, and they lose the ACID guarantee that makes the actual problem tractable.</p>
+</div>
+<p>Let's estimate the QPS. If we assume that there are three steps to reach the reservation page and there is a 10% conversion rate per page,
+we can estimate that if there are 3 reservations, then there must be 30 views of reservation page and 300 views of hotel room detail page.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/qps-estimation.png" alt="qps-estimation" data-width="500" style="max-width:500px" />
+</p>
+<hr>
+</section>
+<section id="step-2-propose-high-level-design-and-get-buy-in">
+<h2 id="step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</h2>
+<p>We'll explore - API Design, Data model, high-level design.</p>
+<h3 id="api-design"><strong>API Design</strong></h3>
+<p>This API Design focuses on the core endpoints (using RESTful practices), we'll need in order to support a hotel reservation system.</p>
+<p>A fully-fledged system would require a more extensive API with support for searching for rooms based on lots of criteria, but we won't be focusing on that in this section.
+Reason is that they aren't technically challenging, so they're out of scope.</p>
+<p><strong>Hotel-related API</strong></p>
+<ul>
+<li><code>GET /v1/hotels/{id}</code> - get detailed info about a hotel</li>
+<li><code>POST /v1/hotels</code> - add a new hotel. Only available to ops</li>
+<li><code>PUT /v1/hotels/{id}</code> - update hotel info. Only available to ops</li>
+<li><code>DELETE /v1/hotels/{id}</code> - delete a hotel. API is only available to ops</li>
+</ul>
+<p><strong>Room-related API</strong></p>
+<ul>
+<li><code>GET /v1/hotels/{id}/rooms/{id}</code> - get detailed information about a room</li>
+<li><code>POST /v1/hotels/{id}/rooms</code> - Add a room. Only available to ops</li>
+<li><code>PUT /v1/hotels/{id}/rooms/{id}</code> - Update room info. Only available to ops</li>
+<li><code>DELETE /v1/hotels/{id}/rooms/{id}</code> - Delete a room. Only available to ops</li>
+</ul>
+<p><strong>Reservation-related API</strong></p>
+<ul>
+<li><code>GET /v1/reservations</code> - get reservation history of current user</li>
+<li><code>GET /v1/reservations/{id}</code> - get detailed info about a reservation</li>
+<li><code>POST /v1/reservations</code> - make a new reservation</li>
+<li><code>DELETE /v1/reservations/{id}</code> - cancel a reservation</li>
+</ul>
+<p>Here's an example request to make a reservation:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>{
+  &quot;startDate&quot;:&quot;2021-04-28&quot;,
+  &quot;endDate&quot;:&quot;2021-04-30&quot;,
+  &quot;hotelID&quot;:&quot;245&quot;,
+  &quot;roomID&quot;:&quot;U12354673389&quot;,
+  &quot;reservationID&quot;:&quot;13422445&quot;
+}
+</code></pre></div>
+<p>Note that the <code>reservationID</code> is an idempotency key to avoid double booking. Details explained in <a href="#concurrency-issues">concurrency section</a></p>
+<h3 id="data-model"><strong>Data model</strong></h3>
+<p>Before we choose what database to use, let's consider our access patterns.</p>
+<p>We need to support the following queries:</p>
+<ul>
+<li>View detailed info about a hotel</li>
+<li>Find available types of rooms given a date range</li>
+<li>Record a reservation</li>
+<li>Look up a reservation or past history of reservations</li>
+</ul>
+<p>From our estimations, we know the scale of the system is not large, but we need to prepare for traffic surges.</p>
+<p>Given this knowledge, we'll choose a relational database because:</p>
+<ul>
+<li>Relational DBs work well with read-heavy and less write-heavy systems.</li>
+<li>NoSQL databases are normally optimized for writes, but we know we won't have many as only a fraction of users who visit the site make a reservation.</li>
+<li>Relational DBs provide ACID guarantees. These are important for such a system as without them, we won't be able to prevent problems such as negative balance, double charge, etc.</li>
+<li>Relational DBs can easily model the data as the structure is very clear.</li>
+</ul>
+<p>Here is our schema design:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/schema-design.png" alt="schema-design" data-width="500" style="max-width:500px" />
+</p>
+<p>Most fields are self-explanatory. Only field worth mentioning is the <code>status</code> field which represents the state machine of a given room:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/status-state-machine.png" alt="status-state-machine" data-width="500" style="max-width:500px" />
+</p>
+<p>This data model works well for a system like Airbnb, but not for hotels where users don't reserve a particular room but a room type.
+They reserve a type of room and a room number is chosen at the point of reservation.</p>
+<p>This shortcoming will be addressed in the <a href="#improved-data-model">Improved Data Model</a> section.</p>
+<h3 id="high-level-design"><strong>High-level Design</strong></h3>
+<p>We've chosen a microservice architecture for this design. It has gained great popularity in recent years:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/high-level-design.png" alt="high-level-design" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li><strong>Users</strong>: book a hotel room on their phone or computer</li>
+<li><strong>Admin</strong>: perform administrative functions such as refunding/cancelling a payment, etc</li>
+<li><strong>CDN</strong>: caches static resources such as JS bundles, images, videos, etc</li>
+<li><strong>Public API Gateway</strong>: fully-managed service which supports rate limiting, authentication, etc.</li>
+<li><strong>Internal APIs</strong>: only visible to authorized personnel. Usually protected by a VPN.</li>
+<li><strong>Hotel service</strong>: provides detailed information about hotels and rooms. Hotel and room data is static, so it can be cached aggressively.</li>
+<li><strong>Rate service</strong>: provides room rates for different future dates. An interesting note about this domain is that prices depend on how full a hotel is at a given day.</li>
+<li><strong>Reservation service</strong>: receives reservation requests and reserves hotel rooms. Also tracks room inventory as reservations are made/cancelled.</li>
+<li><strong>Payment service</strong>: processes payments and updates reservation statuses on success.</li>
+<li><strong>Hotel management service</strong>: available to authorized personnel only. Allows certain administrative functions for managing and viewing reservations, hotels, etc.</li>
+</ul>
+<p>Inter-service communication can be facilitated via a RPC framework, such as gRPC.</p>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<p>Let's dive deeper into:</p>
+<ul>
+<li>Improved data model</li>
+<li>Concurrency issues</li>
+<li>Scalability</li>
+<li>Resolving data inconsistency in microservices</li>
+</ul>
+<h3 id="improved-data-model"><strong>Improved data model</strong></h3>
+<p>As mentioned in a previous section, we need to amend our API and schema to enable reserving a type of room vs. a particular one.</p>
+<p>For the reservation API, we no longer reserve a <code>roomID</code>, but we reserve a <code>roomTypeID</code>:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>POST /v1/reservations
+{
+  &quot;startDate&quot;:&quot;2021-04-28&quot;,
+  &quot;endDate&quot;:&quot;2021-04-30&quot;,
+  &quot;hotelID&quot;:&quot;245&quot;,
+  &quot;roomTypeID&quot;:&quot;12354673389&quot;,
+  &quot;roomCount&quot;:&quot;3&quot;,
+  &quot;reservationID&quot;:&quot;13422445&quot;
+}
+</code></pre></div>
+<p>Here's the updated schema:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/updated-schema.png" alt="updated-schema" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li><strong>room</strong>: contains information about a room</li>
+<li><strong>room_type_rate</strong>: contains information about prices for a given room type</li>
+<li><strong>reservation</strong>: records guest reservation data</li>
+<li><strong>room_type_inventory</strong>: stores inventory data about hotel rooms.</li>
+</ul>
+<p>Let's take a look at the <code>room_type_inventory</code> columns as that table is more interesting:</p>
+<ul>
+<li><strong>hotel_id</strong>: id of hotel</li>
+<li><strong>room_type_id</strong>: id of a room type</li>
+<li><strong>date</strong>: a single date</li>
+<li><strong>total_inventory</strong>: total number of rooms minus those that are temporarily taken off the inventory.</li>
+<li><strong>total_reserved</strong>: total number of rooms booked for given (hotel_id, room_type_id, date)</li>
+</ul>
+<p>There are alternative ways to design this table, but having one room per (hotel_id, room_type_id, date) enables easy
+reservation management and easier queries.</p>
+<p><strong>This is the pivotal design decision in the chapter and it is easy to read past.</strong> The natural model is to store reservations with a start and end date and derive availability from them. That makes every availability check an <strong>interval-overlap query</strong>: find all reservations for this room type whose date range intersects the requested one, count them, compare with capacity. It is correct, and it is poorly suited to both querying and locking — the set of rows involved depends on the data, so you cannot know in advance what to lock, and the count is recomputed from scratch every time.</p>
+<p>Materialising <strong>one row per (hotel, room type, date)</strong> changes the problem completely:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Reservations with date ranges</th>
+<th>One inventory row per date</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Availability check</td>
+<td>Interval-overlap scan and aggregate</td>
+<td><strong>N point lookups</strong> (one per night)</td>
+</tr>
+<tr>
+<td>The invariant lives</td>
+<td>Implicitly, across many rows</td>
+<td><strong>Explicitly, in a single column</strong></td>
+</tr>
+<tr>
+<td>Enforceable by the database?</td>
+<td>Not really</td>
+<td><strong>Yes — a <code>CHECK</code> constraint on one row</strong></td>
+</tr>
+<tr>
+<td>What to lock</td>
+<td>Depends on the data</td>
+<td><strong>Known before you start: these N rows</strong></td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>Nothing extra stored</td>
+<td>73 M pre-populated rows</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The denormalisation buys the thing the whole chapter needs: <strong>the invariant becomes a property of a single row</strong>, which is the only form a database can enforce cheaply and absolutely. Trading 73 million rows — which is nothing — for that is an excellent deal, and it is why the concurrency section below has three workable options instead of none.</p>
+<p>The consequence to carry forward: <strong>a three-night booking touches three rows and must be all-or-nothing.</strong> That is what makes this a transaction rather than an update.</p>
+<p>The rows in the table are pre-populated using a daily CRON job.</p>
+<p>Sample data:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>hotel_id</th>
+<th>room_type_id</th>
+<th>date</th>
+<th>total_inventory</th>
+<th>total_reserved</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>211</td>
+<td>1001</td>
+<td>2021-06-01</td>
+<td>100</td>
+<td>80</td>
+</tr>
+<tr>
+<td>211</td>
+<td>1001</td>
+<td>2021-06-02</td>
+<td>100</td>
+<td>82</td>
+</tr>
+<tr>
+<td>211</td>
+<td>1001</td>
+<td>2021-06-03</td>
+<td>100</td>
+<td>86</td>
+</tr>
+<tr>
+<td>211</td>
+<td>1001</td>
+<td>...</td>
+<td>...</td>
+<td></td>
+</tr>
+<tr>
+<td>211</td>
+<td>1001</td>
+<td>2023-05-31</td>
+<td>100</td>
+<td>0</td>
+</tr>
+<tr>
+<td>211</td>
+<td>1002</td>
+<td>2021-06-01</td>
+<td>200</td>
+<td>16</td>
+</tr>
+<tr>
+<td>2210</td>
+<td>101</td>
+<td>2021-06-01</td>
+<td>30</td>
+<td>23</td>
+</tr>
+<tr>
+<td>2210</td>
+<td>101</td>
+<td>2021-06-02</td>
+<td>30</td>
+<td>25</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Sample SQL query to check the availability of a type of room:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>SELECT date, total_inventory, total_reserved
+FROM room_type_inventory
+WHERE room_type_id = ${roomTypeId} AND hotel_id = ${hotelId}
+AND date between ${startDate} and ${endDate}
+</code></pre></div>
+<p>How to check availability for a specified number of rooms using that data (note that we support overbooking):</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>if (total_reserved + ${numberOfRoomsToReserve}) &lt;= 110% * total_inventory
+</code></pre></div>
+<p>Now let's do some estimation about the storage volume.</p>
+<ul>
+<li>We have 5000 hotels.</li>
+<li>Each hotel has 20 types of rooms.</li>
+<li>5000 * 20 * 2 (years) * 365 (days) = 73mil rows</li>
+</ul>
+<p>73 million rows is not a lot of data and a single database server can handle it.
+It makes sense, however, to setup read replication (potentially across different zones) to enable high availability.</p>
+<p>Follow-up question - if reservation data is too large for a single database, what would you do?</p>
+<ul>
+<li>Store only current and future reservation data. Reservation history can be moved to cold storage.</li>
+<li>Database sharding - we can shard our data by <code>hash(hotel_id) % servers_cnt</code> as we always select the <code>hotel_id</code> in our queries.</li>
+</ul>
+<h3 id="concurrency-issues"><strong>Concurrency issues</strong></h3>
+<p>Another important problem to address is double booking.</p>
+<p>There are two issues to address:</p>
+<ul>
+<li>Same user clicks on &quot;book&quot; twice</li>
+<li>Multiple users try to book a room at the same time</li>
+</ul>
+<p>Here's a visualization of the first problem:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/double-booking-single-user.png" alt="double-booking-single-user" data-width="500" style="max-width:500px" />
+</p>
+<p>There are two approaches to solving this problem:</p>
+<ul>
+<li>Client-side handling - front-end can disable the book button once clicked. If a user disabled javascript, however, they won't see the button becoming grayed out.</li>
+<li>Idempotent API - Add an idempotency key to the API, which enables a user to execute an action once, regardless of how many times the endpoint is invoked:</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/idempotency.png" alt="idempotency" data-width="500" style="max-width:500px" />
+</p>
+<p>Here's how this flow works:</p>
+<ul>
+<li>A reservation order is generated once you're in the process of filling in your details and making a booking. The reservation order is generated using a globally unique identifier.</li>
+<li>Submit reservation 1 using the <code>reservation_id</code> generated in the previous step.</li>
+<li>If &quot;complete booking&quot; is clicked a second time, the same <code>reservation_id</code> is sent and the backend detects that this is a duplicate reservation.</li>
+<li>The duplication is avoided by making the <code>reservation_id</code> column have a unique constraint, preventing multiple records with that id being stored in the DB.</li>
+</ul>
+<p><strong>The important detail is <em>when</em> the ID is generated.</strong> It is created when the user starts filling in the booking form — before any submission — so that every retry of that booking carries the <em>same</em> identifier. An ID generated by the server on receipt would be different for each click and would deduplicate nothing.</p>
+<p>This is the idempotency-key pattern in its canonical form, and it is the same mechanism as the <code>client_msg_id</code> in <a href="12-chat-system.html#gotchas--failure-modes">Chapter 12</a> and the idempotency key in <a href="26-payment-system.html">Chapter 26</a>. The database's unique constraint is what makes it airtight: two concurrent requests with the same key both attempt the insert, and exactly one survives — the guarantee is enforced by the storage engine rather than by application logic that can race.</p>
+<p>It also solves a problem beyond double-clicks. A network timeout leaves the client unable to tell whether the reservation succeeded. With an idempotency key, the safe action is simply to retry: either it creates the reservation or it collides with the existing one, and both outcomes are correct.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/unique-constraint-violation.png" alt="unique-constraint-violation" data-width="500" style="max-width:500px" />
+</p>
+<p>What if there are multiple users making the same reservation?</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/double-booking-multiple-users.png" alt="double-booking-multiple-users" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Let's assume the transaction isolation level is not serializable</li>
+<li>User 1 and 2 attempt to book the same room at the same time.</li>
+<li>Transaction 1 checks if there are enough rooms - there are</li>
+<li>Transaction 2 check if there are enough rooms - there are</li>
+<li>Transaction 2 reserves the room and updates the inventory</li>
+<li>Transaction 1 also reserves the room as it still sees there are 99 <code>total_reserved</code> rooms out of 100.</li>
+<li>Both transactions successfully commit the changes</li>
+</ul>
+<p>This problem can be solved using some form of locking mechanism:</p>
+<ul>
+<li>Pessimistic locking</li>
+<li>Optimistic locking</li>
+<li>Database constraints</li>
+</ul>
+<p>Here's the SQL we use to reserve a room:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button></div><pre data-lang="sql"><code># step 1: check room inventory
+SELECT date, total_inventory, total_reserved
+FROM room_type_inventory
+WHERE room_type_id = ${roomTypeId} AND hotel_id = ${hotelId}
+AND date between ${startDate} and ${endDate}
+
+# For every entry returned from step 1
+if((total_reserved + ${numberOfRoomsToReserve}) &gt; 110% * total_inventory) {
+  Rollback
+}
+
+# step 2: reserve rooms
+UPDATE room_type_inventory
+SET total_reserved = total_reserved + ${numberOfRoomsToReserve}
+WHERE room_type_id = ${roomTypeId}
+AND date between ${startDate} and ${endDate}
+
+Commit
+</code></pre></div>
+<h4 id="option-1-pessimistic-locking">Option 1: Pessimistic locking</h4>
+<p>Pessimistic locking prevents simultaneous updates by putting a lock on a record while it's being updated.</p>
+<p>This can be done in MySQL by using the <code>SELECT... FOR UPDATE</code> query, which locks the rows selected by the query until the transaction is committed.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/pessimistic-locking.png" alt="pessimistic-locking" data-width="500" style="max-width:500px" />
+</p>
+<p>Pros:</p>
+<ul>
+<li>Prevents applications from updating data that is being changed</li>
+<li>Easy to implement and avoids conflict by serializing updates. Useful when there is heavy data contention.</li>
+</ul>
+<p>Cons:</p>
+<ul>
+<li>Deadlocks may occur when multiple resources are locked.</li>
+<li>This approach is not scalable - if transaction is locked for too long, this has impact on all other transactions trying to access the resource.</li>
+<li>The impact is severe when the query selects a lot of resources and the transaction is long-lived.</li>
+</ul>
+<p>The author doesn't recommend this approach due to its scalability issues.</p>
+<h4 id="option-2-optimistic-locking">Option 2: Optimistic locking</h4>
+<p>Optimistic locking allows multiple users to attempt to update a record at the same time.</p>
+<p>There are two common ways to implement it - version numbers and timestamps. Version numbers are recommended as server clocks can be inaccurate.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/optimistic-locking.png" alt="optimistic-locking" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>A new <code>version</code> column is added to the database table</li>
+<li>Before a user modifies a database row, the version number is read</li>
+<li>When the user updates the row, the version number is increased by 1 and written back to the database</li>
+<li>Database validation prevents the insert if the new version number doesn't exceed the previous one</li>
+</ul>
+<p>Optimistic locking is usually faster than pessimistic locking as we're not locking the database.
+Its performance tends to degrade when concurrency is high, however, as that leads to a lot of rollbacks.</p>
+<p>Pros:</p>
+<ul>
+<li>It prevents applications from editing stale data</li>
+<li>We don't need to acquire a lock in the database</li>
+<li>Preferred option when data contention is low, ie rarely are there update conflicts</li>
+</ul>
+<p>Cons:</p>
+<ul>
+<li>Performance is poor when data contention is high</li>
+</ul>
+<p>Optimistic locking is a good option for our system as reservation QPS is not extremely high.</p>
+<h4 id="option-3-database-constraints">Option 3: Database constraints</h4>
+<p>This approach is very similar to optimistic locking, but the guardrails are implemented using a database constraint:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>CONSTRAINT `check_room_count` CHECK((`total_inventory - total_reserved` &gt;= 0))
+</code></pre></div>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/database-constraint.png" alt="database-constraint" data-width="500" style="max-width:500px" />
+</p>
+<p>Pros:</p>
+<ul>
+<li>Easy to implement</li>
+<li>Works well when data contention is small</li>
+</ul>
+<p>Cons:</p>
+<ul>
+<li>Similar to optimistic locking, performs poorly when data contention is high</li>
+<li>Database constraints cannot be easily version-controlled like application code</li>
+<li>Not all databases support constraints</li>
+</ul>
+<p>This is another good option for a hotel reservation system due to its ease of implementation.</p>
+<h4 id="choosing-between-the-three">Choosing between the three</h4>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Pessimistic (<code>SELECT … FOR UPDATE</code>)</th>
+<th>Optimistic (version column)</th>
+<th>Database constraint</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>When the conflict is detected</td>
+<td><strong>Before</strong> the work — others wait</td>
+<td><strong>At commit</strong> — loser retries</td>
+<td><strong>At commit</strong> — loser errors</td>
+</tr>
+<tr>
+<td>Cost when contention is low</td>
+<td>Lock overhead on every booking</td>
+<td>Near zero</td>
+<td>Near zero</td>
+</tr>
+<tr>
+<td>Cost when contention is high</td>
+<td>Queueing, growing latency, deadlock risk</td>
+<td><strong>Retry storms</strong> — wasted work</td>
+<td>Repeated failed writes</td>
+</tr>
+<tr>
+<td>Protects against application bugs</td>
+<td>No</td>
+<td>No</td>
+<td><strong>Yes</strong> — the rule lives in the schema</td>
+</tr>
+<tr>
+<td>Risk</td>
+<td>Deadlocks, long-held locks</td>
+<td>Livelock on a very hot row</td>
+<td>Hard to version-control; portability</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Two things are worth drawing out.</p>
+<p><strong>Optimistic locking and the <code>CHECK</code> constraint are the same strategy</strong> — let writes proceed and detect the conflict at commit — differing only in where the rule is written. Pessimistic locking is the genuinely different one: it prevents conflict instead of detecting it.</p>
+<p><strong>They are not mutually exclusive, and the right answer is to use both.</strong> The constraint is the only mechanism that holds regardless of which code path performs the write — a new service, a migration script, an admin tool, or a bug that skips the version check cannot violate it. Optimistic locking gives a clean retry path and a good error message; the constraint is the backstop that makes the invariant actually true. Defence in depth, with the database as the last line.</p>
+<h4 id="the-deadlock-the-chapter-does-not-mention">The deadlock the chapter does not mention</h4>
+<p>A multi-night booking locks several rows, and <strong>lock order decides whether concurrent bookings deadlock</strong>:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>Transaction A (June 1–3):  locks June 1, then June 2, then June 3
+Transaction B (June 3–5):  locks June 3, then June 4, then June 5
+</code></pre></div>
+<p>If B happens to acquire June 3 first while A holds June 1 and 2 and then waits for June 3 — and B subsequently needs a row A holds — the two wait on each other and the database kills one. With overlapping date ranges arriving in arbitrary order, this is not a rare scenario; it is the normal case under load.</p>
+<p>The fix is a one-line discipline: <strong>always acquire rows in a deterministic order</strong>, here ascending by date. Then any two transactions that contend take the same rows in the same sequence, one simply waits, and a cycle is impossible. This applies to pessimistic locking directly, and to the other two options in the softer form that deterministic ordering makes contention behaviour predictable instead of pathological.</p>
+<h4 id="what-is-missing-holds">What is missing: holds</h4>
+<p>A real reservation system does not go straight from &quot;available&quot; to &quot;reserved&quot;. It places a <strong>temporary hold</strong> while the user enters payment details — typically 10–15 minutes — because taking payment takes time and selling the room out from under someone mid-checkout is a terrible experience.</p>
+<p>That adds a third state and a background process:</p>
+<figure class="mermaid-fig">
+<svg id="mmd-b8ec61abee619d9c" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="statediagram" style="max-width: 493.617px; background-color: transparent;" viewBox="0 0 493.6171875 439" role="graphics-document document" aria-roledescription="stateDiagram"><style>#mmd-b8ec61abee619d9c{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-b8ec61abee619d9c .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-b8ec61abee619d9c .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-b8ec61abee619d9c .error-icon{fill:#f4f6f8;}#mmd-b8ec61abee619d9c .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-b8ec61abee619d9c .edge-thickness-normal{stroke-width:1px;}#mmd-b8ec61abee619d9c .edge-thickness-thick{stroke-width:3.5px;}#mmd-b8ec61abee619d9c .edge-pattern-solid{stroke-dasharray:0;}#mmd-b8ec61abee619d9c .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-b8ec61abee619d9c .edge-pattern-dashed{stroke-dasharray:3;}#mmd-b8ec61abee619d9c .edge-pattern-dotted{stroke-dasharray:2;}#mmd-b8ec61abee619d9c .marker{fill:#637381;stroke:#637381;}#mmd-b8ec61abee619d9c .marker.cross{stroke:#637381;}#mmd-b8ec61abee619d9c svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-b8ec61abee619d9c p{margin:0;}#mmd-b8ec61abee619d9c defs [id$="-barbEnd"]{fill:#637381;stroke:#637381;}#mmd-b8ec61abee619d9c g.stateGroup text{fill:#299a8d;stroke:none;font-size:10px;}#mmd-b8ec61abee619d9c g.stateGroup text{fill:#161c24;stroke:none;font-size:10px;}#mmd-b8ec61abee619d9c g.stateGroup .state-title{font-weight:bolder;fill:#161c24;}#mmd-b8ec61abee619d9c g.stateGroup rect{fill:#f1f7f6;stroke:#299a8d;}#mmd-b8ec61abee619d9c g.stateGroup line{stroke:#637381;stroke-width:1;}#mmd-b8ec61abee619d9c .transition{stroke:#637381;stroke-width:1;fill:none;}#mmd-b8ec61abee619d9c .stateGroup .composit{fill:#ffffff;border-bottom:1px;}#mmd-b8ec61abee619d9c .stateGroup .alt-composit{fill:#e0e0e0;border-bottom:1px;}#mmd-b8ec61abee619d9c .state-note{stroke:#e76f51;fill:#fcf4f2;}#mmd-b8ec61abee619d9c .state-note text{fill:#161c24;stroke:none;font-size:10px;}#mmd-b8ec61abee619d9c .stateLabel .box{stroke:none;stroke-width:0;fill:#f1f7f6;opacity:0.5;}#mmd-b8ec61abee619d9c .edgeLabel .label rect{fill:#f1f7f6;opacity:0.5;}#mmd-b8ec61abee619d9c .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-b8ec61abee619d9c .edgeLabel p{background-color:#ffffff;}#mmd-b8ec61abee619d9c .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-b8ec61abee619d9c .edgeLabel .label text{fill:#161c24;}#mmd-b8ec61abee619d9c .label div .edgeLabel{color:#161c24;}#mmd-b8ec61abee619d9c .stateLabel text{fill:#161c24;font-size:10px;font-weight:bold;}#mmd-b8ec61abee619d9c .node circle.state-start{fill:#637381;stroke:#637381;}#mmd-b8ec61abee619d9c .node .fork-join{fill:#637381;stroke:#637381;}#mmd-b8ec61abee619d9c .node circle.state-end{fill:#299a8d;stroke:#ffffff;stroke-width:1.5;}#mmd-b8ec61abee619d9c .end-state-inner{fill:#ffffff;stroke-width:1.5;}#mmd-b8ec61abee619d9c .node rect{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-b8ec61abee619d9c .node polygon{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-b8ec61abee619d9c [id$="-barbEnd"]{fill:#637381;}#mmd-b8ec61abee619d9c .statediagram-cluster rect{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-b8ec61abee619d9c .cluster-label,#mmd-b8ec61abee619d9c .nodeLabel{color:#161c24;}#mmd-b8ec61abee619d9c .statediagram-cluster rect.outer{rx:5px;ry:5px;}#mmd-b8ec61abee619d9c .statediagram-state .divider{stroke:#299a8d;}#mmd-b8ec61abee619d9c .statediagram-state .title-state{rx:5px;ry:5px;}#mmd-b8ec61abee619d9c .statediagram-cluster.statediagram-cluster .inner{fill:#ffffff;}#mmd-b8ec61abee619d9c .statediagram-cluster.statediagram-cluster-alt .inner{fill:#f4f6f8;}#mmd-b8ec61abee619d9c .statediagram-cluster .inner{rx:0;ry:0;}#mmd-b8ec61abee619d9c .statediagram-state rect.basic{rx:5px;ry:5px;}#mmd-b8ec61abee619d9c .statediagram-state rect.divider{stroke-dasharray:10,10;fill:#f4f6f8;}#mmd-b8ec61abee619d9c .note-edge{stroke-dasharray:5;}#mmd-b8ec61abee619d9c .statediagram-note rect{fill:#fcf4f2;stroke:#e76f51;stroke-width:1px;rx:0;ry:0;}#mmd-b8ec61abee619d9c .statediagram-note rect{fill:#fcf4f2;stroke:#e76f51;stroke-width:1px;rx:0;ry:0;}#mmd-b8ec61abee619d9c .statediagram-note text{fill:#161c24;}#mmd-b8ec61abee619d9c .statediagram-note .nodeLabel{color:#161c24;}#mmd-b8ec61abee619d9c .statediagram .edgeLabel{color:red;}#mmd-b8ec61abee619d9c [id$="-dependencyStart"],#mmd-b8ec61abee619d9c [id$="-dependencyEnd"]{fill:#637381;stroke:#637381;stroke-width:1;}#mmd-b8ec61abee619d9c .statediagramTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-b8ec61abee619d9c [data-look="neo"].statediagram-cluster rect{fill:#f1f7f6;stroke:url(#mmd-b8ec61abee619d9c-gradient);stroke-width:1;}#mmd-b8ec61abee619d9c [data-look="neo"].statediagram-cluster rect.outer{rx:5px;ry:5px;filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8ec61abee619d9c .node .neo-node{stroke:#299a8d;}#mmd-b8ec61abee619d9c [data-look="neo"].node rect,#mmd-b8ec61abee619d9c [data-look="neo"].cluster rect,#mmd-b8ec61abee619d9c [data-look="neo"].node polygon{stroke:url(#mmd-b8ec61abee619d9c-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8ec61abee619d9c [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-b8ec61abee619d9c [data-look="neo"].node path{stroke:url(#mmd-b8ec61abee619d9c-gradient);stroke-width:1px;}#mmd-b8ec61abee619d9c [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8ec61abee619d9c [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-b8ec61abee619d9c [data-look="neo"].node circle{stroke:url(#mmd-b8ec61abee619d9c-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8ec61abee619d9c [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-b8ec61abee619d9c [data-look="neo"].icon-shape .icon{fill:url(#mmd-b8ec61abee619d9c-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8ec61abee619d9c [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-b8ec61abee619d9c-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-b8ec61abee619d9c :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><defs><marker id="mmd-b8ec61abee619d9c_stateDiagram-barbEnd" refX="19" refY="7" markerWidth="20" markerHeight="14" markerUnits="userSpaceOnUse" orient="auto"><path d="M 19,7 L9,13 L14,7 L9,1 Z"/></marker></defs><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M279.531,22L279.531,26.167C279.531,30.333,279.531,38.667,279.531,47C279.531,55.333,279.531,63.667,279.531,67.833L279.531,72" id="mmd-b8ec61abee619d9c-edge0" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge0" data-points="W3sieCI6Mjc5LjUzMTI1LCJ5IjoyMn0seyJ4IjoyNzkuNTMxMjUsInkiOjQ3fSx7IngiOjI3OS41MzEyNSwieSI6NzJ9XQ==" data-look="classic" marker-end="url(#mmd-b8ec61abee619d9c_stateDiagram-barbEnd)"/><path d="M243.016,102.143L215.385,110.952C187.755,119.762,132.495,137.381,123.07,155.073C113.646,172.765,150.057,190.529,168.263,199.412L186.469,208.294" id="mmd-b8ec61abee619d9c-edge1" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge1" data-points="W3sieCI6MjQzLjAxNTYyNSwieSI6MTAyLjE0MjU4MTI5Mjk2MzYzfSx7IngiOjc3LjIzNDM3NSwieSI6MTU1fSx7IngiOjE4Ni40Njg3NSwieSI6MjA4LjI5Mzg3Nzc5MjIyMzEzfV0=" data-look="classic" marker-end="url(#mmd-b8ec61abee619d9c_stateDiagram-barbEnd)"/><path d="M209.438,238L209.438,243.917C209.438,249.833,209.438,261.667,222.857,273.688C236.276,285.709,263.115,297.919,276.534,304.023L289.953,310.128" id="mmd-b8ec61abee619d9c-edge2" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge2" data-points="W3sieCI6MjA5LjQzNzUsInkiOjIzOH0seyJ4IjoyMDkuNDM3NSwieSI6MjczLjV9LHsieCI6Mjg5Ljk1MzEyNSwieSI6MzEwLjEyNzg3OTQyNjA4OTI0fV0=" data-look="classic" marker-end="url(#mmd-b8ec61abee619d9c_stateDiagram-barbEnd)"/><path d="M209.438,201L209.438,193.333C209.438,185.667,209.438,170.333,217.769,155C226.101,139.667,242.764,124.333,251.095,116.667L259.427,109" id="mmd-b8ec61abee619d9c-edge3" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge3" data-points="W3sieCI6MjA5LjQzNzUsInkiOjIwMX0seyJ4IjoyMDkuNDM3NSwieSI6MTU1fSx7IngiOjI1OS40MjY4NDEwODUyNzEzLCJ5IjoxMDl9XQ==" data-look="classic" marker-end="url(#mmd-b8ec61abee619d9c_stateDiagram-barbEnd)"/><path d="M232.406,208.932L251.943,199.943C271.479,190.955,310.552,172.977,321.757,156.322C332.962,139.667,316.299,124.333,307.967,116.667L299.636,109" id="mmd-b8ec61abee619d9c-edge4" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge4" data-points="W3sieCI6MjMyLjQwNjI1LCJ5IjoyMDguOTMyMTIyMTU3ODI0MzV9LHsieCI6MzQ5LjYyNSwieSI6MTU1fSx7IngiOjI5OS42MzU2NTg5MTQ3Mjg3LCJ5IjoxMDl9XQ==" data-look="classic" marker-end="url(#mmd-b8ec61abee619d9c_stateDiagram-barbEnd)"/><path d="M366.328,310.128L379.747,304.023C393.167,297.919,420.005,285.709,433.424,270.605C446.844,255.5,446.844,237.5,446.844,217.75C446.844,198,446.844,176.5,425.044,157.346C403.245,138.192,359.646,121.385,337.846,112.981L316.047,104.577" id="mmd-b8ec61abee619d9c-edge5" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge5" data-points="W3sieCI6MzY2LjMyODEyNSwieSI6MzEwLjEyNzg3OTQyNjA4OTI0fSx7IngiOjQ0Ni44NDM3NSwieSI6MjczLjV9LHsieCI6NDQ2Ljg0Mzc1LCJ5IjoyMTkuNX0seyJ4Ijo0NDYuODQzNzUsInkiOjE1NX0seyJ4IjozMTYuMDQ2ODc1LCJ5IjoxMDQuNTc2OTk4NTA1NzkwMDZ9XQ==" data-look="classic" marker-end="url(#mmd-b8ec61abee619d9c_stateDiagram-barbEnd)"/><path d="M328.141,346L328.141,351.917C328.141,357.833,328.141,369.667,328.141,381.499C328.141,393.331,328.141,405.162,328.141,411.078L328.141,416.993" id="mmd-b8ec61abee619d9c-edge6" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge6" data-points="W3sieCI6MzI4LjE0MDYyNSwieSI6MzQ2fSx7IngiOjMyOC4xNDA2MjUsInkiOjM4MS41fSx7IngiOjMyOC4xNDA2MjUsInkiOjQxNi45OTMzNTMzNjY4NTE4fV0=" data-look="classic" marker-end="url(#mmd-b8ec61abee619d9c_stateDiagram-barbEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="edge0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(77.234375, 155)"><g class="label" data-id="edge1" transform="translate(-69.234375, -21)"><foreignObject width="138.46875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>user begins checkout<br />(hold with expiry)</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(209.4375, 273.5)"><g class="label" data-id="edge2" transform="translate(-60.828125, -10.5)"><foreignObject width="121.65625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>payment succeeds</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(209.4375, 155)"><g class="label" data-id="edge3" transform="translate(-42.96875, -10.5)"><foreignObject width="85.9375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>payment fails</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(321.87286, 167.76871)"><g class="label" data-id="edge4" transform="translate(-77.21875, -10.5)"><foreignObject width="154.4375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>expiry reaper releases it</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(446.84375, 219.5)"><g class="label" data-id="edge5" transform="translate(-38.7734375, -10.5)"><foreignObject width="77.546875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>cancellation</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(328.140625, 381.5)"><g class="label" data-id="edge6" transform="translate(-49.59375, -10.5)"><foreignObject width="99.1875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>stay completed</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-b8ec61abee619d9c-state-root_start-0" data-look="classic" transform="translate(279.53125, 15)"><circle class="state-start" r="7" width="14" height="14"/></g><g class="node  statediagram-state" id="mmd-b8ec61abee619d9c-state-Available-5" data-look="classic" transform="translate(279.53125, 90.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-36.515625" y="-18.5" width="73.03125" height="37"/><g class="label" style="" transform="translate(-28.515625, -10.5)"><rect/><foreignObject width="57.03125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>Available</p></span></div></foreignObject></g></g><g class="node  statediagram-state" id="mmd-b8ec61abee619d9c-state-Held-4" data-look="classic" transform="translate(209.4375, 219.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-22.96875" y="-18.5" width="45.9375" height="37"/><g class="label" style="" transform="translate(-14.96875, -10.5)"><rect/><foreignObject width="29.9375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>Held</p></span></div></foreignObject></g></g><g class="node  statediagram-state" id="mmd-b8ec61abee619d9c-state-Reserved-6" data-look="classic" transform="translate(328.140625, 327.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-38.1875" y="-18.5" width="76.375" height="37"/><g class="label" style="" transform="translate(-30.1875, -10.5)"><rect/><foreignObject width="60.375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>Reserved</p></span></div></foreignObject></g></g><g class="node default" id="mmd-b8ec61abee619d9c-state-root_end-6" data-look="classic" transform="translate(328.140625, 424)"><g class="outer-path"><path d="M7 0 C7 0.40517908122283747, 6.964012880168563 0.816513743121899, 6.893654271085456 1.2155372436685123 C6.823295662002349 1.6145607442151257, 6.716427752933756 2.013397210557766, 6.5778483455013586 2.394141003279681 C6.439268938068961 2.7748847960015954, 6.26476736710249 3.149104622578984, 6.062177826491071 3.4999999999999996 C5.859588285879653 3.8508953774210153, 5.622755194947063 4.189128084166967, 5.362311101832846 4.499513267805774 C5.10186700871863 4.809898451444582, 4.809898451444583 5.10186700871863, 4.499513267805775 5.362311101832846 C4.189128084166968 5.622755194947063, 3.8508953774210166 5.859588285879652, 3.500000000000001 6.06217782649107 C3.149104622578985 6.264767367102489, 2.7748847960015963 6.439268938068961, 2.3941410032796817 6.5778483455013586 C2.013397210557767 6.716427752933756, 1.6145607442151264 6.823295662002349, 1.2155372436685128 6.893654271085456 C0.8165137431218992 6.964012880168563, 0.4051790812228379 7, 4.286263797015736e-16 7 C-0.405179081222837 7, -0.8165137431218985 6.964012880168563, -1.2155372436685121 6.893654271085456 C-1.6145607442151257 6.823295662002349, -2.0133972105577667 6.716427752933756, -2.394141003279681 6.5778483455013586 C-2.774884796001595 6.439268938068961, -3.149104622578983 6.26476736710249, -3.4999999999999982 6.062177826491071 C-3.8508953774210135 5.859588285879653, -4.189128084166966 5.6227551949470636, -4.499513267805773 5.362311101832848 C-4.809898451444581 5.101867008718632, -5.101867008718628 4.809898451444586, -5.3623111018328435 4.499513267805779 C-5.622755194947059 4.189128084166971, -5.859588285879649 3.8508953774210206, -6.062177826491068 3.5000000000000053 C-6.264767367102486 3.14910462257899, -6.439268938068958 2.774884796001602, -6.577848345501356 2.394141003279688 C-6.716427752933754 2.0133972105577738, -6.823295662002347 1.614560744215134, -6.893654271085454 1.215537243668521 C-6.9640128801685615 0.816513743121908, -6.999999999999999 0.4051790812228472, -7 1.0183126166254463e-14 C-7.000000000000001 -0.40517908122282686, -6.964012880168565 -0.8165137431218878, -6.893654271085459 -1.215537243668501 C-6.823295662002352 -1.6145607442151142, -6.716427752933759 -2.0133972105577542, -6.577848345501363 -2.394141003279669 C-6.439268938068967 -2.7748847960015834, -6.264767367102496 -3.149104622578972, -6.062177826491078 -3.4999999999999876 C-5.859588285879661 -3.8508953774210033, -5.6227551949470715 -4.1891280841669545, -5.362311101832856 -4.499513267805763 C-5.10186700871864 -4.809898451444571, -4.809898451444594 -5.10186700871862, -4.499513267805787 -5.362311101832836 C-4.189128084166979 -5.622755194947053, -3.850895377421028 -5.859588285879643, -3.5000000000000133 -6.062177826491062 C-3.1491046225789985 -6.264767367102482, -2.774884796001611 -6.439268938068954, -2.3941410032796973 -6.577848345501353 C-2.0133972105577835 -6.716427752933752, -1.6145607442151435 -6.823295662002345, -1.2155372436685306 -6.893654271085453 C-0.8165137431219176 -6.9640128801685615, -0.40517908122285695 -6.999999999999999, -1.9937625952807352e-14 -7 C0.4051790812228171 -7.000000000000001, 0.8165137431218781 -6.964012880168565, 1.2155372436684913 -6.89365427108546 C1.6145607442151044 -6.823295662002354, 2.013397210557745 -6.716427752933763, 2.3941410032796595 -6.5778483455013665 C2.774884796001574 -6.43926893806897, 3.149104622578963 -6.2647673671025, 3.499999999999979 -6.062177826491083 C3.8508953774209953 -5.859588285879665, 4.189128084166947 -5.622755194947077, 4.499513267805756 -5.362311101832862 C4.809898451444564 -5.1018670087186475, 5.101867008718613 -4.809898451444602, 5.362311101832829 -4.499513267805796 C5.622755194947046 -4.189128084166989, 5.859588285879637 -3.8508953774210393, 6.062177826491056 -3.500000000000025 C6.2647673671024755 -3.1491046225790105, 6.439268938068949 -2.774884796001623, 6.577848345501348 -2.3941410032797092 C6.716427752933747 -2.0133972105577955, 6.823295662002342 -1.6145607442151562, 6.893654271085451 -1.2155372436685434 C6.96401288016856 -0.8165137431219307, 6.982275711847575 -0.2025895406114567, 7 -3.2800750208310675e-14 C7.017724288152425 0.2025895406113911, 7.017724288152424 -0.2025895406114242, 7 0" stroke="none" stroke-width="0" fill="#f1f7f6" style=""/><path d="M7 0 C7 0.40517908122283747, 6.964012880168563 0.816513743121899, 6.893654271085456 1.2155372436685123 C6.823295662002349 1.6145607442151257, 6.716427752933756 2.013397210557766, 6.5778483455013586 2.394141003279681 C6.439268938068961 2.7748847960015954, 6.26476736710249 3.149104622578984, 6.062177826491071 3.4999999999999996 C5.859588285879653 3.8508953774210153, 5.622755194947063 4.189128084166967, 5.362311101832846 4.499513267805774 C5.10186700871863 4.809898451444582, 4.809898451444583 5.10186700871863, 4.499513267805775 5.362311101832846 C4.189128084166968 5.622755194947063, 3.8508953774210166 5.859588285879652, 3.500000000000001 6.06217782649107 C3.149104622578985 6.264767367102489, 2.7748847960015963 6.439268938068961, 2.3941410032796817 6.5778483455013586 C2.013397210557767 6.716427752933756, 1.6145607442151264 6.823295662002349, 1.2155372436685128 6.893654271085456 C0.8165137431218992 6.964012880168563, 0.4051790812228379 7, 4.286263797015736e-16 7 C-0.405179081222837 7, -0.8165137431218985 6.964012880168563, -1.2155372436685121 6.893654271085456 C-1.6145607442151257 6.823295662002349, -2.0133972105577667 6.716427752933756, -2.394141003279681 6.5778483455013586 C-2.774884796001595 6.439268938068961, -3.149104622578983 6.26476736710249, -3.4999999999999982 6.062177826491071 C-3.8508953774210135 5.859588285879653, -4.189128084166966 5.6227551949470636, -4.499513267805773 5.362311101832848 C-4.809898451444581 5.101867008718632, -5.101867008718628 4.809898451444586, -5.3623111018328435 4.499513267805779 C-5.622755194947059 4.189128084166971, -5.859588285879649 3.8508953774210206, -6.062177826491068 3.5000000000000053 C-6.264767367102486 3.14910462257899, -6.439268938068958 2.774884796001602, -6.577848345501356 2.394141003279688 C-6.716427752933754 2.0133972105577738, -6.823295662002347 1.614560744215134, -6.893654271085454 1.215537243668521 C-6.9640128801685615 0.816513743121908, -6.999999999999999 0.4051790812228472, -7 1.0183126166254463e-14 C-7.000000000000001 -0.40517908122282686, -6.964012880168565 -0.8165137431218878, -6.893654271085459 -1.215537243668501 C-6.823295662002352 -1.6145607442151142, -6.716427752933759 -2.0133972105577542, -6.577848345501363 -2.394141003279669 C-6.439268938068967 -2.7748847960015834, -6.264767367102496 -3.149104622578972, -6.062177826491078 -3.4999999999999876 C-5.859588285879661 -3.8508953774210033, -5.6227551949470715 -4.1891280841669545, -5.362311101832856 -4.499513267805763 C-5.10186700871864 -4.809898451444571, -4.809898451444594 -5.10186700871862, -4.499513267805787 -5.362311101832836 C-4.189128084166979 -5.622755194947053, -3.850895377421028 -5.859588285879643, -3.5000000000000133 -6.062177826491062 C-3.1491046225789985 -6.264767367102482, -2.774884796001611 -6.439268938068954, -2.3941410032796973 -6.577848345501353 C-2.0133972105577835 -6.716427752933752, -1.6145607442151435 -6.823295662002345, -1.2155372436685306 -6.893654271085453 C-0.8165137431219176 -6.9640128801685615, -0.40517908122285695 -6.999999999999999, -1.9937625952807352e-14 -7 C0.4051790812228171 -7.000000000000001, 0.8165137431218781 -6.964012880168565, 1.2155372436684913 -6.89365427108546 C1.6145607442151044 -6.823295662002354, 2.013397210557745 -6.716427752933763, 2.3941410032796595 -6.5778483455013665 C2.774884796001574 -6.43926893806897, 3.149104622578963 -6.2647673671025, 3.499999999999979 -6.062177826491083 C3.8508953774209953 -5.859588285879665, 4.189128084166947 -5.622755194947077, 4.499513267805756 -5.362311101832862 C4.809898451444564 -5.1018670087186475, 5.101867008718613 -4.809898451444602, 5.362311101832829 -4.499513267805796 C5.622755194947046 -4.189128084166989, 5.859588285879637 -3.8508953774210393, 6.062177826491056 -3.500000000000025 C6.2647673671024755 -3.1491046225790105, 6.439268938068949 -2.774884796001623, 6.577848345501348 -2.3941410032797092 C6.716427752933747 -2.0133972105577955, 6.823295662002342 -1.6145607442151562, 6.893654271085451 -1.2155372436685434 C6.96401288016856 -0.8165137431219307, 6.982275711847575 -0.2025895406114567, 7 -3.2800750208310675e-14 C7.017724288152425 0.2025895406113911, 7.017724288152424 -0.2025895406114242, 7 0" stroke="#637381" stroke-width="2" fill="none" stroke-dasharray="0 0" style=""/><g><path d="M2.5 0 C2.5 0.14470681472244193, 2.487147457203058 0.29161205111496386, 2.46201938253052 0.4341204441673258 C2.436891307857982 0.5766288372196877, 2.3987241974763416 0.7190704323420595, 2.3492315519647713 0.8550503583141718 C2.299738906453201 0.991030284286284, 2.2374169168223177 1.124680222349637, 2.165063509461097 1.2499999999999998 C2.092710102099876 1.3753197776503625, 2.0081268553382365 1.496117172916774, 1.915111107797445 1.6069690242163481 C1.8220953602566536 1.7178208755159223, 1.7178208755159226 1.8220953602566536, 1.6069690242163484 1.915111107797445 C1.4961171729167742 2.0081268553382365, 1.375319777650363 2.0927101020998755, 1.2500000000000002 2.1650635094610964 C1.1246802223496375 2.2374169168223172, 0.9910302842862845 2.2997389064532, 0.8550503583141721 2.349231551964771 C0.7190704323420597 2.3987241974763416, 0.576628837219688 2.436891307857982, 0.43412044416732604 2.46201938253052 C0.291612051114964 2.487147457203058, 0.14470681472244212 2.5, 1.5308084989341916e-16 2.5 C-0.1447068147224418 2.5, -0.2916120511149638 2.487147457203058, -0.43412044416732576 2.46201938253052 C-0.5766288372196877 2.436891307857982, -0.7190704323420595 2.3987241974763416, -0.8550503583141718 2.3492315519647713 C-0.991030284286284 2.299738906453201, -1.124680222349637 2.2374169168223177, -1.2499999999999996 2.165063509461097 C-1.375319777650362 2.092710102099876, -1.4961171729167733 2.008126855338237, -1.6069690242163475 1.9151111077974459 C-1.7178208755159217 1.8220953602566548, -1.822095360256653 1.7178208755159234, -1.9151111077974443 1.6069690242163495 C-2.0081268553382357 1.4961171729167755, -2.0927101020998746 1.3753197776503645, -2.1650635094610955 1.250000000000002 C-2.2374169168223164 1.1246802223496395, -2.2997389064531992 0.9910302842862865, -2.34923155196477 0.8550503583141743 C-2.3987241974763407 0.7190704323420621, -2.436891307857981 0.5766288372196907, -2.4620193825305194 0.434120444167329 C-2.487147457203058 0.29161205111496724, -2.5 0.14470681472244545, -2.5 3.636830773662308e-15 C-2.5 -0.14470681472243818, -2.4871474572030587 -0.2916120511149599, -2.4620193825305208 -0.4341204441673218 C-2.436891307857983 -0.5766288372196837, -2.398724197476343 -0.7190704323420553, -2.3492315519647726 -0.8550503583141675 C-2.2997389064532023 -0.9910302842862798, -2.23741691682232 -1.1246802223496328, -2.165063509461099 -1.2499999999999956 C-2.092710102099878 -1.3753197776503583, -2.00812685533824 -1.4961171729167695, -1.9151111077974488 -1.606969024216344 C-1.8220953602566576 -1.7178208755159183, -1.7178208755159263 -1.82209536025665, -1.6069690242163523 -1.9151111077974416 C-1.4961171729167784 -2.0081268553382334, -1.3753197776503672 -2.0927101020998724, -1.2500000000000047 -2.1650635094610937 C-1.1246802223496422 -2.237416916822315, -0.9910302842862897 -2.299738906453198, -0.8550503583141776 -2.3492315519647686 C-0.7190704323420656 -2.3987241974763394, -0.5766288372196942 -2.4368913078579806, -0.43412044416733236 -2.462019382530519 C-0.29161205111497057 -2.4871474572030574, -0.1447068147224489 -2.4999999999999996, -7.120580697431198e-15 -2.5 C0.14470681472243463 -2.5000000000000004, 0.29161205111495647 -2.487147457203059, 0.4341204441673183 -2.4620193825305217 C0.5766288372196802 -2.436891307857984, 0.7190704323420518 -2.3987241974763442, 0.8550503583141642 -2.349231551964774 C0.9910302842862766 -2.2997389064532037, 1.1246802223496295 -2.2374169168223212, 1.2499999999999925 -2.165063509461101 C1.3753197776503554 -2.0927101020998804, 1.4961171729167668 -2.008126855338242, 1.6069690242163412 -1.915111107797451 C1.7178208755159157 -1.82209536025666, 1.8220953602566472 -1.7178208755159294, 1.915111107797439 -1.6069690242163557 C2.0081268553382308 -1.496117172916782, 2.09271010209987 -1.3753197776503712, 2.1650635094610915 -1.2500000000000089 C2.237416916822313 -1.1246802223496466, 2.299738906453196 -0.9910302842862939, 2.3492315519647673 -0.855050358314182 C2.3987241974763385 -0.71907043234207, 2.4368913078579792 -0.5766288372196986, 2.462019382530518 -0.4341204441673369 C2.487147457203057 -0.29161205111497523, 2.4936698970884197 -0.07235340736123454, 2.5 -1.1714553645825241e-14 C2.5063301029115803 0.07235340736121111, 2.50633010291158 -0.07235340736122292, 2.5 0" stroke="none" stroke-width="0" fill="#299a8d" style=""/><path d="M2.5 0 C2.5 0.14470681472244193, 2.487147457203058 0.29161205111496386, 2.46201938253052 0.4341204441673258 C2.436891307857982 0.5766288372196877, 2.3987241974763416 0.7190704323420595, 2.3492315519647713 0.8550503583141718 C2.299738906453201 0.991030284286284, 2.2374169168223177 1.124680222349637, 2.165063509461097 1.2499999999999998 C2.092710102099876 1.3753197776503625, 2.0081268553382365 1.496117172916774, 1.915111107797445 1.6069690242163481 C1.8220953602566536 1.7178208755159223, 1.7178208755159226 1.8220953602566536, 1.6069690242163484 1.915111107797445 C1.4961171729167742 2.0081268553382365, 1.375319777650363 2.0927101020998755, 1.2500000000000002 2.1650635094610964 C1.1246802223496375 2.2374169168223172, 0.9910302842862845 2.2997389064532, 0.8550503583141721 2.349231551964771 C0.7190704323420597 2.3987241974763416, 0.576628837219688 2.436891307857982, 0.43412044416732604 2.46201938253052 C0.291612051114964 2.487147457203058, 0.14470681472244212 2.5, 1.5308084989341916e-16 2.5 C-0.1447068147224418 2.5, -0.2916120511149638 2.487147457203058, -0.43412044416732576 2.46201938253052 C-0.5766288372196877 2.436891307857982, -0.7190704323420595 2.3987241974763416, -0.8550503583141718 2.3492315519647713 C-0.991030284286284 2.299738906453201, -1.124680222349637 2.2374169168223177, -1.2499999999999996 2.165063509461097 C-1.375319777650362 2.092710102099876, -1.4961171729167733 2.008126855338237, -1.6069690242163475 1.9151111077974459 C-1.7178208755159217 1.8220953602566548, -1.822095360256653 1.7178208755159234, -1.9151111077974443 1.6069690242163495 C-2.0081268553382357 1.4961171729167755, -2.0927101020998746 1.3753197776503645, -2.1650635094610955 1.250000000000002 C-2.2374169168223164 1.1246802223496395, -2.2997389064531992 0.9910302842862865, -2.34923155196477 0.8550503583141743 C-2.3987241974763407 0.7190704323420621, -2.436891307857981 0.5766288372196907, -2.4620193825305194 0.434120444167329 C-2.487147457203058 0.29161205111496724, -2.5 0.14470681472244545, -2.5 3.636830773662308e-15 C-2.5 -0.14470681472243818, -2.4871474572030587 -0.2916120511149599, -2.4620193825305208 -0.4341204441673218 C-2.436891307857983 -0.5766288372196837, -2.398724197476343 -0.7190704323420553, -2.3492315519647726 -0.8550503583141675 C-2.2997389064532023 -0.9910302842862798, -2.23741691682232 -1.1246802223496328, -2.165063509461099 -1.2499999999999956 C-2.092710102099878 -1.3753197776503583, -2.00812685533824 -1.4961171729167695, -1.9151111077974488 -1.606969024216344 C-1.8220953602566576 -1.7178208755159183, -1.7178208755159263 -1.82209536025665, -1.6069690242163523 -1.9151111077974416 C-1.4961171729167784 -2.0081268553382334, -1.3753197776503672 -2.0927101020998724, -1.2500000000000047 -2.1650635094610937 C-1.1246802223496422 -2.237416916822315, -0.9910302842862897 -2.299738906453198, -0.8550503583141776 -2.3492315519647686 C-0.7190704323420656 -2.3987241974763394, -0.5766288372196942 -2.4368913078579806, -0.43412044416733236 -2.462019382530519 C-0.29161205111497057 -2.4871474572030574, -0.1447068147224489 -2.4999999999999996, -7.120580697431198e-15 -2.5 C0.14470681472243463 -2.5000000000000004, 0.29161205111495647 -2.487147457203059, 0.4341204441673183 -2.4620193825305217 C0.5766288372196802 -2.436891307857984, 0.7190704323420518 -2.3987241974763442, 0.8550503583141642 -2.349231551964774 C0.9910302842862766 -2.2997389064532037, 1.1246802223496295 -2.2374169168223212, 1.2499999999999925 -2.165063509461101 C1.3753197776503554 -2.0927101020998804, 1.4961171729167668 -2.008126855338242, 1.6069690242163412 -1.915111107797451 C1.7178208755159157 -1.82209536025666, 1.8220953602566472 -1.7178208755159294, 1.915111107797439 -1.6069690242163557 C2.0081268553382308 -1.496117172916782, 2.09271010209987 -1.3753197776503712, 2.1650635094610915 -1.2500000000000089 C2.237416916822313 -1.1246802223496466, 2.299738906453196 -0.9910302842862939, 2.3492315519647673 -0.855050358314182 C2.3987241974763385 -0.71907043234207, 2.4368913078579792 -0.5766288372196986, 2.462019382530518 -0.4341204441673369 C2.487147457203057 -0.29161205111497523, 2.4936698970884197 -0.07235340736123454, 2.5 -1.1714553645825241e-14 C2.5063301029115803 0.07235340736121111, 2.50633010291158 -0.07235340736122292, 2.5 0" stroke="#299a8d" stroke-width="2" fill="none" stroke-dasharray="0 0" style=""/></g></g></g></g></g></g><defs><filter id="mmd-b8ec61abee619d9c-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-b8ec61abee619d9c-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-b8ec61abee619d9c-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>Two consequences worth stating: <strong>the inventory check must count holds as consumed</strong>, or holds are pointless; and <strong>a reaper must release expired holds</strong>, or inventory leaks away every time a user abandons a checkout. The reaper is the part that gets forgotten, and the symptom — a hotel that appears full while rooms sit unsold — looks like a data bug rather than a missing cron job.</p>
+<h3 id="scalability"><strong>Scalability</strong></h3>
+<p>Usually, the load of a hotel reservation system is not high.</p>
+<p>However, the interviewer might ask you how you'd handle a situation where the system gets adopted for a larger, popular travel site such as booking.com
+In that case, QPS can be 1000 times larger.</p>
+<p>When there is such a situation, it is important to understand where our bottlenecks are. All the services are stateless, so they can be easily scaled via replication.</p>
+<p>The database, however, is stateful and it's not as obvious how it can get scaled.</p>
+<p><strong>It is more obvious here than in most chapters, and for a reason worth naming: <code>hotel_id</code> is both the natural shard key and the transaction boundary.</strong> A reservation never spans two hotels, so every transaction — availability check, inventory decrement, reservation insert — touches rows belonging to exactly one hotel. Sharding on <code>hash(hotel_id)</code> therefore keeps every transaction inside a single shard, and you keep ACID guarantees while scaling horizontally.</p>
+<p>That is a genuinely fortunate property and not the usual case. Compare <a href="15-google-drive.html#gotchas--failure-modes">Chapter 15</a>, where sharding metadata by <code>user_id</code> is broken by file sharing, because a shared file's transaction spans two users and therefore two shards. <strong>Sharding is easy exactly when the shard key contains every transaction, and hard the moment a single operation crosses the boundary.</strong> Checking that alignment before proposing a shard key is the general lesson.</p>
+<p>For the read path, the answer is different and simpler: hotel and room data is static, so cache it aggressively and serve the ~100× read traffic from cache and CDN. Rates change daily and belong in a short-TTL cache.</p>
+<p><strong>The one thing sharding does not fix is a hot row.</strong> A single desirable hotel on a single date — a festival weekend, a holiday — concentrates all its contention on one <code>(hotel_id, room_type_id, date)</code> row, and that row cannot be split without breaking the invariant that lives in it. The options:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>Trade-off</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Optimistic retry with backoff</td>
+<td>Simplest; adequate when the contention window is short</td>
+</tr>
+<tr>
+<td>Deliberately serialise that row</td>
+<td>Queue requests for the hot key and process them in order — predictable latency, bounded throughput</td>
+</tr>
+<tr>
+<td>Split inventory into buckets</td>
+<td>Borrows global-local aggregation from <a href="21-ad-click-event-aggregation.html">Chapter 21</a>; now availability must sum the buckets, and a room can be unsellable because it is stranded in the wrong bucket</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The second is usually the right answer, and it is a useful instinct generally: when a resource must be serialised anyway, serialising it <em>explicitly</em> with a queue gives better and more predictable behaviour than letting the database discover the conflict through repeated failed transactions.</p>
+<p>One way to scale it is by implementing database sharding - we can split the data across multiple databases, where each of them contain a portion of the data.</p>
+<p>We can shard based on <code>hotel_id</code> as all queries filter based on it.
+Assuming, QPS is 30,000, after sharding the database in 16 shards, each shard handles 1875 QPS, which is within a single MySQL cluster's load capacity.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/database-sharding.png" alt="database-sharding" data-width="500" style="max-width:500px" />
+</p>
+<p>We can also utilize caching for room inventory and reservations via Redis. We can set TTL so that old data can expire for days which are past.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/inventory-cache.png" alt="inventory-cache" data-width="500" style="max-width:500px" />
+</p>
+<p>The way we store an inventory is based on the <code>hotel_id</code>, <code>room_type_id</code> and <code>date</code>:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>key: hotelID_roomTypeID_{date}
+value: the number of available rooms for the given hotel ID, room type ID and date.
+</code></pre></div>
+<p>Data consistency happens async and is managed by using a CDC streaming mechanism - database changes are read and applied to a separate system.
+Debezium is a popular option for synchronizing database changes with Redis.</p>
+<p>Using such a mechanism, there is a possibility that the cache and database are inconsistent for some time.
+This is fine in our case because the database will prevent us from making an invalid reservation.</p>
+<p>This will cause some issue on the UI as a user would have to refresh the page to see that &quot;there are no more rooms left&quot;,
+but that is something which can happen regardless of this issue if eg a person hesitates a lot before making a reservation.</p>
+<p>Caching pros:</p>
+<ul>
+<li>Reduced database load</li>
+<li>High performance, as Redis manages data in-memory</li>
+</ul>
+<p>Caching cons:</p>
+<ul>
+<li>Maintaining data consistency between cache and DB is hard. We need to consider how the inconsistency impacts user experience.</li>
+</ul>
+<h3 id="data-consistency-among-services"><strong>Data consistency among services</strong></h3>
+<p>A monolithic application enables us to use a shared relational database for ensuring data consistency.</p>
+<p>In our microservice design, we chose a hybrid approach where some services are separate,
+but the reservation and inventory APIs are handled by the same service.</p>
+<p>This is done because we want to leverage the relational database's ACID guarantees to ensure consistency.</p>
+<p>However, the interviewer might challenge this approach as it's not a pure microservice architecture, where each service has a dedicated database:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/microservices-vs-monolith.png" alt="microservices-vs-monolith" data-width="500" style="max-width:500px" />
+</p>
+<p>This can lead to consistency issues. In a monolithic server, we can leverage a relational DBs transaction capabilities to implement atomic operations:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/atomicity-monolith.png" alt="atomicity-monolith" data-width="500" style="max-width:500px" />
+</p>
+<p>It's more challenging, however, to guarantee this atomicity when the operation spans across multiple services:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/22.%20Hotel%20Reservation%20System/images/microservice-non-atomic-operation.png" alt="microservice-non-atomic-operation" data-width="500" style="max-width:500px" />
+</p>
+<p>There are some well-known techniques to handle these data inconsistencies:</p>
+<ul>
+<li><strong>Two-phase commit</strong>: a database protocol which guarantees atomic transaction commit across multiple nodes.
+It's not performant, though, since a single node lag leads to all nodes blocking the operation.</li>
+<li><strong>Saga</strong>: a sequence of local transactions, where compensating transactions are triggered if any of the steps in a workflow fail. This is an eventually consistent approach.</li>
+</ul>
+<p>It's worth noting that addressing data inconsistencies across microservices is a challenging problem, which raises the system complexity.
+It is good to consider whether the cost is worth it, given our more pragmatic approach of encapsulating dependent operations within the same relational database.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Single service + ACID transaction (chosen)</th>
+<th>Two-phase commit</th>
+<th>Saga</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Consistency</td>
+<td><strong>Strong, immediate</strong></td>
+<td>Strong</td>
+<td><strong>Eventual</strong></td>
+</tr>
+<tr>
+<td>Failure behaviour</td>
+<td>Rollback, nothing happened</td>
+<td>Blocks if a participant stalls</td>
+<td>Compensating transactions undo earlier steps</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>One transaction</td>
+<td>Two round trips, locks held throughout</td>
+<td>Fast per step</td>
+</tr>
+<tr>
+<td>Availability</td>
+<td>Limited by one database</td>
+<td><strong>Worst</strong> — any participant can block all</td>
+<td>Best</td>
+</tr>
+<tr>
+<td>Complexity</td>
+<td><strong>Lowest</strong></td>
+<td>High</td>
+<td>High — every step needs a compensator</td>
+</tr>
+<tr>
+<td>Partial states visible?</td>
+<td>No</td>
+<td>No</td>
+<td><strong>Yes</strong> — a reservation can exist unpaid</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>The chapter's conclusion is the right one and worth defending rather than apologising for.</strong> At 3 TPS, splitting reservation and inventory into separate services with separate databases buys nothing and costs you atomicity — you would then rebuild atomicity, badly, with a saga. &quot;Service boundaries should not cut through a transaction&quot; is the principle; the pure-microservices answer here is architecture as fashion.</p>
+<p><strong>Where a saga is genuinely needed is payment</strong>, which cannot be inside the database transaction because it is a call to an external provider that may take seconds and cannot be rolled back. So the real flow is: reserve inventory atomically → charge the card → on failure, compensate by releasing the inventory. The hold mechanism above is precisely that compensation window, and the expiry reaper is the compensator of last resort for the case where the system crashes mid-flow. <a href="26-payment-system.html">Chapter 26</a> is this problem taken seriously.</p>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Never make the availability <em>decision</em> from a cache.</strong> Showing cached availability on a listing page is fine and necessary. Deciding whether to accept a booking from a cached value is a double-booking generator, because the cache is by definition behind. The display may be optimistic; the write must be transactional.</li>
+<li><strong>Read replica lag has the same effect.</strong> An availability check against a replica can see a stale <code>total_reserved</code>. Availability checks on the write path must read the primary.</li>
+<li><strong>Multi-night bookings deadlock without a lock order.</strong> Overlapping date ranges acquired in arbitrary order produce cycles. Always lock rows in ascending date order.</li>
+<li><strong>No expiry reaper means inventory leaks.</strong> Every abandoned checkout permanently consumes a room. The hotel shows as full while rooms go unsold, and it looks like a data corruption bug.</li>
+<li><strong>Cancellation must be idempotent too.</strong> A retried cancellation that decrements <code>total_reserved</code> twice silently creates phantom inventory — the mirror image of double booking, and harder to notice because nobody complains about a room being available.</li>
+<li><strong>The inventory pre-population cron job is a silent dependency.</strong> If it stops running, rows for future dates simply do not exist. Depending on the code path, that reads as &quot;no availability&quot; (lost revenue, no error) or — worse — a write path that inserts a missing row unconstrained and bypasses the invariant entirely. Alert on inventory horizon, not just on job success.</li>
+<li><strong><code>date</code> needs a declared timezone.</strong> A booking is for a hotel's local calendar date, which is not the server's date and not UTC. Deriving the date from a server timestamp will put bookings on the wrong night for some fraction of guests, and DST transitions make some local days 23 or 25 hours long.</li>
+<li><strong>Overbooking is a policy, not a bug — and it needs an owner.</strong> 110% must be configurable per hotel and per date (a hotel with no nearby alternatives should not oversell), and someone must handle the walk. Hard-coding it in a <code>CHECK</code> constraint makes it uneditable without a migration.</li>
+<li><strong>A hot row cannot be sharded.</strong> The invariant lives in that row. Serialise access deliberately or bucket the inventory and accept the consequences.</li>
+<li><strong>Retry storms make contention worse.</strong> Optimistic locking plus immediate client retries on a popular row turns one conflict into a sustained load spike. Exponential backoff with jitter, and a cap on attempts.</li>
+<li><strong>Payment cannot be in the database transaction.</strong> It is an external call that may succeed after your transaction times out. The reservation must tolerate &quot;charged but not confirmed&quot; and &quot;confirmed but not charged&quot; and have a reconciliation path for both.</li>
+<li><strong>The <code>CHECK</code> constraint lives in the schema, so changing the rules means a migration.</strong> The chapter lists this as a con and it is a real one: price and policy logic belongs in code, but <em>integrity</em> rules belong in the schema. Keep the constraint as the invariant (&quot;never negative&quot;) and put the policy (how much overbooking) in a column the constraint reads.</li>
+<li><strong>Rates change daily, which makes the price a point-in-time fact.</strong> The price quoted at booking must be stored on the reservation, not looked up later. Otherwise a guest's bill changes when the hotel reprices.</li>
+<li><strong>Admin tools bypass everything.</strong> The internal API lets staff adjust reservations and inventory. Those paths need the same constraints and the same idempotency, and they are the ones that get written in a hurry.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Never sell the same room twice</td>
+<td>The invariant in a single row, enforced by a database <code>CHECK</code> constraint</td>
+</tr>
+<tr>
+<td>Availability without interval-overlap queries</td>
+<td>Materialised <code>room_type_inventory</code>, one row per (hotel, type, date)</td>
+</tr>
+<tr>
+<td>All-or-nothing multi-night bookings</td>
+<td>One ACID transaction over the N date rows</td>
+</tr>
+<tr>
+<td>Avoiding deadlock across those rows</td>
+<td>Deterministic lock order (ascending date)</td>
+</tr>
+<tr>
+<td>Low contention, cheap writes</td>
+<td>Optimistic locking with a version column; retry on conflict</td>
+</tr>
+<tr>
+<td>Protection from any code path</td>
+<td>The constraint as a backstop beneath the application check</td>
+</tr>
+<tr>
+<td>Double-clicks and retried requests</td>
+<td>Idempotency key created before submission, with a unique constraint</td>
+</tr>
+<tr>
+<td>Holding a room during checkout</td>
+<td>A <code>Held</code> state counted as consumed, plus an expiry reaper</td>
+</tr>
+<tr>
+<td>~100× read traffic on static data</td>
+<td>Aggressive caching and CDN for hotel/room data; short TTL for rates</td>
+</tr>
+<tr>
+<td>Scaling writes if volume grows 1000×</td>
+<td>Shard on <code>hotel_id</code>, which contains every transaction</td>
+</tr>
+<tr>
+<td>A single in-demand hotel-date</td>
+<td>Deliberate serialisation of that row, or bucketed inventory</td>
+</tr>
+<tr>
+<td>Atomicity across reservation and inventory</td>
+<td>Keep them in one service and one database — do not cut a transaction with a service boundary</td>
+</tr>
+<tr>
+<td>Payment, which cannot be transactional</td>
+<td>Saga: reserve, charge, compensate by releasing on failure</td>
+</tr>
+<tr>
+<td>Cancellations freeing inventory</td>
+<td>Idempotent decrement keyed on the reservation</td>
+</tr>
+<tr>
+<td>Overbooking</td>
+<td>Configurable percentage per hotel/date, read by the constraint</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Compute the reservation TPS. Name three design decisions that number lets you avoid.</li>
+<li>Reads are roughly 100× writes here. Why does that mean the read and write paths share almost no design?</li>
+<li>What does overbooking by 10% reveal about the nature of the constraint, and what business process makes it acceptable?</li>
+<li>Why store one inventory row per date rather than deriving availability from reservation date ranges? Name the property that buys you.</li>
+<li>A three-night booking must be all-or-nothing. What does that make it, and what does it imply about service boundaries?</li>
+<li>Optimistic locking and a <code>CHECK</code> constraint are nearly the same strategy. What is the difference, and why use both?</li>
+<li>Two overlapping multi-night bookings arrive at once. Describe the deadlock and the one-line fix.</li>
+<li>Why must the idempotency key be generated before the user submits, rather than by the server?</li>
+<li>A user abandons checkout. What two mechanisms must exist for the room to become sellable again?</li>
+<li>Why is <code>hash(hotel_id)</code> an unusually good shard key, and which earlier chapter shows the opposite case?</li>
+<li>A festival weekend concentrates all bookings on one inventory row. Why can't sharding help, and what are the options?</li>
+<li>Why can't the availability decision be made from a cache or a read replica?</li>
+<li>What breaks if a retried cancellation decrements <code>total_reserved</code> twice, and why is it harder to detect than double booking?</li>
+<li>Why must the price be stored on the reservation rather than looked up from the rate table later?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Room type</strong></td>
+<td>The sellable unit — guests book a category, not a specific room</td>
+</tr>
+<tr>
+<td><strong><code>room_type_inventory</code></strong></td>
+<td>Materialised per-date capacity and reserved count; where the invariant lives</td>
+</tr>
+<tr>
+<td><strong>Overbooking</strong></td>
+<td>Deliberately selling above capacity, expecting cancellations</td>
+</tr>
+<tr>
+<td><strong>Double booking</strong></td>
+<td>Selling the same inventory twice — the failure this chapter exists to prevent</td>
+</tr>
+<tr>
+<td><strong>Pessimistic locking</strong></td>
+<td><code>SELECT … FOR UPDATE</code>; prevent conflict by making others wait</td>
+</tr>
+<tr>
+<td><strong>Optimistic locking</strong></td>
+<td>Version column checked at commit; detect conflict and retry</td>
+</tr>
+<tr>
+<td><strong>Database constraint</strong></td>
+<td><code>CHECK</code> enforcing the invariant regardless of the code path</td>
+</tr>
+<tr>
+<td><strong>Lock ordering</strong></td>
+<td>Acquiring contended rows in a deterministic sequence to make deadlock impossible</td>
+</tr>
+<tr>
+<td><strong>Idempotency key</strong></td>
+<td>A client-generated reservation ID, made unique in the schema</td>
+</tr>
+<tr>
+<td><strong>Hold</strong></td>
+<td>Temporary inventory reservation during checkout, with an expiry</td>
+</tr>
+<tr>
+<td><strong>Reaper</strong></td>
+<td>The background job releasing expired holds</td>
+</tr>
+<tr>
+<td><strong>Two-phase commit</strong></td>
+<td>Blocking protocol giving atomicity across databases</td>
+</tr>
+<tr>
+<td><strong>Saga</strong></td>
+<td>A sequence of local transactions with compensating actions on failure</td>
+</tr>
+<tr>
+<td><strong>Compensating transaction</strong></td>
+<td>The undo step — here, releasing inventory when payment fails</td>
+</tr>
+<tr>
+<td><strong>Hot row</strong></td>
+<td>A single inventory row absorbing disproportionate contention</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="26-payment-system.html">Chapter 26 – Payment System</a> — idempotency, sagas and reconciliation where the money actually moves.</li>
+<li><a href="27-digital-wallet.html">Chapter 27 – Digital Wallet</a> — the same correctness problem with a constraint the business <em>cannot</em> absorb.</li>
+<li><a href="15-google-drive.html#gotchas--failure-modes">Chapter 15 – Design Google Drive</a> — the counter-example: a shard key that does not contain the transaction.</li>
+<li><a href="21-ad-click-event-aggregation.html">Chapter 21 – Ad Click Event Aggregation</a> — bucketing a hot key, and why it is harder when an invariant lives in the key.</li>
+<li><a href="06-key-value-store.html#cap-theorem">Chapter 6 – Design A Key-Value Store</a> — why this chapter chooses consistency over availability without hesitation.</li>
+</ul>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
+<p>We presented a design for a hotel reservation system.</p>
+<p>These are the steps we went through:</p>
+<ul>
+<li>Gathering requirements and doing back-of-the-envelope calculations to understand the system's scale</li>
+<li>We presented the API Design, Data Model and system architecture in the high-level design</li>
+<li>In the deep dive, we explored alternative database schema designs as requirements changed</li>
+<li>We discussed race conditions and proposed solutions - pessimistic/optimistic locking, database constraints</li>
+<li>Ways to scale the system via database sharding and caching</li>
+<li>Finally we addressed how to handle data consistency issues across multiple microservices</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

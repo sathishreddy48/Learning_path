@@ -1,0 +1,753 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 6: Design a Key-Value Store — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="06-key-value-store">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Building Blocks › Chapter 6 of 28</div>
+  <h1>Chapter 6: Design a Key-Value Store</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#single-server-key-value-store">Single Server Key-Value Store</a></li><li><a href="#distributed-key-value-store">Distributed Key-Value Store</a></li><li><a href="#system-components">System Components</a></li><li><a href="#write-and-read-paths">Write and Read Paths</a></li><li><a href="#final-architecture">Final Architecture</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>A <strong>key-value store</strong> is a type of non-relational database where data is stored as key-value pairs. Each key is unique, and values are accessed using these keys. This chapter details how to design a scalable, high-availability distributed key-value store that supports operations like:</p>
+<ul>
+<li><code>put(key, value)</code> for inserting data.</li>
+<li><code>get(key)</code> for retrieving data.</li>
+</ul>
+<p>The API is two functions, which is exactly why this problem is a favourite: <strong>nothing is hidden behind the interface.</strong> Every hard part of distributed systems — partitioning, replication, consistency, failure detection, conflict resolution, storage engines — has to be solved explicitly, and none of it can be delegated to a query planner.</p>
+<p>This chapter is essentially a walk through the design of Amazon Dynamo and Apache Cassandra. It builds directly on <a href="05-consistent-hashing.html">Chapter 5</a>, which supplies the partitioning scheme.</p>
+<h3 id="characteristics-of-the-design">Characteristics of the Design</h3>
+<ul>
+<li>Small key-value pairs (&lt;10 KB).</li>
+<li>Supports big data with high availability and scalability.</li>
+<li>Automatic scaling and tunable consistency.</li>
+<li>Low latency.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>the structure of this chapter <em>is</em> the structure of a good answer. Partition → replicate → make consistency tunable → handle failures → describe the storage engine. If you can recite that spine and justify each step, you can rebuild the whole design under pressure.</p>
+</div>
+<hr>
+</section>
+<section id="single-server-key-value-store">
+<h2 id="single-server-key-value-store">Single Server Key-Value Store</h2>
+<h3 id="implementation">Implementation</h3>
+<ul>
+<li>Use a <strong>hash table</strong> to store key-value pairs in memory.</li>
+<li>Optimizations:
+<ul>
+<li>Data compression.</li>
+<li>Storing less frequently accessed data on disk.</li>
+</ul>
+</li>
+</ul>
+<h3 id="limitation">Limitation</h3>
+<p>A single server's memory is limited, requiring a <strong>distributed approach</strong> for scalability.</p>
+<p>Start here in an interview anyway — it takes thirty seconds, it is genuinely correct for small data, and it establishes the constraint that motivates everything after it. A machine with a few hundred GB of RAM holds a lot of 10 KB values; it is when the dataset exceeds what one machine can hold, or when one machine's failure is unacceptable, that you must distribute.</p>
+<hr>
+</section>
+<section id="distributed-key-value-store">
+<h2 id="distributed-key-value-store">Distributed Key-Value Store</h2>
+<p>A <strong>distributed key-value store</strong> partitions data across multiple servers and must address trade-offs outlined by the <strong>CAP theorem</strong>.</p>
+<h3 id="cap-theorem">CAP Theorem</h3>
+<ol>
+<li><strong>Consistency:</strong> All clients see the same data simultaneously.</li>
+<li><strong>Availability:</strong> The system responds to every request, even if some nodes are down.</li>
+<li><strong>Partition Tolerance:</strong> The system continues to operate despite network partitions.</li>
+</ol>
+<p><strong>Trade-off:</strong> According to CAP theorem only two of the three guarantees can be achieved.</p>
+<p align="center">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/cap.png" alt="CAP" data-width="400" style="max-width:400px">
+</p>
+<h4 id="system-types">System Types:</h4>
+<ul>
+<li>
+<p><strong>CP Systems:</strong> Consistency and partition tolerance while sacrificing availability (e.g., banking systems).</p>
+</li>
+<li>
+<p><strong>AP Systems:</strong> Availability and partition tolerance while sacrificing consistency (e.g., eventual consistency).</p>
+</li>
+<li>
+<p><strong>CA Systems:</strong> Consistency and Availability while sacrificing partition tolerance.</p>
+<p><strong>Since network failure is unavoidable, a distributed system must tolerate network partition. Thus, a CA system cannot exist in real-world applications.</strong></p>
+<p>In a distributed system, partitions are inevitable. When a partition occurs, we must choose between consistency and availability. For example, if node n3 goes down,
+any data written to nodes n1 or n2 cannot be propagated to n3. Conversely, if data is written to n3 but not yet propagated to n1 and n2, nodes n1 and n2 will have stale data.</p>
+  <p align="center">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/server-down.png"  alt="Server down" data-width="400" style="max-width:400px">
+  </p>
+</li>
+<li>
+<p>If we choose CP system, we must block all write operations to n1 and n2 to avoid data inconsistency.</p>
+</li>
+<li>
+<p>If we choose AP system, the system keeps accepting reads, even though it might return stale data.
+For writes, n1 and n2 keep accepting writes,
+and data will be synced to n3 when the network partition is resolved.</p>
+</li>
+</ul>
+<h4 id="stating-cap-precisely">Stating CAP precisely</h4>
+<p>&quot;Pick two of three&quot; is the popular phrasing and it is slightly misleading. The accurate statement is narrower and more useful:</p>
+<div class="callout callout-quote">
+<p><strong>When a network partition occurs, you must choose between consistency and availability.</strong> When there is no partition, you can have both.</p>
+</div>
+<p>That is why CA &quot;doesn't exist&quot; — partitions are not a design choice, they are a fact about networks, so P is always required and the real choice is binary: CP or AP, <em>during a partition</em>.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>CP</strong> — choose consistency</th>
+<th><strong>AP</strong> — choose availability</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>During a partition</td>
+<td>Refuse requests it cannot serve correctly</td>
+<td>Keep serving, possibly with stale data</td>
+</tr>
+<tr>
+<td>The user sees</td>
+<td>An error or a timeout</td>
+<td>An answer that may be out of date</td>
+</tr>
+<tr>
+<td>Right for</td>
+<td>Balances, inventory, bookings, anything where a wrong answer costs money</td>
+<td>Feeds, carts, session data, metrics, likes</td>
+</tr>
+<tr>
+<td>Examples</td>
+<td>HBase, ZooKeeper, etcd, Spanner</td>
+<td>Dynamo, Cassandra, Riak</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>The extension worth knowing: PACELC.</strong> CAP only describes behaviour during a partition, which is rare. PACELC adds the common case: <em>if there is a <strong>P</strong>artition, choose <strong>A</strong> or <strong>C</strong>; <strong>E</strong>lse, choose <strong>L</strong>atency or <strong>C</strong>onsistency.</em> Even when the network is perfectly healthy, waiting for more replicas to acknowledge a write buys consistency at the cost of latency. This is the trade-off you actually make every day, and it is exactly what the quorum settings below expose as a dial.</p>
+<p>This chapter designs an <strong>AP system</strong> with tunable consistency — the Dynamo model.</p>
+<hr>
+</section>
+<section id="system-components">
+<h2 id="system-components">System Components</h2>
+<h3 id="1-data-partitioning">1. Data Partitioning</h3>
+<ul>
+<li><strong>Technique:</strong> Consistent Hashing is used to distribute data across multiple servers evenly.</li>
+<li><strong>Advantages:</strong>
+<ul>
+<li>Automatic scaling with server addition/removal.</li>
+<li>Heterogeneity through virtual nodes. The number of virtual nodes for a server is proportional to the server capacity.</li>
+</ul>
+</li>
+</ul>
+<p>This is <a href="05-consistent-hashing.html">Chapter 5</a> applied directly. The two properties being bought are that adding or removing a node moves only about <code>1/N</code> of the data, and that virtual nodes let servers of different sizes carry proportional shares.</p>
+<h3 id="2-data-replication">2. Data Replication</h3>
+<ul>
+<li>
+<p>Replicate data across <code>N</code> servers for high availability.</p>
+</li>
+<li>
+<p>The N servers are chosen by walking clockwise from the server position and choose the first N servers on the ring to store data copies.</p>
+  <p align="center">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/data-replication.png" alt="Data replication" data-width="300" style="max-width:300px">
+  </p>
+</li>
+</ul>
+<p><strong>The virtual-node subtlety.</strong> Because each physical server owns many virtual nodes, &quot;the first N nodes clockwise&quot; can easily select several virtual nodes that belong to the <strong>same physical machine</strong> — leaving you with three replicas on one box and no redundancy at all. The fix is to <strong>skip virtual nodes whose physical server you have already chosen</strong>, continuing clockwise until N <em>distinct</em> physical servers are found.</p>
+<p>For the same reason, replicas are placed in <strong>distinct data centers</strong> where possible, connected by high-speed links, so that losing a rack or a region does not take every copy with it.</p>
+<h3 id="3-consistency">3. Consistency</h3>
+<p>Since data is replicated at multiple nodes, it must be synchronized across replicas.</p>
+<ul>
+<li><strong>Quorum Consensus:</strong>
+<ul>
+<li>
+<p><code>N</code>: Total replicas.</p>
+</li>
+<li>
+<p><code>W</code>: Write quorum size. For a write to be considered successful, write must be acknowledged from W replicas.</p>
+</li>
+<li>
+<p><code>R</code>: Read quorum size. For a read to be considered as successful, read must wait for responses from at least R replicas.</p>
+</li>
+<li>
+<p><strong>Rule:</strong> <code>W + R &gt; N</code> ensures strong consistency.</p>
+</li>
+<li>
+<p>The configuration of W, R and N is a typical tradeoff between latency and consistency.</p>
+<p align="center">
+<img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/quorum-consensus.png"   alt="Quorum consensus" data-width="400" style="max-width:400px">
+</p>
+<ul>
+<li>If R = 1 and W = N, the system is optimized for a fast read.</li>
+<li>If W = 1 and R = N, the system is optimized for fast write.</li>
+<li>If W + R &gt; N, strong consistency is guaranteed (Usually N = 3, W = R = 2).</li>
+<li>If W + R &lt;= N, strong consistency is not guaranteed.</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p><strong>Why <code>W + R &gt; N</code> works</strong> — and this is a one-line proof worth being able to give: if the write touched <code>W</code> replicas and the read consults <code>R</code> replicas out of <code>N</code>, then <code>W + R &gt; N</code> forces the two sets to <strong>overlap in at least one replica</strong>. That replica has the latest write, so the read is guaranteed to see it. Versioning then decides which of the returned values is newest.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>N</th>
+<th>W</th>
+<th>R</th>
+<th><code>W+R&gt;N</code></th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3</td>
+<td>1</td>
+<td>1</td>
+<td>No</td>
+<td>Fastest reads and writes; eventual consistency only</td>
+</tr>
+<tr>
+<td>3</td>
+<td>3</td>
+<td>1</td>
+<td>Yes</td>
+<td>Fast reads, slow and fragile writes — one node down blocks all writes</td>
+</tr>
+<tr>
+<td>3</td>
+<td>1</td>
+<td>3</td>
+<td>Yes</td>
+<td>Fast writes, slow reads; any node down blocks all reads</td>
+</tr>
+<tr>
+<td>3</td>
+<td>2</td>
+<td>2</td>
+<td>Yes</td>
+<td><strong>The usual default.</strong> Tolerates one node failure for both reads and writes</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code>N=3, W=2, R=2</code> is standard because it is the smallest configuration that is both strongly consistent <em>and</em> survives a single node failure — with <code>W=3</code> a single dead replica makes the system unwritable.</p>
+<ul>
+<li><strong>Models</strong>:
+<ul>
+<li><strong>Strong Consistency:</strong> A read operation returns a value corresponding to the result of the most updated write data item.</li>
+<li><strong>Weak Consistency:</strong> Subsequent read operations may not see the most updated value.</li>
+<li><strong>Eventual Consistency:</strong> Given enough time, all updates are propagated, and all replicas are consistent.</li>
+</ul>
+</li>
+</ul>
+<p>&quot;Eventual consistency&quot; is a family, not a single guarantee, and being specific about which member you need is what makes it a usable answer:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Guarantee</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Read-your-own-writes</strong></td>
+<td>A client always sees its own writes, though maybe not others'</td>
+</tr>
+<tr>
+<td><strong>Monotonic reads</strong></td>
+<td>A client never sees data move <em>backwards</em> in time</td>
+</tr>
+<tr>
+<td><strong>Consistent prefix</strong></td>
+<td>Writes are seen in the order they happened, possibly delayed</td>
+</tr>
+<tr>
+<td><strong>Eventual</strong></td>
+<td>Only that replicas converge, given no new writes</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The read-your-own-writes problem is the same one that replication lag creates in <a href="01-scaling.html#section-5-database-replication">Chapter 1 §5</a> — here it is tunable rather than accidental.</p>
+<h3 id="4-inconsistency-resolution">4. Inconsistency Resolution</h3>
+<p>Replication gives high availability but causes inconsistencies among replicas. Versioning and
+vector clocks are used to solve inconsistency problems.</p>
+<ul>
+<li>
+<p><strong>Versioning:</strong></p>
+<ul>
+<li>
+<p>Use <strong>vector clocks</strong> to track data versions and resolve conflicts.</p>
+</li>
+<li>
+<p>Versioning means treating each data modification as a new immutable version of data.</p>
+  <p align="left">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/consistent-server.png"   alt="Consistent server" data-width="400" style="max-width:400px">
+  <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/inconsistent-server.png"   alt="Inconsistent server" data-height="230" style="max-height:230px">
+  </p>
+</li>
+<li>
+<p>Server 1 changes the name , and server 2 also changes the name. These two changes are performed simultaneously. Now, we have conflicting values, called versions v1 and v2.</p>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Vector Clock</strong></p>
+<ol>
+<li>
+<p><strong>Setup</strong>: A vector clock is a [server, version] pair associated with a data item. It can be used to check
+if one version precedes, succeeds, or in conflict with others.</p>
+<ul>
+<li>Assume a vector clock represented by D([S1, v1], [S2, v2], …, [Sn, vn]), If data item D is written to server
+Si, the system must perform one of the following tasks.</li>
+<li>Where: <code>D</code> is the data item.<code>Si</code> is the server identifier.<code>vi</code> is the version counter for the data at server <code>Si</code>.</li>
+</ul>
+</li>
+<li>
+<p><strong>Updating the Vector Clock:</strong>  When a data item is modified at a server:</p>
+<ul>
+<li>If the server exists in the vector clock, its version counter is incremented.</li>
+<li>Otherwise, a new entry is added to the vector clock.</li>
+</ul>
+</li>
+<li>
+<p><strong>Conflict Detection:</strong></p>
+<ul>
+<li><strong>No Conflict:</strong> A version X is an ancestor of version Y if all counters in X are less than or equal to those in Y.</li>
+<li><strong>Conflict Exists:</strong> Two versions are siblings if there is at least one counter in Y that is less than its counterpart in X.</li>
+</ul>
+</li>
+<li>
+<p><strong>Conflict Resolution:</strong> When conflicts are detected (sibling versions), the system relies on application-specific logic or client intervention to   reconcile the data.</p>
+ <p align="center">
+ <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/vector-clock.png"  alt="Vector clock" data-width="500" style="max-width:500px">
+ </p>
+</li>
+</ol>
+</li>
+</ul>
+<p><strong>A worked trace.</strong> Follow the counters and the conflict becomes obvious:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>1. Client writes D1, handled by Sx   -&gt;  D1([Sx,1])
+2. Client updates it, handled by Sx  -&gt;  D2([Sx,2])
+3. Client updates D2, handled by Sy  -&gt;  D3([Sx,2], [Sy,1])
+4. A DIFFERENT client reads D2 and
+   updates it, handled by Sz         -&gt;  D4([Sx,2], [Sz,1])
+
+   D3 has [Sy,1] which D4 lacks.
+   D4 has [Sz,1] which D3 lacks.
+   Neither descends from the other  -&gt;  CONFLICT (siblings)
+
+5. A client reads, receives both D3 and D4, reconciles them,
+   and writes the result            -&gt;  D5([Sx,3], [Sy,1], [Sz,1])
+</code></pre></div>
+<p>The rule in words: <strong>if every counter in X is ≤ the corresponding counter in Y, then X happened before Y and can be discarded. If each has a counter the other lacks, they are concurrent and the system cannot decide</strong> — so it returns both and asks the application to merge.</p>
+<p>Amazon's canonical example is a shopping cart: when two versions conflict, the system returns both and the application takes the <strong>union</strong> of the items. The visible symptom — a deleted item reappearing in your cart — is the price paid for a cart that is always writable.</p>
+<p><strong>The cheaper alternative: last-write-wins (LWW).</strong> Attach a timestamp and keep the newer value. It is trivial to implement and is what Cassandra does by default — but it <strong>silently discards one of the two concurrent writes</strong>, and it depends on clocks agreeing across machines, which they do not. Choose it when losing an occasional concurrent update is acceptable, and know that you have chosen it.</p>
+<ul>
+<li><strong>Challenges:</strong>
+<ul>
+<li>Increased complexity for clients.</li>
+<li>Vector clock size may grow with many updates, requiring trimming strategies to limit its size.</li>
+</ul>
+</li>
+</ul>
+<p>Trimming has a real cost: dropping the oldest <code>[server, version]</code> entries can make two versions <em>look</em> like ancestors when they are actually siblings, so a genuine conflict is missed and a write is lost. Dynamo capped the list length and accepted this as a rare, tolerable inefficiency.</p>
+<h3 id="5-handling-failures">5. Handling Failures</h3>
+<h4 id="a-failure-detection">a. Failure Detection</h4>
+<p>It is insufficient to believe that a server is down because another server says so.Usually, it requires at least two independent sources of information to mark a server down.</p>
+<ul>
+<li>
+<p><strong>Gossip Protocol:</strong></p>
+  <p align="left">
+      <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/gossip-protocol.png"  alt="Gossip protocol" data-width="600" style="max-width:600px">
+  </p>
+<ul>
+<li>Each node maintains member IDs and heartbeat counters.</li>
+<li>Each node periodically increments its heartbeat counter.</li>
+<li>Each node periodically sends heartbeats to a set of random nodes.</li>
+<li>If the heartbeat has not increased for more than predefined periods, the member is
+considered as offline</li>
+</ul>
+</li>
+</ul>
+<p><strong>Why gossip rather than everyone pinging everyone?</strong> All-to-all heartbeating costs <code>O(n²)</code> messages, which stops being viable at a few hundred nodes. Gossip spreads membership information in <code>O(log n)</code> rounds at constant cost per node — each node talks to a few random peers and the news propagates epidemically. It is also decentralised, so there is no monitoring node to become a single point of failure.</p>
+<p>The requirement for <strong>two independent sources</strong> before marking a node down exists because one node's inability to reach another may mean the <em>reporter</em> is partitioned, not the target. Marking a healthy node dead triggers unnecessary data movement, and in the worst case a cascade.</p>
+<h4 id="b-temporary-failures">b. Temporary Failures</h4>
+<ul>
+<li>
+<p><strong>Sloppy Quorum:</strong> Use healthy nodes to maintain operations temporarily.
+<p align="center">
+<img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/sloppy-quorum.png"   alt="Sloppy Quorum" data-width="400" style="max-width:400px">
+</p></p>
+<ul>
+<li>After detecting failures, the system needs to deploy certain mechanisms to ensure availability</li>
+<li>Instead of enforcing the quorum requirement, the system chooses the first W healthy servers for writes and first R
+healthy servers for reads on the hash ring.</li>
+<li>Offline servers are ignored. If a server is unavailable, another server will process requests temporarily</li>
+</ul>
+</li>
+<li>
+<p><strong>Hinted Handoff:</strong> Offline servers catch up with changes upon recovery.</p>
+<ul>
+<li>When the down server is up, changes will be pushed back to achieve data consistency</li>
+</ul>
+</li>
+</ul>
+<p>The pair works like this: a <strong>sloppy quorum</strong> keeps writes succeeding by accepting them on whichever <code>W</code> nodes are reachable — <em>not necessarily the N nodes that own the key</em>. The substitute node stores the data with a <strong>hint</strong> recording where it really belongs, and hands it back when the rightful owner returns.</p>
+<p>The cost is honest to state: during a sloppy quorum, <code>W + R &gt; N</code> <strong>no longer guarantees an overlap</strong>, because the write may have landed entirely outside the key's home replicas. Availability is preserved by weakening the consistency guarantee for the duration — which is the AP choice from CAP, made concrete.</p>
+<h4 id="c-permanent-failures">c. Permanent Failures</h4>
+<ul>
+<li>
+<p>Use <strong>Merkle Trees</strong> for efficient synchronization between replicas.
+A <strong>Merkle Tree</strong> (or hash tree) is a data structure to efficiently detect and resolve inconsistencies between replicas during permanent failures.</p>
+</li>
+<li>
+<p>Working</p>
+<ol>
+<li>
+<p><strong>Structure:</strong></p>
+<ul>
+<li><strong>Leaf Nodes</strong> store the hash of individual data blocks.</li>
+<li><strong>Non-Leaf Nodes</strong> store the hash of their child nodes.</li>
+<li>The <strong>root hash</strong> represents the combined state of all data in the tree.</li>
+</ul>
+</li>
+<li>
+<p><strong>Building a Merkle Tree:</strong></p>
+<ul>
+<li>
+<p><strong>Step 1:</strong> Divide the key space into buckets.</p>
+  <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/key-bucket.png"   alt="Key Bucket" data-width="500" style="max-width:500px">
+</li>
+<li>
+<p><strong>Step 2:</strong> Hash each key in a bucket using uniform hashing.</p>
+  <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/hash-key-bucket.png"   alt="Hash Key Bucket" data-width="500" style="max-width:500px">
+</li>
+<li>
+<p><strong>Step 3:</strong> Create a single hash for each bucket.</p>
+  <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/hash-bucket.png"   alt="Hash Bucket" data-width="500" style="max-width:500px">
+</li>
+<li>
+<p><strong>Step 4:</strong> Combine hashes of buckets to compute higher-level hashes, culminating in the root hash.</p>
+  <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/merkel-tree.png"   alt="Merkel Tree" data-width="500" style="max-width:500px">
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Synchronization:</strong></p>
+<ul>
+<li>To synchronize two replicas:
+<ul>
+<li>Compare their root hashes.</li>
+<li>If the root hashes match, the replicas are consistent.</li>
+<li>If the root hashes differ, compare child hashes recursively to identify inconsistent buckets.</li>
+</ul>
+</li>
+<li>Only the inconsistent data is synchronized.</li>
+</ul>
+</li>
+</ol>
+</li>
+<li>
+<p>Advantages</p>
+<ul>
+<li><strong>Efficiency:</strong> Only inconsistent data is synchronized, reducing data transfer.</li>
+<li><strong>Scalability:</strong> Effective for large datasets with minimal synchronization overhead.</li>
+<li><strong>Reliability:</strong> Ensures data consistency across replicas.</li>
+</ul>
+</li>
+</ul>
+<p><strong>The point in one sentence:</strong> comparing two replicas naively means transferring and comparing every key, but a Merkle tree finds the differing buckets in roughly <code>O(log n)</code> comparisons and transfers <strong>only the data that actually differs</strong> — so two replicas holding a terabyte of identical data confirm agreement by exchanging a single root hash.</p>
+<p>This background repair process is called <strong>anti-entropy</strong>, and it is what eventual consistency relies on to be <em>eventual</em> rather than merely hopeful. The usual complement is <strong>read repair</strong>: when a read discovers replicas disagreeing, the newest value is written back immediately, so frequently read keys heal without waiting for the next anti-entropy pass.</p>
+<h3 id="6-handling-data-center-outages">6. Handling Data Center Outages</h3>
+<ul>
+<li>Replicate data across multiple data centers to ensure availability during outages.</li>
+</ul>
+<hr>
+</section>
+<section id="write-and-read-paths">
+<h2 id="write-and-read-paths">Write and Read Paths</h2>
+<h3 id="1-write-path-based-on-cassandra-architecture">1. Write Path (Based on Cassandra architecture)</h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/write-path.png"   alt="Write path" data-width="500" style="max-width:500px">
+</p>
+<ul>
+<li>Persist the write in a <strong>commit log</strong>.</li>
+<li>Save data to a <strong>memory cache</strong>.</li>
+<li>Flush data to <strong>SSTable</strong> (Sorted String Table) on disk when cache is full.</li>
+</ul>
+<p>This is an <strong>LSM tree</strong> (log-structured merge tree), and the reason it is used rather than the B-tree in a relational database is worth understanding, because it explains the whole shape of the storage engine.</p>
+<p>The insight: <strong>random disk writes are slow, sequential writes are fast</strong> — the 10 ms seek versus 30 ms-per-MB sequential figures from <a href="02-back-of-the-envelope-estimation.html">Chapter 2</a>. So instead of updating data in place where it belongs, never update anything:</p>
+<ol>
+<li><strong>Commit log (write-ahead log).</strong> Append the write to a sequential file. This is the durability guarantee — if the process dies, the log is replayed on restart.</li>
+<li><strong>Memtable.</strong> Apply the write to a sorted in-memory structure. The write is now acknowledged; it has touched no random disk location at all.</li>
+<li><strong>Flush to SSTable.</strong> When the memtable is full, write it to disk <strong>once, sequentially</strong>, as an immutable sorted file.</li>
+<li><strong>Compaction.</strong> A background process merges SSTables, discarding superseded values and tombstones (deletion markers) to stop files multiplying forever.</li>
+</ol>
+<p>Note that a <strong>delete is also a write</strong> — a tombstone — because files are immutable. Space is only reclaimed at compaction, which is why deletions in these systems do not immediately free disk.</p>
+<h3 id="2-read-path">2. Read Path</h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/read-path.png"   alt="Read path" data-width="500" style="max-width:500px">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/read-path-without-cache.png"   alt="Read path without cache" data-width="500" style="max-width:500px">
+</p>
+<ul>
+<li>Check <strong>memory cache</strong> for the data.</li>
+<li>If absent, use a <strong>Bloom Filter</strong> to locate the data in SSTables.</li>
+<li>Retrieve and return the data.</li>
+</ul>
+<p>The read is harder than the write, because a key may live in the memtable or in any of several SSTables. Checking each one on disk would be ruinous — hence the <strong>Bloom filter</strong>, a compact probabilistic structure answering &quot;is this key <em>possibly</em> in this SSTable?&quot;:</p>
+<ul>
+<li><strong>No false negatives.</strong> A &quot;no&quot; is definitive, so the SSTable can be skipped without touching the disk.</li>
+<li><strong>Tunable false positives.</strong> A &quot;yes&quot; may be wrong, costing one wasted disk read. Around 10 bits per key gives roughly a 1% false-positive rate.</li>
+</ul>
+<p>So the read checks the memtable, consults each SSTable's Bloom filter, and reads only the files that might contain the key — newest first.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>LSM tree</strong> (Cassandra, RocksDB, HBase)</th>
+<th><strong>B-tree</strong> (PostgreSQL, InnoDB)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Writes</td>
+<td>Sequential appends — very fast</td>
+<td>Update in place — random I/O</td>
+</tr>
+<tr>
+<td>Reads</td>
+<td>May consult several SSTables</td>
+<td>One tree traversal, predictable</td>
+</tr>
+<tr>
+<td>Background work</td>
+<td>Compaction, which competes for I/O</td>
+<td>Comparatively little</td>
+</tr>
+<tr>
+<td>Space</td>
+<td>Temporarily holds superseded values and tombstones</td>
+<td>Compact, with some page fragmentation</td>
+</tr>
+<tr>
+<td>Best for</td>
+<td><strong>Write-heavy</strong> workloads</td>
+<td><strong>Read-heavy</strong> and transactional workloads</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>&quot;why is a write fast if it still has to be durable?&quot; is the question this section answers, and the answer is that the only synchronous disk operation is a <strong>sequential append</strong> to the commit log. If you can explain that plus the Bloom filter's role, you have covered most of what interviewers probe here.</p>
+</div>
+<hr>
+</section>
+<section id="final-architecture">
+<h2 id="final-architecture">Final Architecture</h2>
+<p align="center">
+<img loading="lazy" decoding="async" src="../../system-design-notes/06.%20Key-Value%20Store/images/final-architecture.png"   alt="Final architecture" data-width="500" style="max-width:500px">
+</p>
+<ul>
+<li>Clients communicate with the key-value store through simple APIs: get(key) and put(key,
+value).</li>
+<li>A coordinator is a node that acts as a proxy between the client and the key-value store.</li>
+<li>Nodes are distributed on a ring using consistent hashing.</li>
+<li>The system is completely decentralized so adding and moving nodes can be automatic.</li>
+<li>Data is replicated at multiple nodes.</li>
+<li>There is no single point of failure as every node has the same set of responsibilities.</li>
+</ul>
+<p>The <strong>coordinator</strong> is any node the client happens to contact — it is a role, not a dedicated server. It hashes the key, finds the N replicas on the ring, forwards the request, waits for <code>W</code> or <code>R</code> acknowledgements, resolves versions, and replies. Because every node can coordinate and every node holds the same responsibilities, there is no master to lose and no special node to fail.</p>
+<h3 id="the-design-as-problem-and-technique">The design, as problem and technique</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Store big data</td>
+<td>Consistent hashing to spread load across servers</td>
+</tr>
+<tr>
+<td>High availability reads</td>
+<td>Data replication; multi-data-center setup</td>
+</tr>
+<tr>
+<td>Highly available writes</td>
+<td>Versioning and conflict resolution with vector clocks</td>
+</tr>
+<tr>
+<td>Incremental scalability</td>
+<td>Consistent hashing</td>
+</tr>
+<tr>
+<td>Heterogeneity (servers of different sizes)</td>
+<td>Virtual nodes proportional to capacity</td>
+</tr>
+<tr>
+<td>Tunable consistency</td>
+<td>Quorum consensus (<code>N</code>, <code>W</code>, <code>R</code>)</td>
+</tr>
+<tr>
+<td>Detecting failures</td>
+<td>Gossip protocol</td>
+</tr>
+<tr>
+<td>Temporary failures</td>
+<td>Sloppy quorum and hinted handoff</td>
+</tr>
+<tr>
+<td>Permanent failures</td>
+<td>Merkle tree anti-entropy, plus read repair</td>
+</tr>
+<tr>
+<td>Data center outage</td>
+<td>Cross-data-center replication</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Quorum does not make it linearizable.</strong> <code>W + R &gt; N</code> guarantees a read sees <em>a</em> value at least as new as the last completed write, but concurrent operations can still interleave surprisingly, and a sloppy quorum voids the guarantee entirely. If you need true linearizability, you need consensus (Paxos, Raft) and a CP system, not a quorum.</li>
+<li><strong>Last-write-wins loses data silently.</strong> It is the default in several real systems and depends on synchronised clocks. With clock skew, an <em>older</em> write can win.</li>
+<li><strong>Hot keys are not solved here.</strong> Consistent hashing balances the key space, not request volume — one popular key still saturates its N replicas. See <a href="05-consistent-hashing.html#gotchas--failure-modes">Chapter 5</a>.</li>
+<li><strong>Tombstones and the delete problem.</strong> Deletions consume space until compaction, and a tombstone must outlive any replica that might still hold the old value — delete it too early and the old value is resurrected by anti-entropy. This is why these systems have a tunable grace period, and why a node offline longer than it must be re-bootstrapped rather than simply restarted.</li>
+<li><strong>Compaction is an I/O tax.</strong> It runs in the background and competes with live traffic, so latency spikes during heavy compaction are a well-known operational reality.</li>
+<li><strong>Range queries are awkward.</strong> Hash partitioning scatters adjacent keys across the ring deliberately, so &quot;all keys between X and Y&quot; means querying every partition. If range scans matter, you need an ordered partitioner — and the hotspots it brings back.</li>
+<li><strong>Values must stay small.</strong> The &lt;10 KB assumption is load-bearing. Large values make replication, compaction, and repair expensive; store blobs elsewhere and keep a pointer, exactly as with the media in <a href="02-back-of-the-envelope-estimation.html">Chapter 2's Twitter estimate</a>.</li>
+</ul>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Why can a CA system not exist in practice, and what does CAP actually constrain?</li>
+<li><code>N=3, W=2, R=2</code>. Prove that a read sees the latest write. Now explain why <code>W=3, R=1</code> is a worse choice.</li>
+<li>Two vector clocks are <code>([Sx,2],[Sy,1])</code> and <code>([Sx,2],[Sz,1])</code>. Is one an ancestor of the other? What must the system do?</li>
+<li>What does last-write-wins cost you, and when is that acceptable?</li>
+<li>Why is all-to-all heartbeating replaced by gossip, and why must two nodes agree before marking a peer down?</li>
+<li>During a sloppy quorum, which guarantee stops holding, and why?</li>
+<li>Two replicas hold 1 TB of identical data. How many bytes must they exchange to confirm agreement?</li>
+<li>Why is an LSM-tree write fast even though it is durable before acknowledgement?</li>
+<li>A Bloom filter says a key is present but it isn't. What is the cost? What if it said absent when the key was present?</li>
+<li>Why does deleting data in this system not immediately free disk space?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>N / W / R</strong></td>
+<td>Replica count, write quorum, read quorum</td>
+</tr>
+<tr>
+<td><strong>Quorum overlap</strong></td>
+<td><code>W + R &gt; N</code>, forcing read and write sets to share a replica</td>
+</tr>
+<tr>
+<td><strong>Vector clock</strong></td>
+<td>A list of <code>[server, counter]</code> pairs used to detect concurrent versions</td>
+</tr>
+<tr>
+<td><strong>Sibling versions</strong></td>
+<td>Two concurrent versions, neither descending from the other</td>
+</tr>
+<tr>
+<td><strong>LWW</strong></td>
+<td>Last-write-wins — timestamp-based conflict resolution that discards a version</td>
+</tr>
+<tr>
+<td><strong>Gossip protocol</strong></td>
+<td>Epidemic membership and failure detection by random peer exchange</td>
+</tr>
+<tr>
+<td><strong>Sloppy quorum</strong></td>
+<td>Accepting writes on any <code>W</code> healthy nodes, not only the key's owners</td>
+</tr>
+<tr>
+<td><strong>Hinted handoff</strong></td>
+<td>Holding a write for an absent node and delivering it on recovery</td>
+</tr>
+<tr>
+<td><strong>Merkle tree</strong></td>
+<td>Hash tree enabling cheap detection of differing data ranges</td>
+</tr>
+<tr>
+<td><strong>Anti-entropy / read repair</strong></td>
+<td>Background / on-read reconciliation of diverging replicas</td>
+</tr>
+<tr>
+<td><strong>LSM tree</strong></td>
+<td>Log-structured merge tree — the write-optimised storage engine described above</td>
+</tr>
+<tr>
+<td><strong>SSTable</strong></td>
+<td>Sorted String Table — an immutable sorted file of key-value pairs</td>
+</tr>
+<tr>
+<td><strong>Memtable</strong></td>
+<td>The in-memory sorted buffer writes land in before being flushed</td>
+</tr>
+<tr>
+<td><strong>Tombstone</strong></td>
+<td>A marker recording a deletion, since files are immutable</td>
+</tr>
+<tr>
+<td><strong>Compaction</strong></td>
+<td>Background merging of SSTables to reclaim space</td>
+</tr>
+<tr>
+<td><strong>Bloom filter</strong></td>
+<td>Probabilistic set membership with no false negatives</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="05-consistent-hashing.html">Chapter 5 – Design Consistent Hashing</a> — the partitioning scheme this design assumes.</li>
+<li><a href="01-scaling.html#section-12-database-scaling">Chapter 1 §12 – Database Scaling</a> — the same problem from the relational side.</li>
+<li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener">Amazon Dynamo paper</a> — the original source for most of this chapter.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

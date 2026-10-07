@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 2: Back-of-the-Envelope Estimation — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="02-back-of-the-envelope-estimation">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Foundations › Chapter 2 of 28</div>
+  <h1>Chapter 2: Back-of-the-Envelope Estimation</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#section-1-key-concepts">Section 1: Key Concepts</a></li><li><a href="#section-2-example-estimation---twitter-qps-and-storage-requirements">Section 2: Example Estimation - Twitter QPS and Storage Requirements</a></li><li><a href="#section-3-tips-for-effective-estimation">Section 3: Tips for Effective Estimation</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>Back-of-the-envelope estimation is a crucial skill in system design interviews. It involves making quick, rough calculations to assess system capacity or performance. According to Jeff Dean, Google Senior Fellow, these estimates help evaluate whether designs meet requirements through thought experiments and common performance benchmarks.</p>
+<p>This chapter covers key concepts, methodologies, and examples to build proficiency in scalability and estimation.</p>
+<p><strong>Why this matters more than it looks.</strong> Estimation is not arithmetic for its own sake — it is how you decide <em>which</em> parts of <a href="01-scaling.html">Chapter 1</a> your design actually needs. A system at 50 QPS and 10 GB does not need sharding, a CDN, or multiple regions, and proposing them signals poor judgement. A system at 500,000 QPS and 50 PB needs all of them, and omitting them signals the same thing. The numbers tell you which conversation to have.</p>
+<p>The goal is an answer within roughly an order of magnitude, reached in two or three minutes. Nobody is checking your long division.</p>
+<hr>
+</section>
+<section id="section-1-key-concepts">
+<h2 id="section-1-key-concepts">Section 1: Key Concepts</h2>
+<h3 id="power-of-two">Power of Two</h3>
+<p>Understanding data volume in terms of powers of two is fundamental:</p>
+<img loading="lazy" decoding="async" src="../../system-design-notes/02.%20Back%20Of%20the%20Envelope%20Estimation/images/power-of-two.png" alt="power-of-two" data-width="500" style="max-width:500px" />
+<p>This knowledge helps in performing accurate storage and bandwidth calculations.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Power</th>
+<th>Exact value</th>
+<th>Approximate value</th>
+<th>Unit</th>
+<th>Short</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2^10</td>
+<td>1,024</td>
+<td>1 thousand</td>
+<td>1 Kilobyte</td>
+<td>1 KB</td>
+</tr>
+<tr>
+<td>2^20</td>
+<td>1,048,576</td>
+<td>1 million</td>
+<td>1 Megabyte</td>
+<td>1 MB</td>
+</tr>
+<tr>
+<td>2^30</td>
+<td>1,073,741,824</td>
+<td>1 billion</td>
+<td>1 Gigabyte</td>
+<td>1 GB</td>
+</tr>
+<tr>
+<td>2^40</td>
+<td>1,099,511,627,776</td>
+<td>1 trillion</td>
+<td>1 Terabyte</td>
+<td>1 TB</td>
+</tr>
+<tr>
+<td>2^50</td>
+<td>1,125,899,906,842,624</td>
+<td>1 quadrillion</td>
+<td>1 Petabyte</td>
+<td>1 PB</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The practical takeaway is to <strong>treat each step as ×1000, not ×1024</strong>. The 2.4% error is irrelevant next to the fact that your assumptions are guesses, and it makes every calculation doable in your head.</p>
+<hr>
+<h3 id="latency-numbers-every-programmer-should-know">Latency Numbers Every Programmer Should Know</h3>
+<p>Latency numbers represent the time taken for various operations in computing systems. These provide insights into relative performance:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Latency (2020)</th>
+<th>What it means for your design</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L1 Cache Access</td>
+<td>0.5 ns</td>
+<td>Effectively free</td>
+</tr>
+<tr>
+<td>L2 Cache Access</td>
+<td>7 ns</td>
+<td>Effectively free</td>
+</tr>
+<tr>
+<td>Mutex lock/unlock</td>
+<td>100 ns</td>
+<td>Cheap, but contention is not — a hot lock serialises your whole service</td>
+</tr>
+<tr>
+<td>Main Memory Access</td>
+<td>100 ns</td>
+<td>The baseline &quot;fast&quot;. Everything below is a different category</td>
+</tr>
+<tr>
+<td>Compress 1 KB</td>
+<td>~10 µs</td>
+<td>~100× a memory read, but ~1000× cheaper than sending the bytes over the internet — so compress before transmitting</td>
+</tr>
+<tr>
+<td>Read 1 MB from memory</td>
+<td>~250 µs</td>
+<td>In-memory scans are cheap. This is why a cache tier works</td>
+</tr>
+<tr>
+<td>SSD Random Read</td>
+<td>150 µs</td>
+<td>~1,500× slower than memory. Still fine; random reads on SSD are not disasters</td>
+</tr>
+<tr>
+<td>Round-Trip in Data Center</td>
+<td>500 µs</td>
+<td><strong>Your real budget unit.</strong> Every service hop and DB query costs about this much, minimum</td>
+</tr>
+<tr>
+<td>HDD Random Seek</td>
+<td>10 ms</td>
+<td>~100,000× slower than memory. Avoid random disk access; design for sequential</td>
+</tr>
+<tr>
+<td>Read 1 MB over 1 Gbps</td>
+<td>~10 ms</td>
+<td>Bandwidth, not latency, dominates large transfers</td>
+</tr>
+<tr>
+<td>Read 1 MB from disk</td>
+<td>~30 ms</td>
+<td>Sequential disk is survivable; it is <em>seeks</em> that kill you</td>
+</tr>
+<tr>
+<td>Inter-Region Data Center</td>
+<td>150 ms</td>
+<td>Noticeable to humans. Never do this synchronously per request</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Key Insights:</strong></p>
+<ul>
+<li>Memory is fast, disk is slow.</li>
+<li>Avoid disk seeks whenever possible.</li>
+<li>Compress data before transmitting over the internet to save bandwidth.</li>
+<li><strong>The gaps are what matter, not the digits.</strong> Memory → SSD → disk → cross-region each jump roughly 1000×. Knowing the <em>order</em> of these reliably is worth more than memorising any single figure.</li>
+<li><strong>Count round trips, not CPU.</strong> A request making 20 sequential service calls has spent 10 ms doing nothing but waiting, before any work. Batching and parallelising calls usually beats optimising code.</li>
+</ul>
+<div class="callout callout-note">
+<span class="callout-title">A note on these figures</span>
+<p>this table is the widely circulated &quot;latency numbers every programmer should know&quot; list, useful as <em>orders of magnitude</em> rather than current benchmarks. Modern NVMe drives are considerably faster than the SSD row suggests. Nobody will challenge you on the exact values; they will challenge you if you treat a disk read and a memory read as comparable.</p>
+</div>
+<hr>
+<h3 id="availability-numbers">Availability Numbers</h3>
+<p>High availability (HA) ensures minimal downtime. Availability is expressed in <strong>nines</strong>:</p>
+<ul>
+<li><strong>99% (Two Nines):</strong> ~3.65 days/year of downtime</li>
+<li><strong>99.9% (Three Nines):</strong> ~8.8 hours/year of downtime</li>
+<li><strong>99.99% (Four Nines):</strong> ~52 minutes/year of downtime</li>
+<li><strong>99.999% (Five Nines):</strong> ~5.3 minutes/year of downtime</li>
+<li><strong>99.9999% (Six Nines):</strong> ~31.56 seconds/year of downtime</li>
+</ul>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Availability</th>
+<th>Downtime per day</th>
+<th>Per month</th>
+<th>Per year</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>99%</td>
+<td>14.4 minutes</td>
+<td>~7.3 hours</td>
+<td>~3.65 days</td>
+</tr>
+<tr>
+<td>99.9%</td>
+<td>~1.44 minutes</td>
+<td>~43.8 minutes</td>
+<td>~8.8 hours</td>
+</tr>
+<tr>
+<td>99.99%</td>
+<td>~8.6 seconds</td>
+<td>~4.4 minutes</td>
+<td>~52.6 minutes</td>
+</tr>
+<tr>
+<td>99.999%</td>
+<td>~0.86 seconds</td>
+<td>~26 seconds</td>
+<td>~5.3 minutes</td>
+</tr>
+<tr>
+<td>99.9999%</td>
+<td>~86 milliseconds</td>
+<td>~2.6 seconds</td>
+<td>~31.6 seconds</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Cloud providers like Amazon, Google, and Microsoft aim for SLAs (Service Level Agreements) of <strong>99.9% or higher</strong>.</p>
+<p><strong>The rule people forget: dependencies in series multiply.</strong> If a request passes through a load balancer, an API service, and a database that are each 99.9% available, the combined availability is 0.999³ ≈ <strong>99.7%</strong> — nearly three times the downtime of any single component. Every component you add to the request path makes availability <em>worse</em> unless it is made redundant.</p>
+<p>This is precisely why <a href="01-scaling.html">Chapter 1</a> insists on redundancy at every tier: two components in <strong>parallel</strong>, each 99% available, give 1 − 0.01² = <strong>99.99%</strong>. Redundancy is how you buy back the nines that your component count spent.</p>
+<p>Two more things worth knowing:</p>
+<ul>
+<li><strong>Four nines is roughly the ceiling for a design conversation.</strong> Beyond that, downtime budget is measured in minutes per year, which is less than a careless deploy takes — so five nines is an organisational and automation achievement, not an architectural one.</li>
+<li><strong>Availability is not the same as correctness.</strong> A service returning errors fast is &quot;up&quot; by most health checks.</li>
+</ul>
+<hr>
+</section>
+<section id="section-2-example-estimation---twitter-qps-and-storage-requirements">
+<h2 id="section-2-example-estimation---twitter-qps-and-storage-requirements">Section 2: Example Estimation - Twitter QPS and Storage Requirements</h2>
+<h3 id="assumptions">Assumptions</h3>
+<ul>
+<li><strong>300 million monthly active users (MAU).</strong></li>
+<li><strong>50% daily active users (DAU).</strong></li>
+<li><strong>Average tweets/user/day:</strong> 2.</li>
+<li><strong>10% of tweets contain media.</strong></li>
+<li><strong>Data retention:</strong> 5 years.</li>
+</ul>
+<p>State these out loud and write them down. The interviewer will often correct one (&quot;assume 20% have media&quot;), and correcting an assumption is cheap — redoing an estimate whose assumptions were never stated is not.</p>
+<h3 id="estimations">Estimations</h3>
+<p><strong>1. Daily active users</strong></p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>DAU = 300M MAU x 50% = 150M users/day
+</code></pre></div>
+<p><strong>2. Write QPS (tweets per second)</strong></p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>Tweets/day     = 150M users x 2 tweets  = 300M tweets/day
+Average QPS    = 300M / 86,400 s        = ~3,500 tweets/sec
+Peak QPS       = ~3,500 x 2             = ~7,000 tweets/sec
+</code></pre></div>
+<p>A day is 86,400 seconds, which is close enough to 100,000 (10^5) for mental arithmetic — so &quot;300M per day&quot; is about &quot;3,000 per second&quot; before you reach for a calculator.</p>
+<p><strong>3. Storage: one tweet</strong></p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Size</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tweet_id</code></td>
+<td>64 bytes</td>
+</tr>
+<tr>
+<td><code>text</code></td>
+<td>140 bytes</td>
+</tr>
+<tr>
+<td><code>media</code> (10% of tweets)</td>
+<td>1 MB</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>4. Daily and 5-year storage</strong></p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>Media/day      = 150M x 2 x 10% x 1 MB  = 30M MB   = ~30 TB/day
+5-year total   = 30 TB x 365 x 5        = 54,750 TB = ~55 PB
+</code></pre></div>
+<p>For contrast, the text itself is almost free:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>Text/day       = 300M tweets x 204 bytes = ~61 GB/day
+5-year total   = 61 GB x 1,825 days      = ~112 TB
+</code></pre></div>
+<p><strong>Media is ~500× the text volume.</strong> That single observation reshapes the design: tweet text belongs in a database, but media belongs in blob storage behind a CDN, with only a URL stored in the database. This is the point of estimating — the number told you the architecture.</p>
+<p>Finally, remember the 55 PB figure is <strong>before replication</strong>. At the typical replication factor of 3, you are provisioning closer to <strong>165 PB</strong>, which is also why the real design tiers old media to cheaper cold storage.</p>
+<hr>
+</section>
+<section id="section-3-tips-for-effective-estimation">
+<h2 id="section-3-tips-for-effective-estimation">Section 3: Tips for Effective Estimation</h2>
+<h3 id="1-rounding-and-approximation">1. Rounding and Approximation</h3>
+<p>Precision is not critical; focus on the process. Simplify complex calculations using round numbers. For example:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>99,987 / 9.1  ≈  100,000 / 10  =  10,000
+</code></pre></div>
+<h3 id="2-write-down-assumptions">2. Write Down Assumptions</h3>
+<p>Document assumptions clearly for future reference.</p>
+<h3 id="3-label-units">3. Label Units</h3>
+<p>Avoid ambiguity by labeling units (e.g., <code>5 MB</code> instead of <code>5</code>).</p>
+<h3 id="4-common-estimation-scenarios">4. Common Estimation Scenarios</h3>
+<ul>
+<li><strong>QPS (Queries Per Second):</strong> Measure traffic intensity.</li>
+<li><strong>Peak QPS:</strong> Account for traffic spikes.</li>
+<li><strong>Storage Requirements:</strong> Estimate total data needs.</li>
+<li><strong>Cache Requirements:</strong> Evaluate memory requirements for caching.</li>
+<li><strong>Number of Servers:</strong> Calculate hardware needs based on workload.</li>
+</ul>
+<hr>
+<h3 id="the-estimation-recipe">The estimation recipe</h3>
+<p>Almost every estimate follows the same chain. Learn the chain once and you never have to invent an approach under pressure:</p>
+<figure class="mermaid-fig">
+<svg id="mmd-94a31def395a5662" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1142.92px; background-color: transparent;" viewBox="0 0 1142.921875 198" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-94a31def395a5662{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-94a31def395a5662 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-94a31def395a5662 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-94a31def395a5662 .error-icon{fill:#f4f6f8;}#mmd-94a31def395a5662 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-94a31def395a5662 .edge-thickness-normal{stroke-width:1px;}#mmd-94a31def395a5662 .edge-thickness-thick{stroke-width:3.5px;}#mmd-94a31def395a5662 .edge-pattern-solid{stroke-dasharray:0;}#mmd-94a31def395a5662 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-94a31def395a5662 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-94a31def395a5662 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-94a31def395a5662 .marker{fill:#637381;stroke:#637381;}#mmd-94a31def395a5662 .marker.cross{stroke:#637381;}#mmd-94a31def395a5662 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-94a31def395a5662 p{margin:0;}#mmd-94a31def395a5662 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-94a31def395a5662 .cluster-label text{fill:#454f5b;}#mmd-94a31def395a5662 .cluster-label span{color:#454f5b;}#mmd-94a31def395a5662 .cluster-label span p{background-color:transparent;}#mmd-94a31def395a5662 .label text,#mmd-94a31def395a5662 span{fill:#161c24;color:#161c24;}#mmd-94a31def395a5662 .node rect,#mmd-94a31def395a5662 .node circle,#mmd-94a31def395a5662 .node ellipse,#mmd-94a31def395a5662 .node polygon,#mmd-94a31def395a5662 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-94a31def395a5662 .rough-node .label text,#mmd-94a31def395a5662 .node .label text,#mmd-94a31def395a5662 .image-shape .label,#mmd-94a31def395a5662 .icon-shape .label{text-anchor:middle;}#mmd-94a31def395a5662 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-94a31def395a5662 .rough-node .label,#mmd-94a31def395a5662 .node .label,#mmd-94a31def395a5662 .image-shape .label,#mmd-94a31def395a5662 .icon-shape .label{text-align:center;}#mmd-94a31def395a5662 .node.clickable{cursor:pointer;}#mmd-94a31def395a5662 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-94a31def395a5662 .arrowheadPath{fill:#000000;}#mmd-94a31def395a5662 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-94a31def395a5662 .flowchart-link{stroke:#637381;fill:none;}#mmd-94a31def395a5662 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-94a31def395a5662 .edgeLabel p{background-color:#ffffff;}#mmd-94a31def395a5662 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-94a31def395a5662 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-94a31def395a5662 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-94a31def395a5662 .cluster text{fill:#454f5b;}#mmd-94a31def395a5662 .cluster span{color:#454f5b;}#mmd-94a31def395a5662 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-94a31def395a5662 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-94a31def395a5662 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-94a31def395a5662 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-94a31def395a5662 rect.text{fill:none;stroke-width:0;}#mmd-94a31def395a5662 .icon-shape,#mmd-94a31def395a5662 .image-shape{background-color:#ffffff;text-align:center;}#mmd-94a31def395a5662 .icon-shape p,#mmd-94a31def395a5662 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-94a31def395a5662 .icon-shape .label rect,#mmd-94a31def395a5662 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-94a31def395a5662 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-94a31def395a5662 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-94a31def395a5662 .node .neo-node{stroke:#299a8d;}#mmd-94a31def395a5662 [data-look="neo"].node rect,#mmd-94a31def395a5662 [data-look="neo"].cluster rect,#mmd-94a31def395a5662 [data-look="neo"].node polygon{stroke:url(#mmd-94a31def395a5662-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-94a31def395a5662 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-94a31def395a5662 [data-look="neo"].node path{stroke:url(#mmd-94a31def395a5662-gradient);stroke-width:1px;}#mmd-94a31def395a5662 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-94a31def395a5662 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-94a31def395a5662 [data-look="neo"].node circle{stroke:url(#mmd-94a31def395a5662-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-94a31def395a5662 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-94a31def395a5662 [data-look="neo"].icon-shape .icon{fill:url(#mmd-94a31def395a5662-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-94a31def395a5662 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-94a31def395a5662-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-94a31def395a5662 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-94a31def395a5662_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-94a31def395a5662_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-94a31def395a5662_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-94a31def395a5662_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-94a31def395a5662_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-94a31def395a5662_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-94a31def395a5662_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-94a31def395a5662_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-94a31def395a5662_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-94a31def395a5662_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-94a31def395a5662_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-94a31def395a5662_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M169.75,99L173.917,99C178.083,99,186.417,99,194.083,99C201.75,99,208.75,99,212.25,99L215.75,99" id="mmd-94a31def395a5662-L_M_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_D_0" data-points="W3sieCI6MTY5Ljc1LCJ5Ijo5OX0seyJ4IjoxOTQuNzUsInkiOjk5fSx7IngiOjIxOS43NSwieSI6OTl9XQ==" data-look="classic" marker-end="url(#mmd-94a31def395a5662_flowchart-v2-pointEnd)"/><path d="M351.132,66L358.292,61.833C365.452,57.667,379.773,49.333,390.433,45.167C401.094,41,408.094,41,411.594,41L415.094,41" id="mmd-94a31def395a5662-L_D_Q_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_Q_0" data-points="W3sieCI6MzUxLjEzMTczNDkxMzc5MzEsInkiOjY2fSx7IngiOjM5NC4wOTM3NSwieSI6NDF9LHsieCI6NDE5LjA5Mzc1LCJ5Ijo0MX1d" data-look="classic" marker-end="url(#mmd-94a31def395a5662_flowchart-v2-pointEnd)"/><path d="M616.172,41L620.339,41C624.505,41,632.839,41,643.948,41C655.057,41,668.943,41,675.885,41L682.828,41" id="mmd-94a31def395a5662-L_Q_P_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q_P_0" data-points="W3sieCI6NjE2LjE3MTg3NSwieSI6NDF9LHsieCI6NjQxLjE3MTg3NSwieSI6NDF9LHsieCI6Njg2LjgyODEyNSwieSI6NDF9XQ==" data-look="classic" marker-end="url(#mmd-94a31def395a5662_flowchart-v2-pointEnd)"/><path d="M351.132,132L358.292,136.167C365.452,140.333,379.773,148.667,392.424,152.833C405.076,157,416.057,157,421.548,157L427.039,157" id="mmd-94a31def395a5662-L_D_S_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_S_0" data-points="W3sieCI6MzUxLjEzMTczNDkxMzc5MzEsInkiOjEzMn0seyJ4IjozOTQuMDkzNzUsInkiOjE1N30seyJ4Ijo0MzEuMDM5MDYyNSwieSI6MTU3fV0=" data-look="classic" marker-end="url(#mmd-94a31def395a5662_flowchart-v2-pointEnd)"/><path d="M604.227,157L610.384,157C616.542,157,628.857,157,638.514,157C648.172,157,655.172,157,658.672,157L662.172,157" id="mmd-94a31def395a5662-L_S_T_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_T_0" data-points="W3sieCI6NjA0LjIyNjU2MjUsInkiOjE1N30seyJ4Ijo2NDEuMTcxODc1LCJ5IjoxNTd9LHsieCI6NjY2LjE3MTg3NSwieSI6MTU3fV0=" data-look="classic" marker-end="url(#mmd-94a31def395a5662_flowchart-v2-pointEnd)"/><path d="M844.734,41L852.344,41C859.953,41,875.172,41,886.281,41C897.391,41,904.391,41,907.891,41L911.391,41" id="mmd-94a31def395a5662-L_P_N_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_P_N_0" data-points="W3sieCI6ODQ0LjczNDM3NSwieSI6NDF9LHsieCI6ODkwLjM5MDYyNSwieSI6NDF9LHsieCI6OTE1LjM5MDYyNSwieSI6NDF9XQ==" data-look="classic" marker-end="url(#mmd-94a31def395a5662_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_M_D_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_D_Q_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_Q_P_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_D_S_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_S_T_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_P_N_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-94a31def395a5662-flowchart-M-0" data-look="classic" transform="translate(88.875, 99)"><rect class="basic label-container" style="" x="-80.875" y="-33" width="161.75" height="66"/><g class="label" style="" transform="translate(-56.875, -21)"><rect/><foreignObject width="113.75" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>MAU<br />given or assumed</p></span></div></foreignObject></g></g><g class="node default" id="mmd-94a31def395a5662-flowchart-D-1" data-look="classic" transform="translate(294.421875, 99)"><rect class="basic label-container" style="" x="-74.671875" y="-33" width="149.34375" height="66"/><g class="label" style="" transform="translate(-50.671875, -21)"><rect/><foreignObject width="101.34375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>DAU<br />MAU x active %</p></span></div></foreignObject></g></g><g class="node default" id="mmd-94a31def395a5662-flowchart-Q-3" data-look="classic" transform="translate(517.6328125, 41)"><rect class="basic label-container" style="" x="-98.5390625" y="-33" width="197.078125" height="66"/><g class="label" style="" transform="translate(-74.5390625, -21)"><rect/><foreignObject width="149.078125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Average QPS<br />DAU x actions / 86,400</p></span></div></foreignObject></g></g><g class="node default" id="mmd-94a31def395a5662-flowchart-P-5" data-look="classic" transform="translate(765.78125, 41)"><rect class="basic label-container" style="" x="-78.953125" y="-33" width="157.90625" height="66"/><g class="label" style="" transform="translate(-54.953125, -21)"><rect/><foreignObject width="109.90625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Peak QPS<br />average x 2 to 10</p></span></div></foreignObject></g></g><g class="node default" id="mmd-94a31def395a5662-flowchart-S-7" data-look="classic" transform="translate(517.6328125, 157)"><rect class="basic label-container" style="" x="-86.59375" y="-33" width="173.1875" height="66"/><g class="label" style="" transform="translate(-62.59375, -21)"><rect/><foreignObject width="125.1875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Storage per day<br />writes x record size</p></span></div></foreignObject></g></g><g class="node default" id="mmd-94a31def395a5662-flowchart-T-9" data-look="classic" transform="translate(765.78125, 157)"><rect class="basic label-container" style="" x="-99.609375" y="-33" width="199.21875" height="66"/><g class="label" style="" transform="translate(-75.609375, -21)"><rect/><foreignObject width="151.21875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Total storage<br />x retention x replication</p></span></div></foreignObject></g></g><g class="node default" id="mmd-94a31def395a5662-flowchart-N-11" data-look="classic" transform="translate(1025.15625, 41)"><rect class="basic label-container" style="" x="-109.765625" y="-22.5" width="219.53125" height="45"/><g class="label" style="" transform="translate(-85.765625, -10.5)"><rect/><foreignObject width="171.53125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Servers, bandwidth, cache</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-94a31def395a5662-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-94a31def395a5662-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-94a31def395a5662-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>Written out as formulas:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Formula</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DAU</td>
+<td><code>MAU x daily-active %</code></td>
+</tr>
+<tr>
+<td>Average QPS</td>
+<td><code>DAU x actions per user per day / 86,400</code></td>
+</tr>
+<tr>
+<td>Peak QPS</td>
+<td><code>average QPS x peak factor</code> (2–10; use 2 unless the product is bursty)</td>
+</tr>
+<tr>
+<td>Read QPS</td>
+<td><code>write QPS x read:write ratio</code></td>
+</tr>
+<tr>
+<td>Storage per day</td>
+<td><code>writes per day x bytes per record</code></td>
+</tr>
+<tr>
+<td>Total storage</td>
+<td><code>storage per day x retention days x replication factor</code></td>
+</tr>
+<tr>
+<td>Bandwidth</td>
+<td><code>QPS x average response size</code></td>
+</tr>
+<tr>
+<td>Cache size</td>
+<td><code>daily reads x hot fraction (often ~20%) x record size</code></td>
+</tr>
+<tr>
+<td>Server count</td>
+<td><code>peak QPS / QPS one server handles</code>, then add headroom</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="handy-constants">Handy constants</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Value</th>
+<th>Round to</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Seconds in a day</td>
+<td>86,400</td>
+<td>10^5</td>
+</tr>
+<tr>
+<td>Seconds in a month</td>
+<td>~2.6 million</td>
+<td>2.5 x 10^6</td>
+</tr>
+<tr>
+<td>Seconds in a year</td>
+<td>~31.5 million</td>
+<td>3 x 10^7</td>
+</tr>
+<tr>
+<td>Days in 5 years</td>
+<td>1,825</td>
+<td>~2,000</td>
+</tr>
+<tr>
+<td>One ASCII character</td>
+<td>1 byte</td>
+<td>—</td>
+</tr>
+<tr>
+<td>A UUID as text</td>
+<td>36 bytes</td>
+<td>~40 bytes</td>
+</tr>
+<tr>
+<td>A typical row with indexes</td>
+<td>—</td>
+<td>assume 1.5–2× the raw field sizes</td>
+</tr>
+<tr>
+<td>Replication factor</td>
+<td>3</td>
+<td>always multiply storage by it</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Rough per-server capacity, useful for sanity checks rather than quotation:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Order of magnitude</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Web/API server</td>
+<td>thousands of QPS for simple work; hundreds for heavy work</td>
+</tr>
+<tr>
+<td>Relational DB (single node)</td>
+<td>thousands of simple reads/sec; far fewer complex writes</td>
+</tr>
+<tr>
+<td>Redis / in-memory cache</td>
+<td>~100k operations/sec per node</td>
+</tr>
+<tr>
+<td>Modern server RAM</td>
+<td>tens to hundreds of GB — decides whether a cache fits on one box</td>
+</tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h3 id="a-second-worked-example-url-shortener">A second worked example: URL shortener</h3>
+<p>The value of a recipe is that the second example is mechanical.</p>
+<p><strong>Assumptions:</strong> 100M new URLs per day, read:write ratio of 10:1, 5-year retention, ~500 bytes per record (short code, long URL, owner, timestamps, indexes).</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>Write QPS       = 100M / 86,400          = ~1,200 writes/sec
+Read QPS        = 1,200 x 10             = ~12,000 reads/sec
+Peak read QPS   = 12,000 x 2             = ~24,000 reads/sec
+
+Records in 5y   = 100M x 365 x 5         = 182.5 billion records
+Raw storage     = 182.5B x 500 bytes     = ~91 TB
+With 3x replication                      = ~275 TB
+
+Daily reads     = 12,000 x 86,400        = ~1 billion reads/day
+Cache (hot 20%) = 200M x 500 bytes       = ~100 GB
+Read bandwidth  = 12,000 x 500 bytes     = ~6 MB/s
+</code></pre></div>
+<p><strong>What these numbers decided for you:</strong></p>
+<ul>
+<li>24,000 peak reads/sec with ~6 MB/s of bandwidth is a <strong>read-heavy, low-bandwidth</strong> workload — ideal for caching, and nowhere near needing a CDN for the redirect itself.</li>
+<li>~100 GB of hot data <strong>does not fit on one cache node comfortably</strong>, so the cache tier is a cluster, which is what makes <a href="05-consistent-hashing.html">Chapter 5 – Consistent Hashing</a> relevant.</li>
+<li>275 TB across 182 billion rows <strong>will not fit on one database</strong>, so sharding is justified here — unlike many problems where it is not.</li>
+<li>12,000 reads vs 1,200 writes means <strong>replicas and caching matter far more than write throughput</strong>.</li>
+</ul>
+<hr>
+<h3 id="common-mistakes">Common mistakes</h3>
+<ul>
+<li><strong>Dropping the replication factor.</strong> Storage estimates are routinely 3× too low because the ×3 never got applied.</li>
+<li><strong>Confusing bits and bytes.</strong> Network capacity is quoted in <strong>bits</strong> per second (Gbps), storage in <strong>bytes</strong>. A 1 Gbps link carries ~125 MB/s, not 1 GB/s — a factor of 8.</li>
+<li><strong>Mbps vs MBps.</strong> Same trap, one capital letter apart. Always write the unit out.</li>
+<li><strong>Forgetting the peak factor.</strong> Provisioning for average QPS guarantees failure at the daily peak. Products with strong time-of-day or event-driven patterns can peak 10× the average.</li>
+<li><strong>Ignoring metadata and index overhead.</strong> Indexes, timestamps, and per-row overhead commonly add 50–100% to the raw field sizes.</li>
+<li><strong>Over-precision.</strong> Reporting &quot;54,750 TB&quot; invites questions about digits that came from a guessed 10% media rate. Say &quot;~55 PB&quot;.</li>
+<li><strong>Estimating and then ignoring the result.</strong> The number exists to drive a decision. Always close with &quot;so this means…&quot;.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>interviewers care about the <em>method and the conclusion</em>, not the digits. Narrate the chain out loud, round aggressively, label every unit, and finish by naming what the numbers rule in or out: &quot;7,000 peak writes/sec is manageable on a sharded cluster, but 55 PB of media means blob storage plus a CDN, not a database.&quot; That final sentence is the whole point of the exercise.</p>
+</div>
+<h3 id="self-check">Self-check</h3>
+<ol>
+<li>Convert 1 Gbps to megabytes per second.</li>
+<li>Your service chains four components, each 99.9% available. What is the end-to-end availability?</li>
+<li>50M DAU each perform 10 actions per day. What is the average QPS? The peak?</li>
+<li>Why does a 1 MB random disk read cost so much more than a 1 MB memory read?</li>
+<li>You estimate 20 TB of data. What do you actually provision, and why?</li>
+<li>Which is the more expensive design mistake: 20 sequential service calls, or one unindexed query? What would you need to know to decide?</li>
+</ol>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

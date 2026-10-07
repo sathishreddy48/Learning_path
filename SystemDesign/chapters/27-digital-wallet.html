@@ -1,0 +1,886 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 27: Digital Wallet — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="27-digital-wallet">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 27 of 28</div>
+  <h1>Chapter 27: Digital Wallet</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</a></li><li><a href="#step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap Up</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p><strong>Payment platforms</strong> usually have a <strong>wallet service</strong>, where they allow clients to store funds within the application, which they can withdraw later.</p>
+<p>You can also use it to pay for goods &amp; services or transfer money to other users, who use the <strong>digital wallet</strong> service. That can be faster and cheaper than doing it via normal payment rails.</p>
+<p><strong>The one-sentence version:</strong> this system has the one constraint the business <strong>cannot</strong> absorb — <em>money must never be created or destroyed</em> — combined with a throughput requirement of <strong>1 million TPS</strong>, which puts the usual answer to strict correctness (one ACID database) permanently out of reach. The chapter is therefore a tour of what you do when you need transactional guarantees at a scale no transactional database can deliver: <strong>stop using a database's transaction log and build your own.</strong></p>
+<p>Compare <a href="22-hotel-reservation-system.html">Chapter 22</a>: there, overbooking by 10% is acceptable because a hotel can walk a guest to another property. There is no equivalent move here. A wallet that is wrong by a cent is a defect, and one that is wrong by a cent <em>and cannot explain why</em> is unshippable — which is why the requirements ask for <strong>reproducibility</strong> rather than just reconciliation.</p>
+<p><strong>The chapter's real content is its sequence of designs</strong>, each fixing the previous one's defect and introducing a new one. It is worth holding the whole arc in view before reading the parts:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Design</th>
+<th>What it fixes</th>
+<th>What it now costs you</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>In-memory Redis <code>map&lt;user, balance&gt;</code></td>
+<td>Fast enough</td>
+<td><strong>Not durable</strong> — a restart loses money</td>
+</tr>
+<tr>
+<td>Sharded relational DBs + <strong>2PC</strong></td>
+<td>Durable, atomic</td>
+<td>Lock contention; coordinator is a single point of failure</td>
+</tr>
+<tr>
+<td><strong>TC/C</strong> or <strong>Saga</strong></td>
+<td>No distributed locks; available</td>
+<td>Atomicity is gone — intermediate states are visible, compensation can fail</td>
+</tr>
+<tr>
+<td><strong>Event sourcing</strong></td>
+<td>Auditable and reproducible</td>
+<td>Slower; replay time grows forever</td>
+</tr>
+<tr>
+<td>Events on <strong>local disk</strong> instead of Kafka</td>
+<td>Removes a network hop; sequential appends</td>
+<td>The service is now <strong>stateful</strong></td>
+</tr>
+<tr>
+<td><strong>Raft</strong> replication</td>
+<td>Durable and fast, no SPOF</td>
+<td>Capacity is limited to one Raft group</td>
+</tr>
+<tr>
+<td><strong>Sharded Raft groups + Saga</strong></td>
+<td>Scales to 1 M TPS</td>
+<td>Back to distributed transactions, now over your own log</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Notice it ends where it began — with distributed transactions — but over infrastructure that can actually sustain the throughput. That is the shape of the answer, and being able to narrate it as a sequence of forced moves is worth more than any individual component.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/digital-wallet.png" alt="digital-wallet" data-width="500" style="max-width:500px" />
+</p>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-establish-design-scope">
+<h2 id="step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</h2>
+<ul>
+<li>C: Should we only focus on transfers between digital wallets? Should we support any other operations?</li>
+<li>I: Let's focus on transfers between digital wallets for now.</li>
+<li>C: How many transactions per second does the system need to support?</li>
+<li>I: Let's assume 1mil TPS</li>
+<li>C: A digital wallet has strict correctness requirements. Can we assume transactional guarantees are sufficient?</li>
+<li>I: Sounds good</li>
+<li>C: Do we need to prove correctness?</li>
+<li>I: We can do that via reconciliation, but that only detects discrepancies vs. showing us the root cause for them. Instead, we want to be able to replay data from the beginning to reconstruct the history.</li>
+<li>C: Can we assume availability requirement is 99.99%?</li>
+<li>I: Yes</li>
+<li>C: Do we need to take foreign exchange into consideration?</li>
+<li>I: No, it's out of scope</li>
+</ul>
+<p>Here's what we have to support in summary:</p>
+<ul>
+<li>Support balance transfers between two accounts</li>
+<li>Support 1mil TPS</li>
+<li>Reliability is 99.99%</li>
+<li>Support transactions</li>
+<li>Support reproducibility</li>
+</ul>
+<h3 id="back-of-the-envelope-estimation"><strong>Back-of-the-envelope estimation</strong></h3>
+<p>A traditional relational database, provisioned in the cloud can support ~1000 TPS.</p>
+<p>In order to reach 1mil TPS, we'd need 1000 database nodes. But if each transfer has two legs, then we actually need to support 2mil TPS.</p>
+<p>One of our design goals would be to increase the TPS a single node can handle so that we can have less database nodes.</p>
+<p><strong>And the reason that is a design goal is not cost — it is correctness complexity.</strong> Every transfer whose two legs land on different shards needs a distributed transaction, and distributed transactions get worse as the number of participants grows:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Nodes</th>
+<th>Consequence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>20,000</td>
+<td>Almost every transfer is cross-shard; coordination dominates; the probability that <em>some</em> participant is unhealthy approaches 1</td>
+</tr>
+<tr>
+<td>2,000</td>
+<td>Still mostly cross-shard</td>
+</tr>
+<tr>
+<td>200</td>
+<td>Fewer, shorter coordination paths; far fewer participants to fail</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>So raising per-node throughput <strong>reduces the number of distributed transactions you have to get right</strong>, which is the expensive part of this system. Every optimisation in Step 3 — local disk instead of Kafka, append-only writes, caching the read path — is ultimately in service of that, not of hardware savings.</p>
+<p>The 2× factor is also worth noting explicitly: <strong>a transfer is two balance changes</strong>, so 1 M transfers/sec is 2 M balance updates/sec. Double-entry bookkeeping (<a href="26-payment-system.html#double-entry-ledger-system">Chapter 26</a>) is not optional here, and it doubles the write volume by construction.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Per-node TPS</th>
+<th>Node Number</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>100</td>
+<td>20,000</td>
+</tr>
+<tr>
+<td>1,000</td>
+<td>2,000</td>
+</tr>
+<tr>
+<td>10,000</td>
+<td>200</td>
+</tr>
+</tbody>
+</table>
+</div>
+<hr>
+</section>
+<section id="step-2-propose-high-level-design-and-get-buy-in">
+<h2 id="step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</h2>
+<h3 id="api-design"><strong>API Design</strong></h3>
+<p>We only need to support one endpoint for this interview:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>POST /v1/wallet/balance_transfer - transfers balance from one wallet to another
+</code></pre></div>
+<p>Request parameters - from_account, to_account, amount (string to not lose precision), currency, transaction_id (idempotency key).</p>
+<p>Sample response:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>{
+    &quot;status&quot;: &quot;success&quot;
+    &quot;transaction_id&quot;: &quot;01589980-2664-11ec-9621-0242ac130002&quot;
+}
+</code></pre></div>
+<h3 id="in-memory-sharding-solution"><strong>In-memory sharding solution</strong></h3>
+<p>Our wallet application maintains account balances for every user account.</p>
+<p>One good data structure to represent this is a <code>map&lt;user_id, balance&gt;</code>, which can be implemented using an in-memory Redis store.</p>
+<p>Since one redis node cannot withstand 1mil TPS, we need to partition our redis cluster into multiple nodes.</p>
+<p>Example partitioning algorithm:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>String accountID = &quot;A&quot;;
+Int partitionNumber = 7;
+Int myPartition = accountID.hashCode() % partitionNumber;
+</code></pre></div>
+<p>Zookeeper can be used to store the number of partitions and addresses of redis nodes as it's a highly-available configuration storage.</p>
+<p>Finally, a wallet service is a stateless service responsible for carrying out transfer operations. It can easily scale horizontally:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/wallet-service.png" alt="wallet-service" data-width="500" style="max-width:500px" />
+</p>
+<p>Although this solution addresses scalability concerns, it doesn't allow us to execute balance transfers atomically.</p>
+<h3 id="distributed-transactions"><strong>Distributed transactions</strong></h3>
+<p>One approach for handling transactions is to use the two-phase commit protocol on top of standard, sharded relational databases:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/distributed-transactions-relational-dbs.png" alt="distributed-transactions-relational-dbs" data-width="500" style="max-width:500px" />
+</p>
+<p>Here's how the two-phase commit (2PC) protocol works:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/2pc-protocol.png" alt="2pc-protocol" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Coordinator (wallet service) performs read and write operations on multiple databases as normal</li>
+<li>When application is ready to commit the transaction, coordinator asks all databases to prepare it</li>
+<li>If all databases replied with a &quot;yes&quot;, then the coordinator asks the databases to commit the transaction.</li>
+<li>Otherwise, all databases are asked to abort the transaction</li>
+</ul>
+<p>Downsides to the 2PC approach:</p>
+<ul>
+<li>Not performant due to lock contention</li>
+<li>The coordinator is a single point of failure</li>
+</ul>
+<p><strong>Be precise about why 2PC is slow, because &quot;lock contention&quot; undersells it.</strong> Locks are held on every participant from <code>prepare</code> until <code>commit</code>, which means <strong>for the duration of a network round trip plus the slowest participant's response</strong>. The locked rows are unavailable to everyone else for that whole window, so throughput is bounded by round-trip latency rather than by any node's capacity. At 1 M TPS that is not a tuning problem.</p>
+<p>And the coordinator failure is worse than &quot;single point of failure&quot; suggests. If the coordinator dies after participants have voted <code>yes</code> but before the commit decision reaches them, those participants are <strong>blocked holding locks and cannot safely decide anything</strong> — committing risks violating atomicity if the decision was <code>abort</code>, and aborting risks it if the decision was <code>commit</code>. They must wait for the coordinator to return. This is the well-known blocking property of 2PC, and it is the reason the chapter moves on.</p>
+<h3 id="distributed-transaction-using-try-confirmcancel-tcc"><strong>Distributed transaction using Try-Confirm/Cancel (TC/C)</strong></h3>
+<p>TC/C is a variation of the 2PC protocol, which works with compensating transactions:</p>
+<ul>
+<li>Coordinator asks all databases to reserve resources for the transaction</li>
+<li>Coordinator collects replies from DBs - if yes, DBs are asked to try-confirm. If no, DBs are asked to try-cancel.</li>
+</ul>
+<p>One important difference between TC/C and 2PC is that 2PC performs a single transaction, whereas in TC/C, there are two independent transactions.</p>
+<p><strong>That difference is the whole point: no locks are held across the network.</strong> Each phase commits locally and immediately, so nothing blocks waiting for a peer. The price is that <strong>atomicity is gone and intermediate states are visible</strong> — between Try and Confirm, A's money has left but has not arrived.</p>
+<p><strong>Which raises a money-conservation problem that is easy to miss.</strong> If the Try phase simply debits A by $1, then for that interval the system's total balance is $1 short, and any audit run in that window finds money missing. The standard fix comes straight from double-entry: debit A and credit a <strong>clearing (suspense) account</strong> representing funds in flight. Then</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>A: −$1    clearing: +$1     → total unchanged
+</code></pre></div>
+<p>and Confirm moves it from clearing to C. <strong>The invariant &quot;total money is constant&quot; now holds at every instant</strong>, including mid-transaction, which is what makes continuous auditing possible. Treating in-flight money as an account rather than as an absence is the mechanism, and it is why real ledgers are full of suspense accounts.</p>
+<p>Two more consequences of TC/C worth naming:</p>
+<ul>
+<li><strong>Reserved funds leak if the coordinator dies.</strong> A Try with no Confirm or Cancel leaves A's money sitting in clearing indefinitely. You need a timeout and a reaper to cancel stale reservations — exactly the hold-and-expiry mechanism from <a href="22-hotel-reservation-system.html#what-is-missing-holds">Chapter 22</a>.</li>
+<li><strong>Cancel must be idempotent and must not fail.</strong> A compensating action that can itself fail leaves the system in a state with no defined recovery, so compensations must be retried until they succeed, which in turn means they must be safe to repeat.</li>
+</ul>
+<p>Here's how TC/C works in phases:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Operation</th>
+<th>A</th>
+<th>C</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Try</td>
+<td>Balance change: -$1</td>
+<td>Do nothing</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Confirm</td>
+<td>Do nothing</td>
+<td>Balance change: +$1</td>
+</tr>
+<tr>
+<td></td>
+<td>Cancel</td>
+<td>Balance change: +$1</td>
+<td>Do Nothing</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Phase 1 - try:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/try-phase.png" alt="try-phase" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>coordinator starts local transaction in A's DB to reduce A's balance by 1$</li>
+<li>C's DB is given a NOP instruction, which does nothing</li>
+</ul>
+<p>Phase 2a - confirm:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/confirm-phase.png" alt="confirm-phase" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>if both DBs replied with &quot;yes&quot;, confirm phase starts.</li>
+<li>A's DB receives NOP, whereas C's DB is instructed to increase C's balance by 1$ (local transaction)</li>
+</ul>
+<p>Phase 2b - cancel:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/cancel-phase.png" alt="cancel-phase" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>If any of the operations in phase 1 fails, the cancel phase starts.</li>
+<li>A's DB is instructed to increase A's balance by 1$, C's DB receives NOP</li>
+</ul>
+<p>Here's a comparison between 2PC and TC/C:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>First Phase</th>
+<th>Second Phase: success</th>
+<th>Second Phase: fail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2PC</td>
+<td>transactions are not done yet</td>
+<td>Commit/Cancel all transactions</td>
+<td>Cancel all transactions</td>
+</tr>
+<tr>
+<td>TC/C</td>
+<td>All transactions are completed - committed or canceled</td>
+<td>Execute new transactions if needed</td>
+<td>Reverse the already committed transaction</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>TC/C is also referred to as a distributed transaction by compensation. High-level operation is handled in the business logic.</p>
+<p>Other properties of TC/C:</p>
+<ul>
+<li>database agnostic, as long as database supports transactions</li>
+<li>Details and complexity of distributed transactions need to be handled in the business logic</li>
+</ul>
+<h3 id="tcc-failure-modes"><strong>TC/C Failure modes</strong></h3>
+<p>If the coordinator dies mid-flight, it needs to recover its intermediary state.
+That can be done by maintaining phase status tables, atomically updated within the database shards:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/phase-status-tables.png" alt="phase-status-tables" data-width="500" style="max-width:500px" />
+</p>
+<p>What does that table contain:</p>
+<ul>
+<li>ID and content of distributed transaction</li>
+<li>status of try phase - not sent, has been sent, response received</li>
+<li>second phase name - confirm or cancel</li>
+<li>status of second phase</li>
+<li>out-of-order flag (explained later)</li>
+</ul>
+<p>One caveat when using TC/C is that there is a brief moment where the account states are inconsistent with each other while a distributed transaction is in-flight:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/unbalanced-state.png" alt="unbalanced-state" data-width="500" style="max-width:500px" />
+</p>
+<p>This is fine as long as we always recover from this state and that users cannot use the intermediary state to eg spend it.
+This is guaranteed by always executing deductions prior to additions.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Try phase choices</th>
+<th>Account A</th>
+<th>Account C</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Choice 1</td>
+<td>-$1</td>
+<td>NOP</td>
+</tr>
+<tr>
+<td>Choice 2 (invalid)</td>
+<td>NOP</td>
+<td>+$1</td>
+</tr>
+<tr>
+<td>Choice 3 (invalid)</td>
+<td>-$1</td>
+<td>+$1</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Note that choice 3 from table above is invalid because we cannot guarantee atomic execution of transactions across different databases without relying on 2PC.</p>
+<p>One edge-case to address is out of order execution:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/out-of-order-execution.png" alt="out-of-order-execution" data-width="500" style="max-width:500px" />
+</p>
+<p>It is possible that a database receives a cancel operation, before receiving a try. This edge case can be handled by adding an out of order flag in our phase status table.
+When we receive a try operation, we first check if the out of order flag is set and if so, a failure is returned.</p>
+<h3 id="distributed-transaction-using-saga"><strong>Distributed transaction using Saga</strong></h3>
+<p>Another popular approach is using Sagas - a standard for implementing distributed transactions with microservice architectures.</p>
+<p>Here's how it works:</p>
+<ul>
+<li>all operations are ordered in a sequence. All operations are independent in their own databases.</li>
+<li>operations are executed from first to last</li>
+<li>when an operation fails, the entire process starts to roll back until the beginning with compensating operations</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/saga.png" alt="saga" data-width="500" style="max-width:500px" />
+</p>
+<p>How do we coordinate the workflow? There are two approaches we can take:</p>
+<ul>
+<li>Choreography - all services involved in a saga subscribe to the related events and do their part in the saga</li>
+<li>Orchestration - a single coordinator instructs all services to do their jobs in the correct order</li>
+</ul>
+<p>The challenge of using choreography is that business logic is split across multiple service, which communicate asynchronously.
+The orchestration approach handles complexity well, so it is typically the preferred approach in a digital wallet system.</p>
+<p>Here's a comparison between TC/C and Saga:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>TC/C</th>
+<th>Saga</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Compensating action</td>
+<td>In Cancel phase</td>
+<td>In rollback phase</td>
+</tr>
+<tr>
+<td>Central coordination</td>
+<td>Yes</td>
+<td>Yes (orchestration mode)</td>
+</tr>
+<tr>
+<td>Operation execution order</td>
+<td>any</td>
+<td>linear</td>
+</tr>
+<tr>
+<td>Parallel execution possibility</td>
+<td>Yes</td>
+<td>No (linear execution)</td>
+</tr>
+<tr>
+<td>Could see the partial inconsistent status</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Application or database logic</td>
+<td>Application</td>
+<td>Application</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The main difference is that TC/C is parallelizable, so our decision is based on the latency requirement - if we need to achieve low latency, we should go for the TC/C approach.</p>
+<p>Regardless of the approach we take, we still need to support auditing and replaying history to recover from failed states.</p>
+<h3 id="event-sourcing"><strong>Event sourcing</strong></h3>
+<p>In real-life, a digital wallet application might be audited and we have to answer certain questions:</p>
+<ul>
+<li>Do we know the account balance at any given time?</li>
+<li>How do we know the historical and current balances are correct?</li>
+<li>How do we prove the system logic is correct after a code change?</li>
+</ul>
+<p>Event sourcing is a technique which helps us answer these questions.</p>
+<p>It consists of four concepts:</p>
+<ul>
+<li>command - intended action from the real world, eg transfer 1$ from account A to B. Need to have a global order, due to which they're put into a FIFO queue.
+<ul>
+<li>commands, unlike events, can fail and have some randomness due to eg IO or invalid state.</li>
+<li>commands can produce zero or more events</li>
+<li>event generation can contain randomness such as external IO. This will be revisited later</li>
+</ul>
+</li>
+<li>event - historical facts about events which occurred in the system, eg &quot;transferred 1$ from A to B&quot;.
+<ul>
+<li>unlike commands, events are facts that have happened within our system</li>
+<li>similar to commands, they need to be ordered, hence, they're enqueued in a FIFO queue</li>
+</ul>
+</li>
+<li>state - what has changed as a result of an event. Eg a key-value store between account and their balances.</li>
+<li>state machine - drives the event sourcing process. It mainly validates commands and applies events to update the system state.
+<ul>
+<li>the state machine should be deterministic, hence, it shouldn't read external IO or rely on randomness.</li>
+</ul>
+</li>
+</ul>
+<p><strong>That last bullet is the single most important sentence in the chapter, and everything the design claims rests on it.</strong> Reproducibility means: take the event list, feed it through the state machine, and get <em>exactly</em> the state the system had. That holds only if the state machine is a pure function of its inputs — so the moment it reads the clock, generates a random ID, calls an external service, or iterates a hash map in an unspecified order, replay can diverge and the audit guarantee silently evaporates.</p>
+<p>The discipline this imposes is specific and worth stating: <strong>every non-deterministic input must be resolved before the event is written, and recorded inside it.</strong> The command may say &quot;transfer $1 from A to B&quot;; the event must say &quot;at timestamp T, with fee F computed at rate R, transferred $1 from A to B&quot; — with T, F and R baked in as facts. Replay then reads them rather than recomputing them.</p>
+<p><strong>This is also why the chapter replicates the <em>event</em> log and not the command log</strong>, which otherwise looks like an arbitrary choice:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Commands</th>
+<th>Events</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Nature</td>
+<td>Requests — &quot;please do this&quot;</td>
+<td>Facts — &quot;this happened&quot;</td>
+</tr>
+<tr>
+<td>Can fail / be rejected</td>
+<td><strong>Yes</strong></td>
+<td><strong>No</strong> — already happened</td>
+</tr>
+<tr>
+<td>Deterministic</td>
+<td><strong>No</strong> — validation depends on current state and external input</td>
+<td><strong>Yes</strong></td>
+</tr>
+<tr>
+<td>Replayable</td>
+<td><strong>No</strong> — replaying could produce different events</td>
+<td><strong>Yes</strong> — always produces identical state</td>
+</tr>
+<tr>
+<td>Must be durable?</td>
+<td>No</td>
+<td><strong>Yes — this is the only data that cannot be regenerated</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>State and snapshots are derived and rebuildable. The event list is not. That is the reliability analysis in one table, and it is the same source-of-truth-plus-projection structure as the ledger and wallet in <a href="26-payment-system.html#double-entry-ledger-system">Chapter 26</a>, the raw events and aggregates in <a href="21-ad-click-event-aggregation.html">Chapter 21</a>, and the score log and sorted set in <a href="25-real-time-gaming-leaderboard.html">Chapter 25</a>.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/event-sourcing.png" alt="event-sourcing" data-width="500" style="max-width:500px" />
+</p>
+<p>Here's a dynamic view of event sourcing:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/dynamic-event-sourcing.png" alt="dynamic-event-sourcing" data-width="500" style="max-width:500px" />
+</p>
+<p>For our wallet service, the commands are balance transfer requests. We can put them in a FIFO queue, such as Kafka:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/command-queue.png" alt="command-queue" data-width="500" style="max-width:500px" />
+</p>
+<p>Here's the full picture:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/wallet-service-state-macghine.png" alt="wallet-service-state-machine" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>state machine reads commands from the command queue</li>
+<li>balance state is read from the database</li>
+<li>command is validated. If valid, two events for each of the accounts is generated</li>
+<li>next event is read and applied by updating the balance (state) in the database</li>
+</ul>
+<p>The main advantage of using event sourcing is its reproducibility. In this design, all state update operations are saved as immutable history of all balance changes.</p>
+<p>Historical balances can always be reconstructed by replaying events from the beginning.
+Because the event list is immutable and the state machine is deterministic, we are guaranteed to succeed in replaying any of the intermediary states.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/historical-states.png" alt="historical-states" data-width="500" style="max-width:500px" />
+</p>
+<p>All audit-related questions asked in the beginning of the section can be addressed by relying on event sourcing:</p>
+<ul>
+<li>Do we know the account balance at any given time? - events can be replayed from the start until the point which we are interested in</li>
+<li>How do we know the historical and current balances are correct? - correctness can be verified by recalculating all events from the start</li>
+<li>How do we prove the system logic is correct after a code change? - we can run different versions of the code against the events and verify their results are identical</li>
+</ul>
+<p>That third answer is more powerful than it sounds: it is <strong>regression testing against the entire production history.</strong> Rather than hoping a test suite covers the interesting cases, you replay every transaction that has ever happened through the new code and diff the resulting state against the old. For financial logic — fee calculations, rounding rules, limit checks — this is about as strong an assurance as is available, and it exists only because the event log is complete and the state machine is deterministic.</p>
+<p><strong>The cost that comes with it: replay time grows without bound.</strong> Rebuilding state from genesis is fine in month one and impossible in year five. The fix is <strong>periodic snapshots</strong> — persist the full state at event N, and replay only from there — which is why the chapter lists &quot;state and snapshot&quot; together as regenerable. The snapshot is an optimisation, never a source of truth: it must always be reconstructible from the events, and it is the first thing to discard if it is ever suspected.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>this chapter is best answered as a narrative rather than a diagram — &quot;Redis is fast but not durable, so relational with 2PC; 2PC holds locks across the network, so TC/C or saga; now I've lost atomicity and auditability, so event sourcing; the external log is too slow, so local disk; now I'm stateful, so Raft; now I'm capped at one group, so sharded groups with a saga.&quot; Each step is forced by the previous step's defect. Then be ready for the two follow-ups that separate depth from recall: &quot;what exactly must be deterministic, and what breaks if it isn't?&quot; and &quot;during a transfer, where is the money?&quot; — the clearing account.</p>
+</div>
+<p>Answering client queries about their balance can be addressed using the CQRS architecture - there can be multiple read-only state machines which are responsible for querying the historical state, based on the immutable events list:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/cqrs-architecture.png" alt="cqrs-architecture" data-width="500" style="max-width:500px" />
+</p>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<p>In this section we'll explore some performance optimizations as we're still required to scale to 1mil TPS.</p>
+<h3 id="high-performance-event-sourcing"><strong>High-performance event sourcing</strong></h3>
+<p>The first optimization we'll explore is to save commands and events into local disk store instead of an external store such as Kafka.</p>
+<p>This avoids the network latency and also, since we're only doing appends, that operation is generally fast for HDDs.</p>
+<p>This is the same argument as <a href="19-distributed-message-queue.html#the-number-that-justifies-the-whole-storage-design">Chapter 19</a>, and the numbers from there apply directly: sequential disk writes run at <strong>100–200 MB/s</strong> against roughly <strong>0.4–1 MB/s</strong> for random I/O — two to three orders of magnitude. An append-only event log is the single most disk-friendly access pattern there is, and writing it locally removes the network round trip that Kafka would add to every transaction.</p>
+<p>What is being traded away is worth naming: Kafka gave you durability and replication for free. Taking the log in-process means <strong>you now owe both of them yourself</strong>, which is precisely what the next two sections are about.</p>
+<p>The next optimization is to cache recent commands and events in-memory in order to save the time of loading them back from disk.</p>
+<p>At a low-level, we can achieve the aforementioned optimizations by leveraging a command called mmap, which stores data in local disk as well as cache it in-memory:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/mmap-optimization.png" alt="mmap-optimization" data-width="500" style="max-width:500px" />
+</p>
+<p>The next optimization we can do is also store state in the local file system using SQLite - a file-based local relational database. RocksDB is also another good option.</p>
+<p>For our purposes, we'll choose RocksDB because it uses a log-structured merge-tree (LSM), which is optimized for write operations.
+Read performance is optimized via caching.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/rocks-db-approach.png" alt="rocks-db-approach" data-width="500" style="max-width:500px" />
+</p>
+<p>To optimize the reproducibility, we can periodically save snapshots to disk so that we don't have to reproduce a given state from the very beginning every time. We could store snapshots as large binary files in distributed file storage, eg HDFS:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/snapshot-approach.png" alt="snapshot-approach" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="reliable-high-performance-event-sourcing"><strong>Reliable high-performance event sourcing</strong></h3>
+<p>All the optimizations done so far are great, but they make our service stateful. We need to introduce some form of replication for reliability purposes.</p>
+<p>Before we do that, we should analyze what kind of data needs high reliability in our system:</p>
+<ul>
+<li>state and snapshot can always be regenerated by reproducing them from the events list. Hence, we only need to guarantee the event list reliability.</li>
+<li>one might think we can always regenerate the events list from the command list, but that is not true, since commands are non-deterministic.</li>
+<li>conclusion is that we need to ensure high reliability for the events list only</li>
+</ul>
+<p>In order to achieve high reliability for events, we need to replicate the list across multiple nodes. We need to guarantee:</p>
+<ul>
+<li>that there is no data loss</li>
+<li>the relative order of data within a log file remains the same across replicas</li>
+</ul>
+<p>To achieve this, we can employ a consensus algorithm, such as Raft.</p>
+<p><strong>The fit between Raft and event sourcing is unusually tight, and not by coincidence.</strong> Raft's job is to maintain <em>a replicated, totally-ordered, append-only log</em> across a set of nodes — which is exactly the data structure event sourcing needs. Both are built around &quot;an ordered sequence of immutable entries, applied in order to a deterministic state machine&quot;; Raft even uses that terminology. So rather than bolting replication onto an event log, you are using a protocol whose native abstraction <em>is</em> an event log.</p>
+<p>Two properties worth stating precisely:</p>
+<ul>
+<li><strong>A majority quorum is what provides durability.</strong> An entry is committed once more than half the nodes have it, so with 5 nodes the system survives 2 failures and loses nothing — committing to a majority guarantees any future leader's log contains that entry.</li>
+<li><strong>&quot;More than half&quot; is also what prevents split-brain.</strong> Two disjoint majorities cannot exist, so two leaders cannot both commit. That is why the group size is odd and why availability requires a majority rather than merely one survivor.</li>
+</ul>
+<p>The honest cost: <strong>a write now requires a round trip to a majority before it is acknowledged.</strong> Local disk made writes fast; Raft puts a network hop back on the critical path — just one, to peers you choose, rather than to an external system.</p>
+<p>With Raft, there is a leader who is active and there are followers who are passive. If a leader dies, one of the followers picks up.
+As long as more than half of the nodes are up, the system continues running.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/raft-replication.png" alt="raft-replication" data-width="500" style="max-width:500px" />
+</p>
+<p>With this approach, all nodes update the state, based on the events list. Raft ensures leader and followers have the same events list.</p>
+<h3 id="distributed-event-sourcing"><strong>Distributed event sourcing</strong></h3>
+<p>So far, we've managed to design a system which has high single-node performance and is reliable.</p>
+<p>Some limitations we have to tackle:</p>
+<ul>
+<li>The capacity of a single raft group is limited. At some point, we need to shard the data and implement distributed transactions</li>
+<li>In the CQRS architecture, the request/response flow is slow. A client would need to periodically poll the system to learn when their wallet has been updated</li>
+</ul>
+<p>Polling is not real-time, hence, it can take a while for a user to learn about an update in their balance. Also, it can overload the query services if the polling frequency is too high:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/polling-approach.png" alt="polling-approach" data-width="500" style="max-width:500px" />
+</p>
+<p>To mitigate the system load, we can introduce a reverse proxy, which sends commands on behalf of the user and polls for response on their behalf:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/reverse-proxy.png" alt="reverse-proxy" data-width="500" style="max-width:500px" />
+</p>
+<p>This alleviates the system load as we could fetch data for multiple users using a single request, but it still doesn't solve the real-time receipt requirement.</p>
+<p>One final change we could do is make the read-only state machines push responses back to the reverse proxy once it's available. This can give the user the sense that updates happen real-time:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/push-state-machines.png" alt="push-state-machines" data-width="500" style="max-width:500px" />
+</p>
+<p>Finally, to scale the system even further, we can shard the system into multiple raft groups, where we implement distributed transactions on top of them using an orchestrator either via TC/C or Sagas:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/27.%20%20Digital%20Wallet/images/sharded-raft-groups.png" alt="sharded-raft-groups" data-width="500" style="max-width:500px" />
+</p>
+<p>Here's an example lifecycle of a balance transfer request in our final system:</p>
+<ul>
+<li>User A sends a distributed transaction to the Saga coordinator with two operations - <code>A-1</code> and <code>C+1</code>.</li>
+<li>Saga coordinator creates a record in the phase status table to trace the status of the transaction</li>
+<li>Coordinator determines which partitions it needs to send commands to.</li>
+<li>Partition 1's raft leader receives the <code>A-1</code> command, validates it, converts it to an event and replicates it across other nodes in the raft group</li>
+<li>Event result is synchronized to the read state machine, which pushes a response back to the coordinator</li>
+<li>Coordinator creates a record indicating that the operation was successful and proceeds with the next operation - <code>C+1</code></li>
+<li>Next operation is executed similarly to the first one - partition is determined, command is sent, executed, read state machine pushes back a response</li>
+<li>Coordinator creates a record indicating operation 2 was also successful and finally informs the client of the result</li>
+</ul>
+<p><strong>Note what the phase status table is doing: it makes the saga itself event-sourced.</strong> The coordinator records each step's outcome durably before proceeding, so a coordinator that dies mid-transfer can be replaced by one that reads the table and continues — or compensates. Without it, a crashed coordinator leaves a transfer half-applied with nobody knowing which half. It is the same &quot;persisted to-do list&quot; device as the <code>ledger_updated</code> / <code>wallet_updated</code> flags in <a href="26-payment-system.html#payment-service-data-model">Chapter 26</a>, applied to a distributed transaction.</p>
+<p><strong>And here is the limitation the sharded design cannot remove: a hot account.</strong> A popular merchant's wallet receives transfers from everyone, but its balance lives in exactly one Raft group with exactly one leader, so all of those writes serialise through one node. You cannot shard a single account's balance, because the invariant being protected — the balance — <em>is</em> the thing you would be splitting. This is the same wall as the hot inventory row in <a href="22-hotel-reservation-system.html#the-deadlock-the-chapter-does-not-mention">Chapter 22</a> and the hot ad in <a href="21-ad-click-event-aggregation.html#scale-the-system">Chapter 21</a>, and the available responses are the same three: serialise deliberately and accept the ceiling, batch many transfers into one update, or split the account into sub-balances and sum them — at which point &quot;what is my balance&quot; becomes a scatter-gather and the simple invariant is gone.</p>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
+<p>Here's the evolution of our design:</p>
+<ul>
+<li>We started from a solution using an in-memory Redis. The problem with this approach is that it is not durable storage.</li>
+<li>We moved on to using relational databases, on top of which we execute distributed transactions using 2PC, TC/C or distributed saga.</li>
+<li>Next, we introduced event sourcing in order to make all the operations auditable</li>
+<li>We started by storing the data into external storage using external database and queue, but that's not performant</li>
+<li>We proceeded to store data in local file storage, leveraging the performance of append-only operations. We also used caching to optimize the read path</li>
+<li>The previous approach, although performant, wasn't durable. Hence, we introduced Raft consensus with replication to avoid single points of failure</li>
+<li>We also adopted CQRS with a reverse proxy to manage a transaction's lifecycle on behalf of our users</li>
+</ul>
+<figure class="mermaid-fig">
+<svg id="mmd-8b05a2366c16fc9b" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1423.06px; background-color: transparent;" viewBox="0 0 1423.0625 507.4067077636719" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-8b05a2366c16fc9b{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-8b05a2366c16fc9b .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-8b05a2366c16fc9b .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-8b05a2366c16fc9b .error-icon{fill:#f4f6f8;}#mmd-8b05a2366c16fc9b .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-8b05a2366c16fc9b .edge-thickness-normal{stroke-width:1px;}#mmd-8b05a2366c16fc9b .edge-thickness-thick{stroke-width:3.5px;}#mmd-8b05a2366c16fc9b .edge-pattern-solid{stroke-dasharray:0;}#mmd-8b05a2366c16fc9b .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-8b05a2366c16fc9b .edge-pattern-dashed{stroke-dasharray:3;}#mmd-8b05a2366c16fc9b .edge-pattern-dotted{stroke-dasharray:2;}#mmd-8b05a2366c16fc9b .marker{fill:#637381;stroke:#637381;}#mmd-8b05a2366c16fc9b .marker.cross{stroke:#637381;}#mmd-8b05a2366c16fc9b svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-8b05a2366c16fc9b p{margin:0;}#mmd-8b05a2366c16fc9b .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-8b05a2366c16fc9b .cluster-label text{fill:#454f5b;}#mmd-8b05a2366c16fc9b .cluster-label span{color:#454f5b;}#mmd-8b05a2366c16fc9b .cluster-label span p{background-color:transparent;}#mmd-8b05a2366c16fc9b .label text,#mmd-8b05a2366c16fc9b span{fill:#161c24;color:#161c24;}#mmd-8b05a2366c16fc9b .node rect,#mmd-8b05a2366c16fc9b .node circle,#mmd-8b05a2366c16fc9b .node ellipse,#mmd-8b05a2366c16fc9b .node polygon,#mmd-8b05a2366c16fc9b .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-8b05a2366c16fc9b .rough-node .label text,#mmd-8b05a2366c16fc9b .node .label text,#mmd-8b05a2366c16fc9b .image-shape .label,#mmd-8b05a2366c16fc9b .icon-shape .label{text-anchor:middle;}#mmd-8b05a2366c16fc9b .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-8b05a2366c16fc9b .rough-node .label,#mmd-8b05a2366c16fc9b .node .label,#mmd-8b05a2366c16fc9b .image-shape .label,#mmd-8b05a2366c16fc9b .icon-shape .label{text-align:center;}#mmd-8b05a2366c16fc9b .node.clickable{cursor:pointer;}#mmd-8b05a2366c16fc9b .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-8b05a2366c16fc9b .arrowheadPath{fill:#000000;}#mmd-8b05a2366c16fc9b .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-8b05a2366c16fc9b .flowchart-link{stroke:#637381;fill:none;}#mmd-8b05a2366c16fc9b .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-8b05a2366c16fc9b .edgeLabel p{background-color:#ffffff;}#mmd-8b05a2366c16fc9b .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-8b05a2366c16fc9b .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-8b05a2366c16fc9b .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-8b05a2366c16fc9b .cluster text{fill:#454f5b;}#mmd-8b05a2366c16fc9b .cluster span{color:#454f5b;}#mmd-8b05a2366c16fc9b .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-8b05a2366c16fc9b .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-8b05a2366c16fc9b div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-8b05a2366c16fc9b .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-8b05a2366c16fc9b rect.text{fill:none;stroke-width:0;}#mmd-8b05a2366c16fc9b .icon-shape,#mmd-8b05a2366c16fc9b .image-shape{background-color:#ffffff;text-align:center;}#mmd-8b05a2366c16fc9b .icon-shape p,#mmd-8b05a2366c16fc9b .image-shape p{background-color:#ffffff;padding:2px;}#mmd-8b05a2366c16fc9b .icon-shape .label rect,#mmd-8b05a2366c16fc9b .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-8b05a2366c16fc9b .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-8b05a2366c16fc9b .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-8b05a2366c16fc9b .node .neo-node{stroke:#299a8d;}#mmd-8b05a2366c16fc9b [data-look="neo"].node rect,#mmd-8b05a2366c16fc9b [data-look="neo"].cluster rect,#mmd-8b05a2366c16fc9b [data-look="neo"].node polygon{stroke:url(#mmd-8b05a2366c16fc9b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-8b05a2366c16fc9b [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-8b05a2366c16fc9b [data-look="neo"].node path{stroke:url(#mmd-8b05a2366c16fc9b-gradient);stroke-width:1px;}#mmd-8b05a2366c16fc9b [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-8b05a2366c16fc9b [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-8b05a2366c16fc9b [data-look="neo"].node circle{stroke:url(#mmd-8b05a2366c16fc9b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-8b05a2366c16fc9b [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-8b05a2366c16fc9b [data-look="neo"].icon-shape .icon{fill:url(#mmd-8b05a2366c16fc9b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-8b05a2366c16fc9b [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-8b05a2366c16fc9b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-8b05a2366c16fc9b :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-8b05a2366c16fc9b_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-8b05a2366c16fc9b_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-8b05a2366c16fc9b_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-8b05a2366c16fc9b_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-8b05a2366c16fc9b_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-8b05a2366c16fc9b_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-8b05a2366c16fc9b_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-8b05a2366c16fc9b_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-8b05a2366c16fc9b_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-8b05a2366c16fc9b_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-8b05a2366c16fc9b_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-8b05a2366c16fc9b_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"><g class="cluster" id="mmd-8b05a2366c16fc9b-P1" data-look="classic"><rect style="" x="668.25" y="8" width="746.8125" height="332.9067039489746"/><g class="cluster-label" transform="translate(965.75, 8)"><foreignObject width="151.8125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5;"><span class="nodeLabel"><p>partition 1 — Raft group</p></span></div></foreignObject></g></g></g><g class="edgePaths"><path d="M91.188,310L95.354,310C99.521,310,107.854,310,115.521,310C123.188,310,130.188,310,133.688,310L137.188,310" id="mmd-8b05a2366c16fc9b-L_U_RP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_U_RP_0" data-points="W3sieCI6OTEuMTg3NSwieSI6MzEwfSx7IngiOjExNi4xODc1LCJ5IjozMTB9LHsieCI6MTQxLjE4NzUsInkiOjMxMH1d" data-look="classic" marker-end="url(#mmd-8b05a2366c16fc9b_flowchart-v2-pointEnd)"/><path d="M389.188,281.705L393.354,280.754C397.521,279.803,405.854,277.902,413.521,276.951C421.188,276,428.188,276,431.688,276L435.188,276" id="mmd-8b05a2366c16fc9b-L_RP_SC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RP_SC_0" data-points="W3sieCI6Mzg5LjE4NzUsInkiOjI4MS43MDQ2OTc5ODY1NzcyfSx7IngiOjQxNC4xODc1LCJ5IjoyNzZ9LHsieCI6NDM5LjE4NzUsInkiOjI3Nn1d" data-look="classic" marker-end="url(#mmd-8b05a2366c16fc9b_flowchart-v2-pointEnd)"/><path d="M559.596,309L573.538,323.901C587.48,338.802,615.365,368.604,633.474,383.506C651.583,398.407,659.917,398.407,668.596,398.407C677.276,398.407,686.302,398.407,690.815,398.407L695.328,398.407" id="mmd-8b05a2366c16fc9b-L_SC_P2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SC_P2_0" data-points="W3sieCI6NTU5LjU5NTU4MjEzNDc0NTcsInkiOjMwOX0seyJ4Ijo2NDMuMjUsInkiOjM5OC40MDY3MDM5NDg5NzQ2fSx7IngiOjY2OC4yNSwieSI6Mzk4LjQwNjcwMzk0ODk3NDZ9LHsieCI6Njk5LjMyODEyNSwieSI6Mzk4LjQwNjcwMzk0ODk3NDZ9XQ==" data-look="classic" marker-end="url(#mmd-8b05a2366c16fc9b_flowchart-v2-pointEnd)"/><path d="M846.05,127.5L860.404,117.167C874.757,106.833,903.465,86.167,927.334,75.833C951.203,65.5,970.234,65.5,979.75,65.5L989.266,65.5" id="mmd-8b05a2366c16fc9b-L_L1_F1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_L1_F1_0" data-points="W3sieCI6ODQ2LjA1LCJ5IjoxMjcuNX0seyJ4Ijo5MzIuMTcxODc1LCJ5Ijo2NS41fSx7IngiOjk5My4yNjU2MjUsInkiOjY1LjV9XQ==" data-look="classic" marker-end="url(#mmd-8b05a2366c16fc9b_flowchart-v2-pointEnd)"/><path d="M907.172,160.5L911.339,160.5C915.505,160.5,923.839,160.5,937.521,160.5C951.203,160.5,970.234,160.5,979.75,160.5L989.266,160.5" id="mmd-8b05a2366c16fc9b-L_L1_F2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_L1_F2_0" data-points="W3sieCI6OTA3LjE3MTg3NSwieSI6MTYwLjV9LHsieCI6OTMyLjE3MTg3NSwieSI6MTYwLjV9LHsieCI6OTkzLjI2NTYyNSwieSI6MTYwLjV9XQ==" data-look="classic" marker-end="url(#mmd-8b05a2366c16fc9b_flowchart-v2-pointEnd)"/><path d="M841.488,193.5L856.602,205.583C871.716,217.667,901.944,241.833,920.558,253.917C939.172,266,946.172,266,949.672,266L953.172,266" id="mmd-8b05a2366c16fc9b-L_L1_SM1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_L1_SM1_0" data-points="W3sieCI6ODQxLjQ4NzgxODQyNDE3MDcsInkiOjE5My41fSx7IngiOjkzMi4xNzE4NzUsInkiOjI2Nn0seyJ4Ijo5NTcuMTcxODc1LCJ5IjoyNjZ9XQ==" data-look="classic" marker-end="url(#mmd-8b05a2366c16fc9b_flowchart-v2-pointEnd)"/><path d="M1084.065,233L1095.583,223.818C1107.101,214.636,1130.136,196.271,1151.142,187.089C1172.148,177.907,1191.125,177.907,1200.613,177.907L1210.102,177.907" id="mmd-8b05a2366c16fc9b-L_SM1_ST1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SM1_ST1_0" data-points="W3sieCI6MTA4NC4wNjU0OTAyMTc3NTYsInkiOjIzM30seyJ4IjoxMTUzLjE3MTg3NSwieSI6MTc3LjkwNjcwMzk0ODk3NDZ9LHsieCI6MTIxNC4xMDE1NjI1LCJ5IjoxNzcuOTA2NzAzOTQ4OTc0Nn1d" data-look="classic" marker-end="url(#mmd-8b05a2366c16fc9b_flowchart-v2-pointEnd)"/><path d="M1128.172,289.914L1132.339,291.08C1136.505,292.245,1144.839,294.576,1166.173,317.964C1187.507,341.352,1221.843,385.796,1239.01,408.019L1256.178,430.241" id="mmd-8b05a2366c16fc9b-L_SM1_RO_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SM1_RO_0" data-points="W3sieCI6MTEyOC4xNzE4NzUsInkiOjI4OS45MTQyMzY5OTIxOTN9LHsieCI6MTE1My4xNzE4NzUsInkiOjI5Ni45MDY3MDM5NDg5NzQ2fSx7IngiOjEyNTguNjIzNDA5ODQ1MTMyOCwieSI6NDMzLjQwNjcwMzk0ODk3NDZ9XQ==" data-look="classic" marker-end="url(#mmd-8b05a2366c16fc9b_flowchart-v2-pointEnd)"/><path d="M1178.172,466.407L1174.005,466.407C1169.839,466.407,1161.505,466.407,1138.922,466.407C1116.339,466.407,1079.505,466.407,1042.672,466.407C1005.839,466.407,969.005,466.407,928.595,466.407C888.185,466.407,844.198,466.407,800.211,466.407C756.224,466.407,712.237,466.407,686.077,466.407C659.917,466.407,651.583,466.407,628.328,466.407C605.073,466.407,566.896,466.407,528.719,466.407C490.542,466.407,452.365,466.407,415.809,448.072C379.254,429.737,344.32,393.066,326.853,374.731L309.387,356.396" id="mmd-8b05a2366c16fc9b-L_RO_RP_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RO_RP_0" data-points="W3sieCI6MTE3OC4xNzE4NzUsInkiOjQ2Ni40MDY3MDM5NDg5NzQ2fSx7IngiOjExNTMuMTcxODc1LCJ5Ijo0NjYuNDA2NzAzOTQ4OTc0Nn0seyJ4IjoxMDQyLjY3MTg3NSwieSI6NDY2LjQwNjcwMzk0ODk3NDZ9LHsieCI6OTMyLjE3MTg3NSwieSI6NDY2LjQwNjcwMzk0ODk3NDZ9LHsieCI6ODAwLjIxMDkzNzUsInkiOjQ2Ni40MDY3MDM5NDg5NzQ2fSx7IngiOjY2OC4yNSwieSI6NDY2LjQwNjcwMzk0ODk3NDZ9LHsieCI6NjQzLjI1LCJ5Ijo0NjYuNDA2NzAzOTQ4OTc0Nn0seyJ4Ijo1MjguNzE4NzUsInkiOjQ2Ni40MDY3MDM5NDg5NzQ2fSx7IngiOjQxNC4xODc1LCJ5Ijo0NjYuNDA2NzAzOTQ4OTc0Nn0seyJ4IjozMDYuNjI3NTM5NTY1Nzg4LCJ5IjozNTMuNX1d" data-look="classic" marker-end="url(#mmd-8b05a2366c16fc9b_flowchart-v2-pointEnd)"/><path d="M561.442,243L575.077,229.25C588.711,215.5,615.981,188,633.115,174.25C650.25,160.5,657.25,160.5,660.75,160.5L664.25,160.5" id="mmd-8b05a2366c16fc9b-L_SC_P1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SC_P1_0" data-points="W3sieCI6NTYxLjQ0MTk2NDI4NTcxNDMsInkiOjI0M30seyJ4Ijo2NDMuMjUsInkiOjE2MC41fSx7IngiOjY2OC4yNSwieSI6MTYwLjV9LHsieCI6NjY4LjI1LCJ5IjoxNjAuNX1d" data-look="classic" marker-end="url(#mmd-8b05a2366c16fc9b_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_U_RP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RP_SC_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_SC_P2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_L1_F1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_L1_F2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_L1_SM1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_SM1_ST1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_SM1_RO_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(800.2109375, 466.4067039489746)"><g class="label" data-id="L_RO_RP_0" transform="translate(-35.90625, -10.5)"><foreignObject width="71.8125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>push result</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_SC_P1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-8b05a2366c16fc9b-flowchart-U-0" data-look="classic" transform="translate(49.59375, 310)"><rect class="basic label-container" style="" x="-41.59375" y="-22.5" width="83.1875" height="45"/><g class="label" style="" transform="translate(-17.59375, -10.5)"><rect/><foreignObject width="35.1875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>client</p></span></div></foreignObject></g></g><g class="node default" id="mmd-8b05a2366c16fc9b-flowchart-RP-1" data-look="classic" transform="translate(265.1875, 310)"><rect class="basic label-container" style="" x="-124" y="-43.5" width="248" height="87"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>reverse proxy<br />submits commands, awaits push</p></span></div></foreignObject></g></g><g class="node default" id="mmd-8b05a2366c16fc9b-flowchart-SC-3" data-look="classic" transform="translate(528.71875, 276)"><rect class="basic label-container" style="" x="-89.53125" y="-33" width="179.0625" height="66"/><g class="label" style="" transform="translate(-65.53125, -21)"><rect/><foreignObject width="131.0625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Saga coordinator<br />+ phase status table</p></span></div></foreignObject></g></g><g class="node default" id="mmd-8b05a2366c16fc9b-flowchart-P2-7" data-look="classic" transform="translate(800.2109375, 398.4067039489746)"><rect class="basic label-container" style="" x="-100.8828125" y="-22.5" width="201.765625" height="45"/><g class="label" style="" transform="translate(-76.8828125, -10.5)"><rect/><foreignObject width="153.765625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>partition 2 — Raft group</p></span></div></foreignObject></g></g><g class="node default" id="mmd-8b05a2366c16fc9b-flowchart-L1-8" data-look="classic" transform="translate(800.2109375, 160.5)"><rect class="basic label-container" style="" x="-106.9609375" y="-33" width="213.921875" height="66"/><g class="label" style="" transform="translate(-82.9609375, -21)"><rect/><foreignObject width="165.921875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>leader: validate command<br />append event</p></span></div></foreignObject></g></g><g class="node default" id="mmd-8b05a2366c16fc9b-flowchart-F1-9" data-look="classic" transform="translate(1042.671875, 65.5)"><rect class="basic label-container" style="" x="-49.40625" y="-22.5" width="98.8125" height="45"/><g class="label" style="" transform="translate(-25.40625, -10.5)"><rect/><foreignObject width="50.8125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>follower</p></span></div></foreignObject></g></g><g class="node default" id="mmd-8b05a2366c16fc9b-flowchart-F2-11" data-look="classic" transform="translate(1042.671875, 160.5)"><rect class="basic label-container" style="" x="-49.40625" y="-22.5" width="98.8125" height="45"/><g class="label" style="" transform="translate(-25.40625, -10.5)"><rect/><foreignObject width="50.8125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>follower</p></span></div></foreignObject></g></g><g class="node default" id="mmd-8b05a2366c16fc9b-flowchart-SM1-13" data-look="classic" transform="translate(1042.671875, 266)"><rect class="basic label-container" style="" x="-85.5" y="-33" width="171" height="66"/><g class="label" style="" transform="translate(-61.5, -21)"><rect/><foreignObject width="123" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>state machine<br />deterministic apply</p></span></div></foreignObject></g></g><g class="node default" id="mmd-8b05a2366c16fc9b-flowchart-ST1-15" data-look="classic" transform="translate(1284.1171875, 177.9067039489746)"><path d="M0,13.208937625280038 a70.015625,13.208937625280038 0,0,0 140.03125,0 a70.015625,13.208937625280038 0,0,0 -140.03125,0 l0,67.20893762528004 a70.015625,13.208937625280038 0,0,0 140.03125,0 l0,-67.20893762528004" class="basic label-container outer-path" style="" transform="translate(-70.015625, -46.81340643792006)"/><g class="label" style="" transform="translate(-64.015625, -13)"><rect/><foreignObject width="128.03125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>balance state<br />+ periodic snapshot</p></span></div></foreignObject></g></g><g class="node default" id="mmd-8b05a2366c16fc9b-flowchart-RO-17" data-look="classic" transform="translate(1284.1171875, 466.4067039489746)"><rect class="basic label-container" style="" x="-105.9453125" y="-33" width="211.890625" height="66"/><g class="label" style="" transform="translate(-81.9453125, -21)"><rect/><foreignObject width="163.890625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>read-only state machines<br />(CQRS projections)</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-8b05a2366c16fc9b-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-8b05a2366c16fc9b-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-8b05a2366c16fc9b-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Any non-determinism in the state machine destroys the audit guarantee, silently.</strong> A clock read, a random ID, an external call, or an unordered map iteration can make replay diverge from production. Resolve every non-deterministic input <em>before</em> writing the event and record it inside the event.</li>
+<li><strong>Events are a permanent API.</strong> Code written in year five must still correctly replay events written in year one, so event schemas can only be extended, never changed or removed, and every version's semantics must be preserved in the replay path forever. This is the real long-term cost of event sourcing, and it is usually underestimated.</li>
+<li><strong>Replay time grows without bound.</strong> Snapshots are mandatory, not an optimisation — but a snapshot must never become a source of truth, and must always be reconstructible from the events.</li>
+<li><strong>Replaying only the commands does not work.</strong> Commands are non-deterministic and can be rejected; replaying them may produce different events. The event log is the only data that cannot be regenerated, which is why it is the only thing that must be replicated.</li>
+<li><strong>TC/C's Try phase can appear to destroy money.</strong> Debiting A without crediting anything leaves the global total short for the duration. Credit a clearing account so the conservation invariant holds at every instant.</li>
+<li><strong>A reservation with no Confirm or Cancel leaks funds indefinitely.</strong> Timeouts and a reaper are required, exactly as with reservation holds.</li>
+<li><strong>A compensating action that fails has no defined recovery.</strong> Compensations must be idempotent and retried until they succeed; a Cancel that can permanently fail is a design defect.</li>
+<li><strong>Saga exposes intermediate states.</strong> With A debited and C not yet credited, a balance query sees an inconsistent world. Either model in-flight funds explicitly or make the read path aware of pending transactions.</li>
+<li><strong>2PC blocks participants when the coordinator dies after voting.</strong> Locks are held with no safe unilateral decision available.</li>
+<li><strong>A stateful service is operationally heavier.</strong> Local event logs mean node identity matters, deploys must preserve data, restores take as long as replay, and you cannot treat instances as interchangeable.</li>
+<li><strong>Raft commits need a majority, so losing it stops writes.</strong> A 3-node group tolerates one failure; a 5-node group tolerates two. Partition the group and the minority side must refuse writes — correctly, but it is unavailable.</li>
+<li><strong>A hot account is a hard ceiling.</strong> One account is one Raft group is one leader. The balance invariant is what prevents splitting it.</li>
+<li><strong>Overdraft validation must live inside the deterministic state machine.</strong> If the balance check happens anywhere else — in a service that read a stale cache, say — replay will not reproduce the decision, and the system can create money.</li>
+<li><strong>Commands need idempotency keys too.</strong> The <code>transaction_id</code> in the API is that key; without it a client retry submits a second transfer. The uniqueness must be enforced where the command is accepted, not later.</li>
+<li><strong>Ordering must come from the log, not from timestamps.</strong> Wall clocks across nodes disagree; the event log's position is the only authoritative order. Using timestamps to sequence events reintroduces clock skew as a correctness bug.</li>
+<li><strong>CQRS read projections lag the write side.</strong> A user who completes a transfer and immediately queries their balance may not see it — hence the push mechanism. Read-your-own-writes needs explicit handling.</li>
+<li><strong>Reconciliation is still required.</strong> Event sourcing proves your state matches your events; it cannot prove your events match the outside world. Where the wallet touches external rails, <a href="26-payment-system.html#reconciliation">Chapter 26</a>'s reconciliation applies unchanged.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Money must never be created or destroyed</td>
+<td>Double-entry balance changes; conservation checkable at every instant</td>
+</tr>
+<tr>
+<td>Proving correctness, not just detecting error</td>
+<td>Event sourcing — immutable event log plus a deterministic state machine</td>
+</tr>
+<tr>
+<td>Answering &quot;what was the balance at time T?&quot;</td>
+<td>Replay events up to T</td>
+</tr>
+<tr>
+<td>Validating a code change against reality</td>
+<td>Replay the full history through both versions and diff the resulting state</td>
+</tr>
+<tr>
+<td>Replay getting slower forever</td>
+<td>Periodic snapshots, always reconstructible from events</td>
+</tr>
+<tr>
+<td>Atomicity across shards without distributed locks</td>
+<td>TC/C or Saga with compensating transactions</td>
+</tr>
+<tr>
+<td>Money appearing to vanish mid-transfer</td>
+<td>Clearing/suspense account holding in-flight funds</td>
+</tr>
+<tr>
+<td>Abandoned reservations</td>
+<td>Timeout plus a reaper that cancels stale Try phases</td>
+</tr>
+<tr>
+<td>Surviving a coordinator crash mid-saga</td>
+<td>Phase status table — the saga's own durable to-do list</td>
+</tr>
+<tr>
+<td>Removing the network hop from the write path</td>
+<td>Append the event log to local disk instead of Kafka</td>
+</tr>
+<tr>
+<td>Durability of a local log</td>
+<td>Raft replication to a majority quorum</td>
+</tr>
+<tr>
+<td>Avoiding split-brain</td>
+<td>Majority quorum — two disjoint majorities cannot exist</td>
+</tr>
+<tr>
+<td>Scaling past one Raft group</td>
+<td>Shard into multiple groups; coordinate cross-shard transfers with a saga</td>
+</tr>
+<tr>
+<td>Clients learning their transfer completed</td>
+<td>CQRS read projections, with the reverse proxy receiving a push</td>
+</tr>
+<tr>
+<td>Duplicate transfer submissions</td>
+<td><code>transaction_id</code> as an idempotency key at command acceptance</td>
+</tr>
+<tr>
+<td>Deterministic ordering</td>
+<td>The position in the event log — never wall-clock timestamps</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Which constraint here is one the business cannot absorb, and which earlier chapter shows the opposite case?</li>
+<li>Narrate the chapter's seven designs as a chain of forced moves: what each fixes and what each costs.</li>
+<li>1 M transfers/sec means how many balance updates/sec, and why?</li>
+<li>Why is raising per-node throughput a <em>correctness</em> goal and not just a cost goal?</li>
+<li>Why does a coordinator failure in 2PC leave participants unable to decide anything?</li>
+<li>During a TC/C Try phase, money has left A and not arrived at C. What invariant breaks, and what accounting device repairs it?</li>
+<li>What happens to reserved funds if the coordinator dies between Try and Confirm?</li>
+<li>State the difference between a command and an event along four dimensions.</li>
+<li>Why is the event log replicated rather than the command log?</li>
+<li>Name four ways a state machine can be accidentally non-deterministic, and what each breaks.</li>
+<li>How do you verify that a change to fee logic is correct? What makes that possible?</li>
+<li>Why are snapshots mandatory, and what must never be true of them?</li>
+<li>Why does Raft's abstraction fit event sourcing so naturally?</li>
+<li>Why must a Raft group have an odd number of nodes and a majority to commit?</li>
+<li>A merchant account receives transfers from a million users. Why can't you shard it, and what are the options?</li>
+<li>Where must the overdraft check live, and what goes wrong if it lives elsewhere?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Two-phase commit (2PC)</strong></td>
+<td>Prepare-then-commit across participants; atomic, blocking, coordinator-dependent</td>
+</tr>
+<tr>
+<td><strong>TC/C (Try-Confirm/Cancel)</strong></td>
+<td>Two independent local transactions — reserve, then confirm or compensate</td>
+</tr>
+<tr>
+<td><strong>Saga</strong></td>
+<td>A sequence of local transactions with compensating actions on failure</td>
+</tr>
+<tr>
+<td><strong>Compensating transaction</strong></td>
+<td>The opposite operation undoing an earlier committed step</td>
+</tr>
+<tr>
+<td><strong>Clearing / suspense account</strong></td>
+<td>An account holding in-flight funds so the total is conserved mid-transfer</td>
+</tr>
+<tr>
+<td><strong>Command vs event</strong></td>
+<td>A request that may fail vs a recorded fact that already happened</td>
+</tr>
+<tr>
+<td><strong>Event sourcing</strong></td>
+<td>Storing the immutable event log as the source of truth; state is derived by replay</td>
+</tr>
+<tr>
+<td><strong>Deterministic state machine</strong></td>
+<td>Applies events to state with no external input, so replay is exact</td>
+</tr>
+<tr>
+<td><strong>Reproducibility</strong></td>
+<td>The ability to reconstruct any historical state by replaying events</td>
+</tr>
+<tr>
+<td><strong>Snapshot</strong></td>
+<td>Persisted state at a known event offset, shortening replay</td>
+</tr>
+<tr>
+<td><strong>CQRS</strong></td>
+<td>Separating the write path (state machine) from read projections</td>
+</tr>
+<tr>
+<td><strong>Raft</strong></td>
+<td>Consensus protocol maintaining a replicated, ordered, append-only log</td>
+</tr>
+<tr>
+<td><strong>Majority quorum</strong></td>
+<td>More than half the nodes — what makes a commit durable and split-brain impossible</td>
+</tr>
+<tr>
+<td><strong>Raft group / partition</strong></td>
+<td>One replicated log and its nodes; the unit of sharding</td>
+</tr>
+<tr>
+<td><strong>Phase status table</strong></td>
+<td>The coordinator's durable record of a saga's progress</td>
+</tr>
+<tr>
+<td><strong>Hot account</strong></td>
+<td>An account whose write rate exceeds one Raft group, and which cannot be split</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="26-payment-system.html">Chapter 26 – Payment System</a> — the double-entry ledger and reconciliation this chapter builds on, and the external rails it eventually touches.</li>
+<li><a href="19-distributed-message-queue.html">Chapter 19 – Distributed Message Queue</a> — the replicated append-only log as a product, including the sequential-I/O numbers used here.</li>
+<li><a href="22-hotel-reservation-system.html">Chapter 22 – Hotel Reservation System</a> — sagas, holds and reapers where the compensating action genuinely undoes the earlier step.</li>
+<li><a href="06-key-value-store.html#3-consistency">Chapter 6 – Design A Key-Value Store</a> — quorums and the consistency/availability trade-off Raft resolves toward consistency.</li>
+<li><a href="28-stock-exchange.html">Chapter 28 – Stock Exchange</a> — a deterministic state machine over an ordered event log again, with latency as the dominant requirement.</li>
+</ul>
+<ul>
+<li>Finally, we partitioned our data across multiple raft groups, which are orchestrated using a distributed transaction mechanism - TC/C or distributed saga</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

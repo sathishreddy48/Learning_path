@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 9: Design a Web Crawler — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="09-web-crawler">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 1 Systems › Chapter 9 of 28</div>
+  <h1>Chapter 9: Design a Web Crawler</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understanding-the-problem">Step 1: Understanding the Problem</a></li><li><a href="#step-2-high-level-design">Step 2: High-Level Design</a></li><li><a href="#step-3-deep-dive-into-key-components">Step 3: Deep Dive into Key Components</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap Up</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>A <strong>web crawler</strong>, also known as a spider or robot, is used to discover and collect web content, such as web pages, images, and videos. This chapter focuses on designing a scalable web crawler for <strong>search engine indexing</strong>.</p>
+<p><strong>The one-sentence version:</strong> a crawler is a distributed breadth-first traversal of a graph you do not own, and its throughput is limited not by bandwidth, CPU, or storage but by <strong>politeness</strong> — you may only hit any single host slowly, so the only way to go fast is to crawl a great many hosts at once.</p>
+<p>That constraint is what makes the design non-obvious. Nearly every component in this chapter exists either to keep track of an enormous frontier of pending work, or to defend the crawler against a web that is full of duplicates, loops, and traps.</p>
+<h3 id="applications-of-web-crawlers">Applications of Web Crawlers</h3>
+<ol>
+<li><strong>Search Engine Indexing:</strong> Collect web pages to create searchable indexes (e.g., Googlebot).</li>
+<li><strong>Web Archiving:</strong> Preserve web data for future use (e.g., US Library of Congress).</li>
+<li><strong>Web Mining:</strong> Extract knowledge from web data (e.g., financial analysis of shareholder reports).</li>
+<li><strong>Web Monitoring:</strong> Detect copyright or trademark infringements.</li>
+</ol>
+<h3 id="design-challenges">Design Challenges</h3>
+<p>A good web crawler must address:</p>
+<ul>
+<li><strong>Scalability:</strong> Handle billions of pages using parallelization.</li>
+<li><strong>Robustness:</strong> Manage bad HTML, crashes, and malicious links.</li>
+<li><strong>Politeness:</strong> Avoid overwhelming servers with too many requests.</li>
+<li><strong>Extensibility:</strong> Support new content types with minimal changes.</li>
+</ul>
+<p>These four are not equal. <strong>Politeness is the binding constraint, and the other three are consequences of working around it.</strong> If you could hammer one host at 400 requests/second, a crawler would be a <code>for</code> loop. Because you cannot, you need thousands of hosts in flight simultaneously, which forces distribution (scalability), exposes you to every broken server on the internet (robustness), and demands a frontier large enough to hold work for all of them.</p>
+<hr>
+</section>
+<section id="step-1-understanding-the-problem">
+<h2 id="step-1-understanding-the-problem">Step 1: Understanding the Problem</h2>
+<h3 id="requirements">Requirements</h3>
+<ol>
+<li>Crawl <strong>1 billion web pages per month</strong> (400 pages/second, peak 800 QPS).</li>
+<li>Collect <strong>HTML-only content</strong>.</li>
+<li>Track new and updated pages.</li>
+<li>Ignore duplicate content.</li>
+<li>Store crawled data for <strong>5 years</strong>, requiring ~30 PB of storage.</li>
+</ol>
+<h3 id="where-those-numbers-come-from">Where those numbers come from</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Derivation</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Average crawl rate</td>
+<td>1 B pages / 30 days / 86,400 s</td>
+<td><strong>~400 pages/sec</strong></td>
+</tr>
+<tr>
+<td>Peak rate</td>
+<td>2 × average</td>
+<td><strong>~800 pages/sec</strong></td>
+</tr>
+<tr>
+<td>Average page size</td>
+<td>Given</td>
+<td><strong>~500 KB</strong></td>
+</tr>
+<tr>
+<td>Bandwidth</td>
+<td>400 × 500 KB</td>
+<td><strong>~200 MB/sec sustained</strong></td>
+</tr>
+<tr>
+<td>Monthly storage</td>
+<td>1 B × 500 KB</td>
+<td><strong>500 TB/month</strong></td>
+</tr>
+<tr>
+<td>5-year storage</td>
+<td>500 TB × 60 months</td>
+<td><strong>~30 PB</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="the-arithmetic-that-actually-shapes-the-design">The arithmetic that actually shapes the design</h3>
+<p>Politeness convention is roughly <strong>one request per host at a time, with a delay between requests</strong> — call it one page per second per host. To sustain 400 pages/second you therefore need <strong>at least 400 hosts being crawled concurrently</strong>, and in practice thousands, because most hosts have only a handful of pages and go idle immediately.</p>
+<p>This single calculation explains the entire frontier design. The crawler is not a queue of URLs; it is a scheduler that keeps thousands of per-host queues active while never letting any one of them run hot.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>stating &quot;politeness caps me at ~1 page/sec/host, so 400 pages/sec means 400+ hosts in parallel, so my frontier must be organised <em>by host</em>&quot; is the single highest-value sentence in this chapter. It derives the architecture instead of recalling it.</p>
+</div>
+<hr>
+</section>
+<section id="step-2-high-level-design">
+<h2 id="step-2-high-level-design">Step 2: High-Level Design</h2>
+<h3 id="components">Components</h3>
+<p align="center">
+<img loading="lazy" decoding="async" src="../../system-design-notes/09.%20Web%20Crawler/images/web-crawler-architecture.png" alt="Web Crawler Architecture" data-width="700" style="max-width:700px">
+</p>
+<ol>
+<li>
+<p><strong>Seed URLs:</strong> Starting points for the crawler.</p>
+<ul>
+<li>Need to selective as a good starting point that a crawler can utilize to traverse as many links as possible.</li>
+<li>Can be based on locality based on different popular website or based on topics.</li>
+<li>Strategies: Categorize by locality or topic (e.g., sports, healthcare).</li>
+</ul>
+</li>
+<li>
+<p><strong>URL Frontier:</strong> Stores URLs to be downloaded.</p>
+<ul>
+<li>Implemented as a <strong>FIFO queue</strong>.</li>
+</ul>
+</li>
+<li>
+<p><strong>HTML Downloader:</strong> Downloads web pages from URLs provided by the URL Frontier.</p>
+</li>
+<li>
+<p><strong>DNS Resolver:</strong> Converts URLs to IP addresses.</p>
+</li>
+<li>
+<p><strong>Content Parser:</strong> Validates and parses web pages.</p>
+<ul>
+<li>Discards malformed pages.</li>
+</ul>
+</li>
+<li>
+<p><strong>Content Seen?:</strong> Checks for duplicate content using hash comparisons (compare the hash values of the two web pages).</p>
+</li>
+<li>
+<p><strong>Content Storage:</strong> Stores HTML pages on disk (popular content in memory to reduce latency).</p>
+</li>
+<li>
+<p><strong>URL Extractor:</strong> Extracts new links from parsed pages.</p>
+</li>
+<li>
+<p><strong>URL Filter:</strong> Excludes blacklisted or erroneous URLs.</p>
+</li>
+<li>
+<p><strong>URL Seen?</strong> Tracks visited URLs to avoid duplication.</p>
+</li>
+<li>
+<p><strong>URL Storage:</strong> Stores already visited URLs.</p>
+</li>
+</ol>
+<h3 id="which-of-these-are-actually-hard">Which of these are actually hard</h3>
+<p>Most of the eleven boxes are small. Three of them are the engineering:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Why it is hard</th>
+<th>What it needs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>URL Frontier</strong></td>
+<td>Holds hundreds of millions of pending URLs while enforcing both priority and politeness — two requirements that pull in opposite directions</td>
+<td>Disk-backed storage, a two-tier queue design, host-partitioned state</td>
+</tr>
+<tr>
+<td><strong>URL Seen?</strong></td>
+<td>A membership test against billions of URLs, consulted several times per crawled page</td>
+<td>A Bloom filter in memory, not a hash set</td>
+</tr>
+<tr>
+<td><strong>Content Seen?</strong></td>
+<td>Exact hashes miss near-duplicates, which are the overwhelming majority of web redundancy</td>
+<td>Shingling plus SimHash/MinHash, not just a digest</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The rest — downloader, parser, extractor, filter — are ordinary code that must simply never crash on malformed input.</p>
+<hr>
+<h3 id="workflow">Workflow</h3>
+<ol>
+<li>Add <strong>Seed URLs</strong> to the URL Frontier.</li>
+<li><strong>HTML Downloader</strong> fetches URLs and resolves their IPs via the DNS Resolver.</li>
+<li><strong>Content Parser</strong> validates and passes content to the &quot;Content Seen?&quot; component.</li>
+<li>If the content is new, extract links via the <strong>URL Extractor</strong>.</li>
+<li>Filter and add unique links to the URL Frontier.</li>
+</ol>
+<figure class="mermaid-fig">
+<svg id="mmd-7cbcc86d6672ebb6" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1942.95px; background-color: transparent;" viewBox="0 0 1942.953125 308.85546875" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-7cbcc86d6672ebb6{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-7cbcc86d6672ebb6 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-7cbcc86d6672ebb6 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-7cbcc86d6672ebb6 .error-icon{fill:#f4f6f8;}#mmd-7cbcc86d6672ebb6 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-7cbcc86d6672ebb6 .edge-thickness-normal{stroke-width:1px;}#mmd-7cbcc86d6672ebb6 .edge-thickness-thick{stroke-width:3.5px;}#mmd-7cbcc86d6672ebb6 .edge-pattern-solid{stroke-dasharray:0;}#mmd-7cbcc86d6672ebb6 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-7cbcc86d6672ebb6 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-7cbcc86d6672ebb6 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-7cbcc86d6672ebb6 .marker{fill:#637381;stroke:#637381;}#mmd-7cbcc86d6672ebb6 .marker.cross{stroke:#637381;}#mmd-7cbcc86d6672ebb6 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-7cbcc86d6672ebb6 p{margin:0;}#mmd-7cbcc86d6672ebb6 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-7cbcc86d6672ebb6 .cluster-label text{fill:#454f5b;}#mmd-7cbcc86d6672ebb6 .cluster-label span{color:#454f5b;}#mmd-7cbcc86d6672ebb6 .cluster-label span p{background-color:transparent;}#mmd-7cbcc86d6672ebb6 .label text,#mmd-7cbcc86d6672ebb6 span{fill:#161c24;color:#161c24;}#mmd-7cbcc86d6672ebb6 .node rect,#mmd-7cbcc86d6672ebb6 .node circle,#mmd-7cbcc86d6672ebb6 .node ellipse,#mmd-7cbcc86d6672ebb6 .node polygon,#mmd-7cbcc86d6672ebb6 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-7cbcc86d6672ebb6 .rough-node .label text,#mmd-7cbcc86d6672ebb6 .node .label text,#mmd-7cbcc86d6672ebb6 .image-shape .label,#mmd-7cbcc86d6672ebb6 .icon-shape .label{text-anchor:middle;}#mmd-7cbcc86d6672ebb6 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-7cbcc86d6672ebb6 .rough-node .label,#mmd-7cbcc86d6672ebb6 .node .label,#mmd-7cbcc86d6672ebb6 .image-shape .label,#mmd-7cbcc86d6672ebb6 .icon-shape .label{text-align:center;}#mmd-7cbcc86d6672ebb6 .node.clickable{cursor:pointer;}#mmd-7cbcc86d6672ebb6 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-7cbcc86d6672ebb6 .arrowheadPath{fill:#000000;}#mmd-7cbcc86d6672ebb6 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-7cbcc86d6672ebb6 .flowchart-link{stroke:#637381;fill:none;}#mmd-7cbcc86d6672ebb6 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-7cbcc86d6672ebb6 .edgeLabel p{background-color:#ffffff;}#mmd-7cbcc86d6672ebb6 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-7cbcc86d6672ebb6 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-7cbcc86d6672ebb6 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-7cbcc86d6672ebb6 .cluster text{fill:#454f5b;}#mmd-7cbcc86d6672ebb6 .cluster span{color:#454f5b;}#mmd-7cbcc86d6672ebb6 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-7cbcc86d6672ebb6 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-7cbcc86d6672ebb6 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-7cbcc86d6672ebb6 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-7cbcc86d6672ebb6 rect.text{fill:none;stroke-width:0;}#mmd-7cbcc86d6672ebb6 .icon-shape,#mmd-7cbcc86d6672ebb6 .image-shape{background-color:#ffffff;text-align:center;}#mmd-7cbcc86d6672ebb6 .icon-shape p,#mmd-7cbcc86d6672ebb6 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-7cbcc86d6672ebb6 .icon-shape .label rect,#mmd-7cbcc86d6672ebb6 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-7cbcc86d6672ebb6 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-7cbcc86d6672ebb6 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-7cbcc86d6672ebb6 .node .neo-node{stroke:#299a8d;}#mmd-7cbcc86d6672ebb6 [data-look="neo"].node rect,#mmd-7cbcc86d6672ebb6 [data-look="neo"].cluster rect,#mmd-7cbcc86d6672ebb6 [data-look="neo"].node polygon{stroke:url(#mmd-7cbcc86d6672ebb6-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-7cbcc86d6672ebb6 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-7cbcc86d6672ebb6 [data-look="neo"].node path{stroke:url(#mmd-7cbcc86d6672ebb6-gradient);stroke-width:1px;}#mmd-7cbcc86d6672ebb6 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-7cbcc86d6672ebb6 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-7cbcc86d6672ebb6 [data-look="neo"].node circle{stroke:url(#mmd-7cbcc86d6672ebb6-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-7cbcc86d6672ebb6 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-7cbcc86d6672ebb6 [data-look="neo"].icon-shape .icon{fill:url(#mmd-7cbcc86d6672ebb6-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-7cbcc86d6672ebb6 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-7cbcc86d6672ebb6-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-7cbcc86d6672ebb6 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-7cbcc86d6672ebb6_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-7cbcc86d6672ebb6_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-7cbcc86d6672ebb6_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-7cbcc86d6672ebb6_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-7cbcc86d6672ebb6_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-7cbcc86d6672ebb6_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-7cbcc86d6672ebb6_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-7cbcc86d6672ebb6_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-7cbcc86d6672ebb6_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-7cbcc86d6672ebb6_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M126.859,46.094L131.026,46.094C135.193,46.094,143.526,46.094,151.193,46.094C158.859,46.094,165.859,46.094,169.359,46.094L172.859,46.094" id="mmd-7cbcc86d6672ebb6-L_S_F_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_F_0" data-points="W3sieCI6MTI2Ljg1OTM3NSwieSI6NDYuMDkzNzV9LHsieCI6MTUxLjg1OTM3NSwieSI6NDYuMDkzNzV9LHsieCI6MTc2Ljg1OTM3NSwieSI6NDYuMDkzNzV9XQ==" data-look="classic" marker-end="url(#mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd)"/><path d="M341.485,79.094L349.298,82.706C357.11,86.318,372.735,93.542,392.125,104.384C411.515,115.226,434.671,129.686,446.249,136.917L457.827,144.147" id="mmd-7cbcc86d6672ebb6-L_F_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_F_D_0" data-points="W3sieCI6MzQxLjQ4NTE5NjY2MzMzMjQsInkiOjc5LjA5Mzc1fSx7IngiOjM4OC4zNTkzNzUsInkiOjEwMC43NjU2MjV9LHsieCI6NDYxLjIyMDAxMzc4Njc2NDcsInkiOjE0Ni4yNjU2MjV9XQ==" data-look="classic" marker-end="url(#mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd)"/><path d="M336.375,172.855L345.039,172.855C353.703,172.855,371.031,172.855,383.862,172.699C396.693,172.542,405.026,172.229,409.193,172.073L413.359,171.916" id="mmd-7cbcc86d6672ebb6-L_DNS_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DNS_D_0" data-points="W3sieCI6MzM2LjM3NSwieSI6MTcyLjg1NTQ2ODc1fSx7IngiOjM4OC4zNTkzNzUsInkiOjE3Mi44NTU0Njg3NX0seyJ4Ijo0MTMuMzU5Mzc1LCJ5IjoxNzEuOTE2NDg4OTgyNDU4MDJ9XQ==" data-look="classic"/><path d="M346.664,278.355L353.613,278.355C360.563,278.355,374.461,278.355,395.833,263.84C417.204,249.326,446.049,220.296,460.471,205.781L474.894,191.266" id="mmd-7cbcc86d6672ebb6-L_RT_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RT_D_0" data-points="W3sieCI6MzQ2LjY2NDA2MjUsInkiOjI3OC4zNTU0Njg3NX0seyJ4IjozODguMzU5Mzc1LCJ5IjoyNzguMzU1NDY4NzV9LHsieCI6NDc0Ljg5MzU1NzI5ODE2NDMsInkiOjE5MS4yNjU2MjV9XQ==" data-look="classic"/><path d="M581.141,168.766L585.307,168.766C589.474,168.766,597.807,168.766,605.474,168.766C613.141,168.766,620.141,168.766,623.641,168.766L627.141,168.766" id="mmd-7cbcc86d6672ebb6-L_D_P_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_P_0" data-points="W3sieCI6NTgxLjE0MDYyNSwieSI6MTY4Ljc2NTYyNX0seyJ4Ijo2MDYuMTQwNjI1LCJ5IjoxNjguNzY1NjI1fSx7IngiOjYzMS4xNDA2MjUsInkiOjE2OC43NjU2MjV9XQ==" data-look="classic" marker-end="url(#mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd)"/><path d="M775.875,168.766L780.042,168.766C784.208,168.766,792.542,168.766,800.208,168.766C807.875,168.766,814.875,168.766,818.375,168.766L821.875,168.766" id="mmd-7cbcc86d6672ebb6-L_P_CS_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_P_CS_0" data-points="W3sieCI6Nzc1Ljg3NSwieSI6MTY4Ljc2NTYyNX0seyJ4Ijo4MDAuODc1LCJ5IjoxNjguNzY1NjI1fSx7IngiOjgyNS44NzUsInkiOjE2OC43NjU2MjV9XQ==" data-look="classic" marker-end="url(#mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd)"/><path d="M947.268,185.732L956.476,188.724C965.684,191.716,984.1,197.7,1012.534,200.692C1040.969,203.684,1079.422,203.684,1115.661,203.684C1151.901,203.684,1185.927,203.684,1218.59,203.684C1251.253,203.684,1282.552,203.684,1318.81,203.684C1355.068,203.684,1396.284,203.684,1435.283,203.684C1474.281,203.684,1511.063,203.684,1542.885,203.684C1574.708,203.684,1601.573,203.684,1628.646,203.684C1655.719,203.684,1683,203.684,1712.132,203.684C1741.263,203.684,1772.245,203.684,1797.888,192.442C1823.531,181.2,1843.836,158.717,1853.988,147.476L1864.14,136.234" id="mmd-7cbcc86d6672ebb6-L_CS_X_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_CS_X_0" data-points="W3sieCI6OTQ3LjI2ODI3OTE3OTQ2OTksInkiOjE4NS43MzE3MjA4MjA1MzAwNn0seyJ4IjoxMDAyLjUxNTYyNSwieSI6MjAzLjY4MzU5Mzc1fSx7IngiOjExMTcuODc1LCJ5IjoyMDMuNjgzNTkzNzV9LHsieCI6MTIxOS45NTMxMjUsInkiOjIwMy42ODM1OTM3NX0seyJ4IjoxMzEzLjg1MTU2MjUsInkiOjIwMy42ODM1OTM3NX0seyJ4IjoxNDM3LjUsInkiOjIwMy42ODM1OTM3NX0seyJ4IjoxNTQ3Ljg0Mzc1LCJ5IjoyMDMuNjgzNTkzNzV9LHsieCI6MTYyOC40Mzc1LCJ5IjoyMDMuNjgzNTkzNzV9LHsieCI6MTcxMC4yODEyNSwieSI6MjAzLjY4MzU5Mzc1fSx7IngiOjE4MDMuMjI2NTYyNSwieSI6MjAzLjY4MzU5Mzc1fSx7IngiOjE4NjYuODIwOTEyNTUyMDI0MywieSI6MTMzLjI2NTYyNX1d" data-look="classic" marker-end="url(#mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd)"/><path d="M943.764,148.296L953.556,144.181C963.348,140.066,982.932,131.835,998.437,127.72C1013.943,123.605,1025.37,123.605,1031.083,123.605L1036.797,123.605" id="mmd-7cbcc86d6672ebb6-L_CS_ST_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_CS_ST_0" data-points="W3sieCI6OTQzLjc2NDI5ODI4ODY5MjQsInkiOjE0OC4yOTU1NDgyODg2OTIzN30seyJ4IjoxMDAyLjUxNTYyNSwieSI6MTIzLjYwNTQ2ODc1fSx7IngiOjEwNDAuNzk2ODc1LCJ5IjoxMjMuNjA1NDY4NzV9XQ==" data-look="classic" marker-end="url(#mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd)"/><path d="M1194.953,123.605L1199.12,123.605C1203.286,123.605,1211.62,123.605,1219.286,123.605C1226.953,123.605,1233.953,123.605,1237.453,123.605L1240.953,123.605" id="mmd-7cbcc86d6672ebb6-L_ST_EX_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_ST_EX_0" data-points="W3sieCI6MTE5NC45NTMxMjUsInkiOjEyMy42MDU0Njg3NX0seyJ4IjoxMjE5Ljk1MzEyNSwieSI6MTIzLjYwNTQ2ODc1fSx7IngiOjEyNDQuOTUzMTI1LCJ5IjoxMjMuNjA1NDY4NzV9XQ==" data-look="classic" marker-end="url(#mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd)"/><path d="M1382.75,123.605L1391.875,123.605C1401,123.605,1419.25,123.605,1436.833,123.605C1454.417,123.605,1471.333,123.605,1479.792,123.605L1488.25,123.605" id="mmd-7cbcc86d6672ebb6-L_EX_FI_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_EX_FI_0" data-points="W3sieCI6MTM4Mi43NSwieSI6MTIzLjYwNTQ2ODc1fSx7IngiOjE0MzcuNSwieSI6MTIzLjYwNTQ2ODc1fSx7IngiOjE0OTIuMjUsInkiOjEyMy42MDU0Njg3NX1d" data-look="classic" marker-end="url(#mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd)"/><path d="M1603.438,123.605L1607.604,123.605C1611.771,123.605,1620.104,123.605,1631.855,118.16C1643.606,112.715,1658.775,101.824,1666.36,96.378L1673.944,90.933" id="mmd-7cbcc86d6672ebb6-L_FI_US_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_FI_US_0" data-points="W3sieCI6MTYwMy40Mzc1LCJ5IjoxMjMuNjA1NDY4NzV9LHsieCI6MTYyOC40Mzc1LCJ5IjoxMjMuNjA1NDY4NzV9LHsieCI6MTY3Ny4xOTM1OTE5OTE5NDMzLCJ5Ijo4OC41OTk4NDE5OTE5NDMzMn1d" data-look="classic" marker-end="url(#mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd)"/><path d="M1767.125,64.844L1773.142,64.844C1779.159,64.844,1791.193,64.844,1803.758,68.427C1816.323,72.011,1829.42,79.178,1835.969,82.762L1842.517,86.345" id="mmd-7cbcc86d6672ebb6-L_US_X_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_US_X_0" data-points="W3sieCI6MTc2Ny4xMjUsInkiOjY0Ljg0Mzc1fSx7IngiOjE4MDMuMjI2NTYyNSwieSI6NjQuODQzNzV9LHsieCI6MTg0Ni4wMjU4NzUwODUwNjMsInkiOjg4LjI2NTYyNX1d" data-look="classic" marker-end="url(#mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd)"/><path d="M1668.215,50.067L1661.585,47.738C1654.956,45.409,1641.697,40.751,1621.635,38.423C1601.573,36.094,1574.708,36.094,1542.885,36.094C1511.063,36.094,1474.281,36.094,1435.283,36.094C1396.284,36.094,1355.068,36.094,1318.81,36.094C1282.552,36.094,1251.253,36.094,1218.59,36.094C1185.927,36.094,1151.901,36.094,1115.661,36.094C1079.422,36.094,1040.969,36.094,1003.832,36.094C966.695,36.094,930.875,36.094,897.268,36.094C863.661,36.094,832.268,36.094,800.344,36.094C768.419,36.094,735.964,36.094,703.508,36.094C671.052,36.094,638.596,36.094,604.22,36.094C569.844,36.094,533.547,36.094,497.25,36.094C460.953,36.094,424.656,36.094,403.005,36.39C381.355,36.686,374.35,37.278,370.848,37.575L367.345,37.871" id="mmd-7cbcc86d6672ebb6-L_US_F_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_US_F_0" data-points="W3sieCI6MTY2OC4yMTQ2MjYzMDY4NjY0LCJ5Ijo1MC4wNjY2MjM2OTMxMzM2Nn0seyJ4IjoxNjI4LjQzNzUsInkiOjM2LjA5Mzc1fSx7IngiOjE1NDcuODQzNzUsInkiOjM2LjA5Mzc1fSx7IngiOjE0MzcuNSwieSI6MzYuMDkzNzV9LHsieCI6MTMxMy44NTE1NjI1LCJ5IjozNi4wOTM3NX0seyJ4IjoxMjE5Ljk1MzEyNSwieSI6MzYuMDkzNzV9LHsieCI6MTExNy44NzUsInkiOjM2LjA5Mzc1fSx7IngiOjEwMDIuNTE1NjI1LCJ5IjozNi4wOTM3NX0seyJ4Ijo4OTUuMDU0Njg3NSwieSI6MzYuMDkzNzV9LHsieCI6ODAwLjg3NSwieSI6MzYuMDkzNzV9LHsieCI6NzAzLjUwNzgxMjUsInkiOjM2LjA5Mzc1fSx7IngiOjYwNi4xNDA2MjUsInkiOjM2LjA5Mzc1fSx7IngiOjQ5Ny4yNSwieSI6MzYuMDkzNzV9LHsieCI6Mzg4LjM1OTM3NSwieSI6MzYuMDkzNzV9LHsieCI6MzYzLjM1OTM3NSwieSI6MzguMjA3OTE0OTA0ODYyNTh9XQ==" data-look="classic" marker-end="url(#mmd-7cbcc86d6672ebb6_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_S_F_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_F_D_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_DNS_D_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RT_D_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_D_P_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_P_CS_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(1437.5, 203.68359375)"><g class="label" data-id="L_CS_X_0" transform="translate(-29.75, -10.5)"><foreignObject width="59.5" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>duplicate</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(1002.515625, 123.60546875)"><g class="label" data-id="L_CS_ST_0" transform="translate(-13.28125, -10.5)"><foreignObject width="26.5625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>new</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_ST_EX_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_EX_FI_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_FI_US_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(1803.2265625, 64.84375)"><g class="label" data-id="L_US_X_0" transform="translate(-11.1015625, -10.5)"><foreignObject width="22.203125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>yes</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(1002.515625, 36.09375)"><g class="label" data-id="L_US_F_0" transform="translate(-8.0703125, -10.5)"><foreignObject width="16.140625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>no</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-7cbcc86d6672ebb6-flowchart-S-0" data-look="classic" transform="translate(67.4296875, 46.09375)"><rect class="basic label-container" style="" x="-59.4296875" y="-22.5" width="118.859375" height="45"/><g class="label" style="" transform="translate(-35.4296875, -10.5)"><rect/><foreignObject width="70.859375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Seed URLs</p></span></div></foreignObject></g></g><g class="node default" id="mmd-7cbcc86d6672ebb6-flowchart-F-1" data-look="classic" transform="translate(270.109375, 46.09375)"><rect class="basic label-container" style="" x="-93.25" y="-33" width="186.5" height="66"/><g class="label" style="" transform="translate(-69.25, -21)"><rect/><foreignObject width="138.5" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>URL Frontier<br />(priority + politeness)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-7cbcc86d6672ebb6-flowchart-D-3" data-look="classic" transform="translate(497.25, 168.765625)"><rect class="basic label-container" style="" x="-83.890625" y="-22.5" width="167.78125" height="45"/><g class="label" style="" transform="translate(-59.890625, -10.5)"><rect/><foreignObject width="119.78125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>HTML Downloader</p></span></div></foreignObject></g></g><g class="node default" id="mmd-7cbcc86d6672ebb6-flowchart-DNS-4" data-look="classic" transform="translate(270.109375, 172.85546875)"><rect class="basic label-container" style="" x="-66.265625" y="-33" width="132.53125" height="66"/><g class="label" style="" transform="translate(-42.265625, -21)"><rect/><foreignObject width="84.53125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>DNS resolver<br />+ cache</p></span></div></foreignObject></g></g><g class="node default" id="mmd-7cbcc86d6672ebb6-flowchart-RT-6" data-look="classic" transform="translate(270.109375, 278.35546875)"><rect class="basic label-container" style="" x="-76.5546875" y="-22.5" width="153.109375" height="45"/><g class="label" style="" transform="translate(-52.5546875, -10.5)"><rect/><foreignObject width="105.109375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>robots.txt cache</p></span></div></foreignObject></g></g><g class="node default" id="mmd-7cbcc86d6672ebb6-flowchart-P-9" data-look="classic" transform="translate(703.5078125, 168.765625)"><rect class="basic label-container" style="" x="-72.3671875" y="-22.5" width="144.734375" height="45"/><g class="label" style="" transform="translate(-48.3671875, -10.5)"><rect/><foreignObject width="96.734375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Content Parser</p></span></div></foreignObject></g></g><g class="node default" id="mmd-7cbcc86d6672ebb6-flowchart-CS-11" data-look="classic" transform="translate(895.0546875, 168.765625)"><polygon points="69.1796875,0 138.359375,-69.1796875 69.1796875,-138.359375 0,-69.1796875" class="label-container" transform="translate(-68.6796875, 69.1796875)"/><g class="label" style="" transform="translate(-46.6796875, -10.5)"><rect/><foreignObject width="93.359375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Content seen?</p></span></div></foreignObject></g></g><g class="node default" id="mmd-7cbcc86d6672ebb6-flowchart-X-13" data-look="classic" transform="translate(1887.140625, 110.765625)"><rect class="basic label-container" style="" x="-47.8125" y="-22.5" width="95.625" height="45"/><g class="label" style="" transform="translate(-23.8125, -10.5)"><rect/><foreignObject width="47.625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>discard</p></span></div></foreignObject></g></g><g class="node default" id="mmd-7cbcc86d6672ebb6-flowchart-ST-15" data-look="classic" transform="translate(1117.875, 123.60546875)"><rect class="basic label-container" style="" x="-77.078125" y="-22.5" width="154.15625" height="45"/><g class="label" style="" transform="translate(-53.078125, -10.5)"><rect/><foreignObject width="106.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Content Storage</p></span></div></foreignObject></g></g><g class="node default" id="mmd-7cbcc86d6672ebb6-flowchart-EX-17" data-look="classic" transform="translate(1313.8515625, 123.60546875)"><rect class="basic label-container" style="" x="-68.8984375" y="-22.5" width="137.796875" height="45"/><g class="label" style="" transform="translate(-44.8984375, -10.5)"><rect/><foreignObject width="89.796875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>URL Extractor</p></span></div></foreignObject></g></g><g class="node default" id="mmd-7cbcc86d6672ebb6-flowchart-FI-19" data-look="classic" transform="translate(1547.84375, 123.60546875)"><rect class="basic label-container" style="" x="-55.59375" y="-22.5" width="111.1875" height="45"/><g class="label" style="" transform="translate(-31.59375, -10.5)"><rect/><foreignObject width="63.1875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>URL Filter</p></span></div></foreignObject></g></g><g class="node default" id="mmd-7cbcc86d6672ebb6-flowchart-US-21" data-look="classic" transform="translate(1710.28125, 64.84375)"><polygon points="56.84375,0 113.6875,-56.84375 56.84375,-113.6875 0,-56.84375" class="label-container" transform="translate(-56.34375, 56.84375)"/><g class="label" style="" transform="translate(-34.34375, -10.5)"><rect/><foreignObject width="68.6875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>URL seen?</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-7cbcc86d6672ebb6-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-7cbcc86d6672ebb6-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-7cbcc86d6672ebb6-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>The loop is the whole system, and it is worth noticing that <strong>two different deduplication checks</strong> sit in it. &quot;Content seen?&quot; stops you from <em>storing</em> the same page twice; &quot;URL seen?&quot; stops you from <em>fetching</em> the same page twice. They are not redundant: the second saves a network request, the first catches the same content served under several different URLs — which is extremely common, and which URL-level checks cannot detect.</p>
+<hr>
+</section>
+<section id="step-3-deep-dive-into-key-components">
+<h2 id="step-3-deep-dive-into-key-components">Step 3: Deep Dive into Key Components</h2>
+<h3 id="dfsbfs">DFS/BFS</h3>
+<ul>
+<li>The web can be though of as a directed graph where web pages are nodes and hyperlinks (URLs) as edges.</li>
+<li>BFS is usually used for graph traversal as the depth can be be very deep thus DFS is not ideal.</li>
+<li>Standard BFS does not take the priority of a URL into consideration, not every page has the same level of quality and importance.</li>
+</ul>
+<p>There is a second, less obvious problem with standard BFS: <strong>a page's links point overwhelmingly at its own host.</strong> A naive BFS queue therefore fills up with URLs from one site and the crawler, processing the queue in order, hammers that site — the politeness violation arrives automatically, not through carelessness. Plain BFS is not just unprioritised; it is actively impolite.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>DFS</th>
+<th>BFS</th>
+<th>What the crawler actually does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Traversal depth</td>
+<td>Unbounded — the web has no natural bottom</td>
+<td>Level by level</td>
+<td>BFS, bounded by a depth cap</td>
+</tr>
+<tr>
+<td>Host locality</td>
+<td>Dives into one host</td>
+<td>Still clusters by host</td>
+<td>BFS <strong>de-clustered by host</strong> across many queues</td>
+</tr>
+<tr>
+<td>Priority awareness</td>
+<td>None</td>
+<td>None</td>
+<td>Priority-weighted queue selection</td>
+</tr>
+<tr>
+<td>Memory</td>
+<td>Small stack</td>
+<td>Large frontier</td>
+<td>Disk-backed frontier, memory buffer</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="url-frontier">URL Frontier</h3>
+<ul>
+<li>
+<p><strong>Politeness:</strong></p>
+<ul>
+<li>
+<p>Ensure only one request per host at a time. Add a dealy b/w two download tasks.</p>
+</li>
+<li>
+<p>Use a mapping from hostnames to queues and worker (download) threads.</p>
+</li>
+<li>
+<p>Each downloader thread has a separate FIFO queue and only downloads URLs from that queue.</p>
+  <img loading="lazy" decoding="async" src="../../system-design-notes/09.%20Web%20Crawler/images/politeness.png" alt="Politeness" data-width="500" style="max-width:500px">
+</li>
+<li>
+<p><strong>Queue router:</strong> Ensures that each queue (b1, b2, … bn) only contains URLs from the same host.</p>
+</li>
+<li>
+<p><strong>Mapping table:</strong> It maps each host to a queue.</p>
+</li>
+<li>
+<p><strong>Queue selector:</strong> Each worker thread is mapped to a FIFO queue, and it only downloads URLs from that queue. The queue selection logic is done by the Queue selector.</p>
+</li>
+<li>
+<p><strong>Worker thread 1 to N.</strong> A worker thread downloads web pages sequentially from the same host. A delay can be added between two download tasks.</p>
+</li>
+</ul>
+<p>The mapping table is what makes this work, and it must be <strong>stable</strong>: a host must always route to the same queue, or two threads could crawl it concurrently and the politeness guarantee evaporates. In a distributed crawler the same requirement applies one level up — <strong>partition the frontier by host across machines</strong> (consistent hashing, <a href="05-consistent-hashing.html">Chapter 5</a>), so all state and all rate limiting for a host live on exactly one node. Partitioning by URL instead would scatter one host's URLs across every machine, and no machine would be able to tell it was collectively overwhelming the server.</p>
+</li>
+<li>
+<p><strong>Priority:</strong></p>
+<ul>
+<li>
+<p>Assign higher priority to important pages (e.g., by PageRank or update frequency).</p>
+  <img loading="lazy" decoding="async" src="../../system-design-notes/09.%20Web%20Crawler/images/prioritizer.png" alt="Politeness" data-width="500" style="max-width:500px">
+</li>
+<li>
+<p><strong>Prioritizer:</strong> It takes URLs as input and computes the priorities.</p>
+</li>
+<li>
+<p><strong>Queue f1 to fn:</strong> Each queue has an assigned priority. Queues with high priority are selected with higher probability.</p>
+</li>
+<li>
+<p><strong>Queue selector:</strong> Randomly choose a queue with a bias towards queues with higher priority.</p>
+</li>
+<li>
+<p><strong>Front queues:</strong> manage prioritization</p>
+</li>
+<li>
+<p><strong>Back queues:</strong> manage politeness</p>
+</li>
+</ul>
+</li>
+</ul>
+<p><strong>Why two tiers rather than one queue.</strong> The two requirements are genuinely incompatible in a single structure:</p>
+<ul>
+<li>A pure <strong>priority</strong> queue would pop the highest-priority URLs back to back — and because links cluster by host, those are frequently from the same host. Politeness broken.</li>
+<li>A pure <strong>politeness</strong> arrangement (one queue per host, round-robin) treats a link-farm host and Wikipedia as equals. Priority ignored.</li>
+</ul>
+<p>The two-tier design resolves this by separating <em>what to crawl next</em> from <em>when it is allowed to be crawled</em>. Front queues decide importance; a URL then drains into a back queue keyed by host, which decides timing. Each tier is simple; only the composition is clever.</p>
+<figure class="mermaid-fig">
+<svg id="mmd-206d861c159473ac" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 521.195px; background-color: transparent;" viewBox="0 0 521.1953125 736" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-206d861c159473ac{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-206d861c159473ac .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-206d861c159473ac .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-206d861c159473ac .error-icon{fill:#f4f6f8;}#mmd-206d861c159473ac .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-206d861c159473ac .edge-thickness-normal{stroke-width:1px;}#mmd-206d861c159473ac .edge-thickness-thick{stroke-width:3.5px;}#mmd-206d861c159473ac .edge-pattern-solid{stroke-dasharray:0;}#mmd-206d861c159473ac .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-206d861c159473ac .edge-pattern-dashed{stroke-dasharray:3;}#mmd-206d861c159473ac .edge-pattern-dotted{stroke-dasharray:2;}#mmd-206d861c159473ac .marker{fill:#637381;stroke:#637381;}#mmd-206d861c159473ac .marker.cross{stroke:#637381;}#mmd-206d861c159473ac svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-206d861c159473ac p{margin:0;}#mmd-206d861c159473ac .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-206d861c159473ac .cluster-label text{fill:#454f5b;}#mmd-206d861c159473ac .cluster-label span{color:#454f5b;}#mmd-206d861c159473ac .cluster-label span p{background-color:transparent;}#mmd-206d861c159473ac .label text,#mmd-206d861c159473ac span{fill:#161c24;color:#161c24;}#mmd-206d861c159473ac .node rect,#mmd-206d861c159473ac .node circle,#mmd-206d861c159473ac .node ellipse,#mmd-206d861c159473ac .node polygon,#mmd-206d861c159473ac .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-206d861c159473ac .rough-node .label text,#mmd-206d861c159473ac .node .label text,#mmd-206d861c159473ac .image-shape .label,#mmd-206d861c159473ac .icon-shape .label{text-anchor:middle;}#mmd-206d861c159473ac .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-206d861c159473ac .rough-node .label,#mmd-206d861c159473ac .node .label,#mmd-206d861c159473ac .image-shape .label,#mmd-206d861c159473ac .icon-shape .label{text-align:center;}#mmd-206d861c159473ac .node.clickable{cursor:pointer;}#mmd-206d861c159473ac .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-206d861c159473ac .arrowheadPath{fill:#000000;}#mmd-206d861c159473ac .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-206d861c159473ac .flowchart-link{stroke:#637381;fill:none;}#mmd-206d861c159473ac .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-206d861c159473ac .edgeLabel p{background-color:#ffffff;}#mmd-206d861c159473ac .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-206d861c159473ac .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-206d861c159473ac .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-206d861c159473ac .cluster text{fill:#454f5b;}#mmd-206d861c159473ac .cluster span{color:#454f5b;}#mmd-206d861c159473ac .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-206d861c159473ac .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-206d861c159473ac div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-206d861c159473ac .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-206d861c159473ac rect.text{fill:none;stroke-width:0;}#mmd-206d861c159473ac .icon-shape,#mmd-206d861c159473ac .image-shape{background-color:#ffffff;text-align:center;}#mmd-206d861c159473ac .icon-shape p,#mmd-206d861c159473ac .image-shape p{background-color:#ffffff;padding:2px;}#mmd-206d861c159473ac .icon-shape .label rect,#mmd-206d861c159473ac .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-206d861c159473ac .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-206d861c159473ac .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-206d861c159473ac .node .neo-node{stroke:#299a8d;}#mmd-206d861c159473ac [data-look="neo"].node rect,#mmd-206d861c159473ac [data-look="neo"].cluster rect,#mmd-206d861c159473ac [data-look="neo"].node polygon{stroke:url(#mmd-206d861c159473ac-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-206d861c159473ac [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-206d861c159473ac [data-look="neo"].node path{stroke:url(#mmd-206d861c159473ac-gradient);stroke-width:1px;}#mmd-206d861c159473ac [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-206d861c159473ac [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-206d861c159473ac [data-look="neo"].node circle{stroke:url(#mmd-206d861c159473ac-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-206d861c159473ac [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-206d861c159473ac [data-look="neo"].icon-shape .icon{fill:url(#mmd-206d861c159473ac-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-206d861c159473ac [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-206d861c159473ac-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-206d861c159473ac :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-206d861c159473ac_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-206d861c159473ac_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-206d861c159473ac_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-206d861c159473ac_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-206d861c159473ac_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-206d861c159473ac_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-206d861c159473ac_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-206d861c159473ac_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-206d861c159473ac_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-206d861c159473ac_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-206d861c159473ac_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-206d861c159473ac_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M276.23,53L276.23,57.167C276.23,61.333,276.23,69.667,276.23,77.333C276.23,85,276.23,92,276.23,95.5L276.23,99" id="mmd-206d861c159473ac-L_U_PR_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_U_PR_0" data-points="W3sieCI6Mjc2LjIzMDQ2ODc1LCJ5Ijo1M30seyJ4IjoyNzYuMjMwNDY4NzUsInkiOjc4fSx7IngiOjI3Ni4yMzA0Njg3NSwieSI6MTAzfV0=" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M189.957,190L181.694,194.167C173.43,198.333,156.902,206.667,148.639,214.333C140.375,222,140.375,229,140.375,232.5L140.375,236" id="mmd-206d861c159473ac-L_PR_F1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PR_F1_0" data-points="W3sieCI6MTg5Ljk1NzI4Nzg2NDk2MzUyLCJ5IjoxOTB9LHsieCI6MTQwLjM3NSwieSI6MjE1fSx7IngiOjE0MC4zNzUsInkiOjI0MH1d" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M273.316,190L273.037,194.167C272.757,198.333,272.199,206.667,271.92,214.333C271.641,222,271.641,229,271.641,232.5L271.641,236" id="mmd-206d861c159473ac-L_PR_F2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PR_F2_0" data-points="W3sieCI6MjczLjMxNTc1MDQ1NjIwNDQsInkiOjE5MH0seyJ4IjoyNzEuNjQwNjI1LCJ5IjoyMTV9LHsieCI6MjcxLjY0MDYyNSwieSI6MjQwfV0=" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M355.32,190L362.895,194.167C370.471,198.333,385.622,206.667,393.198,214.333C400.773,222,400.773,229,400.773,232.5L400.773,236" id="mmd-206d861c159473ac-L_PR_F3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PR_F3_0" data-points="W3sieCI6MzU1LjMxOTc5OTI3MDA3Mjk2LCJ5IjoxOTB9LHsieCI6NDAwLjc3MzQzNzUsInkiOjIxNX0seyJ4Ijo0MDAuNzczNDM3NSwieSI6MjQwfV0=" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M140.375,285L140.375,289.167C140.375,293.333,140.375,301.667,149.446,309.736C158.516,317.806,176.658,325.613,185.729,329.516L194.799,333.419" id="mmd-206d861c159473ac-L_F1_QS1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_F1_QS1_0" data-points="W3sieCI6MTQwLjM3NSwieSI6Mjg1fSx7IngiOjE0MC4zNzUsInkiOjMxMH0seyJ4IjoxOTguNDczNzMzODM2MjA2OSwieSI6MzM1fV0=" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M271.641,285L271.641,289.167C271.641,293.333,271.641,301.667,271.853,309.335C272.066,317.002,272.491,324.005,272.704,327.506L272.917,331.007" id="mmd-206d861c159473ac-L_F2_QS1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_F2_QS1_0" data-points="W3sieCI6MjcxLjY0MDYyNSwieSI6Mjg1fSx7IngiOjI3MS42NDA2MjUsInkiOjMxMH0seyJ4IjoyNzMuMTU5MzQ4MDYwMzQ0OCwieSI6MzM1fV0=" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M400.773,285L400.773,289.167C400.773,293.333,400.773,301.667,392.355,309.721C383.937,317.774,367.1,325.549,358.681,329.436L350.263,333.323" id="mmd-206d861c159473ac-L_F3_QS1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_F3_QS1_0" data-points="W3sieCI6NDAwLjc3MzQzNzUsInkiOjI4NX0seyJ4Ijo0MDAuNzczNDM3NSwieSI6MzEwfSx7IngiOjM0Ni42MzE0NjU1MTcyNDE0LCJ5IjozMzV9XQ==" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M275.164,401L275.164,405.167C275.164,409.333,275.164,417.667,275.164,425.333C275.164,433,275.164,440,275.164,443.5L275.164,447" id="mmd-206d861c159473ac-L_QS1_RTR_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_QS1_RTR_0" data-points="W3sieCI6Mjc1LjE2NDA2MjUsInkiOjQwMX0seyJ4IjoyNzUuMTY0MDYyNSwieSI6NDI2fSx7IngiOjI3NS4xNjQwNjI1LCJ5Ijo0NTF9XQ==" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M170.15,517L156.891,521.167C143.631,525.333,117.112,533.667,103.853,541.333C90.594,549,90.594,556,90.594,559.5L90.594,563" id="mmd-206d861c159473ac-L_RTR_B1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RTR_B1_0" data-points="W3sieCI6MTcwLjE0OTkxOTE4MTAzNDQ4LCJ5Ijo1MTd9LHsieCI6OTAuNTkzNzUsInkiOjU0Mn0seyJ4Ijo5MC41OTM3NSwieSI6NTY3fV0=" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M275.164,517L275.164,521.167C275.164,525.333,275.164,533.667,275.164,541.333C275.164,549,275.164,556,275.164,559.5L275.164,563" id="mmd-206d861c159473ac-L_RTR_B2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RTR_B2_0" data-points="W3sieCI6Mjc1LjE2NDA2MjUsInkiOjUxN30seyJ4IjoyNzUuMTY0MDYyNSwieSI6NTQyfSx7IngiOjI3NS4xNjQwNjI1LCJ5Ijo1Njd9XQ==" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M374.955,517L387.555,521.167C400.155,525.333,425.355,533.667,437.955,541.333C450.555,549,450.555,556,450.555,559.5L450.555,563" id="mmd-206d861c159473ac-L_RTR_B3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RTR_B3_0" data-points="W3sieCI6Mzc0Ljk1NTI4MDE3MjQxMzgsInkiOjUxN30seyJ4Ijo0NTAuNTU0Njg3NSwieSI6NTQyfSx7IngiOjQ1MC41NTQ2ODc1LCJ5Ijo1Njd9XQ==" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M90.594,612L90.594,616.167C90.594,620.333,90.594,628.667,90.594,636.333C90.594,644,90.594,651,90.594,654.5L90.594,658" id="mmd-206d861c159473ac-L_B1_W1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B1_W1_0" data-points="W3sieCI6OTAuNTkzNzUsInkiOjYxMn0seyJ4Ijo5MC41OTM3NSwieSI6NjM3fSx7IngiOjkwLjU5Mzc1LCJ5Ijo2NjJ9XQ==" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M275.164,612L275.164,616.167C275.164,620.333,275.164,628.667,275.164,638.083C275.164,647.5,275.164,658,275.164,663.25L275.164,668.5" id="mmd-206d861c159473ac-L_B2_W2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B2_W2_0" data-points="W3sieCI6Mjc1LjE2NDA2MjUsInkiOjYxMn0seyJ4IjoyNzUuMTY0MDYyNSwieSI6NjM3fSx7IngiOjI3NS4xNjQwNjI1LCJ5Ijo2NzIuNX1d" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/><path d="M450.555,612L450.555,616.167C450.555,620.333,450.555,628.667,450.555,638.083C450.555,647.5,450.555,658,450.555,663.25L450.555,668.5" id="mmd-206d861c159473ac-L_B3_W3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B3_W3_0" data-points="W3sieCI6NDUwLjU1NDY4NzUsInkiOjYxMn0seyJ4Ijo0NTAuNTU0Njg3NSwieSI6NjM3fSx7IngiOjQ1MC41NTQ2ODc1LCJ5Ijo2NzIuNX1d" data-look="classic" marker-end="url(#mmd-206d861c159473ac_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_U_PR_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_PR_F1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_PR_F2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_PR_F3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_F1_QS1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_F2_QS1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_F3_QS1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_QS1_RTR_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RTR_B1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RTR_B2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RTR_B3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_B1_W1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_B2_W2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_B3_W3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-206d861c159473ac-flowchart-U-0" data-look="classic" transform="translate(276.23046875, 30.5)"><rect class="basic label-container" style="" x="-48.6328125" y="-22.5" width="97.265625" height="45"/><g class="label" style="" transform="translate(-24.6328125, -10.5)"><rect/><foreignObject width="49.265625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>URLs in</p></span></div></foreignObject></g></g><g class="node default" id="mmd-206d861c159473ac-flowchart-PR-1" data-look="classic" transform="translate(276.23046875, 146.5)"><rect class="basic label-container" style="" x="-124" y="-43.5" width="248" height="87"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Prioritizer<br />(PageRank, update rate, depth)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-206d861c159473ac-flowchart-F1-3" data-look="classic" transform="translate(140.375, 262.5)"><rect class="basic label-container" style="" x="-50.65625" y="-22.5" width="101.3125" height="45"/><g class="label" style="" transform="translate(-26.65625, -10.5)"><rect/><foreignObject width="53.3125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>f1 (high)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-206d861c159473ac-flowchart-F2-5" data-look="classic" transform="translate(271.640625, 262.5)"><rect class="basic label-container" style="" x="-30.609375" y="-22.5" width="61.21875" height="45"/><g class="label" style="" transform="translate(-6.609375, -10.5)"><rect/><foreignObject width="13.21875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>f2</p></span></div></foreignObject></g></g><g class="node default" id="mmd-206d861c159473ac-flowchart-F3-7" data-look="classic" transform="translate(400.7734375, 262.5)"><rect class="basic label-container" style="" x="-48.5234375" y="-22.5" width="97.046875" height="45"/><g class="label" style="" transform="translate(-24.5234375, -10.5)"><rect/><foreignObject width="49.046875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>fn (low)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-206d861c159473ac-flowchart-QS1-9" data-look="classic" transform="translate(275.1640625, 368)"><rect class="basic label-container" style="" x="-106.53125" y="-33" width="213.0625" height="66"/><g class="label" style="" transform="translate(-82.53125, -21)"><rect/><foreignObject width="165.0625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Queue selector<br />biased random by priority</p></span></div></foreignObject></g></g><g class="node default" id="mmd-206d861c159473ac-flowchart-RTR-15" data-look="classic" transform="translate(275.1640625, 484)"><rect class="basic label-container" style="" x="-106.3671875" y="-33" width="212.734375" height="66"/><g class="label" style="" transform="translate(-82.3671875, -21)"><rect/><foreignObject width="164.734375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Queue router<br />hash(host) → back queue</p></span></div></foreignObject></g></g><g class="node default" id="mmd-206d861c159473ac-flowchart-B1-17" data-look="classic" transform="translate(90.59375, 589.5)"><rect class="basic label-container" style="" x="-61.71875" y="-22.5" width="123.4375" height="45"/><g class="label" style="" transform="translate(-37.71875, -10.5)"><rect/><foreignObject width="75.4375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>b1 — host A</p></span></div></foreignObject></g></g><g class="node default" id="mmd-206d861c159473ac-flowchart-B2-19" data-look="classic" transform="translate(275.1640625, 589.5)"><rect class="basic label-container" style="" x="-62.75" y="-22.5" width="125.5" height="45"/><g class="label" style="" transform="translate(-38.75, -10.5)"><rect/><foreignObject width="77.5" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>b2 — host B</p></span></div></foreignObject></g></g><g class="node default" id="mmd-206d861c159473ac-flowchart-B3-21" data-look="classic" transform="translate(450.5546875, 589.5)"><rect class="basic label-container" style="" x="-62.640625" y="-22.5" width="125.28125" height="45"/><g class="label" style="" transform="translate(-38.640625, -10.5)"><rect/><foreignObject width="77.28125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>bn — host Z</p></span></div></foreignObject></g></g><g class="node default" id="mmd-206d861c159473ac-flowchart-W1-23" data-look="classic" transform="translate(90.59375, 695)"><rect class="basic label-container" style="" x="-82.59375" y="-33" width="165.1875" height="66"/><g class="label" style="" transform="translate(-58.59375, -21)"><rect/><foreignObject width="117.1875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>worker 1<br />sequential + delay</p></span></div></foreignObject></g></g><g class="node default" id="mmd-206d861c159473ac-flowchart-W2-25" data-look="classic" transform="translate(275.1640625, 695)"><rect class="basic label-container" style="" x="-51.9765625" y="-22.5" width="103.953125" height="45"/><g class="label" style="" transform="translate(-27.9765625, -10.5)"><rect/><foreignObject width="55.953125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>worker 2</p></span></div></foreignObject></g></g><g class="node default" id="mmd-206d861c159473ac-flowchart-W3-27" data-look="classic" transform="translate(450.5546875, 695)"><rect class="basic label-container" style="" x="-51.8359375" y="-22.5" width="103.671875" height="45"/><g class="label" style="" transform="translate(-27.8359375, -10.5)"><rect/><foreignObject width="55.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>worker n</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-206d861c159473ac-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-206d861c159473ac-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-206d861c159473ac-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<ul>
+<li><strong>Freshness:</strong> Recrawl based on update history or importance.</li>
+</ul>
+<p>Recrawling is where a crawler spends most of its life — after the first pass, nearly all work is revisiting pages you already have. Two mechanisms make it affordable:</p>
+<ul>
+<li><strong>Adaptive scheduling.</strong> Track how often each page actually changed and recrawl at a rate that matches. A news front page earns minutes; an archived PDF earns months. Crawling everything on one fixed schedule wastes the great majority of requests.</li>
+<li><strong>Conditional GET.</strong> Send <code>If-Modified-Since</code> or <code>If-None-Match</code> with the stored <code>ETag</code>. An unchanged page answers <code>304 Not Modified</code> with no body — the request still costs politeness budget and a round trip, but not the 500 KB. Sitemaps and <code>lastmod</code> hints help further, when the site is honest about them.</li>
+</ul>
+<h3 id="html-downloader">HTML Downloader</h3>
+<ul>
+<li><strong>Robots.txt Compliance:</strong> Respect rules in robots.txt files.</li>
+<li><strong>Performance Optimizations:</strong>
+<ol>
+<li>Distributed crawling using multiple servers.</li>
+<li>Use a <strong>DNS cache</strong> to avoid repeated lookups.</li>
+<li>Geographically distribute crawl servers for faster downloads.</li>
+<li>Use a short timeout to avoid slow or unresponsive servers.</li>
+</ol>
+</li>
+</ul>
+<p><strong>robots.txt is a per-host fetch that must happen first</strong>, so a cold host costs an extra round trip before its first page. Cache the parsed result per host with a TTL (a day is typical) and re-fetch on expiry — a site that adds a <code>Disallow</code> expects it to take effect. The file may also carry <code>Crawl-delay</code>, which overrides your default politeness interval, and a <code>Sitemap:</code> pointer, which is free frontier seeding. Treat a 5xx on robots.txt as &quot;disallow for now&quot; rather than &quot;allow&quot;: failing open against a struggling server is how a crawler turns a bad day into an outage.</p>
+<p><strong>DNS is the bottleneck people do not predict.</strong> A resolution takes tens to hundreds of milliseconds, and the standard library resolver is synchronous — one blocked lookup stalls a thread that should be downloading. At 400 pages/second across thousands of hosts, this dominates. The fixes are an <strong>asynchronous resolver</strong> and an aggressive cache; the subtlety is that caching DNS past its TTL will eventually send you to a decommissioned IP, so respect the TTL even when it is inconveniently short.</p>
+<p><strong>Short timeouts are a correctness mechanism, not just an optimisation.</strong> Some servers accept a connection and then never respond. Without a hard timeout, each one permanently consumes a worker, and the crawler bleeds capacity until it stops. Cap connect time, read time, total time, <em>and</em> response size — an unbounded download or a decompression bomb is the same failure in a different costume.</p>
+<h3 id="robustness">Robustness</h3>
+<ol>
+<li><strong>Consistent Hashing:</strong> Distribute load among servers effectively.</li>
+<li><strong>Error Handling:</strong> Prevent system crashes from exceptions.</li>
+<li><strong>Data Validation:</strong> Ensure content integrity.</li>
+</ol>
+<p>Add two more that matter at this scale:</p>
+<ol start="4">
+<li><strong>Checkpointing.</strong> A frontier of hundreds of millions of URLs cannot be rebuilt from seeds after a crash — that would mean recrawling the web. Persist the frontier and the seen-sets to disk and snapshot them periodically, so a restart resumes rather than restarts.</li>
+<li><strong>Treating all remote input as hostile.</strong> Malformed HTML, invalid encodings, mislabelled content types, redirect loops, and 200-responses-containing-error-pages (&quot;soft 404s&quot;) are the normal case, not the exception. Every parser must fail on one page without taking down the worker.</li>
+</ol>
+<h3 id="extensibility">Extensibility</h3>
+<ul>
+<li>
+<p>Add modules for new content types (e.g., PNG downloader, web monitor).</p>
+</li>
+<li>
+<p>Example: Plug in a module to monitor web content for copyright violations.</p>
+  <img loading="lazy" decoding="async" src="../../system-design-notes/09.%20Web%20Crawler/images/extensibility.png" alt="Politeness" data-width="600" style="max-width:600px">
+</li>
+</ul>
+<hr>
+<h3 id="avoiding-problematic-content">Avoiding Problematic Content</h3>
+<ol>
+<li><strong>Duplicate Content:</strong> Detect using hash comparisons.</li>
+<li><strong>Spider Traps:</strong> Avoid infinite loops with techniques like URL length limits.</li>
+<li><strong>Data Noise:</strong> Filter irrelevant content like ads or spam.</li>
+</ol>
+<h4 id="duplicate-content-why-an-exact-hash-is-not-enough">Duplicate content: why an exact hash is not enough</h4>
+<p>Roughly a third of the web is duplicated. Exact hashing catches only the easy cases — the same bytes served twice. It misses the dominant form of redundancy: pages that are <em>nearly</em> identical, differing by a rotating advertisement, a session ID in a footer, or a &quot;last updated&quot; timestamp. One changed character gives a completely different hash.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Technique</th>
+<th>Catches</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MD5/SHA of the body</td>
+<td>Byte-identical pages only</td>
+<td>Trivial</td>
+</tr>
+<tr>
+<td>Hash after boilerplate stripping</td>
+<td>Same article under different templates</td>
+<td>Cheap, fragile</td>
+</tr>
+<tr>
+<td><strong>Shingling + SimHash / MinHash</strong></td>
+<td>Near-duplicates, by similarity threshold</td>
+<td>A fingerprint per page, comparable in near-constant time</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>SimHash is the practical answer: hash overlapping word <em>shingles</em> into a single fixed-width fingerprint whose <strong>Hamming distance</strong> approximates document similarity, so &quot;is this within 3 bits of anything I have seen?&quot; becomes a cheap lookup rather than an all-pairs comparison.</p>
+<h4 id="url-canonicalization-the-step-that-makes-url-seen-work">URL canonicalization: the step that makes &quot;URL seen?&quot; work</h4>
+<p>These are all the same page, and a crawler that does not normalise them will fetch it five times and count it as five pages:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>http://Example.com/a/           https://example.com/a/
+http://example.com:80/a/        http://example.com/a/index.html
+http://example.com/a/#section   http://example.com/a/?utm_source=twitter
+</code></pre></div>
+<p>Canonicalization lowercases the host, drops the default port, removes the fragment, strips known tracking parameters, sorts the remaining query parameters, and resolves <code>.</code>/<code>..</code>. It is unglamorous string handling that directly determines whether your dedup works at all.</p>
+<h4 id="spider-traps-concretely">Spider traps, concretely</h4>
+<p>A trap is any part of the web that generates infinite distinct URLs:</p>
+<ul>
+<li><strong>Infinite calendars</strong> — <code>/calendar?month=2847</code> is always a valid, linkable, never-before-seen page.</li>
+<li><strong>Session IDs in paths</strong> — every visit mints a new URL for identical content.</li>
+<li><strong>Parameter permutations</strong> — faceted search with six filters produces a combinatorial explosion of URLs.</li>
+<li><strong>Deep recursion</strong> — <code>/a/b/a/b/a/b/…</code> from a broken relative link.</li>
+</ul>
+<p>No single defence covers all of them, so crawlers stack several: a <strong>URL length cap</strong>, a <strong>depth cap</strong>, a <strong>per-host page budget</strong>, canonicalization, and near-duplicate detection to notice that the content is not actually new. The per-host budget is the most important of the five, because it bounds the damage from a trap you failed to recognise.</p>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
+<h3 id="key-takeaways">Key Takeaways</h3>
+<ol>
+<li>Web crawlers must balance scalability, robustness, politeness, and extensibility.</li>
+<li><strong>Politeness</strong> prevents overloading servers, while <strong>priority</strong> ensures important pages are crawled first.</li>
+<li>Efficient storage and error handling are crucial for handling large-scale crawling.</li>
+</ol>
+<h3 id="additional-considerations">Additional Considerations</h3>
+<ul>
+<li><strong>Server-Side Rendering:</strong> Handle dynamic content generated by JavaScript or AJAX.</li>
+<li><strong>Anti-Spam Measures:</strong> Exclude low-quality or irrelevant pages.</li>
+<li><strong>Database Sharding:</strong> Scale the data layer using replication and sharding.</li>
+<li><strong>Horizontal Scaling:</strong> Use stateless servers to scale crawl jobs efficiently.</li>
+<li><strong>Analytics:</strong> Collect and analyze data for insights.</li>
+</ul>
+<p><strong>Rendering is the expensive one.</strong> Fetching HTML costs a request; rendering a page in a headless browser to see what JavaScript produces costs a browser process, seconds of CPU, and all the subresource requests. That is one to two orders of magnitude more per page, which is why real crawlers maintain two pipelines: cheap HTML fetching for everything, and a rendering pipeline for the subset of pages judged worth it. Note that &quot;horizontal scaling with stateless servers&quot; does <strong>not</strong> apply to the frontier — politeness state is inherently stateful and host-partitioned, which is the one place this crawler cannot be stateless.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>the deep-dive follow-ups worth rehearsing are &quot;how do you know you have already seen a URL, given billions of them?&quot; (Bloom filter, and what its false positive costs you), &quot;two URLs serve the same article — how do you notice?&quot; (canonicalization, then SimHash), and &quot;what stops an infinite calendar consuming your whole crawl?&quot; (per-host budget plus depth and length caps).</p>
+</div>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Politeness and throughput trade directly against each other.</strong> The only lever that raises throughput without being rude is <em>breadth</em> — more hosts in flight. Lowering the per-host delay is how a crawler gets its IP range blocked.</li>
+<li><strong>The frontier does not fit in memory.</strong> Hundreds of millions of pending URLs must be disk-backed with an in-memory buffer, and must survive a restart. A crawler that loses its frontier has lost weeks of work.</li>
+<li><strong>A Bloom filter false positive silently drops a page.</strong> &quot;URL seen?&quot; answering yes when it has not been seen means that page is never crawled, and nothing logs an error. There are no false negatives, so you never double-crawl — the error is always in the direction of missing content. Size the filter so that rate is acceptable, and know the number.</li>
+<li><strong>Exact-hash dedup misses most duplicates.</strong> One rotating ad defeats it. Without near-duplicate detection you store the same content many times and feed the index redundant results.</li>
+<li><strong>Without canonicalization, dedup does not work at all.</strong> Case, trailing slashes, default ports, fragments, and tracking parameters each multiply your crawl of the same page.</li>
+<li><strong>Partitioning the frontier by URL breaks politeness.</strong> Every node then holds some of a host's URLs, and each stays under its own limit while the host is collectively overwhelmed. Partition by <strong>host</strong>.</li>
+<li><strong>DNS resolution stalls workers.</strong> Synchronous lookups at thousands of hosts per second dominate latency; a stale DNS cache that ignores TTL eventually crawls decommissioned IPs.</li>
+<li><strong>Slow and hostile servers consume workers permanently.</strong> Connections that open and never respond need hard timeouts on connect, read, total duration, and response size. Decompression bombs and multi-gigabyte &quot;HTML&quot; files belong in the same category.</li>
+<li><strong>Soft 404s and redirect loops poison the data.</strong> A 200 response containing &quot;page not found&quot; gets indexed as content; redirect chains must be followed with a hop limit and the final URL canonicalized, or you will record the alias rather than the page.</li>
+<li><strong>robots.txt failing open turns a struggling site into a downed site.</strong> If you cannot fetch it, do not crawl; and re-fetch on TTL expiry so newly added restrictions take effect.</li>
+<li><strong>One huge site can consume the entire crawl.</strong> A site with a hundred million pages will happily supply a hundred million URLs. Per-host and per-domain budgets are what keep the crawl representative rather than dominated.</li>
+<li><strong>Trap detection is never complete.</strong> New traps are generated faster than you can enumerate patterns, so the defences must be generic (budgets, caps, content-similarity) rather than a blocklist of known shapes.</li>
+<li><strong>Identify yourself.</strong> A descriptive <code>User-Agent</code> with a contact URL is how site operators tell your crawler from an attack, and how they reach you instead of blocking you.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>400 pages/sec without overloading any host</td>
+<td>Thousands of hosts in flight; one connection per host plus a delay</td>
+</tr>
+<tr>
+<td>Priority and politeness at the same time</td>
+<td>Two-tier frontier: front queues prioritise, back queues enforce per-host timing</td>
+</tr>
+<tr>
+<td>Keeping a host's rate limit correct across machines</td>
+<td>Partition the frontier by host with consistent hashing</td>
+</tr>
+<tr>
+<td>Remembering billions of visited URLs</td>
+<td>Bloom filter rather than an exact set, accepting a known miss rate</td>
+</tr>
+<tr>
+<td>Not storing the same content repeatedly</td>
+<td>Shingling plus SimHash fingerprints, compared by Hamming distance</td>
+</tr>
+<tr>
+<td>Not fetching the same page under different names</td>
+<td>URL canonicalization before the seen-check</td>
+</tr>
+<tr>
+<td>Surviving infinite URL spaces</td>
+<td>URL length cap, depth cap, per-host page budget</td>
+</tr>
+<tr>
+<td>Not re-downloading unchanged pages</td>
+<td>Conditional GET with <code>ETag</code> / <code>If-Modified-Since</code>; adaptive recrawl intervals</td>
+</tr>
+<tr>
+<td>DNS not becoming the bottleneck</td>
+<td>Asynchronous resolver plus a TTL-respecting cache</td>
+</tr>
+<tr>
+<td>Surviving a crash without recrawling the web</td>
+<td>Periodic checkpointing of frontier and seen-sets</td>
+</tr>
+<tr>
+<td>Supporting new content types</td>
+<td>Pluggable downloader/parser modules behind the same frontier</td>
+</tr>
+<tr>
+<td>Handling JavaScript-rendered pages</td>
+<td>A separate, far more expensive headless-rendering pipeline for selected pages</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Politeness allows about one page per second per host. What does that imply about the number of hosts you must crawl concurrently to reach 400 pages/sec?</li>
+<li>Why is plain BFS not merely unprioritised but actively impolite?</li>
+<li>What exactly would break if you merged the front and back queues into a single priority queue?</li>
+<li>Why must the frontier be partitioned by host rather than by URL in a multi-machine crawler?</li>
+<li>A Bloom filter reports a URL as seen when it has not been. What is the consequence, and why is the opposite error impossible?</li>
+<li>Two URLs serve the same article with one rotating advertisement. Which dedup check catches it, and which does not?</li>
+<li>List four URL variations that are the same page, and what canonicalization does to each.</li>
+<li>Describe a spider trap and the two independent defences that limit its damage.</li>
+<li>Why is DNS a bottleneck at this scale, and what breaks if you cache resolutions past their TTL?</li>
+<li>Which part of this system cannot be made stateless, and why?</li>
+<li>You have already crawled a billion pages. What is most of your traffic now, and which HTTP feature makes it cheap?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>URL frontier</strong></td>
+<td>The prioritised, politeness-aware store of URLs still to be fetched</td>
+</tr>
+<tr>
+<td><strong>Politeness</strong></td>
+<td>Limiting request rate per host; the crawler's primary throughput constraint</td>
+</tr>
+<tr>
+<td><strong>Front / back queues</strong></td>
+<td>The two frontier tiers: priority selection, then per-host timing</td>
+</tr>
+<tr>
+<td><strong>Queue router / mapping table</strong></td>
+<td>The stable host → back-queue assignment that guarantees one worker per host</td>
+</tr>
+<tr>
+<td><strong>Seed URLs</strong></td>
+<td>The starting set from which the traversal reaches everything else</td>
+</tr>
+<tr>
+<td><strong>URL seen? / content seen?</strong></td>
+<td>Dedup checks that avoid refetching a URL and restoring identical content</td>
+</tr>
+<tr>
+<td><strong>Canonicalization</strong></td>
+<td>Normalising URL variants to one form before the seen-check</td>
+</tr>
+<tr>
+<td><strong>Shingling</strong></td>
+<td>Splitting a document into overlapping token sequences for similarity comparison</td>
+</tr>
+<tr>
+<td><strong>SimHash / MinHash</strong></td>
+<td>Fingerprints whose distance approximates document similarity</td>
+</tr>
+<tr>
+<td><strong>Spider trap</strong></td>
+<td>A region of the web generating unbounded distinct URLs</td>
+</tr>
+<tr>
+<td><strong>Soft 404</strong></td>
+<td>An error page returned with a 200 status, indistinguishable from content by status alone</td>
+</tr>
+<tr>
+<td><strong>Conditional GET</strong></td>
+<td><code>If-Modified-Since</code> / <code>If-None-Match</code>, answered with <code>304</code> when unchanged</td>
+</tr>
+<tr>
+<td><strong>Crawl-delay</strong></td>
+<td>A <code>robots.txt</code> directive overriding the crawler's default per-host interval</td>
+</tr>
+<tr>
+<td><strong>Crawl budget</strong></td>
+<td>A cap on pages fetched per host or domain, keeping one site from dominating</td>
+</tr>
+<tr>
+<td><strong>Checkpointing</strong></td>
+<td>Persisting frontier and seen-state so a restart resumes rather than begins again</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="06-key-value-store.html">Chapter 6 – Design A Key-Value Store</a> — Bloom filters in their other home, used for exactly the same reason: proving a negative without touching disk.</li>
+<li><a href="05-consistent-hashing.html">Chapter 5 – Design Consistent Hashing</a> — how the frontier is partitioned by host across machines.</li>
+<li><a href="01-scaling.html#section-10-message-queue">Chapter 1 §10 – Message Queue</a> — the decoupling that lets downloaders, parsers and extractors scale independently.</li>
+<li><a href="13-search-autocomplete.html">Chapter 13 – Design A Search Autocomplete System</a> — what happens to the crawled corpus once it is indexed.</li>
+<li><a href="http://infolab.stanford.edu/~olston/publications/crawling_survey.pdf" target="_blank" rel="noopener">Web Crawling (Olston &amp; Najork)</a> — the survey this chapter compresses.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

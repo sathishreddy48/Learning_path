@@ -1,0 +1,709 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 15: Design Google Drive — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="15-google-drive">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 1 Systems › Chapter 15 of 28</div>
+  <h1>Chapter 15: Design Google Drive</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understanding-the-problem">Step 1: Understanding the Problem</a></li><li><a href="#step-2-high-level-design">Step 2: High-Level Design</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>Google Drive is a cloud-based file storage and synchronization service that allows users to store, access, and share files from various devices. This chapter discusses designing a scalable system with the following features:</p>
+<ul>
+<li><strong>File Upload and Download</strong></li>
+<li><strong>File Sync Across Devices</strong></li>
+<li><strong>File Sharing</strong></li>
+<li><strong>File Revision History</strong></li>
+<li><strong>Notifications for Edits, Deletes, and Shares</strong></li>
+</ul>
+<p><strong>The one-sentence version:</strong> this looks like a storage problem and is actually a <strong>synchronization</strong> problem. Storing the bytes is a solved exercise — put them in object storage (<a href="24-s3-like-object-storage.html">Chapter 24</a>) — but keeping many devices' views of a mutable file tree agreeing with each other, over networks that drop, while transferring as few bytes as possible, is not.</p>
+<p>Nearly every design decision here follows from one choice: <strong>split files into content-addressed blocks.</strong> That single decision is what makes delta sync, deduplication, resumable upload and parallel transfer possible, and it is also the source of most of the chapter's subtleties.</p>
+<hr>
+</section>
+<section id="step-1-understanding-the-problem">
+<h2 id="step-1-understanding-the-problem">Step 1: Understanding the Problem</h2>
+<h3 id="key-requirements">Key Requirements</h3>
+<h4 id="functional-requirements">Functional Requirements:</h4>
+<ul>
+<li>Upload and download files.</li>
+<li>Sync files across multiple devices.</li>
+<li>Maintain file revisions.</li>
+<li>Enable file sharing with permissions.</li>
+<li>Send notifications on file edits, deletions, and shares.</li>
+</ul>
+<h4 id="non-functional-requirements">Non-Functional Requirements:</h4>
+<ul>
+<li><strong>Reliability:</strong> Data loss is unacceptable.</li>
+<li><strong>Fast Sync Speed:</strong> Avoid user impatience with delayed syncing.</li>
+<li><strong>Bandwidth Efficiency:</strong> Minimize unnecessary data usage.</li>
+<li><strong>Scalability:</strong> Handle 10 million daily active users (DAU).</li>
+<li><strong>High Availability:</strong> Operate seamlessly during server failures or network issues.</li>
+</ul>
+<h3 id="constraints-and-assumptions">Constraints and Assumptions</h3>
+<ul>
+<li>Users get <strong>10 GB free space</strong>.</li>
+<li>Maximum file size: <strong>10 GB</strong>.</li>
+<li>Average file upload size: <strong>500 KB</strong>.</li>
+<li>Upload frequency: <strong>2 files per day per user</strong>.</li>
+<li>Total storage required: <strong>500 PB</strong>.</li>
+</ul>
+<h3 id="what-is-actually-under-pressure">What is actually under pressure</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Derivation</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Uploads/day</td>
+<td>10 M × 2 files</td>
+<td>20 M (<strong>~232 uploads/sec</strong>)</td>
+</tr>
+<tr>
+<td>Bytes uploaded/day</td>
+<td>20 M × 500 KB</td>
+<td><strong>~10 TB/day</strong></td>
+</tr>
+<tr>
+<td>Total stored</td>
+<td>Given</td>
+<td><strong>500 PB</strong></td>
+</tr>
+<tr>
+<td>Long-lived client connections</td>
+<td>10 M DAU × ~2 devices</td>
+<td><strong>~20 M sync connections</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>232 uploads/sec is not a hard problem. 500 PB is a procurement problem, not a design problem — it is what object storage is for. <strong>The interesting number is the last row.</strong></p>
+<p>Every connected device must learn about every change to every file it can see, promptly, or the product's core promise fails. That means tens of millions of long-lived connections whose only job is to wait for a change that usually never comes — the same stateful-connection problem as <a href="12-chat-system.html">Chapter 12</a>, arriving in a system nobody would describe as a messaging system. The notification service, not the storage tier, is where this design's scaling difficulty lives.</p>
+<p><strong>Bandwidth efficiency is also a listed requirement, which is unusual.</strong> It is there because the naive implementation is catastrophically wasteful: changing one character in a 10 MB document and re-uploading the whole file, on every device, on every keystroke-triggered save. Delta sync exists to turn that 10 MB into a few kilobytes.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>say early that storage is the easy part and sync is the hard part, then count the connections rather than the uploads. It redirects the conversation to notification, delta sync and conflict resolution, which is where the substance is.</p>
+</div>
+<hr>
+</section>
+<section id="step-2-high-level-design">
+<h2 id="step-2-high-level-design">Step 2: High-Level Design</h2>
+<h3 id="single-server-setup">Single-Server Setup</h3>
+<p>A basic setup includes:</p>
+<ol>
+<li><strong>Web Server:</strong> Handles uploads and downloads.</li>
+<li><strong>Metadata Database:</strong>  to keep track of metadata like user data, login info, files info/</li>
+<li><strong>Storage Directory:</strong> Holds files organized by namespaces.</li>
+</ol>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/15.%20Google%20Drive/images/namespaces.png" alt="Namespaces" data-width="400" style="max-width:400px" />
+</p>
+<ul>
+<li>A web server and a directory called drive/ is set up as the root directory to store uploaded files.</li>
+<li>Under drive/ directory, there is a list of directories called namespaces.</li>
+<li>Each namespace contains all the uploaded files for that user.</li>
+<li>Each file or folder can be uniquely identified by joining the namespace and the relative path.</li>
+</ul>
+<p>This design serves as a starting point but is inadequate for scaling.</p>
+<h4 id="apis">APIs</h4>
+<ol>
+<li><strong>Upload a file to Google Drive:</strong> Two types of uploads are supported
+<ul>
+<li>Simple upload: Used when file size is small.</li>
+<li>Resumable upload:
+<ul>
+<li>Endpoint: https://api.example.com/files/upload?uploadType=resumable</li>
+<li>Send the initial request to retrieve the resumable URL.</li>
+<li>Upload the data and monitor upload state</li>
+<li>If upload is disturbed, resume the upload.</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>Download a file from Google Drive:</strong> To download a file
+<ul>
+<li>Endpoint: https://api.example.com/files/download</li>
+</ul>
+</li>
+<li><strong>Get file revisions:</strong>
+<ul>
+<li>Endpoint: https://api.example.com/files/list_revisions</li>
+</ul>
+</li>
+</ol>
+<h3 id="moving-to-distributed-systems">Moving to Distributed Systems</h3>
+<h4 id="improvements">Improvements:</h4>
+<ol>
+<li>
+<p><strong>Sharding:</strong> Split storage across servers based on <code>user_id</code>.</p>
+</li>
+<li>
+<p><strong>Amazon S3:</strong> Use S3 for scalable and redundant file storage with cross-region replication.</p>
+ <img loading="lazy" decoding="async" src="../../system-design-notes/15.%20Google%20Drive/images/replication.png" alt="Replication" data-width="600" style="max-width:600px" />
+</li>
+<li>
+<p><strong>Load Balancer:</strong> Distribute traffic across multiple web servers.</p>
+</li>
+<li>
+<p><strong>Metadata Database Replication:</strong> Ensure availability through database sharding and replication.</p>
+</li>
+</ol>
+<h4 id="sync-conflicts">Sync Conflicts:</h4>
+<p>For a large storage system like Google Drive, sync conflicts happen from time to time.
+When two users modify the same file or folder at the same time, a conflict happens.</p>
+<p align="left">
+<img loading="lazy" decoding="async" src="../../system-design-notes/15.%20Google%20Drive/images/sync-conflicts.png" alt="Sync Conflicts" data-width="600" style="max-width:600px" />
+</p>
+<ul>
+<li>In the example user 1 and user 2 tries to update the same file at the same time, but user 1’s file is processed by our system first.</li>
+<li>User 1’s update operation goes through, but, user 2 gets a sync conflict.</li>
+<li>The system presents both copies of the same file: user 2’s local copy and the latest version from the server.</li>
+<li>User 2 has the option to merge both files or override one version with the other.</li>
+</ul>
+<p><strong>Why the system does not resolve the conflict itself.</strong> A merge requires understanding the file's internal structure, and the storage layer sees an opaque sequence of blocks. It cannot merge a spreadsheet, and attempting to merge a binary file would corrupt it. So the only safe policies are <em>first write wins, preserve the loser</em> — which is what this design does — or <em>refuse the second write</em>, which loses work.</p>
+<p>This is worth contrasting with a collaborative editor, because the distinction is often blurred:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>File sync (this chapter)</th>
+<th>Collaborative editor (Google Docs)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unit of change</td>
+<td>Whole file, as blocks</td>
+<td>Individual operations on a known document model</td>
+</tr>
+<tr>
+<td>Server understands content?</td>
+<td>No — opaque bytes</td>
+<td>Yes — it is a structured document</td>
+</tr>
+<tr>
+<td>Concurrent edits</td>
+<td>Conflict; both copies kept</td>
+<td><strong>Merged automatically</strong> via OT or CRDTs</td>
+</tr>
+<tr>
+<td>Offline edits</td>
+<td>Conflict on reconnect</td>
+<td>Replayed and merged</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>They are different products with different data models, not two quality levels of the same feature. &quot;Use CRDTs&quot; is not an available answer to the sync-conflict problem here, because there is no document model to apply them to.</p>
+<h3 id="improved-design">Improved design</h3>
+<p align="left">
+<img loading="lazy" decoding="async" src="../../system-design-notes/15.%20Google%20Drive/images/high-level-design.png" alt="High Level Design" data-width="500" style="max-width:500px" />
+</p>
+<ol>
+<li>
+<p><strong>User Interaction:</strong>: Users access the application via browser or mobile app.</p>
+</li>
+<li>
+<p><strong>Block Servers:</strong></p>
+<ul>
+<li>Files are split into <strong>4 MB blocks</strong> (maximum size) and assigned unique hash values.</li>
+<li>Blocks are stored independently in cloud storage (e.g., Amazon S3).</li>
+<li>File reconstruction involves joining blocks in a specific order.</li>
+</ul>
+<p><strong>Blocking the file is the pivotal design decision, and it buys four things at once:</strong></p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Benefit</th>
+<th>Mechanism</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Delta sync</strong></td>
+<td>Only changed blocks are transferred; an edit costs one block, not one file</td>
+</tr>
+<tr>
+<td><strong>Deduplication</strong></td>
+<td>Identical blocks hash identically, so they are stored once</td>
+</tr>
+<tr>
+<td><strong>Parallel transfer</strong></td>
+<td>Blocks are independent, so they upload and download concurrently</td>
+</tr>
+<tr>
+<td><strong>Cheap retries</strong></td>
+<td>A failed block is re-sent alone; a 10 GB upload never restarts from zero</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Blocks are <strong>content-addressed</strong> — the hash of the content <em>is</em> the identifier. That makes them immutable (changing content produces a different block, never a modified one), trivially verifiable (re-hash to detect corruption), and safely shareable between files and users. A 10 GB file is ~2,500 such blocks.</p>
+<p><strong>The block size is a real trade-off, not a constant:</strong></p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Smaller blocks (e.g. 256 KB)</th>
+<th>Larger blocks (e.g. 4 MB)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Delta sync granularity</td>
+<td>Fine — a small edit moves little data</td>
+<td>Coarse — a 1-byte edit moves 4 MB</td>
+</tr>
+<tr>
+<td>Dedup hit rate</td>
+<td>Higher — more chance of matching</td>
+<td>Lower</td>
+</tr>
+<tr>
+<td>Metadata rows per file</td>
+<td><strong>Many</strong> — 10 GB = 40,000 rows</td>
+<td>Few — 10 GB = 2,500 rows</td>
+</tr>
+<tr>
+<td>Requests per transfer</td>
+<td>Many small requests, more overhead</td>
+<td>Fewer, better throughput</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>4 MB is a compromise weighted toward keeping the metadata database small, which matters because metadata, not block storage, is the component that is hard to scale.</p>
+</li>
+<li>
+<p><strong>Cloud Storage:</strong> Blocks are stored in cloud storage for scalability and redundancy.</p>
+</li>
+<li>
+<p><strong>Cold Storage:</strong> Inactive files are moved to cold storage to reduce costs.</p>
+</li>
+<li>
+<p><strong>Load Balancer:</strong> Distributes requests evenly among API servers to ensure efficient operation.</p>
+</li>
+<li>
+<p><strong>API Servers:</strong></p>
+<ul>
+<li>Handle user authentication, profile management, and file metadata updates.</li>
+<li>Manage all non-uploading workflows.</li>
+</ul>
+</li>
+<li>
+<p><strong>Metadata Database and Cache:</strong></p>
+<ul>
+<li>Stores metadata for users, files, blocks, and versions.</li>
+<li>Frequently accessed metadata is cached for faster retrieval.</li>
+</ul>
+</li>
+<li>
+<p><strong>Notification Service:</strong></p>
+<ul>
+<li>A <strong>publisher/subscriber system</strong> that notifies clients about file changes (add, edit, delete).</li>
+<li>Ensures clients can pull the latest updates.</li>
+</ul>
+</li>
+<li>
+<p><strong>Offline Backup Queue:</strong> Temporarily stores file change information for offline clients to sync when back online.</p>
+</li>
+</ol>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<h3 id="metadata-database">Metadata Database</h3>
+<p>A highly simplified is shown below version as it only includes the most important tables and fields.</p>
+<h4 id="schema-design">Schema Design:</h4>
+<ul>
+<li><strong>User Table:</strong> Stores user profiles and preferences.</li>
+<li><strong>File Table:</strong> Maintains file metadata (e.g., size, name, path).</li>
+<li><strong>Block Table:</strong> Tracks file blocks for reconstructing files.</li>
+<li><strong>File Version Table:</strong> Stores file revision history.</li>
+</ul>
+<p><strong>The metadata database is the source of truth, and the blocks are just content.</strong> A file <em>is</em> its ordered list of block hashes; the bytes in object storage are interchangeable copies of content that the metadata points at. This inversion explains several things that otherwise look arbitrary:</p>
+<ul>
+<li><strong>Upload order is blocks first, metadata last.</strong> The metadata commit is what makes a file exist. Reversing it would briefly publish a file whose content cannot be fetched.</li>
+<li><strong>The <code>pending</code> → <code>uploaded</code> status is a two-phase commit</strong> in miniature, with the storage callback as the second phase.</li>
+<li><strong>Metadata is the hard thing to scale,</strong> because it is relational, transactional, and queried by path. Blocks scale by adding storage; metadata scales by sharding, and sharding it is awkward — see the gotchas.</li>
+</ul>
+<p align="left">
+<img loading="lazy" decoding="async" src="../../system-design-notes/15.%20Google%20Drive/images/metadata-database.png" alt="Metadata Database " data-width="500" style="max-width:500px" />
+</p>
+<hr>
+<h3 id="file-upload-flow">File Upload Flow</h3>
+<ol>
+<li><strong>File Upload:</strong>
+<ul>
+<li>File is split into blocks, compressed, and encrypted by the block server.</li>
+<li>Blocks are uploaded to block servers and stored in S3.</li>
+</ul>
+</li>
+<li><strong>Metadata Upload:</strong>
+<ul>
+<li>Client sends metadata to the API server.</li>
+<li>Metadata is stored in the database with status <code>pending</code>.</li>
+</ul>
+</li>
+<li><strong>Completion:</strong>
+<ul>
+<li>S3 triggers a callback to update the file status to <code>uploaded</code>.</li>
+<li>Notification service informs relevant users.</li>
+</ul>
+</li>
+</ol>
+<figure class="mermaid-fig">
+<svg id="mmd-0a18e54c2d17c11f" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" style="max-width: 1387.5px; background-color: transparent;" viewBox="-74.5 -10 1387.5 685" role="graphics-document document" aria-roledescription="sequence"><g><rect x="1113" y="599" fill="#eaeaea" stroke="#666" width="150" height="65" name="NS" rx="3" ry="3" class="actor actor-bottom"/><text x="1188" y="631.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="1188" dy="0">Notification service</tspan></text></g><g><rect x="923" y="599" fill="#eaeaea" stroke="#666" width="150" height="65" name="MD" rx="3" ry="3" class="actor actor-bottom"/><text x="998" y="631.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="998" dy="0">Metadata DB</tspan></text></g><g><rect x="625" y="599" fill="#eaeaea" stroke="#666" width="150" height="65" name="API" rx="3" ry="3" class="actor actor-bottom"/><text x="700" y="631.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="700" dy="0">API servers</tspan></text></g><g><rect x="435" y="599" fill="#eaeaea" stroke="#666" width="150" height="65" name="S3" rx="3" ry="3" class="actor actor-bottom"/><text x="510" y="631.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="510" dy="0">Object storage</tspan></text></g><g><rect x="239" y="599" fill="#eaeaea" stroke="#666" width="150" height="65" name="BS" rx="3" ry="3" class="actor actor-bottom"/><text x="314" y="631.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="314" dy="0">Block servers</tspan></text></g><g><rect x="0" y="599" fill="#eaeaea" stroke="#666" width="150" height="65" name="C" rx="3" ry="3" class="actor actor-bottom"/><text x="75" y="631.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="75" dy="0">Client</tspan></text></g><g><line id="actor5" x1="1188" y1="65" x2="1188" y2="599" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="NS" data-et="life-line" data-id="NS"/><g id="root-5" data-et="participant" data-type="participant" data-id="NS"><rect x="1113" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="NS" rx="3" ry="3" class="actor actor-top"/><text x="1188" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="1188" dy="0">Notification service</tspan></text></g></g><g><line id="actor4" x1="998" y1="65" x2="998" y2="599" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="MD" data-et="life-line" data-id="MD"/><g id="root-4" data-et="participant" data-type="participant" data-id="MD"><rect x="923" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="MD" rx="3" ry="3" class="actor actor-top"/><text x="998" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="998" dy="0">Metadata DB</tspan></text></g></g><g><line id="actor3" x1="700" y1="65" x2="700" y2="599" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="API" data-et="life-line" data-id="API"/><g id="root-3" data-et="participant" data-type="participant" data-id="API"><rect x="625" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="API" rx="3" ry="3" class="actor actor-top"/><text x="700" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="700" dy="0">API servers</tspan></text></g></g><g><line id="actor2" x1="510" y1="65" x2="510" y2="599" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="S3" data-et="life-line" data-id="S3"/><g id="root-2" data-et="participant" data-type="participant" data-id="S3"><rect x="435" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="S3" rx="3" ry="3" class="actor actor-top"/><text x="510" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="510" dy="0">Object storage</tspan></text></g></g><g><line id="actor1" x1="314" y1="65" x2="314" y2="599" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="BS" data-et="life-line" data-id="BS"/><g id="root-1" data-et="participant" data-type="participant" data-id="BS"><rect x="239" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="BS" rx="3" ry="3" class="actor actor-top"/><text x="314" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="314" dy="0">Block servers</tspan></text></g></g><g><line id="actor0" x1="75" y1="65" x2="75" y2="599" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="C" data-et="life-line" data-id="C"/><g id="root-0" data-et="participant" data-type="participant" data-id="C"><rect x="0" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="C" rx="3" ry="3" class="actor actor-top"/><text x="75" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="75" dy="0">Client</tspan></text></g></g><style>#mmd-0a18e54c2d17c11f{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-0a18e54c2d17c11f .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-0a18e54c2d17c11f .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-0a18e54c2d17c11f .error-icon{fill:#f4f6f8;}#mmd-0a18e54c2d17c11f .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-0a18e54c2d17c11f .edge-thickness-normal{stroke-width:1px;}#mmd-0a18e54c2d17c11f .edge-thickness-thick{stroke-width:3.5px;}#mmd-0a18e54c2d17c11f .edge-pattern-solid{stroke-dasharray:0;}#mmd-0a18e54c2d17c11f .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-0a18e54c2d17c11f .edge-pattern-dashed{stroke-dasharray:3;}#mmd-0a18e54c2d17c11f .edge-pattern-dotted{stroke-dasharray:2;}#mmd-0a18e54c2d17c11f .marker{fill:#637381;stroke:#637381;}#mmd-0a18e54c2d17c11f .marker.cross{stroke:#637381;}#mmd-0a18e54c2d17c11f svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-0a18e54c2d17c11f p{margin:0;}#mmd-0a18e54c2d17c11f .actor{stroke:#299a8d;fill:#f1f7f6;stroke-width:1;}#mmd-0a18e54c2d17c11f rect.actor.outer-path[data-look="neo"]{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-0a18e54c2d17c11f rect.note[data-look="neo"]{stroke:#e76f51;fill:#fcf4f2;filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-0a18e54c2d17c11f text.actor&gt;tspan{fill:#161c24;stroke:none;}#mmd-0a18e54c2d17c11f .actor-line{stroke:#299a8d;}#mmd-0a18e54c2d17c11f .innerArc{stroke-width:1.5;stroke-dasharray:none;}#mmd-0a18e54c2d17c11f .messageLine0{stroke-width:1.5;stroke-dasharray:none;stroke:#454f5b;}#mmd-0a18e54c2d17c11f .messageLine1{stroke-width:1.5;stroke-dasharray:2,2;stroke:#454f5b;}#mmd-0a18e54c2d17c11f [id$="-arrowhead"] path{fill:#454f5b;stroke:#454f5b;}#mmd-0a18e54c2d17c11f .sequenceNumber{fill:#ffffff;}#mmd-0a18e54c2d17c11f [id$="-sequencenumber"]{fill:#454f5b;}#mmd-0a18e54c2d17c11f [id$="-crosshead"] path{fill:#454f5b;stroke:#454f5b;}#mmd-0a18e54c2d17c11f .messageText{fill:#161c24;stroke:none;}#mmd-0a18e54c2d17c11f .labelBox{stroke:#299a8d;fill:#f1f7f6;filter:none;}#mmd-0a18e54c2d17c11f .labelText,#mmd-0a18e54c2d17c11f .labelText&gt;tspan{fill:#161c24;stroke:none;}#mmd-0a18e54c2d17c11f .loopText,#mmd-0a18e54c2d17c11f .loopText&gt;tspan{fill:#161c24;stroke:none;}#mmd-0a18e54c2d17c11f .sectionTitle,#mmd-0a18e54c2d17c11f .sectionTitle&gt;tspan{fill:#161c24;stroke:none;}#mmd-0a18e54c2d17c11f .loopLine{stroke-width:2px;stroke-dasharray:2,2;stroke:#299a8d;fill:#299a8d;}#mmd-0a18e54c2d17c11f .note{stroke:#e76f51;fill:#fcf4f2;}#mmd-0a18e54c2d17c11f .noteText,#mmd-0a18e54c2d17c11f .noteText&gt;tspan{fill:#161c24;stroke:none;font-weight:normal;}#mmd-0a18e54c2d17c11f .activation0{fill:#b5e0dd;stroke:hsl(12, 62.5%, 86.862745098%);}#mmd-0a18e54c2d17c11f .activation1{fill:#b5e0dd;stroke:hsl(12, 62.5%, 86.862745098%);}#mmd-0a18e54c2d17c11f .activation2{fill:#b5e0dd;stroke:hsl(12, 62.5%, 86.862745098%);}#mmd-0a18e54c2d17c11f .actorPopupMenu{position:absolute;}#mmd-0a18e54c2d17c11f .actorPopupMenuPanel{position:absolute;fill:#f1f7f6;box-shadow:0px 8px 16px 0px rgba(0,0,0,0.2);filter:drop-shadow(3px 5px 2px rgb(0 0 0 / 0.4));}#mmd-0a18e54c2d17c11f .actor-man circle,#mmd-0a18e54c2d17c11f line{fill:#f1f7f6;stroke-width:2px;}#mmd-0a18e54c2d17c11f g rect.rect{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));stroke:#299a8d;}#mmd-0a18e54c2d17c11f .node .neo-node{stroke:#299a8d;}#mmd-0a18e54c2d17c11f [data-look="neo"].node rect,#mmd-0a18e54c2d17c11f [data-look="neo"].cluster rect,#mmd-0a18e54c2d17c11f [data-look="neo"].node polygon{stroke:url(#mmd-0a18e54c2d17c11f-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-0a18e54c2d17c11f [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-0a18e54c2d17c11f [data-look="neo"].node path{stroke:url(#mmd-0a18e54c2d17c11f-gradient);stroke-width:1px;}#mmd-0a18e54c2d17c11f [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-0a18e54c2d17c11f [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-0a18e54c2d17c11f [data-look="neo"].node circle{stroke:url(#mmd-0a18e54c2d17c11f-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-0a18e54c2d17c11f [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-0a18e54c2d17c11f [data-look="neo"].icon-shape .icon{fill:url(#mmd-0a18e54c2d17c11f-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-0a18e54c2d17c11f [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-0a18e54c2d17c11f-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-0a18e54c2d17c11f :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g/><defs><symbol id="mmd-0a18e54c2d17c11f-computer" width="24" height="24"><path transform="scale(.5)" d="M2 2v13h20v-13h-20zm18 11h-16v-9h16v9zm-10.228 6l.466-1h3.524l.467 1h-4.457zm14.228 3h-24l2-6h2.104l-1.33 4h18.45l-1.297-4h2.073l2 6zm-5-10h-14v-7h14v7z"/></symbol></defs><defs><symbol id="mmd-0a18e54c2d17c11f-database" fill-rule="evenodd" clip-rule="evenodd"><path transform="scale(.5)" d="M12.258.001l.256.004.255.005.253.008.251.01.249.012.247.015.246.016.242.019.241.02.239.023.236.024.233.027.231.028.229.031.225.032.223.034.22.036.217.038.214.04.211.041.208.043.205.045.201.046.198.048.194.05.191.051.187.053.183.054.18.056.175.057.172.059.168.06.163.061.16.063.155.064.15.066.074.033.073.033.071.034.07.034.069.035.068.035.067.035.066.035.064.036.064.036.062.036.06.036.06.037.058.037.058.037.055.038.055.038.053.038.052.038.051.039.05.039.048.039.047.039.045.04.044.04.043.04.041.04.04.041.039.041.037.041.036.041.034.041.033.042.032.042.03.042.029.042.027.042.026.043.024.043.023.043.021.043.02.043.018.044.017.043.015.044.013.044.012.044.011.045.009.044.007.045.006.045.004.045.002.045.001.045v17l-.001.045-.002.045-.004.045-.006.045-.007.045-.009.044-.011.045-.012.044-.013.044-.015.044-.017.043-.018.044-.02.043-.021.043-.023.043-.024.043-.026.043-.027.042-.029.042-.03.042-.032.042-.033.042-.034.041-.036.041-.037.041-.039.041-.04.041-.041.04-.043.04-.044.04-.045.04-.047.039-.048.039-.05.039-.051.039-.052.038-.053.038-.055.038-.055.038-.058.037-.058.037-.06.037-.06.036-.062.036-.064.036-.064.036-.066.035-.067.035-.068.035-.069.035-.07.034-.071.034-.073.033-.074.033-.15.066-.155.064-.16.063-.163.061-.168.06-.172.059-.175.057-.18.056-.183.054-.187.053-.191.051-.194.05-.198.048-.201.046-.205.045-.208.043-.211.041-.214.04-.217.038-.22.036-.223.034-.225.032-.229.031-.231.028-.233.027-.236.024-.239.023-.241.02-.242.019-.246.016-.247.015-.249.012-.251.01-.253.008-.255.005-.256.004-.258.001-.258-.001-.256-.004-.255-.005-.253-.008-.251-.01-.249-.012-.247-.015-.245-.016-.243-.019-.241-.02-.238-.023-.236-.024-.234-.027-.231-.028-.228-.031-.226-.032-.223-.034-.22-.036-.217-.038-.214-.04-.211-.041-.208-.043-.204-.045-.201-.046-.198-.048-.195-.05-.19-.051-.187-.053-.184-.054-.179-.056-.176-.057-.172-.059-.167-.06-.164-.061-.159-.063-.155-.064-.151-.066-.074-.033-.072-.033-.072-.034-.07-.034-.069-.035-.068-.035-.067-.035-.066-.035-.064-.036-.063-.036-.062-.036-.061-.036-.06-.037-.058-.037-.057-.037-.056-.038-.055-.038-.053-.038-.052-.038-.051-.039-.049-.039-.049-.039-.046-.039-.046-.04-.044-.04-.043-.04-.041-.04-.04-.041-.039-.041-.037-.041-.036-.041-.034-.041-.033-.042-.032-.042-.03-.042-.029-.042-.027-.042-.026-.043-.024-.043-.023-.043-.021-.043-.02-.043-.018-.044-.017-.043-.015-.044-.013-.044-.012-.044-.011-.045-.009-.044-.007-.045-.006-.045-.004-.045-.002-.045-.001-.045v-17l.001-.045.002-.045.004-.045.006-.045.007-.045.009-.044.011-.045.012-.044.013-.044.015-.044.017-.043.018-.044.02-.043.021-.043.023-.043.024-.043.026-.043.027-.042.029-.042.03-.042.032-.042.033-.042.034-.041.036-.041.037-.041.039-.041.04-.041.041-.04.043-.04.044-.04.046-.04.046-.039.049-.039.049-.039.051-.039.052-.038.053-.038.055-.038.056-.038.057-.037.058-.037.06-.037.061-.036.062-.036.063-.036.064-.036.066-.035.067-.035.068-.035.069-.035.07-.034.072-.034.072-.033.074-.033.151-.066.155-.064.159-.063.164-.061.167-.06.172-.059.176-.057.179-.056.184-.054.187-.053.19-.051.195-.05.198-.048.201-.046.204-.045.208-.043.211-.041.214-.04.217-.038.22-.036.223-.034.226-.032.228-.031.231-.028.234-.027.236-.024.238-.023.241-.02.243-.019.245-.016.247-.015.249-.012.251-.01.253-.008.255-.005.256-.004.258-.001.258.001zm-9.258 20.499v.01l.001.021.003.021.004.022.005.021.006.022.007.022.009.023.01.022.011.023.012.023.013.023.015.023.016.024.017.023.018.024.019.024.021.024.022.025.023.024.024.025.052.049.056.05.061.051.066.051.07.051.075.051.079.052.084.052.088.052.092.052.097.052.102.051.105.052.11.052.114.051.119.051.123.051.127.05.131.05.135.05.139.048.144.049.147.047.152.047.155.047.16.045.163.045.167.043.171.043.176.041.178.041.183.039.187.039.19.037.194.035.197.035.202.033.204.031.209.03.212.029.216.027.219.025.222.024.226.021.23.02.233.018.236.016.24.015.243.012.246.01.249.008.253.005.256.004.259.001.26-.001.257-.004.254-.005.25-.008.247-.011.244-.012.241-.014.237-.016.233-.018.231-.021.226-.021.224-.024.22-.026.216-.027.212-.028.21-.031.205-.031.202-.034.198-.034.194-.036.191-.037.187-.039.183-.04.179-.04.175-.042.172-.043.168-.044.163-.045.16-.046.155-.046.152-.047.148-.048.143-.049.139-.049.136-.05.131-.05.126-.05.123-.051.118-.052.114-.051.11-.052.106-.052.101-.052.096-.052.092-.052.088-.053.083-.051.079-.052.074-.052.07-.051.065-.051.06-.051.056-.05.051-.05.023-.024.023-.025.021-.024.02-.024.019-.024.018-.024.017-.024.015-.023.014-.024.013-.023.012-.023.01-.023.01-.022.008-.022.006-.022.006-.022.004-.022.004-.021.001-.021.001-.021v-4.127l-.077.055-.08.053-.083.054-.085.053-.087.052-.09.052-.093.051-.095.05-.097.05-.1.049-.102.049-.105.048-.106.047-.109.047-.111.046-.114.045-.115.045-.118.044-.12.043-.122.042-.124.042-.126.041-.128.04-.13.04-.132.038-.134.038-.135.037-.138.037-.139.035-.142.035-.143.034-.144.033-.147.032-.148.031-.15.03-.151.03-.153.029-.154.027-.156.027-.158.026-.159.025-.161.024-.162.023-.163.022-.165.021-.166.02-.167.019-.169.018-.169.017-.171.016-.173.015-.173.014-.175.013-.175.012-.177.011-.178.01-.179.008-.179.008-.181.006-.182.005-.182.004-.184.003-.184.002h-.37l-.184-.002-.184-.003-.182-.004-.182-.005-.181-.006-.179-.008-.179-.008-.178-.01-.176-.011-.176-.012-.175-.013-.173-.014-.172-.015-.171-.016-.17-.017-.169-.018-.167-.019-.166-.02-.165-.021-.163-.022-.162-.023-.161-.024-.159-.025-.157-.026-.156-.027-.155-.027-.153-.029-.151-.03-.15-.03-.148-.031-.146-.032-.145-.033-.143-.034-.141-.035-.14-.035-.137-.037-.136-.037-.134-.038-.132-.038-.13-.04-.128-.04-.126-.041-.124-.042-.122-.042-.12-.044-.117-.043-.116-.045-.113-.045-.112-.046-.109-.047-.106-.047-.105-.048-.102-.049-.1-.049-.097-.05-.095-.05-.093-.052-.09-.051-.087-.052-.085-.053-.083-.054-.08-.054-.077-.054v4.127zm0-5.654v.011l.001.021.003.021.004.021.005.022.006.022.007.022.009.022.01.022.011.023.012.023.013.023.015.024.016.023.017.024.018.024.019.024.021.024.022.024.023.025.024.024.052.05.056.05.061.05.066.051.07.051.075.052.079.051.084.052.088.052.092.052.097.052.102.052.105.052.11.051.114.051.119.052.123.05.127.051.131.05.135.049.139.049.144.048.147.048.152.047.155.046.16.045.163.045.167.044.171.042.176.042.178.04.183.04.187.038.19.037.194.036.197.034.202.033.204.032.209.03.212.028.216.027.219.025.222.024.226.022.23.02.233.018.236.016.24.014.243.012.246.01.249.008.253.006.256.003.259.001.26-.001.257-.003.254-.006.25-.008.247-.01.244-.012.241-.015.237-.016.233-.018.231-.02.226-.022.224-.024.22-.025.216-.027.212-.029.21-.03.205-.032.202-.033.198-.035.194-.036.191-.037.187-.039.183-.039.179-.041.175-.042.172-.043.168-.044.163-.045.16-.045.155-.047.152-.047.148-.048.143-.048.139-.05.136-.049.131-.05.126-.051.123-.051.118-.051.114-.052.11-.052.106-.052.101-.052.096-.052.092-.052.088-.052.083-.052.079-.052.074-.051.07-.052.065-.051.06-.05.056-.051.051-.049.023-.025.023-.024.021-.025.02-.024.019-.024.018-.024.017-.024.015-.023.014-.023.013-.024.012-.022.01-.023.01-.023.008-.022.006-.022.006-.022.004-.021.004-.022.001-.021.001-.021v-4.139l-.077.054-.08.054-.083.054-.085.052-.087.053-.09.051-.093.051-.095.051-.097.05-.1.049-.102.049-.105.048-.106.047-.109.047-.111.046-.114.045-.115.044-.118.044-.12.044-.122.042-.124.042-.126.041-.128.04-.13.039-.132.039-.134.038-.135.037-.138.036-.139.036-.142.035-.143.033-.144.033-.147.033-.148.031-.15.03-.151.03-.153.028-.154.028-.156.027-.158.026-.159.025-.161.024-.162.023-.163.022-.165.021-.166.02-.167.019-.169.018-.169.017-.171.016-.173.015-.173.014-.175.013-.175.012-.177.011-.178.009-.179.009-.179.007-.181.007-.182.005-.182.004-.184.003-.184.002h-.37l-.184-.002-.184-.003-.182-.004-.182-.005-.181-.007-.179-.007-.179-.009-.178-.009-.176-.011-.176-.012-.175-.013-.173-.014-.172-.015-.171-.016-.17-.017-.169-.018-.167-.019-.166-.02-.165-.021-.163-.022-.162-.023-.161-.024-.159-.025-.157-.026-.156-.027-.155-.028-.153-.028-.151-.03-.15-.03-.148-.031-.146-.033-.145-.033-.143-.033-.141-.035-.14-.036-.137-.036-.136-.037-.134-.038-.132-.039-.13-.039-.128-.04-.126-.041-.124-.042-.122-.043-.12-.043-.117-.044-.116-.044-.113-.046-.112-.046-.109-.046-.106-.047-.105-.048-.102-.049-.1-.049-.097-.05-.095-.051-.093-.051-.09-.051-.087-.053-.085-.052-.083-.054-.08-.054-.077-.054v4.139zm0-5.666v.011l.001.02.003.022.004.021.005.022.006.021.007.022.009.023.01.022.011.023.012.023.013.023.015.023.016.024.017.024.018.023.019.024.021.025.022.024.023.024.024.025.052.05.056.05.061.05.066.051.07.051.075.052.079.051.084.052.088.052.092.052.097.052.102.052.105.051.11.052.114.051.119.051.123.051.127.05.131.05.135.05.139.049.144.048.147.048.152.047.155.046.16.045.163.045.167.043.171.043.176.042.178.04.183.04.187.038.19.037.194.036.197.034.202.033.204.032.209.03.212.028.216.027.219.025.222.024.226.021.23.02.233.018.236.017.24.014.243.012.246.01.249.008.253.006.256.003.259.001.26-.001.257-.003.254-.006.25-.008.247-.01.244-.013.241-.014.237-.016.233-.018.231-.02.226-.022.224-.024.22-.025.216-.027.212-.029.21-.03.205-.032.202-.033.198-.035.194-.036.191-.037.187-.039.183-.039.179-.041.175-.042.172-.043.168-.044.163-.045.16-.045.155-.047.152-.047.148-.048.143-.049.139-.049.136-.049.131-.051.126-.05.123-.051.118-.052.114-.051.11-.052.106-.052.101-.052.096-.052.092-.052.088-.052.083-.052.079-.052.074-.052.07-.051.065-.051.06-.051.056-.05.051-.049.023-.025.023-.025.021-.024.02-.024.019-.024.018-.024.017-.024.015-.023.014-.024.013-.023.012-.023.01-.022.01-.023.008-.022.006-.022.006-.022.004-.022.004-.021.001-.021.001-.021v-4.153l-.077.054-.08.054-.083.053-.085.053-.087.053-.09.051-.093.051-.095.051-.097.05-.1.049-.102.048-.105.048-.106.048-.109.046-.111.046-.114.046-.115.044-.118.044-.12.043-.122.043-.124.042-.126.041-.128.04-.13.039-.132.039-.134.038-.135.037-.138.036-.139.036-.142.034-.143.034-.144.033-.147.032-.148.032-.15.03-.151.03-.153.028-.154.028-.156.027-.158.026-.159.024-.161.024-.162.023-.163.023-.165.021-.166.02-.167.019-.169.018-.169.017-.171.016-.173.015-.173.014-.175.013-.175.012-.177.01-.178.01-.179.009-.179.007-.181.006-.182.006-.182.004-.184.003-.184.001-.185.001-.185-.001-.184-.001-.184-.003-.182-.004-.182-.006-.181-.006-.179-.007-.179-.009-.178-.01-.176-.01-.176-.012-.175-.013-.173-.014-.172-.015-.171-.016-.17-.017-.169-.018-.167-.019-.166-.02-.165-.021-.163-.023-.162-.023-.161-.024-.159-.024-.157-.026-.156-.027-.155-.028-.153-.028-.151-.03-.15-.03-.148-.032-.146-.032-.145-.033-.143-.034-.141-.034-.14-.036-.137-.036-.136-.037-.134-.038-.132-.039-.13-.039-.128-.041-.126-.041-.124-.041-.122-.043-.12-.043-.117-.044-.116-.044-.113-.046-.112-.046-.109-.046-.106-.048-.105-.048-.102-.048-.1-.05-.097-.049-.095-.051-.093-.051-.09-.052-.087-.052-.085-.053-.083-.053-.08-.054-.077-.054v4.153zm8.74-8.179l-.257.004-.254.005-.25.008-.247.011-.244.012-.241.014-.237.016-.233.018-.231.021-.226.022-.224.023-.22.026-.216.027-.212.028-.21.031-.205.032-.202.033-.198.034-.194.036-.191.038-.187.038-.183.04-.179.041-.175.042-.172.043-.168.043-.163.045-.16.046-.155.046-.152.048-.148.048-.143.048-.139.049-.136.05-.131.05-.126.051-.123.051-.118.051-.114.052-.11.052-.106.052-.101.052-.096.052-.092.052-.088.052-.083.052-.079.052-.074.051-.07.052-.065.051-.06.05-.056.05-.051.05-.023.025-.023.024-.021.024-.02.025-.019.024-.018.024-.017.023-.015.024-.014.023-.013.023-.012.023-.01.023-.01.022-.008.022-.006.023-.006.021-.004.022-.004.021-.001.021-.001.021.001.021.001.021.004.021.004.022.006.021.006.023.008.022.01.022.01.023.012.023.013.023.014.023.015.024.017.023.018.024.019.024.02.025.021.024.023.024.023.025.051.05.056.05.06.05.065.051.07.052.074.051.079.052.083.052.088.052.092.052.096.052.101.052.106.052.11.052.114.052.118.051.123.051.126.051.131.05.136.05.139.049.143.048.148.048.152.048.155.046.16.046.163.045.168.043.172.043.175.042.179.041.183.04.187.038.191.038.194.036.198.034.202.033.205.032.21.031.212.028.216.027.22.026.224.023.226.022.231.021.233.018.237.016.241.014.244.012.247.011.25.008.254.005.257.004.26.001.26-.001.257-.004.254-.005.25-.008.247-.011.244-.012.241-.014.237-.016.233-.018.231-.021.226-.022.224-.023.22-.026.216-.027.212-.028.21-.031.205-.032.202-.033.198-.034.194-.036.191-.038.187-.038.183-.04.179-.041.175-.042.172-.043.168-.043.163-.045.16-.046.155-.046.152-.048.148-.048.143-.048.139-.049.136-.05.131-.05.126-.051.123-.051.118-.051.114-.052.11-.052.106-.052.101-.052.096-.052.092-.052.088-.052.083-.052.079-.052.074-.051.07-.052.065-.051.06-.05.056-.05.051-.05.023-.025.023-.024.021-.024.02-.025.019-.024.018-.024.017-.023.015-.024.014-.023.013-.023.012-.023.01-.023.01-.022.008-.022.006-.023.006-.021.004-.022.004-.021.001-.021.001-.021-.001-.021-.001-.021-.004-.021-.004-.022-.006-.021-.006-.023-.008-.022-.01-.022-.01-.023-.012-.023-.013-.023-.014-.023-.015-.024-.017-.023-.018-.024-.019-.024-.02-.025-.021-.024-.023-.024-.023-.025-.051-.05-.056-.05-.06-.05-.065-.051-.07-.052-.074-.051-.079-.052-.083-.052-.088-.052-.092-.052-.096-.052-.101-.052-.106-.052-.11-.052-.114-.052-.118-.051-.123-.051-.126-.051-.131-.05-.136-.05-.139-.049-.143-.048-.148-.048-.152-.048-.155-.046-.16-.046-.163-.045-.168-.043-.172-.043-.175-.042-.179-.041-.183-.04-.187-.038-.191-.038-.194-.036-.198-.034-.202-.033-.205-.032-.21-.031-.212-.028-.216-.027-.22-.026-.224-.023-.226-.022-.231-.021-.233-.018-.237-.016-.241-.014-.244-.012-.247-.011-.25-.008-.254-.005-.257-.004-.26-.001-.26.001z"/></symbol></defs><defs><symbol id="mmd-0a18e54c2d17c11f-clock" width="24" height="24"><path transform="scale(.5)" d="M12 2c5.514 0 10 4.486 10 10s-4.486 10-10 10-10-4.486-10-10 4.486-10 10-10zm0-2c-6.627 0-12 5.373-12 12s5.373 12 12 12 12-5.373 12-12-5.373-12-12-12zm5.848 12.459c.202.038.202.333.001.372-1.907.361-6.045 1.111-6.547 1.111-.719 0-1.301-.582-1.301-1.301 0-.512.77-5.447 1.125-7.445.034-.192.312-.181.343.014l.985 6.238 5.394 1.011z"/></symbol></defs><defs><marker id="mmd-0a18e54c2d17c11f-arrowhead" refX="7.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M -1 0 L 10 5 L 0 10 z"/></marker></defs><defs><marker id="mmd-0a18e54c2d17c11f-crosshead" markerWidth="15" markerHeight="8" orient="auto" refX="4" refY="4.5"><path fill="none" stroke="#000000" stroke-width="1pt" d="M 1,2 L 6,7 M 6,2 L 1,7" style="stroke-dasharray: 0, 0;"/></marker></defs><defs><marker id="mmd-0a18e54c2d17c11f-filled-head" refX="15.5" refY="7" markerWidth="20" markerHeight="28" orient="auto"><path d="M 18,7 L9,13 L14,7 L9,1 Z"/></marker></defs><defs><marker id="mmd-0a18e54c2d17c11f-sequencenumber" refX="15" refY="15" markerWidth="60" markerHeight="40" orient="auto"><circle cx="15" cy="15" r="6"/></marker></defs><defs><marker id="mmd-0a18e54c2d17c11f-solidTopArrowHead" refX="7.9" refY="7.25" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 10 8 L 0 8 z"/></marker></defs><defs><marker id="mmd-0a18e54c2d17c11f-solidBottomArrowHead" refX="7.9" refY="0.75" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 10 0 L 0 8 z"/></marker></defs><defs><marker id="mmd-0a18e54c2d17c11f-stickTopArrowHead" refX="7.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 7 7" stroke="black" stroke-width="1.5" fill="none"/></marker></defs><defs><marker id="mmd-0a18e54c2d17c11f-stickBottomArrowHead" refX="7.5" refY="0" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 7 L 7 0" stroke="black" stroke-width="1.5" fill="none"/></marker></defs><text x="76" y="80" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">chunk, hash, compress, encrypt</text><path d="M 76,109 C 136,99 136,139 76,129" class="messageLine0" data-et="message" data-id="i0" data-from="C" data-to="C" stroke-width="2" stroke="none" marker-end="url(#mmd-0a18e54c2d17c11f-arrowhead)" style="fill: none;"/><text x="386" y="154" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">which of these block hashes do you already have?</text><line x1="76" y1="183" x2="696" y2="183" class="messageLine0" data-et="message" data-id="i1" data-from="C" data-to="API" stroke-width="2" stroke="none" marker-end="url(#mmd-0a18e54c2d17c11f-arrowhead)" style="fill: none;"/><text x="389" y="198" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">all but 3 (dedup)</text><line x1="699" y1="227" x2="79" y2="227" class="messageLine1" data-et="message" data-id="i2" data-from="API" data-to="C" stroke-width="2" stroke="none" marker-end="url(#mmd-0a18e54c2d17c11f-arrowhead)" style="stroke-dasharray: 3, 3; fill: none;"/><text x="193" y="242" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">upload the 3 missing blocks</text><line x1="76" y1="271" x2="310" y2="271" class="messageLine0" data-et="message" data-id="i3" data-from="C" data-to="BS" stroke-width="2" stroke="none" marker-end="url(#mmd-0a18e54c2d17c11f-arrowhead)" style="fill: none;"/><text x="411" y="286" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">store by content hash</text><line x1="315" y1="315" x2="506" y2="315" class="messageLine0" data-et="message" data-id="i4" data-from="BS" data-to="S3" stroke-width="2" stroke="none" marker-end="url(#mmd-0a18e54c2d17c11f-arrowhead)" style="fill: none;"/><text x="386" y="330" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">commit file = [ordered block hashes]</text><line x1="76" y1="359" x2="696" y2="359" class="messageLine0" data-et="message" data-id="i5" data-from="C" data-to="API" stroke-width="2" stroke="none" marker-end="url(#mmd-0a18e54c2d17c11f-arrowhead)" style="fill: none;"/><text x="848" y="374" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">insert file + version, status = pending</text><line x1="701" y1="403" x2="994" y2="403" class="messageLine0" data-et="message" data-id="i6" data-from="API" data-to="MD" stroke-width="2" stroke="none" marker-end="url(#mmd-0a18e54c2d17c11f-arrowhead)" style="fill: none;"/><text x="604" y="418" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">storage callback</text><line x1="511" y1="447" x2="696" y2="447" class="messageLine1" data-et="message" data-id="i7" data-from="S3" data-to="API" stroke-width="2" stroke="none" marker-end="url(#mmd-0a18e54c2d17c11f-arrowhead)" style="stroke-dasharray: 3, 3; fill: none;"/><text x="848" y="462" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">status = uploaded</text><line x1="701" y1="491" x2="994" y2="491" class="messageLine0" data-et="message" data-id="i8" data-from="API" data-to="MD" stroke-width="2" stroke="none" marker-end="url(#mmd-0a18e54c2d17c11f-arrowhead)" style="fill: none;"/><text x="943" y="506" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">file changed</text><line x1="701" y1="535" x2="1184" y2="535" class="messageLine0" data-et="message" data-id="i9" data-from="API" data-to="NS" stroke-width="2" stroke="none" marker-end="url(#mmd-0a18e54c2d17c11f-arrowhead)" style="fill: none;"/><text x="633" y="550" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">notify every other device with access</text><line x1="1187" y1="579" x2="79" y2="579" class="messageLine0" data-et="message" data-id="i10" data-from="NS" data-to="C" stroke-width="2" stroke="none" marker-end="url(#mmd-0a18e54c2d17c11f-arrowhead)" style="fill: none;"/></svg>
+</figure>
+<p><strong>Note the first exchange.</strong> Asking which block hashes the server already holds, before sending anything, is what makes deduplication save <em>bandwidth</em> rather than only disk. It is also the step that creates a privacy side channel, covered in the gotchas — the saving and the leak are the same mechanism.</p>
+<p align="left">
+<img loading="lazy" decoding="async" src="../../system-design-notes/15.%20Google%20Drive/images/upload-flow.png" alt="Upload Flow " data-width="500" style="max-width:500px" />
+</p>
+<hr>
+<h3 id="file-sync">File Sync</h3>
+<ol>
+<li>
+<p><strong>Delta Sync:</strong> Transfer only modified blocks instead of the entire file.</p>
+ <p align="left">
+ <img loading="lazy" decoding="async" src="../../system-design-notes/15.%20Google%20Drive/images/delta-sync.png" alt="Delta Sync" data-width="400" style="max-width:400px" />
+ </p>
+<p><strong>The failure mode fixed-size blocks have, which the diagram hides.</strong> Delta sync works beautifully when a change is <em>in place</em>: edit a byte in block 3, re-upload block 3. But insert or delete bytes near the <em>start</em> of a file, and every subsequent block boundary shifts by that amount. Every block hash changes. Delta sync transfers the entire file and has saved nothing.</p>
+<figure class="mermaid-fig">
+<svg id="mmd-5c5aa511644f10ec" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1763.56px; background-color: transparent;" viewBox="0 0 1763.5625 152" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-5c5aa511644f10ec{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-5c5aa511644f10ec .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-5c5aa511644f10ec .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-5c5aa511644f10ec .error-icon{fill:#f4f6f8;}#mmd-5c5aa511644f10ec .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-5c5aa511644f10ec .edge-thickness-normal{stroke-width:1px;}#mmd-5c5aa511644f10ec .edge-thickness-thick{stroke-width:3.5px;}#mmd-5c5aa511644f10ec .edge-pattern-solid{stroke-dasharray:0;}#mmd-5c5aa511644f10ec .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-5c5aa511644f10ec .edge-pattern-dashed{stroke-dasharray:3;}#mmd-5c5aa511644f10ec .edge-pattern-dotted{stroke-dasharray:2;}#mmd-5c5aa511644f10ec .marker{fill:#637381;stroke:#637381;}#mmd-5c5aa511644f10ec .marker.cross{stroke:#637381;}#mmd-5c5aa511644f10ec svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-5c5aa511644f10ec p{margin:0;}#mmd-5c5aa511644f10ec .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-5c5aa511644f10ec .cluster-label text{fill:#454f5b;}#mmd-5c5aa511644f10ec .cluster-label span{color:#454f5b;}#mmd-5c5aa511644f10ec .cluster-label span p{background-color:transparent;}#mmd-5c5aa511644f10ec .label text,#mmd-5c5aa511644f10ec span{fill:#161c24;color:#161c24;}#mmd-5c5aa511644f10ec .node rect,#mmd-5c5aa511644f10ec .node circle,#mmd-5c5aa511644f10ec .node ellipse,#mmd-5c5aa511644f10ec .node polygon,#mmd-5c5aa511644f10ec .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-5c5aa511644f10ec .rough-node .label text,#mmd-5c5aa511644f10ec .node .label text,#mmd-5c5aa511644f10ec .image-shape .label,#mmd-5c5aa511644f10ec .icon-shape .label{text-anchor:middle;}#mmd-5c5aa511644f10ec .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-5c5aa511644f10ec .rough-node .label,#mmd-5c5aa511644f10ec .node .label,#mmd-5c5aa511644f10ec .image-shape .label,#mmd-5c5aa511644f10ec .icon-shape .label{text-align:center;}#mmd-5c5aa511644f10ec .node.clickable{cursor:pointer;}#mmd-5c5aa511644f10ec .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-5c5aa511644f10ec .arrowheadPath{fill:#000000;}#mmd-5c5aa511644f10ec .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-5c5aa511644f10ec .flowchart-link{stroke:#637381;fill:none;}#mmd-5c5aa511644f10ec .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-5c5aa511644f10ec .edgeLabel p{background-color:#ffffff;}#mmd-5c5aa511644f10ec .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-5c5aa511644f10ec .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-5c5aa511644f10ec .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-5c5aa511644f10ec .cluster text{fill:#454f5b;}#mmd-5c5aa511644f10ec .cluster span{color:#454f5b;}#mmd-5c5aa511644f10ec .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-5c5aa511644f10ec .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-5c5aa511644f10ec div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-5c5aa511644f10ec .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-5c5aa511644f10ec rect.text{fill:none;stroke-width:0;}#mmd-5c5aa511644f10ec .icon-shape,#mmd-5c5aa511644f10ec .image-shape{background-color:#ffffff;text-align:center;}#mmd-5c5aa511644f10ec .icon-shape p,#mmd-5c5aa511644f10ec .image-shape p{background-color:#ffffff;padding:2px;}#mmd-5c5aa511644f10ec .icon-shape .label rect,#mmd-5c5aa511644f10ec .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-5c5aa511644f10ec .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-5c5aa511644f10ec .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-5c5aa511644f10ec .node .neo-node{stroke:#299a8d;}#mmd-5c5aa511644f10ec [data-look="neo"].node rect,#mmd-5c5aa511644f10ec [data-look="neo"].cluster rect,#mmd-5c5aa511644f10ec [data-look="neo"].node polygon{stroke:url(#mmd-5c5aa511644f10ec-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5c5aa511644f10ec [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-5c5aa511644f10ec [data-look="neo"].node path{stroke:url(#mmd-5c5aa511644f10ec-gradient);stroke-width:1px;}#mmd-5c5aa511644f10ec [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5c5aa511644f10ec [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-5c5aa511644f10ec [data-look="neo"].node circle{stroke:url(#mmd-5c5aa511644f10ec-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5c5aa511644f10ec [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-5c5aa511644f10ec [data-look="neo"].icon-shape .icon{fill:url(#mmd-5c5aa511644f10ec-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5c5aa511644f10ec [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-5c5aa511644f10ec-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5c5aa511644f10ec :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-5c5aa511644f10ec_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5c5aa511644f10ec_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5c5aa511644f10ec_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5c5aa511644f10ec_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5c5aa511644f10ec_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5c5aa511644f10ec_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5c5aa511644f10ec_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5c5aa511644f10ec_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5c5aa511644f10ec_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5c5aa511644f10ec_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5c5aa511644f10ec_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-5c5aa511644f10ec_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"/><g class="edgeLabels"/><g class="nodes"><g class="root" transform="translate(0, 0)"><g class="clusters"><g class="cluster" id="mmd-5c5aa511644f10ec-CD" data-look="classic"><rect style="" x="8" y="8" width="879.546875" height="136"/><g class="cluster-label" transform="translate(315.71875, 8)"><foreignObject width="264.109375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5;"><span class="nodeLabel"><p>Content-defined chunking — same insert</p></span></div></foreignObject></g></g></g><g class="edgePaths"><path d="M154.063,76L160.313,76C166.563,76,179.063,76,190.896,76C202.729,76,213.896,76,219.479,76L225.063,76" id="mmd-5c5aa511644f10ec-L_B1_B2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B1_B2_0" data-points="W3sieCI6MTU0LjA2MjUsInkiOjc2fSx7IngiOjE5MS41NjI1LCJ5Ijo3Nn0seyJ4IjoyMjkuMDYyNSwieSI6NzZ9XQ==" data-look="classic" marker-end="url(#mmd-5c5aa511644f10ec_flowchart-v2-pointEnd)"/><path d="M340.391,76L346.641,76C352.891,76,365.391,76,377.224,76C389.057,76,400.224,76,405.807,76L411.391,76" id="mmd-5c5aa511644f10ec-L_B2_B3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B2_B3_0" data-points="W3sieCI6MzQwLjM5MDYyNSwieSI6NzZ9LHsieCI6Mzc3Ljg5MDYyNSwieSI6NzZ9LHsieCI6NDE1LjM5MDYyNSwieSI6NzZ9XQ==" data-look="classic" marker-end="url(#mmd-5c5aa511644f10ec_flowchart-v2-pointEnd)"/><path d="M527.047,76L533.297,76C539.547,76,552.047,76,563.88,76C575.714,76,586.88,76,592.464,76L598.047,76" id="mmd-5c5aa511644f10ec-L_B3_B4_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B3_B4_0" data-points="W3sieCI6NTI3LjA0Njg3NSwieSI6NzZ9LHsieCI6NTY0LjU0Njg3NSwieSI6NzZ9LHsieCI6NjAyLjA0Njg3NSwieSI6NzZ9XQ==" data-look="classic" marker-end="url(#mmd-5c5aa511644f10ec_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_B1_B2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_B2_B3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_B3_B4_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-5c5aa511644f10ec-flowchart-B1-4" data-look="classic" transform="translate(99.78125, 76)"><rect class="basic label-container" style="" x="-54.28125" y="-22.5" width="108.5625" height="45"/><g class="label" style="" transform="translate(-30.28125, -10.5)"><rect/><foreignObject width="60.5625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>chunk1 ✗</p></span></div></foreignObject></g></g><g class="node default" id="mmd-5c5aa511644f10ec-flowchart-B2-5" data-look="classic" transform="translate(284.7265625, 76)"><rect class="basic label-container" style="" x="-55.6640625" y="-22.5" width="111.328125" height="45"/><g class="label" style="" transform="translate(-31.6640625, -10.5)"><rect/><foreignObject width="63.328125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>chunk2 ✓</p></span></div></foreignObject></g></g><g class="node default" id="mmd-5c5aa511644f10ec-flowchart-B3-6" data-look="classic" transform="translate(471.21875, 76)"><rect class="basic label-container" style="" x="-55.828125" y="-22.5" width="111.65625" height="45"/><g class="label" style="" transform="translate(-31.828125, -10.5)"><rect/><foreignObject width="63.65625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>chunk3 ✓</p></span></div></foreignObject></g></g><g class="node default" id="mmd-5c5aa511644f10ec-flowchart-B4-7" data-look="classic" transform="translate(726.046875, 76)"><rect class="basic label-container" style="" x="-124" y="-33" width="248" height="66"/><g class="label" style="" transform="translate(-100, -21)"><rect/><foreignObject width="200" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>chunk4 ✓ — boundaries re-align</p></span></div></foreignObject></g></g></g></g><g class="root" transform="translate(929.546875, 0)"><g class="clusters"><g class="cluster" id="mmd-5c5aa511644f10ec-FX" data-look="classic"><rect style="" x="8" y="8" width="818.015625" height="136"/><g class="cluster-label" transform="translate(273.859375, 8)"><foreignObject width="286.296875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5;"><span class="nodeLabel"><p>Fixed-size blocks — insert 1 byte at the front</p></span></div></foreignObject></g></g></g><g class="edgePaths"><path d="M134.094,76L140.344,76C146.594,76,159.094,76,170.927,76C182.76,76,193.927,76,199.51,76L205.094,76" id="mmd-5c5aa511644f10ec-L_A1_A2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A1_A2_0" data-points="W3sieCI6MTM0LjA5Mzc1LCJ5Ijo3Nn0seyJ4IjoxNzEuNTkzNzUsInkiOjc2fSx7IngiOjIwOS4wOTM3NSwieSI6NzZ9XQ==" data-look="classic" marker-end="url(#mmd-5c5aa511644f10ec_flowchart-v2-pointEnd)"/><path d="M299.641,76L305.891,76C312.141,76,324.641,76,336.474,76C348.307,76,359.474,76,365.057,76L370.641,76" id="mmd-5c5aa511644f10ec-L_A2_A3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A2_A3_0" data-points="W3sieCI6Mjk5LjY0MDYyNSwieSI6NzZ9LHsieCI6MzM3LjE0MDYyNSwieSI6NzZ9LHsieCI6Mzc0LjY0MDYyNSwieSI6NzZ9XQ==" data-look="classic" marker-end="url(#mmd-5c5aa511644f10ec_flowchart-v2-pointEnd)"/><path d="M465.516,76L471.766,76C478.016,76,490.516,76,502.349,76C514.182,76,525.349,76,530.932,76L536.516,76" id="mmd-5c5aa511644f10ec-L_A3_A4_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A3_A4_0" data-points="W3sieCI6NDY1LjUxNTYyNSwieSI6NzZ9LHsieCI6NTAzLjAxNTYyNSwieSI6NzZ9LHsieCI6NTQwLjUxNTYyNSwieSI6NzZ9XQ==" data-look="classic" marker-end="url(#mmd-5c5aa511644f10ec_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_A1_A2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_A2_A3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_A3_A4_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-5c5aa511644f10ec-flowchart-A1-0" data-look="classic" transform="translate(89.796875, 76)"><rect class="basic label-container" style="" x="-44.296875" y="-22.5" width="88.59375" height="45"/><g class="label" style="" transform="translate(-20.296875, -10.5)"><rect/><foreignObject width="40.59375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>blk1 ✗</p></span></div></foreignObject></g></g><g class="node default" id="mmd-5c5aa511644f10ec-flowchart-A2-1" data-look="classic" transform="translate(254.3671875, 76)"><rect class="basic label-container" style="" x="-45.2734375" y="-22.5" width="90.546875" height="45"/><g class="label" style="" transform="translate(-21.2734375, -10.5)"><rect/><foreignObject width="42.546875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>blk2 ✗</p></span></div></foreignObject></g></g><g class="node default" id="mmd-5c5aa511644f10ec-flowchart-A3-2" data-look="classic" transform="translate(420.078125, 76)"><rect class="basic label-container" style="" x="-45.4375" y="-22.5" width="90.875" height="45"/><g class="label" style="" transform="translate(-21.4375, -10.5)"><rect/><foreignObject width="42.875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>blk3 ✗</p></span></div></foreignObject></g></g><g class="node default" id="mmd-5c5aa511644f10ec-flowchart-A4-3" data-look="classic" transform="translate(664.515625, 76)"><rect class="basic label-container" style="" x="-124" y="-33" width="248" height="66"/><g class="label" style="" transform="translate(-100, -21)"><rect/><foreignObject width="200" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>blk4 ✗ — all shifted, all re-uploaded</p></span></div></foreignObject></g></g></g></g></g></g></g><defs><filter id="mmd-5c5aa511644f10ec-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-5c5aa511644f10ec-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-5c5aa511644f10ec-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>The fix is <strong>content-defined chunking</strong>: choose boundaries from the data itself — advance a rolling hash (Rabin fingerprint) over the bytes and cut wherever it hits a pattern — rather than every 4 MB. Because boundaries are determined by content, an insertion shifts only the chunk containing it; the following boundaries fall in the same places as before and their chunks still match. This is the mechanism behind <code>rsync</code>, and behind real dedup-oriented storage systems.</p>
+<p>It is also why block <em>sizes</em> become variable, which is why the schema stores a block list per version rather than assuming an index can be computed from an offset.</p>
+</li>
+<li>
+<p><strong>Compression:</strong> Blocks are compressed using compression algorithms depending on file types.</p>
+<p>Per-type compression matters because the default would waste effort: text and documents compress enormously, while JPEG, MP4 and ZIP are already compressed and attempting it again burns CPU to make the file slightly <em>larger</em>. Detect and skip.</p>
+</li>
+<li>
+<p><strong>Conflict Resolution:</strong></p>
+<ul>
+<li>First processed version wins.</li>
+<li>Conflicting versions are saved separately for user resolution.</li>
+</ul>
+<p>&quot;First processed&quot; means first to commit metadata, not first to be edited — the ordering is decided by arrival at the server, so the winner is partly a function of network luck. That is acceptable only because the loser's work is preserved rather than discarded, which makes &quot;preserve the loser&quot; the load-bearing half of the policy.</p>
+</li>
+</ol>
+<p align="left">
+<img loading="lazy" decoding="async" src="../../system-design-notes/15.%20Google%20Drive/images/file-sync.png" alt="File Synce " data-width="400" style="max-width:400px" />
+</p>
+<hr>
+<h3 id="file-download-flow">File Download Flow</h3>
+<p>Download flow is triggered when a file is added or edited elsewhere. There are two ways a client can know:</p>
+<ul>
+<li>If client A is online while a file is changed by another client, notification service will inform client A.</li>
+<li>If client A is offline while a file is changed by another client, data will be saved to the cache. When the offline client is online again, it pulls the latest changes.</li>
+</ul>
+<p>Once a client knows a file is changed, it first requests metadata via API servers, then
+downloads blocks to construct the file.</p>
+<ol>
+<li><strong>Trigger:</strong> Notification service informs the client of file updates.</li>
+<li><strong>Metadata Fetch:</strong> Client retrieves updated metadata via API.</li>
+<li><strong>Block Download:</strong> Client downloads updated blocks from block servers and reconstructs the file.</li>
+</ol>
+<p align="left">
+<img loading="lazy" decoding="async" src="../../system-design-notes/15.%20Google%20Drive/images/download-flow.png" alt="Upload Flow " data-width="600" style="max-width:600px" />
+</p>
+<hr>
+<h3 id="notification-service">Notification Service</h3>
+<ol>
+<li><strong>Purpose:</strong> Keeps clients updated about file changes.</li>
+<li><strong>Mechanism:</strong> Implements <strong>long polling</strong> for asynchronous notifications.</li>
+<li><strong>Example:</strong> When a file is added, edited, or deleted, notifications are pushed to all relevant clients.</li>
+</ol>
+<p><strong>Why long polling here, when <a href="12-chat-system.html#choosing-the-receive-channel">Chapter 12</a> chose WebSocket for chat.</strong> The traffic profiles are opposite:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Chat</th>
+<th>File sync</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Direction of traffic</td>
+<td>Both ways, continuously</td>
+<td>Server → client, rarely</td>
+</tr>
+<tr>
+<td>Events per connection per hour</td>
+<td>Hundreds</td>
+<td>Often zero</td>
+</tr>
+<tr>
+<td>Needs to send upstream on the same channel</td>
+<td>Yes</td>
+<td>No — uploads are separate HTTP requests</td>
+</tr>
+<tr>
+<td>Best fit</td>
+<td>WebSocket</td>
+<td><strong>Long polling</strong> (or SSE)</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>A file-sync client has nothing to say over the notification channel; it only needs to be told &quot;something changed, come and ask what&quot;. Long polling delivers that with ordinary HTTP, no protocol upgrade, no proxy incompatibility, and a natural reconnection point after every event. The notification itself should be a <strong>cheap signal rather than the data</strong> — &quot;your tree changed, fetch metadata since cursor X&quot; — which keeps the notification service stateless about content and lets the client coalesce a burst of changes into one metadata fetch.</p>
+<hr>
+<h3 id="storage-optimization">Storage Optimization</h3>
+<ol>
+<li><strong>De-duplication:</strong> Remove duplicate blocks at the account level using hash-based comparisons.</li>
+<li><strong>Versioning Strategy:</strong>
+<ul>
+<li>Limit the number of saved revisions.</li>
+<li>Prioritize recent versions for frequently edited files.</li>
+</ul>
+</li>
+<li><strong>Cold Storage:</strong> Move rarely accessed files to cheaper storage solutions (e.g., Amazon S3 Glacier).</li>
+</ol>
+<p><strong>&quot;At the account level&quot; is a deliberate restriction, and the reason is privacy.</strong> Global deduplication — one copy of a block across all users — saves far more, because popular files are stored by millions of people. It also creates an <strong>oracle</strong>: upload a file you suspect someone else has, and if the server replies &quot;I already have those blocks&quot; the upload completes instantly. You have just confirmed the existence of that exact file somewhere in the system without having access to it. This was a real, demonstrated attack against cloud storage providers, and restricting dedup to within one account closes it at the cost of most of the savings.</p>
+<p>The same tension governs encryption. Client-side encryption with a per-user key makes identical plaintext produce different ciphertext, so dedup stops working entirely. <strong>Convergent encryption</strong> — deriving the key from the content's own hash — restores dedup, and simultaneously restores the oracle, because identical plaintext again produces identical ciphertext. There is no configuration that gives you global dedup, client-side encryption, and no side channel at once; pick two.</p>
+<p><strong>Versioning is unbounded growth unless it is capped.</strong> A document saved every few minutes for a year accumulates thousands of versions, each with its own block list. Because blocks are content-addressed and shared between versions, the <em>bytes</em> mostly do not duplicate — but the metadata rows do, which is the scarcer resource. Cap by count, by age, or by thinning older versions (keep every version for a day, daily for a month, monthly thereafter).</p>
+<p><strong>Deleting is harder than it looks</strong> when blocks are shared. A block referenced by three versions of two files cannot be removed when one of them is deleted, so blocks need <strong>reference counting</strong> and a garbage collector, and deletion becomes &quot;unlink, then collect later&quot;. Combined with a trash retention period, the practical consequence is that freeing space is asynchronous and quota accounting has to be a deliberate decision rather than a sum of block sizes.</p>
+<hr>
+<h3 id="failure-handling">Failure Handling</h3>
+<ol>
+<li><strong>Load Balancer Failure:</strong> Secondary load balancer becomes active.</li>
+<li><strong>Block Server Failure:</strong> Pending tasks are reassigned to other servers.</li>
+<li><strong>Metadata Database Failure:</strong>
+<ul>
+<li>Promote a slave node to master.</li>
+<li>Redirect traffic to remaining replicas.</li>
+</ul>
+</li>
+<li><strong>Cloud Storage Failure:</strong> Use cross-region replication to fetch unavailable files.</li>
+<li><strong>Notification Service Failure:</strong> Clients reconnect to alternative servers.</li>
+</ol>
+<p>The fifth item carries a hazard worth naming: when a notification server dies, every one of its long-polling clients reconnects at once — the reconnection storm from <a href="12-chat-system.html#gotchas--failure-modes">Chapter 12</a>. With tens of millions of connections, that needs randomised backoff on the client, or recovering from one server loss will take down the next.</p>
+<p>The reason the system survives losing the notification service at all is that <strong>notifications are an optimisation, not the mechanism</strong>. A client that misses them can still reconcile by asking for changes since its cursor. Keeping a periodic fallback poll means notification failure degrades sync latency rather than breaking sync.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>the two follow-ups that separate depth from recall are &quot;a user inserts a line at the top of a 100 MB file — how much do you transfer?&quot; (fixed blocks: all of it; content-defined chunking: almost nothing) and &quot;why only account-level dedup?&quot; (the existence oracle). Both are places where the obvious design is subtly wrong.</p>
+</div>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Fixed-size blocks defeat delta sync on insertion.</strong> Inserting bytes near the start of a file shifts every later boundary, changing every hash. Content-defined chunking with a rolling hash is what makes delta sync robust to insertions, not just in-place edits.</li>
+<li><strong>Global dedup is an existence oracle.</strong> &quot;I already have that block&quot; confirms someone else stored that exact file. Account-level dedup is the mitigation, and it forfeits most of the savings.</li>
+<li><strong>Client-side encryption and dedup are mutually exclusive</strong> unless you use convergent encryption, which reinstates the oracle. There is no free configuration.</li>
+<li><strong>Sharding metadata by <code>user_id</code> breaks on sharing.</strong> A file shared between users on different shards has no single home: permission checks, listings and change feeds now span shards, and a transaction over both is exactly what sharding was meant to avoid. Sharing is the feature that makes the metadata database genuinely hard.</li>
+<li><strong>Renaming or moving a folder is a metadata storm.</strong> If paths are stored per file, moving a folder containing a million files rewrites a million rows. Storing parent pointers instead makes the move O(1) and makes &quot;list everything under this path&quot; recursive — pick which operation you want to be cheap.</li>
+<li><strong>Committing metadata before blocks publishes a file that cannot be read.</strong> Blocks first, metadata last, with a pending status in between.</li>
+<li><strong>Shared blocks make deletion asynchronous.</strong> Reference counting plus garbage collection, so &quot;deleted&quot; does not mean &quot;space reclaimed&quot; — and quota accounting must decide whose bytes a shared block is.</li>
+<li><strong>Versions grow without bound.</strong> Thousands of revisions of an actively edited document multiply metadata rows even when blocks are shared. Cap or thin them.</li>
+<li><strong>Cold storage has retrieval latency and retrieval cost.</strong> A file moved to archival storage may take minutes to hours to fetch and may be billed per retrieval. Choosing what to demote by access recency is easy; the surprise is that someone will eventually open a five-year-old file and wait.</li>
+<li><strong>Losing the notification service causes a reconnection storm.</strong> Tens of millions of long-polling clients returning at once. Jittered backoff, and treat notifications as an accelerator over a periodic reconciliation poll.</li>
+<li><strong>&quot;Last modified&quot; cannot come from client clocks.</strong> Device clocks disagree, so ordering by client timestamp will pick the wrong winner in a conflict. Order by server commit.</li>
+<li><strong>A 10 GB file is ~2,500 blocks.</strong> Any per-block overhead — a request, a metadata row, a round trip — is multiplied by that. Upload sessions must outlive slow connections, and progress must be resumable per block.</li>
+<li><strong>Conflicts cannot be merged by the storage layer.</strong> It sees opaque bytes. Preserving both copies is the only safe outcome; automatic merge belongs to a product with a document model.</li>
+<li><strong>Mass deletion propagates faithfully.</strong> A user who deletes a folder by accident, or a client bug that reports local files as removed, syncs that destruction to every device. Trash with a retention window and server-side version history is what makes this recoverable — &quot;data loss is unacceptable&quot; includes loss the user caused.</li>
+<li><strong>Re-compressing already-compressed files wastes CPU and can grow them.</strong> Detect type and skip.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transferring as few bytes as possible</td>
+<td>Delta sync over content-addressed blocks</td>
+</tr>
+<tr>
+<td>Delta sync surviving insertions</td>
+<td>Content-defined chunking with a rolling hash</td>
+</tr>
+<tr>
+<td>Storing the same content once</td>
+<td>Block-level dedup, scoped to an account for privacy</td>
+</tr>
+<tr>
+<td>Resumable 10 GB uploads</td>
+<td>Independent blocks, acknowledged individually, with an upload session</td>
+</tr>
+<tr>
+<td>Parallel transfer</td>
+<td>Blocks are independent of each other</td>
+</tr>
+<tr>
+<td>Files never visible without content</td>
+<td>Upload blocks first, commit metadata last, <code>pending</code> → <code>uploaded</code></td>
+</tr>
+<tr>
+<td>Telling 20 M devices about changes</td>
+<td>Long polling with a cheap &quot;changed, fetch since cursor&quot; signal</td>
+</tr>
+<tr>
+<td>Offline devices</td>
+<td>Offline backup queue, drained on reconnect</td>
+</tr>
+<tr>
+<td>Concurrent edits to one file</td>
+<td>First commit wins; the loser's version is preserved, not merged</td>
+</tr>
+<tr>
+<td>Unbounded revision history</td>
+<td>Cap or thin versions; blocks are shared across them</td>
+</tr>
+<tr>
+<td>Cost of cold data</td>
+<td>Tier to archival storage by access recency</td>
+</tr>
+<tr>
+<td>Reclaiming space for shared blocks</td>
+<td>Reference counting plus asynchronous garbage collection</td>
+</tr>
+<tr>
+<td>Surviving notification-service loss</td>
+<td>Periodic reconciliation poll as the fallback; jittered reconnects</td>
+</tr>
+<tr>
+<td>Storage durability</td>
+<td>Object storage with cross-region replication</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Which number in the requirements is the actual scaling challenge, and why is 232 uploads/sec not it?</li>
+<li>Name the four separate benefits that follow from splitting files into blocks.</li>
+<li>What does a smaller block size improve, and what does it cost?</li>
+<li>A user inserts one line at the top of a 100 MB file. How much is transferred with 4 MB fixed blocks, and how much with content-defined chunking? Why?</li>
+<li>Why is deduplication restricted to a single account?</li>
+<li>Why can't you have global dedup <em>and</em> client-side encryption <em>and</em> no information leak?</li>
+<li>Why must blocks be uploaded before the metadata is committed?</li>
+<li>Why is long polling the right choice here when Chapter 12 chose WebSocket?</li>
+<li>Sharding metadata by <code>user_id</code> is natural. Which feature breaks it, and how?</li>
+<li>Storing a full path on every file makes listing cheap. What does it make expensive?</li>
+<li>A user deletes one of three files sharing a block. Can the block be removed? What is needed?</li>
+<li>Why can't a conflict be resolved by merging, and what does Google Docs have that this system does not?</li>
+<li>A notification server with 2 M connections dies. What happens next, and what keeps sync working meanwhile?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Block</strong></td>
+<td>A fixed- or variable-size piece of a file, identified by the hash of its content</td>
+</tr>
+<tr>
+<td><strong>Content addressing</strong></td>
+<td>Using the content's hash as its identifier, making blocks immutable and verifiable</td>
+</tr>
+<tr>
+<td><strong>Delta sync</strong></td>
+<td>Transferring only the blocks that changed</td>
+</tr>
+<tr>
+<td><strong>Content-defined chunking</strong></td>
+<td>Choosing block boundaries from the data via a rolling hash, so insertions shift only one chunk</td>
+</tr>
+<tr>
+<td><strong>Rolling hash / Rabin fingerprint</strong></td>
+<td>The hash advanced byte-by-byte to find chunk boundaries</td>
+</tr>
+<tr>
+<td><strong>Deduplication</strong></td>
+<td>Storing identical blocks once; scoped per account to avoid an existence oracle</td>
+</tr>
+<tr>
+<td><strong>Convergent encryption</strong></td>
+<td>Deriving the encryption key from the content hash, preserving dedup — and the oracle</td>
+</tr>
+<tr>
+<td><strong>Metadata database</strong></td>
+<td>The source of truth: users, files, versions, and each version's ordered block list</td>
+</tr>
+<tr>
+<td><strong><code>pending</code> → <code>uploaded</code></strong></td>
+<td>The two-phase commit making a file visible only once its blocks exist</td>
+</tr>
+<tr>
+<td><strong>Notification service</strong></td>
+<td>Long-polling channel telling clients that their tree changed</td>
+</tr>
+<tr>
+<td><strong>Offline backup queue</strong></td>
+<td>Buffered change notifications for devices that are not connected</td>
+</tr>
+<tr>
+<td><strong>Sync conflict</strong></td>
+<td>Concurrent commits to one file; first wins, loser preserved as a separate copy</td>
+</tr>
+<tr>
+<td><strong>Reference counting</strong></td>
+<td>Tracking how many versions point at a block, so deletion can be garbage collected</td>
+</tr>
+<tr>
+<td><strong>Cold storage</strong></td>
+<td>Cheap archival tier with higher retrieval latency and per-retrieval cost</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="24-s3-like-object-storage.html">Chapter 24 – S3-like Object Storage</a> — the block store underneath this design, including the metadata/data split at a lower level.</li>
+<li><a href="12-chat-system.html#choosing-the-receive-channel">Chapter 12 – Design A Chat System</a> — the persistent-connection problem and the protocol comparison this chapter reuses.</li>
+<li><a href="14-youtube.html">Chapter 14 – Design YouTube</a> — chunked resumable uploads and pre-signed direct-to-storage transfer, solving the same upload problems.</li>
+<li><a href="10-notification-system.html">Chapter 10 – Design A Notification System</a> — where the &quot;file was shared with you&quot; notifications go.</li>
+<li><a href="https://neil.fraser.name/writing/sync/" target="_blank" rel="noopener">Differential Synchronization</a> and <a href="https://www.youtube.com/watch?v=PE4gwstWhmc" target="_blank" rel="noopener">How we've scaled Dropbox</a> — the sync problem treated at length by people who shipped it.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

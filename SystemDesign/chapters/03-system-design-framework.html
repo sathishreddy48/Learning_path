@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 3: A Framework for System Design Interviews — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="03-system-design-framework">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Foundations › Chapter 3 of 28</div>
+  <h1>Chapter 3: A Framework for System Design Interviews</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</a></li><li><a href="#step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap-Up</a></li><li><a href="#best-practices">Best Practices</a></li><li><a href="#time-management">Time Management</a></li><li><a href="#one-page-cheat-sheet">One-page cheat sheet</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>System design interviews are a key part of the hiring process, simulating real-life problem-solving scenarios. These interviews evaluate not just technical skills but also collaboration, communication, and the ability to handle ambiguous requirements.</p>
+<p>This chapter introduces a <strong>4-step framework</strong> for navigating system design interviews effectively.</p>
+<p><strong>What is actually being tested.</strong> A system design interview has no correct answer, which makes it confusing until you understand what is being measured. It is not whether you know what a load balancer is — it is whether you can take a deliberately vague prompt, narrow it into something buildable, justify your choices against <em>that</em> scope, and change your mind gracefully when a constraint shifts. The question is always &quot;would I want to design a system with this person?&quot;</p>
+<p>This chapter is the <strong>process</strong>. <a href="01-scaling.html">Chapter 1</a> is the toolbox it reaches into, and <a href="02-back-of-the-envelope-estimation.html">Chapter 2</a> is how you decide which tools the problem justifies. The framework is what stops you from reciting the toolbox at a problem that doesn't need it.</p>
+<figure class="mermaid-fig">
+<svg id="mmd-76872dacb6cea8ae" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1028.19px; background-color: transparent;" viewBox="0 0 1028.1875 103" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-76872dacb6cea8ae{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-76872dacb6cea8ae .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-76872dacb6cea8ae .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-76872dacb6cea8ae .error-icon{fill:#f4f6f8;}#mmd-76872dacb6cea8ae .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-76872dacb6cea8ae .edge-thickness-normal{stroke-width:1px;}#mmd-76872dacb6cea8ae .edge-thickness-thick{stroke-width:3.5px;}#mmd-76872dacb6cea8ae .edge-pattern-solid{stroke-dasharray:0;}#mmd-76872dacb6cea8ae .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-76872dacb6cea8ae .edge-pattern-dashed{stroke-dasharray:3;}#mmd-76872dacb6cea8ae .edge-pattern-dotted{stroke-dasharray:2;}#mmd-76872dacb6cea8ae .marker{fill:#637381;stroke:#637381;}#mmd-76872dacb6cea8ae .marker.cross{stroke:#637381;}#mmd-76872dacb6cea8ae svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-76872dacb6cea8ae p{margin:0;}#mmd-76872dacb6cea8ae .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-76872dacb6cea8ae .cluster-label text{fill:#454f5b;}#mmd-76872dacb6cea8ae .cluster-label span{color:#454f5b;}#mmd-76872dacb6cea8ae .cluster-label span p{background-color:transparent;}#mmd-76872dacb6cea8ae .label text,#mmd-76872dacb6cea8ae span{fill:#161c24;color:#161c24;}#mmd-76872dacb6cea8ae .node rect,#mmd-76872dacb6cea8ae .node circle,#mmd-76872dacb6cea8ae .node ellipse,#mmd-76872dacb6cea8ae .node polygon,#mmd-76872dacb6cea8ae .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-76872dacb6cea8ae .rough-node .label text,#mmd-76872dacb6cea8ae .node .label text,#mmd-76872dacb6cea8ae .image-shape .label,#mmd-76872dacb6cea8ae .icon-shape .label{text-anchor:middle;}#mmd-76872dacb6cea8ae .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-76872dacb6cea8ae .rough-node .label,#mmd-76872dacb6cea8ae .node .label,#mmd-76872dacb6cea8ae .image-shape .label,#mmd-76872dacb6cea8ae .icon-shape .label{text-align:center;}#mmd-76872dacb6cea8ae .node.clickable{cursor:pointer;}#mmd-76872dacb6cea8ae .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-76872dacb6cea8ae .arrowheadPath{fill:#000000;}#mmd-76872dacb6cea8ae .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-76872dacb6cea8ae .flowchart-link{stroke:#637381;fill:none;}#mmd-76872dacb6cea8ae .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-76872dacb6cea8ae .edgeLabel p{background-color:#ffffff;}#mmd-76872dacb6cea8ae .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-76872dacb6cea8ae .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-76872dacb6cea8ae .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-76872dacb6cea8ae .cluster text{fill:#454f5b;}#mmd-76872dacb6cea8ae .cluster span{color:#454f5b;}#mmd-76872dacb6cea8ae .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-76872dacb6cea8ae .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-76872dacb6cea8ae div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-76872dacb6cea8ae .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-76872dacb6cea8ae rect.text{fill:none;stroke-width:0;}#mmd-76872dacb6cea8ae .icon-shape,#mmd-76872dacb6cea8ae .image-shape{background-color:#ffffff;text-align:center;}#mmd-76872dacb6cea8ae .icon-shape p,#mmd-76872dacb6cea8ae .image-shape p{background-color:#ffffff;padding:2px;}#mmd-76872dacb6cea8ae .icon-shape .label rect,#mmd-76872dacb6cea8ae .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-76872dacb6cea8ae .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-76872dacb6cea8ae .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-76872dacb6cea8ae .node .neo-node{stroke:#299a8d;}#mmd-76872dacb6cea8ae [data-look="neo"].node rect,#mmd-76872dacb6cea8ae [data-look="neo"].cluster rect,#mmd-76872dacb6cea8ae [data-look="neo"].node polygon{stroke:url(#mmd-76872dacb6cea8ae-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-76872dacb6cea8ae [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-76872dacb6cea8ae [data-look="neo"].node path{stroke:url(#mmd-76872dacb6cea8ae-gradient);stroke-width:1px;}#mmd-76872dacb6cea8ae [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-76872dacb6cea8ae [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-76872dacb6cea8ae [data-look="neo"].node circle{stroke:url(#mmd-76872dacb6cea8ae-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-76872dacb6cea8ae [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-76872dacb6cea8ae [data-look="neo"].icon-shape .icon{fill:url(#mmd-76872dacb6cea8ae-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-76872dacb6cea8ae [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-76872dacb6cea8ae-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-76872dacb6cea8ae :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-76872dacb6cea8ae_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-76872dacb6cea8ae_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-76872dacb6cea8ae_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-76872dacb6cea8ae_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-76872dacb6cea8ae_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-76872dacb6cea8ae_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-76872dacb6cea8ae_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-76872dacb6cea8ae_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-76872dacb6cea8ae_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-76872dacb6cea8ae_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-76872dacb6cea8ae_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-76872dacb6cea8ae_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M113.25,46.831L133.124,45.067C152.997,43.304,192.745,39.777,231.827,39.48C270.91,39.183,309.328,42.117,328.537,43.584L347.746,45.05" id="mmd-76872dacb6cea8ae-L_S1_S2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S1_S2_0" data-points="W3sieCI6MTEzLjI1LCJ5Ijo0Ni44MzA1MTUwMjM0MTAxNn0seyJ4IjoyMzIuNDkyMTg3NSwieSI6MzYuMjV9LHsieCI6MzUxLjczNDM3NSwieSI6NDUuMzU1MDIwNzMyMjc5Nzd9XQ==" data-look="classic" marker-end="url(#mmd-76872dacb6cea8ae_flowchart-v2-pointEnd)"/><path d="M512.688,45.364L532.609,43.845C552.531,42.326,592.375,39.288,631.555,39.435C670.734,39.583,709.25,42.915,728.507,44.582L747.765,46.248" id="mmd-76872dacb6cea8ae-L_S2_S3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S2_S3_0" data-points="W3sieCI6NTEyLjY4NzUsInkiOjQ1LjM2MzkwMTgwMDcxMDkwNn0seyJ4Ijo2MzIuMjE4NzUsInkiOjM2LjI1fSx7IngiOjc1MS43NSwieSI6NDYuNTkyODc4NjczNzAwMDh9XQ==" data-look="classic" marker-end="url(#mmd-76872dacb6cea8ae_flowchart-v2-pointEnd)"/><path d="M865.172,51.5L869.339,51.5C873.505,51.5,881.839,51.5,889.505,51.5C897.172,51.5,904.172,51.5,907.672,51.5L911.172,51.5" id="mmd-76872dacb6cea8ae-L_S3_S4_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S3_S4_0" data-points="W3sieCI6ODY1LjE3MTg3NSwieSI6NTEuNX0seyJ4Ijo4OTAuMTcxODc1LCJ5Ijo1MS41fSx7IngiOjkxNS4xNzE4NzUsInkiOjUxLjV9XQ==" data-look="classic" marker-end="url(#mmd-76872dacb6cea8ae_flowchart-v2-pointEnd)"/><path d="M351.734,57.645L331.861,59.162C311.987,60.68,272.24,63.715,233.156,63.528C194.073,63.341,155.654,59.932,136.444,58.228L117.234,56.523" id="mmd-76872dacb6cea8ae-L_S2_S1_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S2_S1_0" data-points="W3sieCI6MzUxLjczNDM3NSwieSI6NTcuNjQ0OTc5MjY3NzIwMjN9LHsieCI6MjMyLjQ5MjE4NzUsInkiOjY2Ljc1fSx7IngiOjExMy4yNSwieSI6NTYuMTY5NDg0OTc2NTg5ODR9XQ==" data-look="classic" marker-end="url(#mmd-76872dacb6cea8ae_flowchart-v2-pointEnd)"/><path d="M751.75,56.407L731.828,58.131C711.906,59.855,672.063,63.302,632.883,63.558C593.704,63.813,555.19,60.877,535.933,59.409L516.676,57.94" id="mmd-76872dacb6cea8ae-L_S3_S2_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S3_S2_0" data-points="W3sieCI6NzUxLjc1LCJ5Ijo1Ni40MDcxMjEzMjYyOTk5Mn0seyJ4Ijo2MzIuMjE4NzUsInkiOjY2Ljc1fSx7IngiOjUxMi42ODc1LCJ5Ijo1Ny42MzYwOTgxOTkyODkwOTR9XQ==" data-look="classic" marker-end="url(#mmd-76872dacb6cea8ae_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_S1_S2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_S2_S3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_S3_S4_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(232.43174, 66.74464)"><g class="label" data-id="L_S2_S1_0" transform="translate(-94.2421875, -10.5)"><foreignObject width="188.484375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>get buy-in before going deep</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(632.21875, 66.75)"><g class="label" data-id="L_S3_S2_0" transform="translate(-94.53125, -10.5)"><foreignObject width="189.0625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>revise if a constraint changes</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-76872dacb6cea8ae-flowchart-S1-0" data-look="classic" transform="translate(60.625, 51.5)"><rect class="basic label-container" style="" x="-52.625" y="-43.5" width="105.25" height="87"/><g class="label" style="" transform="translate(-28.625, -31.5)"><rect/><foreignObject width="57.25" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Step 1<br />Scope<br />3-10 min</p></span></div></foreignObject></g></g><g class="node default" id="mmd-76872dacb6cea8ae-flowchart-S2-1" data-look="classic" transform="translate(432.2109375, 51.5)"><rect class="basic label-container" style="" x="-80.4765625" y="-43.5" width="160.953125" height="87"/><g class="label" style="" transform="translate(-56.4765625, -31.5)"><rect/><foreignObject width="112.953125" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Step 2<br />High-level design<br />10-15 min</p></span></div></foreignObject></g></g><g class="node default" id="mmd-76872dacb6cea8ae-flowchart-S3-3" data-look="classic" transform="translate(808.4609375, 51.5)"><rect class="basic label-container" style="" x="-56.7109375" y="-43.5" width="113.421875" height="87"/><g class="label" style="" transform="translate(-32.7109375, -31.5)"><rect/><foreignObject width="65.421875" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Step 3<br />Deep dive<br />10-25 min</p></span></div></foreignObject></g></g><g class="node default" id="mmd-76872dacb6cea8ae-flowchart-S4-5" data-look="classic" transform="translate(967.6796875, 51.5)"><rect class="basic label-container" style="" x="-52.5078125" y="-43.5" width="105.015625" height="87"/><g class="label" style="" transform="translate(-28.5078125, -31.5)"><rect/><foreignObject width="57.015625" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Step 4<br />Wrap-up<br />3-5 min</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-76872dacb6cea8ae-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-76872dacb6cea8ae-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-76872dacb6cea8ae-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>The dotted arrows matter: this is a loop, not a one-way pipeline. Discovering in Step 3 that your Step 2 design can't meet a requirement and saying so is a <em>good</em> outcome, not a failure.</p>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-establish-design-scope">
+<h2 id="step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</h2>
+<h3 id="key-objectives">Key Objectives</h3>
+<ul>
+<li>Clarify requirements and assumptions.</li>
+<li>Avoid jumping into solutions prematurely.</li>
+<li>Showcase critical thinking by asking good questions.</li>
+</ul>
+<h3 id="approach">Approach</h3>
+<ul>
+<li>
+<p><strong>Ask Clarifying Questions:</strong></p>
+<ul>
+<li>What are the most important features?</li>
+<li>What scale does the system need to handle?</li>
+<li>Are we building for web, mobile, or both?</li>
+<li>Are there existing technologies or constraints?</li>
+</ul>
+</li>
+<li>
+<p><strong>Document Assumptions:</strong> Write assumptions on a whiteboard or paper for reference.</p>
+</li>
+</ul>
+<h3 id="functional-vs-non-functional-requirements">Functional vs non-functional requirements</h3>
+<p>Separating these two explicitly is the highest-value habit in this step, because they drive completely different parts of the design.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>Functional</strong> — what it does</th>
+<th><strong>Non-functional</strong> — how well it does it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Describes</td>
+<td>Features and behaviour</td>
+<td>Scale, latency, availability, consistency, durability, cost</td>
+</tr>
+<tr>
+<td>Examples</td>
+<td>&quot;Users post tweets&quot;, &quot;users follow others&quot;, &quot;feed shows followed users' posts&quot;</td>
+<td>&quot;500M DAU&quot;, &quot;feed loads in under 200 ms&quot;, &quot;99.99% available&quot;, &quot;stale feed acceptable&quot;</td>
+</tr>
+<tr>
+<td>Drives</td>
+<td>APIs and the data model</td>
+<td>Caching, replication, sharding, queues — the whole of Chapter 1</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Most candidates gather the functional requirements and stop. <strong>The non-functional ones are what make it a design problem</strong> — a feed for 100 users and a feed for 500 million need the same API and entirely different architectures.</p>
+<h3 id="a-reusable-question-checklist">A reusable question checklist</h3>
+<p>Pick the handful that matter; do not run the whole list.</p>
+<p><strong>Scope and scale</strong></p>
+<ul>
+<li>How many daily active users? How much growth is expected?</li>
+<li>What is the read-to-write ratio? (This decides nearly everything about the data tier.)</li>
+<li>How much data per record, and how long must it be retained?</li>
+</ul>
+<p><strong>Behaviour</strong></p>
+<ul>
+<li>Which 2–3 features are in scope? What is explicitly out of scope?</li>
+<li>Who are the actors — end users, internal services, third parties?</li>
+</ul>
+<p><strong>Quality attributes</strong></p>
+<ul>
+<li>What latency is acceptable, at p99 rather than on average?</li>
+<li>When something has to give, do we prefer <strong>consistency or availability</strong>? (Showing money needs consistency; showing a like count does not.)</li>
+<li>How stale may data be? Seconds, minutes, or must reads be immediate?</li>
+<li>What is the availability target, and what does an outage cost?</li>
+</ul>
+<p><strong>Context</strong></p>
+<ul>
+<li>Mobile, web, or both? Does offline support matter?</li>
+<li>Is there an existing stack or team constraint?</li>
+<li>Do we need authentication, multi-tenancy, audit logs, regulatory constraints?</li>
+</ul>
+<h3 id="turn-assumptions-into-numbers">Turn assumptions into numbers</h3>
+<p>A vague scope produces a vague design. Convert the answers into a short written list before designing anything:</p>
+<div class="callout callout-quote">
+<p>10M DAU · 2 posts/user/day · read:write ≈ 100:1 · p99 under 200 ms for the feed · a few seconds of staleness is fine · 99.9% availability · media supported, 1 MB average</p>
+</div>
+<p>That block makes the rest of the interview concrete. Everything you propose can now be justified against it, and if the interviewer changes one line you know exactly which decisions to revisit.</p>
+<h3 id="example">Example</h3>
+<p><strong>Problem:</strong> Design a news feed system.<br>
+<strong>Questions:</strong></p>
+<ul>
+<li>Is it a mobile app, web app, or both?</li>
+<li>How many friends can a user have?</li>
+<li>Should the feed include images and videos?</li>
+<li>Is the feed sorted by reverse chronological order?</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>this step is scored on whether your questions are <em>consequential</em>. &quot;How many friends can a user have?&quot; is a strong question because the answer decides fan-out-on-write versus fan-out-on-read. &quot;What colour is the button?&quot; is not. For each question, know what you would do differently with each answer — and if you don't, don't ask it.</p>
+</div>
+<hr>
+</section>
+<section id="step-2-propose-high-level-design-and-get-buy-in">
+<h2 id="step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</h2>
+<h3 id="key-objectives-1">Key Objectives</h3>
+<ul>
+<li>Develop a high-level architecture.</li>
+<li>Collaborate with the interviewer to refine the design.</li>
+</ul>
+<h3 id="approach-1">Approach</h3>
+<ul>
+<li>
+<p><strong>Draft a Blueprint:</strong></p>
+<ul>
+<li>Use box diagrams for key components (e.g., clients, APIs, databases, caches, CDNs).</li>
+<li>Treat the interviewer as a teammate to refine the design.</li>
+</ul>
+</li>
+<li>
+<p><strong>Perform Back-of-the-Envelope Calculations:</strong></p>
+<ul>
+<li>Ensure the design can handle the scale constraints.</li>
+</ul>
+</li>
+<li>
+<p><strong>Walk Through Use Cases:</strong> Identify edge cases and validate design assumptions.</p>
+</li>
+</ul>
+<h3 id="work-in-this-order-api-→-data-model-→-boxes">Work in this order: API → data model → boxes</h3>
+<p>Drawing boxes first is the most common way to lose control of this step, because the boxes have nothing to constrain them. Going API-first keeps the design tied to the requirements:</p>
+<p><strong>1. Sketch the API.</strong> Three or four endpoints is plenty. This forces the functional requirements into something concrete and immediately surfaces questions about pagination, auth, and payload size:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>POST /v1/posts            { content, media_ids }      -&gt; post_id
+GET  /v1/feed?cursor=...&amp;limit=20                     -&gt; posts[]
+POST /v1/users/{id}/follow
+</code></pre></div>
+<p>Cursor-based pagination rather than offsets, for instance, is a small detail that shows you have thought about a feed that changes while being read.</p>
+<p><strong>2. Sketch the data model.</strong> The entities, their keys, and the access patterns. This is where the SQL-vs-NoSQL decision is actually made — by access pattern, as <a href="01-scaling.html#section-2-database-separation">Chapter 1 §2</a> describes, not by preference.</p>
+<p><strong>3. Then draw the boxes</strong>, and only the ones your requirements justify.</p>
+<h3 id="a-starting-canvas">A starting canvas</h3>
+<p>Most designs are a specialisation of this shape. Starting here saves time, as long as you <strong>delete what the problem doesn't need</strong> rather than keeping it for decoration:</p>
+<figure class="mermaid-fig">
+<svg id="mmd-3d78d135a6f10774" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 851.625px; background-color: transparent;" viewBox="0 0 851.625 283.0118408203125" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-3d78d135a6f10774{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-3d78d135a6f10774 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-3d78d135a6f10774 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-3d78d135a6f10774 .error-icon{fill:#f4f6f8;}#mmd-3d78d135a6f10774 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-3d78d135a6f10774 .edge-thickness-normal{stroke-width:1px;}#mmd-3d78d135a6f10774 .edge-thickness-thick{stroke-width:3.5px;}#mmd-3d78d135a6f10774 .edge-pattern-solid{stroke-dasharray:0;}#mmd-3d78d135a6f10774 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-3d78d135a6f10774 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-3d78d135a6f10774 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-3d78d135a6f10774 .marker{fill:#637381;stroke:#637381;}#mmd-3d78d135a6f10774 .marker.cross{stroke:#637381;}#mmd-3d78d135a6f10774 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-3d78d135a6f10774 p{margin:0;}#mmd-3d78d135a6f10774 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-3d78d135a6f10774 .cluster-label text{fill:#454f5b;}#mmd-3d78d135a6f10774 .cluster-label span{color:#454f5b;}#mmd-3d78d135a6f10774 .cluster-label span p{background-color:transparent;}#mmd-3d78d135a6f10774 .label text,#mmd-3d78d135a6f10774 span{fill:#161c24;color:#161c24;}#mmd-3d78d135a6f10774 .node rect,#mmd-3d78d135a6f10774 .node circle,#mmd-3d78d135a6f10774 .node ellipse,#mmd-3d78d135a6f10774 .node polygon,#mmd-3d78d135a6f10774 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-3d78d135a6f10774 .rough-node .label text,#mmd-3d78d135a6f10774 .node .label text,#mmd-3d78d135a6f10774 .image-shape .label,#mmd-3d78d135a6f10774 .icon-shape .label{text-anchor:middle;}#mmd-3d78d135a6f10774 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-3d78d135a6f10774 .rough-node .label,#mmd-3d78d135a6f10774 .node .label,#mmd-3d78d135a6f10774 .image-shape .label,#mmd-3d78d135a6f10774 .icon-shape .label{text-align:center;}#mmd-3d78d135a6f10774 .node.clickable{cursor:pointer;}#mmd-3d78d135a6f10774 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-3d78d135a6f10774 .arrowheadPath{fill:#000000;}#mmd-3d78d135a6f10774 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-3d78d135a6f10774 .flowchart-link{stroke:#637381;fill:none;}#mmd-3d78d135a6f10774 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-3d78d135a6f10774 .edgeLabel p{background-color:#ffffff;}#mmd-3d78d135a6f10774 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-3d78d135a6f10774 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-3d78d135a6f10774 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-3d78d135a6f10774 .cluster text{fill:#454f5b;}#mmd-3d78d135a6f10774 .cluster span{color:#454f5b;}#mmd-3d78d135a6f10774 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-3d78d135a6f10774 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-3d78d135a6f10774 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-3d78d135a6f10774 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-3d78d135a6f10774 rect.text{fill:none;stroke-width:0;}#mmd-3d78d135a6f10774 .icon-shape,#mmd-3d78d135a6f10774 .image-shape{background-color:#ffffff;text-align:center;}#mmd-3d78d135a6f10774 .icon-shape p,#mmd-3d78d135a6f10774 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-3d78d135a6f10774 .icon-shape .label rect,#mmd-3d78d135a6f10774 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-3d78d135a6f10774 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-3d78d135a6f10774 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-3d78d135a6f10774 .node .neo-node{stroke:#299a8d;}#mmd-3d78d135a6f10774 [data-look="neo"].node rect,#mmd-3d78d135a6f10774 [data-look="neo"].cluster rect,#mmd-3d78d135a6f10774 [data-look="neo"].node polygon{stroke:url(#mmd-3d78d135a6f10774-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-3d78d135a6f10774 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-3d78d135a6f10774 [data-look="neo"].node path{stroke:url(#mmd-3d78d135a6f10774-gradient);stroke-width:1px;}#mmd-3d78d135a6f10774 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-3d78d135a6f10774 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-3d78d135a6f10774 [data-look="neo"].node circle{stroke:url(#mmd-3d78d135a6f10774-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-3d78d135a6f10774 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-3d78d135a6f10774 [data-look="neo"].icon-shape .icon{fill:url(#mmd-3d78d135a6f10774-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-3d78d135a6f10774 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-3d78d135a6f10774-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-3d78d135a6f10774 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-3d78d135a6f10774_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-3d78d135a6f10774_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-3d78d135a6f10774_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-3d78d135a6f10774_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-3d78d135a6f10774_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-3d78d135a6f10774_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-3d78d135a6f10774_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-3d78d135a6f10774_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-3d78d135a6f10774_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-3d78d135a6f10774_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-3d78d135a6f10774_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-3d78d135a6f10774_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M130.4,59.421L135.76,56.351C141.121,53.28,151.842,47.14,160.702,44.07C169.563,41,176.563,41,180.063,41L183.563,41" id="mmd-3d78d135a6f10774-L_C_CDN_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_CDN_0" data-points="W3sieCI6MTMwLjM5OTc5Mjg1NDgwMDE4LCJ5Ijo1OS40MjA2MjA5MTgyNzM5MjZ9LHsieCI6MTYyLjU2MjUsInkiOjQxfSx7IngiOjE4Ny41NjI1LCJ5Ijo0MX1d" data-look="classic" marker-end="url(#mmd-3d78d135a6f10774_flowchart-v2-pointEnd)"/><path d="M127.567,125.421L133.4,128.934C139.232,132.447,150.897,139.474,160.266,142.987C169.635,146.5,176.708,146.5,180.245,146.5L183.781,146.5" id="mmd-3d78d135a6f10774-L_C_LB_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_LB_0" data-points="W3sieCI6MTI3LjU2NzAzNTI3MTczMTI3LCJ5IjoxMjUuNDIwNjIwOTE4MjczOTN9LHsieCI6MTYyLjU2MjUsInkiOjE0Ni41fSx7IngiOjE4Ny43ODEyNSwieSI6MTQ2LjV9XQ==" data-look="classic" marker-end="url(#mmd-3d78d135a6f10774_flowchart-v2-pointEnd)"/><path d="M327.5,146.5L331.703,146.5C335.906,146.5,344.313,146.5,352.016,146.5C359.719,146.5,366.719,146.5,370.219,146.5L373.719,146.5" id="mmd-3d78d135a6f10774-L_LB_API_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_LB_API_0" data-points="W3sieCI6MzI3LjUsInkiOjE0Ni41fSx7IngiOjM1Mi43MTg3NSwieSI6MTQ2LjV9LHsieCI6Mzc3LjcxODc1LCJ5IjoxNDYuNX1d" data-look="classic" marker-end="url(#mmd-3d78d135a6f10774_flowchart-v2-pointEnd)"/><path d="M491.167,113.5L503.139,101.638C515.111,89.776,539.056,66.053,554.528,54.191C570,42.329,577,42.329,580.5,42.329L584,42.329" id="mmd-3d78d135a6f10774-L_API_CA_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_CA_0" data-points="W3sieCI6NDkxLjE2NjY2MDYyODI3NzgsInkiOjExMy41fSx7IngiOjU2MywieSI6NDIuMzI5Mzc5MDgxNzI2MDc0fSx7IngiOjU4OCwieSI6NDIuMzI5Mzc5MDgxNzI2MDc0fV0=" data-look="classic" marker-end="url(#mmd-3d78d135a6f10774_flowchart-v2-pointEnd)"/><path d="M538,145.487L542.167,145.434C546.333,145.381,554.667,145.276,563.66,145.223C572.654,145.171,582.307,145.171,587.134,145.171L591.961,145.171" id="mmd-3d78d135a6f10774-L_API_DB_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_DB_0" data-points="W3sieCI6NTM4LCJ5IjoxNDUuNDg2NzE2NDA1MDg2NX0seyJ4Ijo1NjMsInkiOjE0NS4xNzA2MjA5MTgyNzM5M30seyJ4Ijo1OTUuOTYwOTM3NSwieSI6MTQ1LjE3MDYyMDkxODI3MzkzfV0=" data-look="classic" marker-end="url(#mmd-3d78d135a6f10774_flowchart-v2-pointEnd)"/><path d="M494.186,179.5L505.655,189.919C517.124,200.337,540.062,221.175,556.672,231.667C573.281,242.159,583.563,242.307,588.703,242.381L593.844,242.454" id="mmd-3d78d135a6f10774-L_API_Q_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_Q_0" data-points="W3sieCI6NDk0LjE4NjE3ODAyNjYyMDI3LCJ5IjoxNzkuNX0seyJ4Ijo1NjMsInkiOjI0Mi4wMTE4NjI3NTQ4MjE3OH0seyJ4Ijo1OTcuODQzNzUsInkiOjI0Mi41MTE4NjI3NTQ4MjE3OH1d" data-look="classic" marker-end="url(#mmd-3d78d135a6f10774_flowchart-v2-pointEnd)"/><path d="M668.234,242.512L673.875,242.429C679.516,242.345,690.797,242.179,699.938,242.095C709.078,242.012,716.078,242.012,719.578,242.012L723.078,242.012" id="mmd-3d78d135a6f10774-L_Q_W_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q_W_0" data-points="W3sieCI6NjY4LjIzNDM3NSwieSI6MjQyLjUxMTg2Mjc1NDgyMTc4fSx7IngiOjcwMi4wNzgxMjUsInkiOjI0Mi4wMTE4NjI3NTQ4MjE3OH0seyJ4Ijo3MjcuMDc4MTI1LCJ5IjoyNDIuMDExODYyNzU0ODIxNzh9XQ==" data-look="classic" marker-end="url(#mmd-3d78d135a6f10774_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_C_CDN_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_C_LB_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_LB_API_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_CA_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_DB_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_Q_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_Q_W_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-3d78d135a6f10774-flowchart-C-0" data-look="classic" transform="translate(72.78125, 92.42062091827393)"><rect class="basic label-container" style="" x="-64.78125" y="-33" width="129.5625" height="66"/><g class="label" style="" transform="translate(-40.78125, -21)"><rect/><foreignObject width="81.5625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Clients<br />web / mobile</p></span></div></foreignObject></g></g><g class="node default" id="mmd-3d78d135a6f10774-flowchart-CDN-1" data-look="classic" transform="translate(257.640625, 41)"><rect class="basic label-container" style="" x="-70.078125" y="-33" width="140.15625" height="66"/><g class="label" style="" transform="translate(-46.078125, -21)"><rect/><foreignObject width="92.15625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>CDN<br />static &amp; media</p></span></div></foreignObject></g></g><g class="node default" id="mmd-3d78d135a6f10774-flowchart-LB-3" data-look="classic" transform="translate(257.640625, 146.5)"><rect class="basic label-container" style="" x="-69.859375" y="-22.5" width="139.71875" height="45"/><g class="label" style="" transform="translate(-45.859375, -10.5)"><rect/><foreignObject width="91.71875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Load Balancer</p></span></div></foreignObject></g></g><g class="node default" id="mmd-3d78d135a6f10774-flowchart-API-5" data-look="classic" transform="translate(457.859375, 146.5)"><rect class="basic label-container" style="" x="-80.140625" y="-33" width="160.28125" height="66"/><g class="label" style="" transform="translate(-56.140625, -21)"><rect/><foreignObject width="112.28125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>API / App Servers<br />stateless</p></span></div></foreignObject></g></g><g class="node default" id="mmd-3d78d135a6f10774-flowchart-CA-7" data-look="classic" transform="translate(632.5390625, 42.329379081726074)"><rect class="basic label-container" style="" x="-44.5390625" y="-22.5" width="89.078125" height="45"/><g class="label" style="" transform="translate(-20.5390625, -10.5)"><rect/><foreignObject width="41.078125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Cache</p></span></div></foreignObject></g></g><g class="node default" id="mmd-3d78d135a6f10774-flowchart-DB-9" data-look="classic" transform="translate(632.5390625, 145.17062091827393)"><path d="M0,9.229616779687747 a36.578125,9.229616779687747 0,0,0 73.15625,0 a36.578125,9.229616779687747 0,0,0 -73.15625,0 l0,42.229616779687746 a36.578125,9.229616779687747 0,0,0 73.15625,0 l0,-42.229616779687746" class="basic label-container outer-path" style="" transform="translate(-36.578125, -30.34442516953162)"/><g class="label" style="" transform="translate(-30.578125, -2.5)"><rect/><foreignObject width="61.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Database</p></span></div></foreignObject></g></g><g class="node default" id="mmd-3d78d135a6f10774-flowchart-Q-11" data-look="classic" transform="translate(632.5390625, 242.01186275482178)"><polygon points="0,0 54.390625,0 54.390625,-33 0,-33 0,0 -8,0 62.390625,0 62.390625,-33 -8,-33 -8,0" class="label-container" transform="translate(-27.1953125,16.5)"/><g class="label" style="" transform="translate(-21.1953125, -10.5)"><rect/><foreignObject width="42.390625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Queue</p></span></div></foreignObject></g></g><g class="node default" id="mmd-3d78d135a6f10774-flowchart-W-13" data-look="classic" transform="translate(785.3515625, 242.01186275482178)"><rect class="basic label-container" style="" x="-58.2734375" y="-33" width="116.546875" height="66"/><g class="label" style="" transform="translate(-34.2734375, -21)"><rect/><foreignObject width="68.546875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Workers<br />async jobs</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-3d78d135a6f10774-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-3d78d135a6f10774-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-3d78d135a6f10774-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>Then run your estimates from <a href="02-back-of-the-envelope-estimation.html">Chapter 2</a> against it, and say what they rule in or out: &quot;at 100:1 reads, the cache and replicas do the real work here; writes are low enough that one primary is fine, so I won't shard yet.&quot;</p>
+<h3 id="walk-a-request-through-it">Walk a request through it</h3>
+<p>Before going deeper, trace one or two concrete flows end to end — it validates the diagram and almost always exposes a missing box.</p>
+<h3 id="example-1">Example</h3>
+<p>For a news feed system, divide the design into:</p>
+<ol>
+<li><strong>Feed Publishing Flow:</strong> Writing posts into databases and populating friends' feeds.</li>
+<li><strong>Feed Retrieval Flow:</strong> Aggregating and displaying friends' posts in reverse chronological order.</li>
+</ol>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>&quot;get buy-in&quot; is a literal instruction. Pause and ask &quot;does this high-level shape look reasonable before I go deeper?&quot; If the interviewer wants you somewhere else, this is when it costs you nothing to move. Candidates who deep-dive for fifteen minutes on a component the interviewer didn't care about lose the interview in this step, not Step 3.</p>
+</div>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<h3 id="key-objectives-2">Key Objectives</h3>
+<ul>
+<li>Dive into critical components.</li>
+<li>Showcase depth of understanding and adaptability.</li>
+</ul>
+<h3 id="approach-2">Approach</h3>
+<ul>
+<li><strong>Prioritize Key Components:</strong> Focus on areas most relevant to the problem.</li>
+<li><strong>Discuss Bottlenecks:</strong> Identify potential performance issues and propose solutions.</li>
+<li><strong>Balance Detail:</strong> Avoid over-engineering or unnecessary deep dives.</li>
+</ul>
+<h3 id="choosing-what-to-dive-into">Choosing what to dive into</h3>
+<p>Ask the interviewer first — they usually have a component in mind. If they leave it to you, pick the part where the problem's <em>distinctive difficulty</em> lives:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Problem type</th>
+<th>Where the real difficulty is</th>
+<th>Likely deep dives</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Feed / timeline</td>
+<td>Fan-out to many followers</td>
+<td>Fan-out on write vs read, the celebrity problem, feed caching</td>
+</tr>
+<tr>
+<td>Chat / messaging</td>
+<td>Real-time delivery and presence</td>
+<td>WebSockets vs long polling, message ordering, delivery receipts, offline queueing</td>
+</tr>
+<tr>
+<td>URL shortener / ID generation</td>
+<td>Generating unique short keys at scale</td>
+<td>Hashing vs counters, collisions, <a href="07-unique-id-generator.html">unique IDs</a></td>
+</tr>
+<tr>
+<td>Video / media</td>
+<td>Enormous files and processing cost</td>
+<td>Chunked upload, transcoding pipeline, CDN strategy, adaptive bitrate</td>
+</tr>
+<tr>
+<td>Search / autocomplete</td>
+<td>Query latency over huge corpora</td>
+<td>Index structure, tries, ranking, cache warming</td>
+</tr>
+<tr>
+<td>Rate limiter</td>
+<td>Accurate counting in a distributed system</td>
+<td>Algorithm choice, shared counters, race conditions</td>
+</tr>
+<tr>
+<td>Payments / wallet</td>
+<td>Correctness, not throughput</td>
+<td>Idempotency, exactly-once semantics, reconciliation, audit trail</td>
+</tr>
+<tr>
+<td>Proximity / maps</td>
+<td>Indexing two dimensions</td>
+<td>Geohashing, quadtrees, shard-by-region</td>
+</tr>
+<tr>
+<td>Metrics / analytics</td>
+<td>Write volume and aggregation</td>
+<td>Time-series storage, pre-aggregation, stream processing, downsampling</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="a-bottleneck-checklist">A bottleneck checklist</h3>
+<p>Walk the request path and ask what saturates first:</p>
+<ul>
+<li><strong>Web tier</strong> — is it stateless, so it can auto-scale? (<a href="01-scaling.html#section-8-stateless-web-tier">§8</a>)</li>
+<li><strong>Reads</strong> — cache hit rate, replica lag, hot keys (<a href="01-scaling.html#section-5-database-replication">§5</a>, <a href="01-scaling.html#section-6-caching">§6</a>)</li>
+<li><strong>Writes</strong> — single primary, lock contention, sharding key (<a href="01-scaling.html#section-12-database-scaling">§12</a>)</li>
+<li><strong>Slow work in the request path</strong> — move it to a queue (<a href="01-scaling.html#section-10-message-queue">§10</a>)</li>
+<li><strong>Fan-out</strong> — one write causing thousands of writes, or one read fanning out to every shard</li>
+<li><strong>Hot spots</strong> — celebrities, trending items, sequential keys</li>
+<li><strong>Failure</strong> — what happens when each component dies, and what the user sees</li>
+</ul>
+<h3 id="trade-off-vocabulary">Trade-off vocabulary</h3>
+<p>Naming trade-offs explicitly is what &quot;depth&quot; sounds like:</p>
+<ul>
+<li><strong>CAP</strong> — under a network <em>partition</em>, choose consistency or availability. Worth stating precisely: CAP is about behaviour during partitions, not a general &quot;pick two of three&quot;.</li>
+<li><strong>Consistency models</strong> — strong, read-your-own-writes, monotonic reads, eventual. Be specific about which one a feature needs rather than saying &quot;consistent&quot;.</li>
+<li><strong>Push vs pull</strong> — precompute on write (fast reads, expensive fan-out) or assemble on read (cheap writes, slow reads). Hybrids — push for most users, pull for celebrities — are usually the real answer.</li>
+<li><strong>Normalise vs denormalise</strong> — join cost against duplication and update cost.</li>
+<li><strong>Latency vs durability</strong> — acknowledge the write before or after it is safely replicated.</li>
+<li><strong>Freshness vs cost</strong> — TTLs are this trade-off made numeric.</li>
+</ul>
+<h3 id="example-topics">Example Topics</h3>
+<ul>
+<li><strong>URL Shortener:</strong> Focus on hash function design.</li>
+<li><strong>Chat System:</strong> Explore latency reduction and online/offline status handling.</li>
+<li><strong>News Feed System:</strong> Examine feed publishing and retrieval processes.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>depth means naming what your choice <em>costs</em>. &quot;I'd fan out on write so reads are a single cache lookup — but a user with 50M followers makes that write enormous, so for accounts above a threshold I'd fall back to fan-out on read.&quot; That sentence demonstrates more than ten minutes of diagramming.</p>
+</div>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap-Up</h2>
+<h3 id="key-objectives-3">Key Objectives</h3>
+<ul>
+<li>Highlight areas for improvement.</li>
+<li>Recap the design and discuss follow-ups.</li>
+</ul>
+<h3 id="approach-3">Approach</h3>
+<ul>
+<li><strong>Identify Bottlenecks:</strong> Discuss potential limitations and scaling strategies.</li>
+<li><strong>Summarize Design:</strong> Recap major design decisions and trade-offs.</li>
+<li><strong>Propose Enhancements:</strong>
+<ul>
+<li>How to scale from 1 million to 10 million users.</li>
+<li>Error handling for server failures or network issues.</li>
+</ul>
+</li>
+</ul>
+<h3 id="a-wrap-up-that-lands">A wrap-up that lands</h3>
+<p>Three or four minutes, roughly in this order:</p>
+<ol>
+<li><strong>Recap in three sentences</strong> — the shape of the system and the two or three decisions that defined it, tied back to the requirements from Step 1.</li>
+<li><strong>Name the weakest point honestly.</strong> &quot;The feed cache is the thing I'd watch — a cold cache at peak would put full load on the database.&quot; Volunteering a limitation reads as confidence, not doubt; interviewers are specifically listening for whether you know where your own design is fragile.</li>
+<li><strong>Say how it is operated</strong> — what you'd monitor, how you'd roll it out behind a flag, and how it degrades rather than fails (serve a stale feed instead of an error).</li>
+<li><strong>Say what you'd do with more time</strong> — the deep dive you didn't get to, or the next scaling step and its trigger.</li>
+</ol>
+<h3 id="the-operational-story">The operational story</h3>
+<p>This is the most commonly skipped part, and it differentiates people who have run systems from people who have only drawn them:</p>
+<ul>
+<li><strong>Monitoring</strong> — which metrics, which alerts, at which percentiles (<a href="01-scaling.html#section-11-logging-metrics-and-automation">§11</a>)</li>
+<li><strong>Rollout</strong> — feature flags, canary, the rollback plan</li>
+<li><strong>Graceful degradation</strong> — what you shed first under load</li>
+<li><strong>Backups and recovery</strong> — and whether a restore has ever been tested</li>
+</ul>
+<hr>
+</section>
+<section id="best-practices">
+<h2 id="best-practices">Best Practices</h2>
+<h3 id="dos">Dos</h3>
+<ul>
+<li><strong>Ask Questions:</strong> Clarify ambiguities before diving into solutions.</li>
+<li><strong>Communicate:</strong> Share your thought process with the interviewer.</li>
+<li><strong>Iterate with the Interviewer:</strong> Treat them as a collaborator.</li>
+<li><strong>Show Flexibility:</strong> Suggest alternative approaches and refine your design.</li>
+<li><strong>Focus on Critical Components:</strong> Prioritize key parts of the system.</li>
+<li><strong>Start simple, then scale</strong> — present the simplest design that meets the requirements, then evolve it when a bottleneck justifies it.</li>
+<li><strong>Name your trade-offs out loud</strong> — every choice should come with what it costs.</li>
+</ul>
+<h3 id="donts">Don’ts</h3>
+<ul>
+<li><strong>Avoid Premature Solutions:</strong> Don’t design before understanding the requirements.</li>
+<li><strong>Don’t Go Silent:</strong> Communicate regularly during the process.</li>
+<li><strong>Avoid Over-Engineering:</strong> Focus on practical, scalable solutions.</li>
+<li><strong>Don’t bluff.</strong> &quot;I’m not sure, here’s how I’d reason about it&quot; beats a confident wrong answer, which invites exactly the follow-up questions you can’t answer.</li>
+<li><strong>Don’t defend a design past the point of evidence.</strong> Changing your mind when given a new constraint is a scored positive.</li>
+<li><strong>Don’t name technologies as answers.</strong> &quot;I’d use Kafka&quot; is not a design; &quot;I need durable, ordered, replayable events, so a log-based queue such as Kafka&quot; is.</li>
+</ul>
+<h3 id="signals-the-interviewer-is-scoring">Signals the interviewer is scoring</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What it looks like</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Requirements first</td>
+<td>Scope established before any component is named</td>
+</tr>
+<tr>
+<td>Justified choices</td>
+<td>Every decision traced back to a requirement or a number</td>
+</tr>
+<tr>
+<td>Trade-off awareness</td>
+<td>Costs named without being asked</td>
+</tr>
+<tr>
+<td>Appropriate scale</td>
+<td>No sharding at 1,000 QPS; no single database at 1M QPS</td>
+</tr>
+<tr>
+<td>Collaboration</td>
+<td>Checks in, incorporates hints, adjusts course</td>
+</tr>
+<tr>
+<td>Knows the weak spots</td>
+<td>Volunteers the design's limitations</td>
+</tr>
+<tr>
+<td>Communication</td>
+<td>Thinking is audible; the diagram stays readable</td>
+</tr>
+</tbody>
+</table>
+</div>
+<hr>
+</section>
+<section id="time-management">
+<h2 id="time-management">Time Management</h2>
+<h3 id="suggested-time-allocation-for-45-minute-interviews">Suggested Time Allocation (for 45-Minute Interviews):</h3>
+<ol>
+<li><strong>Understand Problem and Scope:</strong> 3–10 minutes</li>
+<li><strong>High-Level Design and Buy-In:</strong> 10–15 minutes</li>
+<li><strong>Deep Dive:</strong> 10–25 minutes</li>
+<li><strong>Wrap-Up:</strong> 3–5 minutes</li>
+</ol>
+<p>The deep dive has the widest range because it absorbs whatever the earlier steps leave behind — which cuts both ways. Spending twenty minutes on requirements leaves no time to show depth, and that is where candidates most often run out of clock.</p>
+<p>Two practical habits:</p>
+<ul>
+<li><strong>Glance at the time after Step 2.</strong> If more than twenty minutes are gone, compress the deep dive to one component and do it well.</li>
+<li><strong>Reserve the last three minutes for the wrap-up</strong> even if the deep dive is unfinished. An unfinished deep dive with a clear wrap-up reads far better than a design that simply stops mid-sentence.</li>
+</ul>
+<hr>
+</section>
+<section id="one-page-cheat-sheet">
+<h2 id="one-page-cheat-sheet">One-page cheat sheet</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Time</th>
+<th>Do</th>
+<th>Output</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>1. Scope</strong></td>
+<td>3–10 min</td>
+<td>Separate functional from non-functional requirements; ask consequential questions; write assumptions as numbers</td>
+<td>A short written list of requirements and numbers</td>
+</tr>
+<tr>
+<td><strong>2. High-level</strong></td>
+<td>10–15 min</td>
+<td>API → data model → boxes; run the estimates; trace one request; <strong>get buy-in</strong></td>
+<td>An agreed architecture diagram</td>
+</tr>
+<tr>
+<td><strong>3. Deep dive</strong></td>
+<td>10–25 min</td>
+<td>Pick where the real difficulty is; find the bottleneck; name trade-offs and their costs</td>
+<td>Detail on 1–3 components</td>
+</tr>
+<tr>
+<td><strong>4. Wrap-up</strong></td>
+<td>3–5 min</td>
+<td>Recap, weakest point, operations, what's next</td>
+<td>A closed, coherent answer</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>The one-line version:</strong> scope it, size it, design the simple version, break it on purpose, fix what broke, and say what the fix cost.</p>
+<h3 id="where-to-go-next">Where to go next</h3>
+<ul>
+<li><a href="01-scaling.html">Chapter 1 – Scale From Zero To Millions Of Users</a> — the toolbox Steps 2 and 3 draw on.</li>
+<li><a href="02-back-of-the-envelope-estimation.html">Chapter 2 – Back-of-the-envelope Estimation</a> — how to decide which tools the problem justifies.</li>
+<li><a href="patterns.html">Recurring Patterns</a> — an index of the ideas that recur across the design chapters, each cross-referenced to the chapters covering it. Useful between Step 1 and Step 2, once the requirements tell you which pattern you are in.</li>
+<li>Chapters 4 onward apply this framework to one problem each.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

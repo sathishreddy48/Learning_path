@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 18: Google Maps — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="18-google-maps">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 18 of 28</div>
+  <h1>Chapter 18: Google Maps</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</a></li><li><a href="#step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap Up</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>We'll design a simple version of <strong>Google Maps</strong>.</p>
+<p>Some facts about google maps:</p>
+<ul>
+<li>Started in 2005</li>
+<li>Provides various services - satellite imagery, street maps, real-time traffic conditions, route planning</li>
+<li>By 2021, had 1bil daily active users, 99% coverage of the world, 25mil updates daily of real-time location info</li>
+</ul>
+<p><strong>The one-sentence version:</strong> &quot;Google Maps&quot; is not one system but <strong>three</strong>, sharing only a coordinate space:</p>
+<ol>
+<li><strong>Serving the map</strong> — delivering precomputed image or vector tiles. A CDN problem, and a very large storage problem.</li>
+<li><strong>Navigation</strong> — a shortest-path search over a road graph far too large to load, let alone search, per request. An algorithms and partitioning problem.</li>
+<li><strong>Location ingest</strong> — absorbing a billion GPS streams, which <em>is</em> the traffic data the navigation service depends on. A write-heavy pipeline problem.</li>
+</ol>
+<p>The idea that unifies them is <strong>tiling</strong>: subdividing space into addressable cells at multiple zoom levels. It is applied to map imagery, then to the road graph (routing tiles), and then — more surprisingly — to bookkeeping about which users' routes pass through which area, for rerouting. Watching the same technique solve three unrelated problems is most of the value of this chapter.</p>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-establish-design-scope">
+<h2 id="step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</h2>
+<p>Sample Q&amp;A between candidate and interviewer:</p>
+<ul>
+<li>C: How many daily active users are we dealing with?</li>
+<li>I: 1bil DAU</li>
+<li>C: What features should we focus on?</li>
+<li>I: Location update, navigation, ETA, map rendering</li>
+<li>C: How large is road data? Do we have access to it?</li>
+<li>I: We obtained road data from various sources, it's TBs of raw data</li>
+<li>C: Should we take traffic conditions into consideration?</li>
+<li>I: Yes, we should for accurate time estimations</li>
+<li>C: How about different travel modes - by foot, biking, driving?</li>
+<li>I: We should support those</li>
+<li>C: How about multi-stop directions?</li>
+<li>I: Let's not focus on that for scope of interview</li>
+<li>C: Business places and photos?</li>
+<li>I: Good question, but no need to consider those</li>
+</ul>
+<p>We'll focus on three key features - user location update, navigation service including ETA, map rendering.</p>
+<h3 id="non-functional-requirements"><strong>Non-functional requirements</strong></h3>
+<ul>
+<li><strong>Accuracy</strong>: user shouldn't get wrong directions</li>
+<li><strong>Smooth navigation</strong>: Users should experience smooth map rendering</li>
+<li><strong>Data and battery usage</strong>: Client should use as little data and battery as possible. Important for mobile devices.</li>
+<li>General availability and scalability requirements</li>
+</ul>
+<h3 id="map-101"><strong>Map 101</strong></h3>
+<p>Before jumping into the design, there are some map-related concepts we should understand.</p>
+<h4 id="positioning-system">Positioning system</h4>
+<p>World is a sphere, rotating on its axis. Positions are defined by latitude (how far north/south you are) and longitude (how far east/west you are):</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/partitioning-system.png" alt="partitioning-system" data-width="500" style="max-width:500px" />
+</p>
+<h4 id="going-from-3d-to-2d">Going from 3D to 2D</h4>
+<p>The process of translating points from 3D to 2D plane is called &quot;map projection&quot;.</p>
+<p>There are different ways to do it and each comes with its pros and cons. Almost all distort the actual geometry.</p>
+<p><strong>Which distortion you accept is a product decision.</strong> No flat map preserves area, shape, distance and direction simultaneously — that is a theorem, not an engineering limitation. Mapping and navigation applications almost universally choose <strong>Web Mercator</strong>, and for a specific reason:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Projection property</th>
+<th>Web Mercator</th>
+<th>Why it matters here</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Conformal</strong> (preserves local angles)</td>
+<td><strong>Yes</strong></td>
+<td>Streets meet at their true angles, so &quot;turn 90° right&quot; looks right. Essential for navigation.</td>
+</tr>
+<tr>
+<td>Preserves area</td>
+<td><strong>No</strong> — badly</td>
+<td>Greenland appears the size of Africa. Irrelevant for driving, notorious for world maps.</td>
+</tr>
+<tr>
+<td>Preserves distance</td>
+<td>No</td>
+<td>Scale varies with latitude; distances must be computed on the sphere, not from the image.</td>
+</tr>
+<tr>
+<td>Maps the world to a square</td>
+<td><strong>Yes</strong></td>
+<td>Makes square tiles and a clean quadtree possible — the reason tiling works so neatly.</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Conformality is the one navigation genuinely needs, and the square world is what makes the whole tiling scheme below fall out naturally. The area distortion is the price, and it is paid everywhere except in arguments about world maps.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/map-projections.png" alt="map-projections" data-width="500" style="max-width:500px" />
+</p>
+<p>Google maps selected a modified version of Mercator projection called &quot;Web Mercator&quot;.</p>
+<h4 id="geocoding">Geocoding</h4>
+<p>Geocoding is the process of converting addresses to geographic coordinates.</p>
+<p>The reverse process is called &quot;reverse geocoding&quot;.</p>
+<p>One way to achieve this is to use interpolation - leveraging data from different sources (eg GIS-es) where street network is mapped to geo coordinate space.</p>
+<h4 id="geohashing">Geohashing</h4>
+<p>Geohashing is an encoding system which encodes a geographic area into a string of letters and digits.</p>
+<p>It depicts the world as a flattened surface and recursively sub-divides it into four quadrants:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/geohashing.png" alt="geohashing" data-width="500" style="max-width:500px" />
+</p>
+<h4 id="map-rendering">Map rendering</h4>
+<p>Map rendering happens via tiling. Instead of rendering entire map as one big custom image, world is broken up into smaller tiles.</p>
+<p>Client only downloads relevant tiles and renders them like stitching together a mosaic.</p>
+<p>There are different tiles for different zoom levels. Client chooses appropriate tiles based on the client's zoom level.</p>
+<p>Eg, zooming out the entire world would download only a single 256x256 tile, representing the whole world.</p>
+<p><strong>The tile scheme, and why it explains the 70 PB.</strong> A tile is addressed by <code>(z, x, y)</code> — zoom level and position. Each zoom level splits every tile into four, so:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Zoom</th>
+<th>Tiles at this level</th>
+<th>What you see</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>1</td>
+<td>Whole world</td>
+</tr>
+<tr>
+<td>1</td>
+<td>4</td>
+<td>Continents</td>
+</tr>
+<tr>
+<td>10</td>
+<td>~1 million</td>
+<td>City</td>
+</tr>
+<tr>
+<td>15</td>
+<td>~1 billion</td>
+<td>Streets</td>
+</tr>
+<tr>
+<td>21</td>
+<td><strong>~4.4 trillion</strong></td>
+<td>Individual buildings</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Summing all levels to zoom 21 gives roughly <strong>5.8 trillion tiles</strong>. At ~20 KB each that is over 100 PB — which is where the chapter's ~70 PB estimate comes from, once you account for the fact that most of the planet is ocean or desert and compresses to almost nothing, and that the deepest zoom levels are only generated where there is detail to show.</p>
+<p>Two properties make this servable:</p>
+<ul>
+<li><strong>Only visible tiles are fetched.</strong> A phone screen shows a handful of tiles at one zoom level, so a client downloads kilobytes, not petabytes.</li>
+<li><strong>Cache locality is excellent.</strong> Tiles are immutable between map updates and demand is enormously concentrated on populated areas, so a CDN serves the overwhelming majority of requests (<a href="01-scaling.html#section-7-content-delivery-network-cdn">Chapter 1 §7</a>).</li>
+</ul>
+<p><strong>Raster tiles versus vector tiles</strong> is the choice that decides whether the 70 PB stays 70 PB:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Raster tiles (pre-rendered images)</th>
+<th>Vector tiles (geometry, rendered on device)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Server work</td>
+<td>Render once, serve as a file</td>
+<td>Serve geometry; client renders</td>
+</tr>
+<tr>
+<td>Size on the wire</td>
+<td>Larger</td>
+<td><strong>Much smaller</strong></td>
+</tr>
+<tr>
+<td>One tile serves</td>
+<td>One style, one language, one rotation</td>
+<td><strong>Every</strong> style, language, rotation, and label placement</td>
+</tr>
+<tr>
+<td>Storage multiplier</td>
+<td>× styles × languages × themes</td>
+<td><strong>× 1</strong></td>
+</tr>
+<tr>
+<td>Client cost</td>
+<td>Trivial — draw a bitmap</td>
+<td>Real CPU and battery to render</td>
+</tr>
+<tr>
+<td>Smooth zoom/rotate</td>
+<td>No — must fetch a new level</td>
+<td><strong>Yes</strong> — scale and rotate locally</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>With raster tiles, supporting dark mode, 40 languages and satellite/terrain styles multiplies that 70 PB by a large constant. Vector tiles move the rendering to the device and make the multiplier disappear — which is why modern maps use them, and why the non-functional requirement about <strong>data and battery usage</strong> is a genuine tension rather than a platitude: vector tiles save data and spend battery.</p>
+<h4 id="road-data-processing-for-navigation-algorithms">Road data processing for navigation algorithms</h4>
+<p>In most routing algorithms, intersections are represented as nodes and roads are represented as edges:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/road-representation.png" alt="road-representation" data-width="500" style="max-width:500px" />
+</p>
+<p>Most navigation algorithms use a modified version of Dijkstra's or A* algorithms.</p>
+<p>Pathfinding performance is sensitive to the size of the graph. To work at scale, we can't represent the whole world as a graph and run the algorithm on it.</p>
+<p><strong>How badly does it scale?</strong> Dijkstra's algorithm is <code>O(E + V log V)</code> and, crucially, it explores <strong>outward in all directions</strong> until it reaches the destination. A planetary road graph has on the order of a billion nodes. Routing from Lisbon to Warsaw with plain Dijkstra would visit most of Europe — hundreds of millions of nodes — for one request, and the requirement is up to <strong>1 million navigation requests per second</strong>. The gap is not a constant factor.</p>
+<p>A* improves on this by adding a heuristic: estimate the remaining distance to the goal and explore promising nodes first. The usual heuristic is <strong>straight-line distance ÷ maximum speed</strong>, which must be an <em>under</em>-estimate of the true remaining cost — an <strong>admissible</strong> heuristic — or A* will confidently return a route that is not the shortest. That requirement is why the heuristic uses maximum speed rather than expected speed: the moment it over-estimates, correctness is gone.</p>
+<p>Even so, A* on a continental graph is still far too slow, which is what the tiling below is for. And the technique real routing engines use goes further: <strong>contraction hierarchies</strong> precompute shortcut edges between important junctions, so a long route is found by climbing onto the &quot;highway&quot; layer, crossing the continent in a few hundred node expansions, and descending again. It converts a continental query from hundreds of millions of node visits into thousands, at the cost of an expensive preprocessing step over the whole graph — which is exactly the trade the hierarchical routing tiles below make.</p>
+<p>Instead, we use a technique similar to tiling - we subdivide the world into smaller and smaller graphs.</p>
+<p>Routing tiles hold references to neighboring tiles and algorithms can stitch together a bigger road graph as it traverses interconnected tiles:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/routing-tiles.png" alt="routing-tiles" data-width="500" style="max-width:500px" />
+</p>
+<p>This technique enables us to significantly reduce memory bandwidth and only load the tiles we need for the given source/destination pair.</p>
+<p>Note what the &quot;references to neighboring tiles&quot; are doing: they are the <strong>stitching seams</strong>. A road crossing a tile boundary must appear in both tiles, with each side carrying a pointer to the node in the adjacent tile, or the graph falls apart at every edge of every tile and no route would cross one. Boundary handling is not a detail here; it is what makes the subdivision legal.</p>
+<p>However, for larger routes, stitching together small, detailed routing tiles would still be time/memory consuming. Instead, there are routing tiles with different level of detail and the algorithm uses the appropriately-detailed tiles, based on the destination we're headed for:</p>
+<p><strong>This mirrors how a person navigates, which is a useful way to remember it.</strong> To drive from a house in Lisbon to a house in Warsaw you do not plan every turn at uniform detail: you work out the local streets to the motorway, then think at motorway level across the continent, then local streets again at the far end. Hierarchical routing tiles encode exactly that — detailed tiles near the endpoints, coarse tiles (motorways only) in the middle:</p>
+<figure class="mermaid-fig">
+<svg id="mmd-83cfe625b430e147" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 863.625px; background-color: transparent;" viewBox="0 0 863.625 103" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-83cfe625b430e147{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-83cfe625b430e147 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-83cfe625b430e147 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-83cfe625b430e147 .error-icon{fill:#f4f6f8;}#mmd-83cfe625b430e147 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-83cfe625b430e147 .edge-thickness-normal{stroke-width:1px;}#mmd-83cfe625b430e147 .edge-thickness-thick{stroke-width:3.5px;}#mmd-83cfe625b430e147 .edge-pattern-solid{stroke-dasharray:0;}#mmd-83cfe625b430e147 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-83cfe625b430e147 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-83cfe625b430e147 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-83cfe625b430e147 .marker{fill:#637381;stroke:#637381;}#mmd-83cfe625b430e147 .marker.cross{stroke:#637381;}#mmd-83cfe625b430e147 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-83cfe625b430e147 p{margin:0;}#mmd-83cfe625b430e147 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-83cfe625b430e147 .cluster-label text{fill:#454f5b;}#mmd-83cfe625b430e147 .cluster-label span{color:#454f5b;}#mmd-83cfe625b430e147 .cluster-label span p{background-color:transparent;}#mmd-83cfe625b430e147 .label text,#mmd-83cfe625b430e147 span{fill:#161c24;color:#161c24;}#mmd-83cfe625b430e147 .node rect,#mmd-83cfe625b430e147 .node circle,#mmd-83cfe625b430e147 .node ellipse,#mmd-83cfe625b430e147 .node polygon,#mmd-83cfe625b430e147 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-83cfe625b430e147 .rough-node .label text,#mmd-83cfe625b430e147 .node .label text,#mmd-83cfe625b430e147 .image-shape .label,#mmd-83cfe625b430e147 .icon-shape .label{text-anchor:middle;}#mmd-83cfe625b430e147 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-83cfe625b430e147 .rough-node .label,#mmd-83cfe625b430e147 .node .label,#mmd-83cfe625b430e147 .image-shape .label,#mmd-83cfe625b430e147 .icon-shape .label{text-align:center;}#mmd-83cfe625b430e147 .node.clickable{cursor:pointer;}#mmd-83cfe625b430e147 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-83cfe625b430e147 .arrowheadPath{fill:#000000;}#mmd-83cfe625b430e147 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-83cfe625b430e147 .flowchart-link{stroke:#637381;fill:none;}#mmd-83cfe625b430e147 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-83cfe625b430e147 .edgeLabel p{background-color:#ffffff;}#mmd-83cfe625b430e147 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-83cfe625b430e147 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-83cfe625b430e147 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-83cfe625b430e147 .cluster text{fill:#454f5b;}#mmd-83cfe625b430e147 .cluster span{color:#454f5b;}#mmd-83cfe625b430e147 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-83cfe625b430e147 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-83cfe625b430e147 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-83cfe625b430e147 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-83cfe625b430e147 rect.text{fill:none;stroke-width:0;}#mmd-83cfe625b430e147 .icon-shape,#mmd-83cfe625b430e147 .image-shape{background-color:#ffffff;text-align:center;}#mmd-83cfe625b430e147 .icon-shape p,#mmd-83cfe625b430e147 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-83cfe625b430e147 .icon-shape .label rect,#mmd-83cfe625b430e147 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-83cfe625b430e147 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-83cfe625b430e147 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-83cfe625b430e147 .node .neo-node{stroke:#299a8d;}#mmd-83cfe625b430e147 [data-look="neo"].node rect,#mmd-83cfe625b430e147 [data-look="neo"].cluster rect,#mmd-83cfe625b430e147 [data-look="neo"].node polygon{stroke:url(#mmd-83cfe625b430e147-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-83cfe625b430e147 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-83cfe625b430e147 [data-look="neo"].node path{stroke:url(#mmd-83cfe625b430e147-gradient);stroke-width:1px;}#mmd-83cfe625b430e147 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-83cfe625b430e147 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-83cfe625b430e147 [data-look="neo"].node circle{stroke:url(#mmd-83cfe625b430e147-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-83cfe625b430e147 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-83cfe625b430e147 [data-look="neo"].icon-shape .icon{fill:url(#mmd-83cfe625b430e147-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-83cfe625b430e147 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-83cfe625b430e147-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-83cfe625b430e147 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-83cfe625b430e147_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-83cfe625b430e147_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-83cfe625b430e147_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-83cfe625b430e147_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-83cfe625b430e147_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-83cfe625b430e147_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-83cfe625b430e147_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-83cfe625b430e147_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-83cfe625b430e147_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-83cfe625b430e147_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-83cfe625b430e147_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-83cfe625b430e147_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M132.875,51.5L137.042,51.5C141.208,51.5,149.542,51.5,157.208,51.5C164.875,51.5,171.875,51.5,175.375,51.5L178.875,51.5" id="mmd-83cfe625b430e147-L_A_B_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_B_0" data-points="W3sieCI6MTMyLjg3NSwieSI6NTEuNX0seyJ4IjoxNTcuODc1LCJ5Ijo1MS41fSx7IngiOjE4Mi44NzUsInkiOjUxLjV9XQ==" data-look="classic" marker-end="url(#mmd-83cfe625b430e147_flowchart-v2-pointEnd)"/><path d="M307.172,51.5L311.339,51.5C315.505,51.5,323.839,51.5,331.505,51.5C339.172,51.5,346.172,51.5,349.672,51.5L353.172,51.5" id="mmd-83cfe625b430e147-L_B_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_C_0" data-points="W3sieCI6MzA3LjE3MTg3NSwieSI6NTEuNX0seyJ4IjozMzIuMTcxODc1LCJ5Ijo1MS41fSx7IngiOjM1Ny4xNzE4NzUsInkiOjUxLjV9XQ==" data-look="classic" marker-end="url(#mmd-83cfe625b430e147_flowchart-v2-pointEnd)"/><path d="M506.453,51.5L510.62,51.5C514.786,51.5,523.12,51.5,530.786,51.5C538.453,51.5,545.453,51.5,548.953,51.5L552.453,51.5" id="mmd-83cfe625b430e147-L_C_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_D_0" data-points="W3sieCI6NTA2LjQ1MzEyNSwieSI6NTEuNX0seyJ4Ijo1MzEuNDUzMTI1LCJ5Ijo1MS41fSx7IngiOjU1Ni40NTMxMjUsInkiOjUxLjV9XQ==" data-look="classic" marker-end="url(#mmd-83cfe625b430e147_flowchart-v2-pointEnd)"/><path d="M680.75,51.5L684.917,51.5C689.083,51.5,697.417,51.5,705.083,51.5C712.75,51.5,719.75,51.5,723.25,51.5L726.75,51.5" id="mmd-83cfe625b430e147-L_D_E_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_E_0" data-points="W3sieCI6NjgwLjc1LCJ5Ijo1MS41fSx7IngiOjcwNS43NSwieSI6NTEuNX0seyJ4Ijo3MzAuNzUsInkiOjUxLjV9XQ==" data-look="classic" marker-end="url(#mmd-83cfe625b430e147_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_A_B_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_B_C_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_C_D_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_D_E_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-83cfe625b430e147-flowchart-A-0" data-look="classic" transform="translate(70.4375, 51.5)"><rect class="basic label-container" style="" x="-62.4375" y="-43.5" width="124.875" height="87"/><g class="label" style="" transform="translate(-38.4375, -31.5)"><rect/><foreignObject width="76.875" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>origin<br />detailed tile<br />every street</p></span></div></foreignObject></g></g><g class="node default" id="mmd-83cfe625b430e147-flowchart-B-1" data-look="classic" transform="translate(245.0234375, 51.5)"><rect class="basic label-container" style="" x="-62.1484375" y="-33" width="124.296875" height="66"/><g class="label" style="" transform="translate(-38.1484375, -21)"><rect/><foreignObject width="76.296875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>regional tile<br />major roads</p></span></div></foreignObject></g></g><g class="node default" id="mmd-83cfe625b430e147-flowchart-C-3" data-look="classic" transform="translate(431.8125, 51.5)"><rect class="basic label-container" style="" x="-74.640625" y="-33" width="149.28125" height="66"/><g class="label" style="" transform="translate(-50.640625, -21)"><rect/><foreignObject width="101.28125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>continental tile<br />motorways only</p></span></div></foreignObject></g></g><g class="node default" id="mmd-83cfe625b430e147-flowchart-D-5" data-look="classic" transform="translate(618.6015625, 51.5)"><rect class="basic label-container" style="" x="-62.1484375" y="-33" width="124.296875" height="66"/><g class="label" style="" transform="translate(-38.1484375, -21)"><rect/><foreignObject width="76.296875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>regional tile<br />major roads</p></span></div></foreignObject></g></g><g class="node default" id="mmd-83cfe625b430e147-flowchart-E-7" data-look="classic" transform="translate(793.1875, 51.5)"><rect class="basic label-container" style="" x="-62.4375" y="-43.5" width="124.875" height="87"/><g class="label" style="" transform="translate(-38.4375, -31.5)"><rect/><foreignObject width="76.875" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>destination<br />detailed tile<br />every street</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-83cfe625b430e147-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-83cfe625b430e147-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-83cfe625b430e147-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>The number of tiles loaded grows with the <strong>logarithm</strong> of the distance rather than linearly, which is what brings a Lisbon-to-Warsaw query into the same cost bracket as a cross-town one. The cost is that a coarse layer omits roads, so a route that would genuinely be faster on a minor road across the middle of the continent will not be found — these systems trade a small amount of optimality for several orders of magnitude of speed, and that trade is deliberate.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/map-routing-hierarchical.png" alt="map-routing-hierarchical" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="back-of-the-envelope-estimation"><strong>Back-of-the-envelope estimation</strong></h3>
+<p>For storage, we need to store:</p>
+<ul>
+<li>map of the world - estimated as ~70pb based on all the tiles we need to store, but factoring in compression of very similar tiles (eg vast desert)</li>
+<li>metadata - negligible in size, so we can skip it from calculation</li>
+<li>Road info - stored as routing tiles</li>
+</ul>
+<p>Estimated QPS for navigation requests - 1bil DAU at 35min of usage per week -&gt; 5bil minutes per day.
+Assuming gps update requests are batched, we arrive at 200k QPS and 1mil QPS at peak load</p>
+<h3 id="reading-these-numbers-together">Reading these numbers together</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Workload</th>
+<th>Scale</th>
+<th>Shape</th>
+<th>Where it goes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Map tiles</td>
+<td>~70 PB stored</td>
+<td>Immutable, enormously skewed demand</td>
+<td>Object storage behind a CDN</td>
+</tr>
+<tr>
+<td>Routing tiles</td>
+<td>TBs</td>
+<td>Rebuilt offline, read-only at request time</td>
+<td>Object storage, cached aggressively in-process</td>
+</tr>
+<tr>
+<td>Navigation requests</td>
+<td>200 K QPS, 1 M peak</td>
+<td>CPU-bound graph search</td>
+<td>Stateless shortest-path fleet</td>
+</tr>
+<tr>
+<td>Location updates</td>
+<td>Continuous from every navigating user</td>
+<td>Write-only, append-only</td>
+<td>Cassandra; feeds traffic and analytics</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>The batching assumption deserves attention.</strong> Sending every GPS reading individually would be both a far larger request rate and a serious battery cost — the radio waking repeatedly is more expensive than the GPS fix itself. Buffering readings on the device and sending them every few seconds is what makes 200 K QPS the number instead of something an order of magnitude higher, and it is a direct consequence of the &quot;data and battery usage&quot; requirement.</p>
+<p><strong>Also note what location updates are really for.</strong> They are stored for analytics, but their immediate purpose is to <em>be</em> the traffic signal: a million phones moving slowly along a motorway is how the system knows there is a jam. The users are the sensors, which is elegant, and has consequences — see the feedback loop in the gotchas.</p>
+<hr>
+</section>
+<section id="step-2-propose-high-level-design-and-get-buy-in">
+<h2 id="step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</h2>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/high-level-design.png" alt="high-level-design" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="location-service"><strong>Location service</strong></h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/location-service.png" alt="location-service" data-width="500" style="max-width:500px" />
+</p>
+<p>It is responsible for recording a user's location updates:</p>
+<ul>
+<li>location updates are sent every <code>t</code> seconds</li>
+<li>location data streams can be used to improve the service over time, eg provide more accurate ETAs, monitor traffic data, detect closed roads, analyze user behavior, etc</li>
+</ul>
+<p>Instead of sending location updates to the server all the time, we can batch the updates on the client-side and send batches instead:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/location-update-batches.png" alt="location-update-batches" data-width="500" style="max-width:500px" />
+</p>
+<p>Despite this optimization, for a system of Google Maps scale, load will still be significant. Therefore, we can leverage a database, optimized for heavy writes such as Cassandra.</p>
+<p>We can also leverage Kafka for efficient stream processing of location updates, meant for further analysis.</p>
+<p>Example location update request payload:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>POST /v1/locations
+Parameters
+  locs: JSON encoded array of (latitude, longitude, timestamp) tuples.
+</code></pre></div>
+<h3 id="navigation-service"><strong>Navigation service</strong></h3>
+<p>This component is responsible for finding fast routes between A and B in a reasonable time (a little bit of latency is okay). Route need not be the fastest, but accuracy is important.</p>
+<p>Example request payload:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>GET /v1/nav?origin=1355+market+street,SF&amp;destination=Disneyland
+</code></pre></div>
+<p>Example response:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="json">JSON</button></div><pre data-lang="json"><code>{
+  &quot;distance&quot;: {&quot;text&quot;:&quot;0.2 mi&quot;, &quot;value&quot;: 259},
+  &quot;duration&quot;: {&quot;text&quot;: &quot;1 min&quot;, &quot;value&quot;: 83},
+  &quot;end_location&quot;: {&quot;lat&quot;: 37.4038943, &quot;Ing&quot;: -121.9410454},
+  &quot;html_instructions&quot;: &quot;Head &lt;b&gt;northeast&lt;/b&gt; on &lt;b&gt;Brandon St&lt;/b&gt; toward &lt;b&gt;Lumin Way&lt;/b&gt;&lt;div style=\&quot;font-size:0.9em\&quot;&gt;Restricted usage road&lt;/div&gt;&quot;,
+  &quot;polyline&quot;: {&quot;points&quot;: &quot;_fhcFjbhgVuAwDsCal&quot;},
+  &quot;start_location&quot;: {&quot;lat&quot;: 37.4027165, &quot;lng&quot;: -121.9435809},
+  &quot;geocoded_waypoints&quot;: [
+    {
+       &quot;geocoder_status&quot; : &quot;OK&quot;,
+       &quot;partial_match&quot; : true,
+       &quot;place_id&quot; : &quot;ChIJwZNMti1fawwRO2aVVVX2yKg&quot;,
+       &quot;types&quot; : [ &quot;locality&quot;, &quot;political&quot; ]
+    },
+    {
+       &quot;geocoder_status&quot; : &quot;OK&quot;,
+       &quot;partial_match&quot; : true,
+       &quot;place_id&quot; : &quot;ChIJ3aPgQGtXawwRLYeiBMUi7bM&quot;,
+       &quot;types&quot; : [ &quot;locality&quot;, &quot;political&quot; ]
+    }
+  ],
+  &quot;travel_mode&quot;: &quot;DRIVING&quot;
+}
+</code></pre></div>
+<p>Traffic changes and reroutes are not taken into consideration yet, those will be tackled in the deep dive section.</p>
+<h3 id="map-rendering-1"><strong>Map rendering</strong></h3>
+<p>Holding the entire data set of mapping tiles on the client-side is not feasible as it's petabytes in size.</p>
+<p>They need to be fetched on-demand from the server, based on the client's location and zoom level.</p>
+<p>When should new tiles be fetched - while user is zooming in/out and during navigation, while they're going towards a new tile.</p>
+<p>How should the map tiles be served to the client?</p>
+<ul>
+<li>They can be built dynamically, but that puts a huge load on the server and also makes caching hard</li>
+<li>Map tiles are served statically, based on their geohash, which a client can calculate. They can be statically stored &amp; served from a CDN</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/static-map-tiles.png" alt="static-map-tiles" data-width="500" style="max-width:500px" />
+</p>
+<p>CDNs enable users to fetch map tiles from point-of-presence servers (POP) which are closest to users in order to minimize latency:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/cdn-vs-no-cdn.png" alt="cdn-vs-no-cdn" data-width="500" style="max-width:500px" />
+</p>
+<p>Options to consider for determining map tiles:</p>
+<ul>
+<li>geohash for map tile can be calculated on the client-side. If that's the case, we should be careful that we commit to this type of map tile calculation for the long-term as forcing clients to update is hard</li>
+<li>alternatively, we can have simple API which calculates the map tile URLs on behalf of the clients at the cost of additional API call</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/map-tile-url-calculation.png" alt="map-tile-url-calculation" data-width="500" style="max-width:500px" />
+</p>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<h3 id="data-model"><strong>Data model</strong></h3>
+<p>Let's discuss how we store the different types of data we're dealing with.</p>
+<h4 id="routing-tiles">Routing tiles</h4>
+<p>Initial road data set is obtained from different sources. It is improved over time based on location updates data.</p>
+<p>The road data is unstructured. We have a periodic offline processing pipeline, which transforms this raw data into the graph-based routing tiles our app needs.</p>
+<p>Instead of storing these tiles in a database as we don't need any database features. We can store them in S3 object storage, while caching them aggressively.</p>
+<p>We can also leverage libraries to compress adjacency lists into binary files efficiently.</p>
+<h4 id="user-location-data">User location data</h4>
+<p>User location data is very useful for updating traffic conditions and doing all sorts of other analysis.</p>
+<p>We can use Cassandra for storing this kind of data as its nature is to be write-heavy.</p>
+<p>Example row:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/user-location-data-torw.png" alt="user-location-data-row" data-width="500" style="max-width:500px" />
+</p>
+<h4 id="geocoding-database">Geocoding database</h4>
+<p>This database stores a key-value pair of lat/long pairs and places.</p>
+<p>We can use Redis for its fast read access speed, as we have frequent read and infrequent writes.</p>
+<h4 id="precomputed-images-of-the-world-map">Precomputed images of the world map</h4>
+<p>As we discussed, we will precompute map tiling images and store them in CDN.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/precomputed-map-tile-image.png" alt="precomputed-map-tile-image" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="services"><strong>Services</strong></h3>
+<h4 id="location-service-1">Location service</h4>
+<p>Let's focus on the database design and how user location is stored in detail for this service.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/location-service-diagram.png" alt="location-service-diagram" data-width="500" style="max-width:500px" />
+</p>
+<p>We can use a NoSQL database to facilitate the heavy write load we have on location updates. We prioritize availability over consistency as user location data often changes and becomes stale as new updates arrive.</p>
+<p>We'll choose Cassandra as our database choice as it nicely fits all our requirements.</p>
+<p>Example row we're going to store:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/user-location-row-example.png" alt="user-location-row-example" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li><code>user_id</code> is the partition key in order to quickly access all location updates for a particular user</li>
+<li><code>timestamp</code> is the clustering key in order to store the data sorted by the time a location update is received</li>
+</ul>
+<p>We also leverage Kafka to stream location updates to various other service which need the location updates for various purposes:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/location-update-streaming.png" alt="location-update-streaming" data-width="500" style="max-width:500px" />
+</p>
+<h4 id="rendering-map">Rendering map</h4>
+<p>Map tiles are stored at various zoom levels. At the lowest zoom level, the entire world is represented by a single 256x256 tile.</p>
+<p>As zoom levels increase, the number of map tiles quadruples:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/zoom-level-increases.png" alt="zoom-level-increases" data-width="500" style="max-width:500px" />
+</p>
+<p>One optimization we can use is to not send the entire image information over the network, but instead represent tiles as vectors (paths &amp; polygons) and let the client render the tiles dynamically.</p>
+<p>This will have substantial bandwidth savings.</p>
+<h4 id="navigation-service-1">Navigation service</h4>
+<p>This service is responsible for finding the fastest routes:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/navigation-service.png" alt="navigation-service" data-width="500" style="max-width:500px" />
+</p>
+<p>Let's go through each component in this sub-system.</p>
+<p>First, we have the geocoding service which resolves an address to a location of lat/long pair.</p>
+<p>Example request:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>https://maps.googleapis.com/maps/api/geocode/json?address=1600+Amphitheatre+Parkway,+Mountain+View,+CA
+</code></pre></div>
+<p>Example response:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="json">JSON</button></div><pre data-lang="json"><code>{
+   &quot;results&quot; : [
+      {
+         &quot;formatted_address&quot; : &quot;1600 Amphitheatre Parkway, Mountain View, CA 94043, USA&quot;,
+         &quot;geometry&quot; : {
+            &quot;location&quot; : {
+               &quot;lat&quot; : 37.4224764,
+               &quot;lng&quot; : -122.0842499
+            },
+            &quot;location_type&quot; : &quot;ROOFTOP&quot;,
+            &quot;viewport&quot; : {
+               &quot;northeast&quot; : {
+                  &quot;lat&quot; : 37.4238253802915,
+                  &quot;lng&quot; : -122.0829009197085
+               },
+               &quot;southwest&quot; : {
+                  &quot;lat&quot; : 37.4211274197085,
+                  &quot;lng&quot; : -122.0855988802915
+               }
+            }
+         },
+         &quot;place_id&quot; : &quot;ChIJ2eUgeAK6j4ARbn5u_wAGqWA&quot;,
+         &quot;plus_code&quot;: {
+            &quot;compound_code&quot;: &quot;CWC8+W5 Mountain View, California, United States&quot;,
+            &quot;global_code&quot;: &quot;849VCWC8+W5&quot;
+         },
+         &quot;types&quot; : [ &quot;street_address&quot; ]
+      }
+   ],
+   &quot;status&quot; : &quot;OK&quot;
+}
+</code></pre></div>
+<p>The route planner service computes a suggested route, optimized for travel time according to current traffic conditions.</p>
+<p>The shortest-path service runs a variation of the A* algorithm against the routing tiles in object storage to compute an optimal path:</p>
+<ul>
+<li>It receives the source/destination pairs, converts them to lat/long pairs and derives the geohashes from those pairs to derive the routing tiles</li>
+<li>The algorithm starts from the initial routing tile and starts traversing it until a good enough path is found to the destination tile</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/shortest-path-service.png" alt="shortest-path-service" data-width="500" style="max-width:500px" />
+</p>
+<p>The ETA service is called by the route planner to get estimated time based on machine learning algorithms, predicting ETA based on traffic data.</p>
+<p><strong>Why ETA needs a model rather than arithmetic, and why it is not simply &quot;current traffic&quot;.</strong> Summing each segment's current travel time would be wrong for any journey of length: by the time a driver reaches a motorway two hours into a trip, conditions there will have changed. The prediction must be of <strong>conditions at the time of arrival at each segment</strong>, which is a forecast, not a measurement — and that is what makes it a model rather than a sum. Historical patterns (this road is always slow at 17:30 on weekdays), live traffic, weather, incidents and road class all feed it.</p>
+<p>This also creates a subtle circularity with routing: the graph's edge weights are the predicted travel times, so routing depends on ETA while ETA is computed over a route. In practice the search uses cheaper time-dependent weights and the ETA service produces the number shown to the user.</p>
+<p>The ranker service is responsible to rank different possible paths based on filters, passed by the user, ie flags to avoid toll roads or freeways.</p>
+<p>The updater service asynchronously updates some of the important databases to keep them up-to-date.</p>
+<h4 id="improvement---adaptive-eta-and-rerouting">Improvement - adaptive ETA and rerouting</h4>
+<p>One improvement we can do is to adaptively update in-flight routes based on newly available traffic data.</p>
+<p>One way to implement this is to store users who are currently navigating through a route in the database by storing all the tiles they're supposed to go through.</p>
+<p>Data might look like this:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>user_1: r_1, r_2, r_3, …, r_k
+user_2: r_4, r_6, r_9, …, r_n
+user_3: r_2, r_8, r_9, …, r_m
+...
+user_n: r_2, r_10, r21, ..., r_l
+</code></pre></div>
+<p>If a traffic accident happens on some tile, we can identify all users whose path goes through that tile and re-route them.</p>
+<p>To reduce the amount of tiles we store in the database, we can instead store the origin routing tile and several routing tiles in different resolution levels until the destination tile is also included:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>user_1, r_1, super(r_1), super(super(r_1)), ...
+</code></pre></div>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/adaptive-eta-data-storage.png" alt="adaptive-eta-data-storage" data-width="500" style="max-width:500px" />
+</p>
+<p>Using this, we only need to check if the final tile of a user includes the traffic accident tile to see if user is impacted.</p>
+<p><strong>This is a cheap over-approximation followed by an exact check, which is a pattern worth recognising.</strong> Storing <code>super(super(...r_1))</code> reduces thousands of fine tiles per user to a handful of coarse ones, so the containment test is cheap — but a coarse tile covering the accident does <strong>not</strong> mean the user's actual path goes through it. The coarse test yields <strong>false positives and no false negatives</strong>, exactly like the Bloom filters in <a href="06-key-value-store.html">Chapter 6</a> and <a href="08-url-shortener.html">Chapter 8</a>: it narrows a huge candidate set cheaply, and the survivors get the expensive precise check against their real route.</p>
+<p>The economics are what make it worthwhile. An incident affects a tiny area; without the coarse index you would examine every navigating user's full path on every incident. With it you examine a small shortlist and only they pay for exact evaluation.</p>
+<p>We can also keep track of all possible routes for a navigating user and notify them if a faster re-route is available.</p>
+<h4 id="delivery-protocols">Delivery protocols</h4>
+<p>We have several options, which enable us to proactively push data to clients from the server:</p>
+<ul>
+<li>Mobile push notifications don't work because payload is limited and it's not available for web apps</li>
+<li>WebSocket is generally a better option than long-polling as it has less compute footprint on servers</li>
+<li>We can also use server-sent events (SSE) but lean towards web sockets as they support bi-directional communication which can come in handy for eg a last-mile delivery feature</li>
+</ul>
+<p>This is the third time this book works through the same protocol comparison, and the three answers differ because the traffic profiles differ — worth holding together:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Chapter</th>
+<th>Traffic shape</th>
+<th>Choice</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="12-chat-system.html#choosing-the-receive-channel">12 – Chat</a></td>
+<td>Continuous, both directions</td>
+<td>WebSocket</td>
+</tr>
+<tr>
+<td><a href="15-google-drive.html#notification-service">15 – Drive</a></td>
+<td>Rare, server → client only</td>
+<td>Long polling</td>
+</tr>
+<tr>
+<td><strong>18 – Maps (navigating)</strong></td>
+<td>Frequent both ways <em>while navigating</em>, nothing otherwise</td>
+<td>WebSocket during a session</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The distinguishing feature here is that the connection is <strong>session-scoped</strong>: it exists only while someone is actively navigating, not for every daily active user. That is what keeps the stateful-connection count manageable at 1 billion DAU — you are holding connections for drivers in progress, not for the whole user base.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>three questions carry this chapter. &quot;Why can't you run Dijkstra on the world graph?&quot; — it explores outward over hundreds of millions of nodes, at 1 M QPS. &quot;What does hierarchy buy you?&quot; — tiles loaded grow with the log of distance, at the cost of some optimality. &quot;How do you reroute everyone affected by an accident without scanning every user's path?&quot; — coarse super-tile containment as a cheap over-approximation, then an exact check.</p>
+</div>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Raster tiles multiply with every style and language.</strong> 70 PB × dark mode × 40 languages × satellite/terrain is untenable. Vector tiles collapse the multiplier by rendering on the device — and spend battery doing it, which is the stated non-functional requirement in direct tension with itself.</li>
+<li><strong>Each zoom level quadruples the tile count.</strong> Deep zoom is only affordable because most of the planet has nothing to show at that resolution. Generating uniformly to zoom 21 would be impossible.</li>
+<li><strong>A map update means invalidating tiles across the CDN.</strong> Tiles are cached everywhere by design, so a changed road is not visible until caches turn over. Versioning the tile URL is the usual answer, because it sidesteps invalidation entirely — at the cost of not reusing the old cached copies.</li>
+<li><strong>Routing tiles must overlap at their seams.</strong> A road crossing a boundary has to exist in both tiles with cross-references, or no route can leave a tile.</li>
+<li><strong>A node-and-edge graph cannot express turn restrictions.</strong> &quot;No left turn here&quot;, &quot;no U-turn&quot;, &quot;this turn takes 90 seconds at rush hour&quot; are properties of a <em>transition between edges</em>, not of a node or an edge. Representing them needs an edge-based graph (nodes are road segments, edges are legal turns) or explicit turn-cost tables. A naive intersection graph will happily route drivers through illegal turns — one of the most common real bugs in routing systems.</li>
+<li><em><em>An inadmissible A</em> heuristic silently returns wrong routes.</em>* Over-estimating remaining cost makes the search faster and the answer incorrect, with no error raised. Use straight-line distance ÷ maximum speed.</li>
+<li><strong>Hierarchical routing gives up some optimality.</strong> Coarse layers omit minor roads, so an unusually good back route across the middle of a long journey will not be discovered. This is a deliberate trade, and worth stating as one.</li>
+<li><strong>ETA must predict conditions at arrival, not report conditions now.</strong> Summing current segment times is wrong for any long trip.</li>
+<li><strong>Rerouting is a feedback loop with real-world consequences.</strong> Diverting thousands of drivers off a jammed motorway creates a jam on the side street you sent them to — and generates genuine complaints from residents of quiet roads suddenly carrying motorway traffic. The system's outputs change its own inputs.</li>
+<li><strong>GPS is wrong in exactly the places navigation matters most.</strong> Urban canyons, tunnels, multi-level interchanges and car parks give readings tens of metres off, or none at all. <strong>Map matching</strong> — snapping a noisy trace to the most plausible road, usually with a hidden Markov model over candidate segments — is a required component, not an optimisation, and dead reckoning covers tunnels.</li>
+<li><strong>A stale or mismatched position produces confidently wrong instructions.</strong> &quot;Turn right now&quot; delivered 50 metres late is worse than no instruction. Accuracy is the first non-functional requirement for this reason.</li>
+<li><strong>Battery and radio, not CPU, are the mobile constraints.</strong> Waking the radio for each GPS reading costs more than the fix; hence batched uploads, and hence the 200 K QPS figure.</li>
+<li><strong>Offline maps are a separate product.</strong> Downloading a region means shipping vector tiles <em>and</em> routing tiles and running the search on the device — a different engine with different data, not a cache of the online one.</li>
+<li><strong>Location history is a surveillance dataset.</strong> Continuous position traces for a billion users are the most sensitive data in this book. Aggregation for traffic should not require retaining identifiable individual traces, and retention limits and opt-out are part of the design rather than a compliance step afterwards.</li>
+<li><strong>A billion DAU does not mean a billion connections.</strong> Only actively navigating users hold a socket. Conflating the two over-sizes the stateful tier by orders of magnitude.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Serving a 70 PB map</td>
+<td>Precomputed <code>(z, x, y)</code> tiles in object storage behind a CDN; fetch only visible tiles</td>
+</tr>
+<tr>
+<td>Correct-looking turns on a flat map</td>
+<td>Web Mercator — conformal, and maps the world to a square for clean tiling</td>
+</tr>
+<tr>
+<td>Storage multiplying per style and language</td>
+<td>Vector tiles rendered on the device</td>
+</tr>
+<tr>
+<td>A road graph too large to search</td>
+<td>Hierarchical routing tiles; load only what the route needs</td>
+</tr>
+<tr>
+<td>Long routes staying cheap</td>
+<td>Coarse tiles in the middle, detailed tiles at the ends — log growth with distance</td>
+</tr>
+<tr>
+<td>Crossing tile boundaries</td>
+<td>Overlapping seams with cross-tile node references</td>
+</tr>
+<tr>
+<td>Pruning the search</td>
+<td>A* with an admissible heuristic (straight-line distance ÷ max speed)</td>
+</tr>
+<tr>
+<td>Legal turns and turn delays</td>
+<td>Edge-based graph or explicit turn costs, not a plain intersection graph</td>
+</tr>
+<tr>
+<td>Realistic arrival times</td>
+<td>ML model predicting conditions at time of arrival per segment</td>
+</tr>
+<tr>
+<td>Knowing about traffic at all</td>
+<td>Users' batched location updates as the sensor network</td>
+</tr>
+<tr>
+<td>Rerouting only affected drivers</td>
+<td>Coarse super-tile containment as a cheap filter, then exact path check</td>
+</tr>
+<tr>
+<td>Pushing route changes to drivers</td>
+<td>Session-scoped WebSocket while navigating</td>
+</tr>
+<tr>
+<td>Noisy GPS</td>
+<td>Map matching onto road segments; dead reckoning in tunnels</td>
+</tr>
+<tr>
+<td>Battery and data budget</td>
+<td>Batched location uploads; vector tiles; fetch only visible tiles</td>
+</tr>
+<tr>
+<td>Raw road data from many sources</td>
+<td>Offline pipeline producing routing tiles, improved by location data over time</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Name the three largely independent systems inside &quot;Google Maps&quot;, and the one technique common to all of them.</li>
+<li>Why do maps use a projection that makes Greenland look enormous?</li>
+<li>How many tiles exist at zoom 21, and why is 70 PB plausible rather than the ~100+ PB the raw count suggests?</li>
+<li>What exactly do vector tiles save, and what do they cost?</li>
+<li>Why is Dijkstra unusable here? Quantify both sides of the problem.</li>
+<li>What makes an A* heuristic admissible, and what happens if it isn't?</li>
+<li>What does hierarchical routing do to the number of tiles loaded as route length grows, and what does it sacrifice?</li>
+<li>Why must routing tiles overlap at their edges?</li>
+<li>Why can't a graph of intersections-as-nodes express &quot;no left turn&quot;?</li>
+<li>Why is ETA a prediction rather than a sum of current segment times?</li>
+<li>An accident blocks one tile. How do you find the affected drivers without examining every user's full route? What error does the cheap check make, and in which direction?</li>
+<li>Chapters 12, 15 and 18 each pick a different push protocol. What distinguishes this chapter's traffic profile?</li>
+<li>Why does 1 billion DAU not imply 1 billion persistent connections?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Map projection</strong></td>
+<td>Flattening a sphere onto a plane; always distorts something</td>
+</tr>
+<tr>
+<td><strong>Web Mercator</strong></td>
+<td>Conformal projection mapping the world to a square — the basis of standard tiling</td>
+</tr>
+<tr>
+<td><strong>Tile <code>(z, x, y)</code></strong></td>
+<td>A square map cell addressed by zoom level and position; each level quadruples the count</td>
+</tr>
+<tr>
+<td><strong>Raster vs vector tile</strong></td>
+<td>A pre-rendered image vs geometry rendered on the device</td>
+</tr>
+<tr>
+<td><strong>Routing tile</strong></td>
+<td>A subgraph of the road network for one area, with references to its neighbours</td>
+</tr>
+<tr>
+<td><strong>Tile hierarchy</strong></td>
+<td>Coarser routing tiles containing only major roads, used for the middle of long routes</td>
+</tr>
+<tr>
+<td><strong>Geocoding</strong></td>
+<td>Translating a place or address to coordinates (and reverse geocoding, the inverse)</td>
+</tr>
+<tr>
+<td><strong>A*</strong></td>
+<td>Dijkstra plus a heuristic estimate of remaining cost; requires admissibility for correctness</td>
+</tr>
+<tr>
+<td><strong>Admissible heuristic</strong></td>
+<td>One that never over-estimates remaining cost</td>
+</tr>
+<tr>
+<td><strong>Contraction hierarchies</strong></td>
+<td>Precomputed shortcut edges making continental routing feasible</td>
+</tr>
+<tr>
+<td><strong>Edge-based graph</strong></td>
+<td>Road segments as nodes and legal turns as edges, so turn restrictions are expressible</td>
+</tr>
+<tr>
+<td><strong>Map matching</strong></td>
+<td>Snapping a noisy GPS trace to the most likely road segments</td>
+</tr>
+<tr>
+<td><strong>Dead reckoning</strong></td>
+<td>Estimating position from speed and heading when GPS is unavailable</td>
+</tr>
+<tr>
+<td><strong>Adaptive ETA / rerouting</strong></td>
+<td>Revising in-flight routes as traffic changes</td>
+</tr>
+<tr>
+<td><strong>Super-tile containment</strong></td>
+<td>The coarse, false-positive-only test for whether a route may pass through an area</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="16-proximity-service.html">Chapter 16 – Proximity Service</a> — geohash, quadtrees and S2, the spatial indexing this chapter assumes you know.</li>
+<li><a href="17-nearby-friends.html">Chapter 17 – Nearby Friends</a> — the location-ingest half of this chapter, treated as its own system.</li>
+<li><a href="01-scaling.html#section-7-content-delivery-network-cdn">Chapter 1 §7 – Content Delivery Network</a> — tile serving and the invalidation problem that comes with it.</li>
+<li><a href="24-s3-like-object-storage.html">Chapter 24 – S3-like Object Storage</a> — where 70 PB of tiles and the routing tiles actually live.</li>
+<li><a href="06-key-value-store.html">Chapter 6 – Design A Key-Value Store</a> — the cheap-over-approximation-then-exact-check pattern, in its original Bloom filter form.</li>
+<li><a href="https://s2geometry.io/" target="_blank" rel="noopener">Google S2 Geometry</a> — the cell system underneath much of this.</li>
+</ul>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
+<p>This is our final design:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/18.%20Google%20Maps/images/final-design.png" alt="final-design" data-width="500" style="max-width:500px" />
+</p>
+<p>One additional feature we could provide is multi-stop navigation which can be sold to enterprise customers such as Uber or Lyft in order to determine optimal path for visiting a set of locations.</p>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

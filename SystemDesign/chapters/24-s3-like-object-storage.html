@@ -1,0 +1,820 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 24: S3-like Object Storage — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="24-s3-like-object-storage">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 24 of 28</div>
+  <h1>Chapter 24: S3-like Object Storage</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</a></li><li><a href="#step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#step-4-wrap-up">Step 4: Wrap Up</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>In this chapter, we'll be designing an <strong>object storage</strong> service, similar to <strong>Amazon S3</strong>.</p>
+<p><strong>The one-sentence version:</strong> two decisions generate this entire design — <strong>objects are immutable</strong>, and <strong>metadata is stored separately from the bytes</strong>. Immutability means you never modify data in place, which is what makes it safe to pack many objects into one big append-only file, to checksum content permanently, to erasure-code it, to version it, and to reclaim space by copying rather than editing. The metadata split is what lets a flat key-value namespace scale independently of petabytes of content.</p>
+<p>Notice the consequence that runs through the chapter: <strong>because nothing is ever modified, &quot;delete&quot; is not an operation on data.</strong> It is a metadata change plus a promise that a background garbage collector will eventually reclaim the space. Almost every hard problem later in the chapter — versioning, deletion, compaction, orphaned upload parts — is a consequence of that one property.</p>
+<p>The other thing worth holding onto: object storage is the layer underneath several earlier chapters. The video tiers in <a href="14-youtube.html">Chapter 14</a>, the blocks in <a href="15-google-drive.html">Chapter 15</a>, the map tiles in <a href="18-google-maps.html">Chapter 18</a> and the archived messages in <a href="19-distributed-message-queue.html">Chapter 19</a> all land here.</p>
+<p>Storage systems fall into three broad categories:</p>
+<ul>
+<li><strong>Block storage</strong></li>
+<li><strong>File storage</strong></li>
+<li><strong>Object storage</strong></li>
+</ul>
+<p><strong>Block storage</strong> are devices, which came out in 1960s. HDDs and SSDs are such examples.
+These devices are typically physically attached to a server, although they can also be network-attached via high-speed network protocols.
+Servers can format the raw blocks and use them as a file system or it can hand control of them to servers directly.</p>
+<p><strong>File storage</strong> is built on top of block storage. It provides a higher level of abstraction, making it easier to manage folders and files.</p>
+<p><strong>Object storage</strong> sacrifices performance for high durability, vast scale and low cost.
+It targets &quot;cold&quot; data and is mainly used for archival and backup.
+There is no hierarchical directory structure, all data is stored as objects in a flat structure.
+It is relatively slow compared to other storage types. Most cloud providers have an object storage offering - Amazon S3, Google GCS, etc.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/storage-comparison.png" alt="storage-comparison" data-width="500" style="max-width:500px" />
+</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Block Storage</th>
+<th>File Storage</th>
+<th>Object Storage</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mutable Content</td>
+<td>Y</td>
+<td>Y</td>
+<td>N (has object versioning）</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>High</td>
+<td>Medium to high</td>
+<td>Low</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>Medium to high, very high</td>
+<td>Medium to high</td>
+<td>Low to medium</td>
+</tr>
+<tr>
+<td>Consistency</td>
+<td>Strong consistency</td>
+<td>Strong consistency</td>
+<td>Strong consistency [5]</td>
+</tr>
+<tr>
+<td>Data access</td>
+<td>SAS/iSCSI/FC</td>
+<td>Standard file access, CIFS/SMB, and NFS</td>
+<td>RESTful API</td>
+</tr>
+<tr>
+<td>Scalability</td>
+<td>Medium scalability</td>
+<td>High scalability</td>
+<td>Vast scalability</td>
+</tr>
+<tr>
+<td>Good for</td>
+<td>Virtual machines (VM), databases</td>
+<td>General-purpose file system access</td>
+<td>Binary data, unstructured data</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Some terminology, related to object storage:</p>
+<ul>
+<li><strong>Bucket</strong> - logical container for objects. Name is globally unique.</li>
+<li><strong>Object</strong> - An individual piece of data, stored in a bucket. Contains object data and metadata.</li>
+<li><strong>Versioning</strong> - A feature keeping multiple variants of an object in the same bucket.</li>
+<li><strong>Uniform Resource Identifier (URI)</strong> - each resource is uniquely identified by a URI.</li>
+<li><strong>Service-level Agreement (SLA)</strong> - contract between service provider and client.</li>
+</ul>
+<p>Amazon S3 Standard-Infrequent Access storage class SLAs:</p>
+<ul>
+<li>Durability of 99.999999999% across multiple Availability Zones</li>
+<li>Data is resilient in the event of entire Availability Zone being destroyed</li>
+<li>Designed for 99.9% availability</li>
+</ul>
+<hr>
+</section>
+<section id="step-1-understand-the-problem-and-establish-design-scope">
+<h2 id="step-1-understand-the-problem-and-establish-design-scope">Step 1: Understand the Problem and Establish Design Scope</h2>
+<ul>
+<li>C: Which features should be included?</li>
+<li>I: Bucket creation, Object upload/download, versioning, Listing objects in a bucket</li>
+<li>C: What is the typical data size?</li>
+<li>I: We need to store both massive objects and small objects efficiently</li>
+<li>C: How much data do we store in a year?</li>
+<li>I: 100 petabytes</li>
+<li>C: Can we assume 6 nines of data durability (99.9999%) and service availability of 4 nines (99.99%)?</li>
+<li>I: Yes, sounds reasonable</li>
+</ul>
+<h3 id="non-functional-requirements"><strong>Non-functional requirements</strong></h3>
+<ul>
+<li><strong>100 PB of data</strong></li>
+<li><strong>6 nines of data durability</strong></li>
+<li><strong>4 nines of service availability</strong></li>
+<li>Storage efficiency. Reduce storage cost while maintaining high reliability and performance</li>
+</ul>
+<h3 id="back-of-the-envelope-estimation"><strong>Back-of-the-envelope estimation</strong></h3>
+<p>Object storage is likely to have bottlenecks in disk capacity or IO per second (IOPS).</p>
+<p>Assumptions:</p>
+<ul>
+<li>we have 20% small (less than 1mb), 60% mid-size (1-64mb) and 20% large objects (greater than 64mb),</li>
+<li>One hard disk (SATA, 7200rpm) is capable of doing 100-150 random seeks per second (100-150 IOPS)</li>
+</ul>
+<p>Given the assumptions, we can estimate the total number of objects the system can persist.</p>
+<ul>
+<li>Let's use median size per object type to simplify calculation - 0.5mb for small, 32mb for medium, 200mb for large.</li>
+<li>Given 100PB of storage (10^11 MB) and 40% of storage usage results in 0.68bil objects</li>
+<li>If we assume metadata is 1kb, then we need 0.68tb space to store metadata info</li>
+</ul>
+<h3 id="why-these-two-numbers-matter-more-than-they-look">Why these two numbers matter more than they look</h3>
+<p><strong>0.68 billion objects is the number that forces the packing design.</strong> If each object were a separate file:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Problem</th>
+<th>Arithmetic</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Block waste</td>
+<td>A filesystem block is typically 4 KB, and a file occupies whole blocks. A 1 KB object wastes 75% of its block — and 20% of objects are under 1 MB</td>
+</tr>
+<tr>
+<td>Inode exhaustion</td>
+<td>One inode per file × 0.68 billion files. Filesystems have hard inode limits, and performance degrades badly long before them</td>
+</tr>
+<tr>
+<td>IOPS</td>
+<td>At 100–150 IOPS per HDD, every extra seek per request is a direct reduction in throughput</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>So merging small objects into large append-only files is <strong>not an optimisation, it is a requirement</strong> — the naive one-file-per-object design does not fit on the hardware at all.</p>
+<p><strong>0.68 TB of metadata against 100 PB of data is a ratio of about 1:150,000.</strong> That asymmetry is the justification for the metadata/data split: the metadata is small enough to live in a database with indexes, transactions and rich queries, while the data is far too large for any of that. Scaling them together would mean either a database holding 100 PB or an object store you cannot query — the split lets each be the right kind of system.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>derive the object count, then say what it rules out. &quot;0.68 billion objects means one-file-per-object exhausts inodes and wastes 4 KB blocks, so I need to pack objects into large files and keep an offset index&quot; is the central insight of the chapter, reached from the estimate rather than recalled.</p>
+</div>
+</section>
+<section id="step-2-propose-high-level-design-and-get-buy-in">
+<h2 id="step-2-propose-high-level-design-and-get-buy-in">Step 2: Propose High-Level Design and Get Buy-In</h2>
+<p>Let's explore some interesting properties of object storage before diving into the design:</p>
+<ul>
+<li><strong>Object immutability</strong> - objects in object storage are immutable (not the case in other storage systems). We may delete them or replace them, but no update.</li>
+<li><strong>Key-value store</strong> - an object URI is its key and we can get its contents by making an HTTP call</li>
+<li><strong>Write once, read many times</strong> - data access pattern is writing once and reading many times. According to some Linkedin research, 95% of operations are reads</li>
+<li>Support both small and large objects</li>
+</ul>
+<p>Design philosophy of object storage is similar to UNIX - when we save a file, it creates the filename in a data structure, called inode and file data is stored in different disk locations.
+The inode contains a list of file block pointers, which point to different locations on disk.</p>
+<p>When accessing a file, we first fetch its metadata from the inode, prior to fetching the file contents.</p>
+<p>Object storage works similarly - metadata store is used for file information, but contents are stored on disk:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/object-store-vs-unix.png" alt="object-store-vs-unix" data-width="500" style="max-width:500px" />
+</p>
+<p>By separating metadata from file contents, we can scale the different stores independently:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/bucket-and-object.png" alt="bucket-and-object" data-width="500" style="max-width:500px" />
+</p>
+<h3 id="high-level-design"><strong>High-level design</strong></h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/high-level-design.png" alt="high-level-design" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li><strong>Load balancer</strong> - distributes API requests across service replicas</li>
+<li><strong>API service</strong> - Stateless server, orchestrating calls to metadata and object store, as well as IAM service.</li>
+<li><strong>Identity and access management (IAM)</strong> - central place for auth, authz, access control.</li>
+<li><strong>Data store</strong> - stores and retrieves actual data. Operations are based on object ID (UUID).</li>
+<li><strong>Metadata store</strong> - stores object metadata</li>
+</ul>
+<h3 id="uploading-an-object"><strong>Uploading an object</strong></h3>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/uploading-object.png" alt="uploading-object" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Create a bucket named &quot;bucket-to-share&quot; via HTTP PUT request</li>
+<li>API service calls IAM to ensure user is authorized and has write permissions</li>
+<li>API service calls metadata store to create a bucket entry. Once created, success response is returned.</li>
+<li>After bucket is created, HTTP PUT is sent to create an object named &quot;script.txt&quot;</li>
+<li>API service verifies user identity and ensures user has write permissions</li>
+<li>Once validation passes, object payload is sent via HTTP PUT to the data store. Data store persists it and returns a UUID.</li>
+<li>API service calls metadata store to create a new entry with object_id, bucket_id and bucket_name, among other metadata.</li>
+</ul>
+<p>Example object upload request:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>PUT /bucket-to-share/script.txt HTTP/1.1
+Host: foo.s3example.org
+Date: Sun, 12 Sept 2021 17:51:00 GMT
+Authorization: authorization string
+Content-Type: text/plain
+Content-Length: 4567
+x-amz-meta-author: Alex
+
+[4567 bytes of object data]
+</code></pre></div>
+<h3 id="downloading-an-object"><strong>Downloading an object</strong></h3>
+<p>Buckets have no directory hierarchy, buy we can create a logical hierarchy by concatenating bucket name and object name to simulate a folder structure.</p>
+<p>Example GET request for fetching an object:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>GET /bucket-to-share/script.txt HTTP/1.1
+Host: foo.s3example.org
+Date: Sun, 12 Sept 2021 18:30:01 GMT
+Authorization: authorization string
+</code></pre></div>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/download-object.png" alt="download-object" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Client sends an HTTP GET request to the load balancer, ie <code>GET /bucket-to-share/script.txt</code></li>
+<li>API service queries IAM to verify the user has correct permissions to read the bucket</li>
+<li>Once validated, UUID of object is retrieved from metadata store</li>
+<li>Object payload is retrieved from data store based on UUID and returned to the client</li>
+</ul>
+<hr>
+<p>// sprint 1</p>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<h3 id="data-store"><strong>Data store</strong></h3>
+<p>Here's how the API service interacts with the data store:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/data-store-interactions.png" alt="data-store-interactions" data-width="500" style="max-width:500px" />
+</p>
+<p>The data store's main components:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/data-store-main-components.png" alt="data-store-main-components" data-width="500" style="max-width:500px" />
+</p>
+<p>The data routing service provides a RESTful or gRPC API to access the data node cluster.
+It is a stateless service, which scales by adding more servers.</p>
+<p>It's main responsibilities are:</p>
+<ul>
+<li>querying the placement service to get the best data node to store data</li>
+<li>reading data from data nodes and returning it to the API service</li>
+<li>Writing data to data nodes</li>
+</ul>
+<p>The placement service determines which data nodes should store an object.
+It maintains a virtual cluster map, which determines the physical topology of a cluster.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/virtual-cluster-map.png" alt="virtual-cluster-map" data-width="500" style="max-width:500px" />
+</p>
+<p>The service also sends heartbeats to all data nodes to determine if they should be removed from the virtual cluster.</p>
+<p>Since this is a critical service, it is recommended to maintain a cluster of 5 or 7 replicas, synchronized via Paxos or Raft consensus algorithms.
+Eg a 7 node cluster can tolerate 3 nodes failing.</p>
+<p>Data nodes store the actual object data.
+Reliability and durability is ensured by replicating data to multiple data nodes.</p>
+<p>Each data node has a daemon running, which sends heartbeats to the placement service.</p>
+<p>The heartbeat includes:</p>
+<ul>
+<li>How many disk drives (HDD or SSD) does the data node manage?</li>
+<li>How much data is stored on each drive?</li>
+</ul>
+<h4 id="data-persistence-flow">Data persistence flow</h4>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/data-persistence-flow.png" alt="data-persistence-flow" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>API service forwards the object data to data store</li>
+<li>Data routing service sends the data to the primary data node</li>
+<li>Primary data node saves the data locally and replicates it to two secondary data nodes. Response is sent after successful replication.</li>
+<li>The UUID of the object is returned to the API service.</li>
+</ul>
+<p>Caveats:</p>
+<ul>
+<li>Given an object UUID, it's replication group is deterministically chosen by using consistent hashing</li>
+<li>In step 4, the primary data node replicates the object data before returning a response. This favors strong consistency over higher latency.</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/consistency-vs-latency.png" alt="consistency-vs-latency" data-width="500" style="max-width:500px" />
+</p>
+<h4 id="how-data-is-organized">How data is organized</h4>
+<p>One simple approach to managing data is to store each object in a separate file.</p>
+<p>This works, but is not performant with many small files in a file system:</p>
+<ul>
+<li>Data blocks on HDD are wasted, because every file uses the whole block size. Typical block size is 4kb.</li>
+<li>Many files means many inodes. Operating systems don't deal well with too many inodes and there is also a max inode limit.</li>
+</ul>
+<p>These issues can be addressed by merging many small files into bigger ones via a write-ahead log (WAL). Once the file reaches its capacity (typically a few GB), a new file is created:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/wal-optimization.png" alt="wal-optimization" data-width="500" style="max-width:500px" />
+</p>
+<p>The downside of this approach is that write access to the file needs to be serialized. Multiple cores accessing the same file must wait for each other.
+To fix this, we can confine files to specific cores to avoid lock contention.</p>
+<h4 id="object-lookup">Object lookup</h4>
+<p>To support storing multiple objects in the same file, we need to maintain a table, which tells the data node:</p>
+<ul>
+<li><code>object_id</code></li>
+<li><code>filename</code> where object is stored</li>
+<li><code>file_offset</code> where object starts</li>
+<li><code>object_size</code></li>
+</ul>
+<p>We can deploy this table in a file-based db like RocksDB or a traditional relational database.
+Since the access pattern is low write+high read, a relational database works better.</p>
+<p>Note the structure this creates. The object mapping table is an <strong>offset index into a packed file</strong> — <code>object_id → (filename, offset, size)</code> — which is precisely the UNIX inode's list of block pointers, rebuilt one level up. The chapter's analogy is not decorative; it is the same mechanism.</p>
+<p>How should we deploy it?
+We could deploy the db and scale it separately in a cluster, accessed by all data nodes.</p>
+<p>Downsides:</p>
+<ul>
+<li>we'd need to aggressively scale the cluster to serve all requests</li>
+<li>there's additional network latency between data node and db cluster</li>
+</ul>
+<p>An alternative is to take advantage of the fact that data nodes are only interested to data related to them,
+so we can deploy the relational db within the data node itself.</p>
+<p>SQLite is a good option as it's a lightweight file-based relational database.</p>
+<p><strong>This is the most quietly important decision in the data store, and the reason is IOPS and latency, not convenience.</strong> 95% of operations are reads, and every read needs one lookup before it can seek to the bytes. If that lookup is a network call to a shared database cluster:</p>
+<ul>
+<li>every read pays an extra round trip before any data moves;</li>
+<li>the cluster must be sized for the <em>entire fleet's</em> read rate, making it the global bottleneck;</li>
+<li>and it becomes a shared failure domain — its outage stops all reads everywhere.</li>
+</ul>
+<p>Co-locating the index with the data it describes makes the lookup a local file read, removes the round trip, and scales automatically with the number of data nodes, because each node's index only ever describes its own files. <strong>The index is partitioned by construction rather than by a sharding scheme</strong> — which is the cleanest form of partitioning available, and it works only because a data node genuinely never needs to know about another node's objects.</p>
+<h4 id="updated-data-persistence-flow">Updated data persistence flow</h4>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/updated-data-persistence-flow.png" alt="updated-data-persistence-flow" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>API Service sends a request to save a new object</li>
+<li>Data node service appends the new object at the end of a file, named &quot;/data/c&quot;</li>
+<li>A new record for the object is inserted into the object mapping table</li>
+</ul>
+<h4 id="durability">Durability</h4>
+<p>Data durability is an important requirement in our design. In order to achieve 6 nines of durability, every failure case needs to be properly examined.</p>
+<p>First problem to address is hardware failures. We can achieve that by replicating data nodes to minimize probability of failure.
+But in addition to that, we also ought to replicate across different failure domains (cross-rack, cross-dc, separate networks, etc).
+A critical event can cause multiple hardware failures within the same domain:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/failure-domain-isolation.png" alt="failure-domain-isolation" data-width="500" style="max-width:500px" />
+</p>
+<p>Assuming annual failure rate of a typical HDD is 0.81%, making three copies gives us 6 nines of durability.</p>
+<p><strong>The arithmetic, since &quot;nines&quot; is easy to assert and worth being able to derive.</strong> If a disk's annual failure rate is 0.81% and the three copies fail independently:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>P(losing all three in a year) = 0.0081³ ≈ 5.3 × 10⁻⁷
+durability = 1 − 5.3 × 10⁻⁷ ≈ 0.9999995  →  ~6 nines
+</code></pre></div>
+<p>Two things that calculation depends on, and both are design requirements rather than assumptions:</p>
+<p><strong>The failures must be independent.</strong> <code>0.0081³</code> is only valid if the three copies cannot fail together — which is exactly why replicas are placed across racks, power domains, networks and data centres. Three copies in one rack are, for the purposes of this formula, one copy: a single power event correlates them and the exponent collapses. <strong>Failure-domain isolation is what makes the multiplication legal</strong>, and it is the whole reason the chapter raises it before the maths.</p>
+<p><strong>Lost copies must be re-created quickly.</strong> The model assumes you are back to three copies long before a second disk fails. Durability is really a race between failure rate and repair rate, which is why repair speed — see the erasure coding caveat below — is a durability property, not just an operational one.</p>
+<p>Replicating the data nodes like that grants us the durability we want, but we could also leverage erasure coding to reduce storage costs.</p>
+<p>Erasure coding enables us to use parity bits, which allow us to reconstruct lost bits in the event of a failure:</p>
+<p><strong>How it works, in one paragraph.</strong> Split an object into <code>n</code> data chunks, compute <code>m</code> parity chunks from them (Reed-Solomon coding is the usual scheme), and distribute all <code>n + m</code> across failure domains. Any <code>n</code> of the <code>n + m</code> chunks are sufficient to reconstruct the original — it does not matter which <code>n</code>. With 8+4 you store 12 chunks and survive the loss of <strong>any 4</strong>, while occupying 12/8 = <strong>1.5×</strong> the logical size instead of replication's 3×.</p>
+<p>The cost saving at this scale is the headline number:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Scheme</th>
+<th>Raw storage for 100 PB logical</th>
+<th>Survives</th>
+<th>Overhead</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3× replication</td>
+<td><strong>300 PB</strong></td>
+<td>any 2 losses</td>
+<td>200%</td>
+</tr>
+<tr>
+<td>8+4 erasure coding</td>
+<td><strong>150 PB</strong></td>
+<td>any 4 losses</td>
+<td>50%</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>150 petabytes saved, with better fault tolerance.</strong> That is why every large object store uses erasure coding for the bulk of its data.</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/erasure-coding.png" alt="erasure-coding" data-width="500" style="max-width:500px" />
+</p>
+<p>Imagine those bits are data nodes. If two of them go down, they can be recovered using the remaining four ones.</p>
+<p>There are different erasure coding schemes. In our case, we could use 8+4 erasure coding, split across different failure domains to maximize reliability:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/erasure-coding-across-failure-domains.png" alt="erasure-coding-across-failure-domains" data-width="500" style="max-width:500px" />
+</p>
+<p>Erasure coding enables us to achieve a much lower storage cost (50% improvement) at the expense of access speed due to the data routing service having to collect data from multiple locations:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/erasure-coding-vs-replication.png" alt="erasure-coding-vs-replication" data-width="500" style="max-width:500px" />
+</p>
+<p>Other caveats:</p>
+<ul>
+<li>Replication requires 200% storage overhead (in case of 3 replicas) vs. 50% via erasure coding</li>
+<li>Erasure coding <a href="https://github.com/Backblaze/erasure-coding-durability" target="_blank" rel="noopener">gives us 11 nines of durability</a> vs 6 nines via replication</li>
+<li>Erasure coding requires more computation to calculate and store parities</li>
+</ul>
+<p>In sum, replication is more useful for latency-sensitive applications, whereas erasure coding is attractive for storage cost efficiency and durability.
+Erasure coding is also much harder to implement.</p>
+<p><strong>Three costs of erasure coding that the comparison leaves implicit, and they are the reasons it is not used for everything:</strong></p>
+<p><strong>Reads touch many nodes, so tail latency gets worse.</strong> A replicated read can be served by whichever of three replicas answers first — the <em>minimum</em> of three latencies, which is a latency <em>improvement</em>. An 8+4 read must collect 8 chunks and therefore waits for the <strong>slowest of 8</strong> — the maximum, not the minimum. One slow disk anywhere in the group sets the response time. This single asymmetry is why hot data is replicated and cold data is erasure-coded.</p>
+<p><strong>Repair amplification.</strong> Losing one replicated chunk means copying one chunk from a peer. Losing one erasure-coded chunk means reading <strong>8 chunks</strong> across the network and recomputing the missing one — eight times the repair traffic for the same amount of lost data, plus CPU. During a disk or node failure this repair load competes with live traffic, and because durability depends on repairing before the next failure, slow repair is a durability problem as well as an operational one.</p>
+<p><strong>Small objects do not erasure-code sensibly.</strong> Splitting a 1 KB object into eight 128-byte chunks plus four parity chunks gives you twelve tiny network round trips and twelve index entries to manage a kilobyte. Erasure coding has a minimum sensible object size, which is one more reason small objects are packed into large files first.</p>
+<p>Which gives a clear policy:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Data profile</th>
+<th>Scheme</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Small, hot, latency-sensitive</td>
+<td>Replication</td>
+<td>Read the fastest copy; EC overhead is absurd below a few MB</td>
+</tr>
+<tr>
+<td>Large, cold, cost-dominated</td>
+<td><strong>Erasure coding</strong></td>
+<td>Half the storage, better durability, latency does not matter</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h4 id="correctness-verification">Correctness verification</h4>
+<p>If a disk fails entirely, then the failure is easy to detect. This is less straightforward in the event part of the disk memory gets corrupted.</p>
+<p>To detect this, we can use checksums - a hash of the file contents, which can be used to verify the file's integrity.</p>
+<p>In our case, we'll store checksums for each file and each object:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/checksums-for-correctness.png" alt="checksums-for-correctness" data-width="500" style="max-width:500px" />
+</p>
+<p>In the case of erasure coding (8+4), we'll need to fetch each of the 8 pieces of data separately and verify each of their checksums.</p>
+<p><strong>Checksums are what make the durability claim meaningful, and the failure they defend against is the nasty one.</strong> A disk that dies is obvious — it stops answering, repair begins, the system heals. A disk that silently returns <em>wrong bytes</em> — bit rot, a firmware bug, a cosmic-ray flip, a misdirected write — is invisible. Without checksums you serve corruption as though it were data, and you cheerfully replicate it over your good copies.</p>
+<p>And detection on read is not sufficient. Cold data may not be read for years, by which time all copies could have rotted independently. The missing piece is <strong>scrubbing</strong>: a background process that continuously reads every object, verifies its checksum, and repairs from a good copy or from parity. Durability figures like 11 nines implicitly assume scrubbing is running — they describe a system that <em>finds and fixes</em> corruption, not one that merely stores three copies and hopes.</p>
+<p>This is also why immutability matters again: because content never changes, a checksum computed once is valid forever, and any mismatch is unambiguously corruption rather than a stale digest.</p>
+<h3 id="metadata-data-model"><strong>Metadata data model</strong></h3>
+<p>Table schemas:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/metadata-data-model.png" alt="metadata-data-model" data-width="500" style="max-width:500px" />
+</p>
+<p>Queries we need to support:</p>
+<ul>
+<li>Find an object ID by name</li>
+<li>Insert/delete object based on name</li>
+<li>List objects in a bucket sharing the same prefix</li>
+</ul>
+<p>There is usually a limit on the number of buckets a user can create, hence, the size of the buckets table is small and can fit into a single db server.
+But we still need to scale the server for read throughput.</p>
+<p>The object table will probably not fit into a single database server, though. Hence, we can scale the table via sharding:</p>
+<ul>
+<li>Sharding by bucket_id will lead to hotspot issues as a bucket can have billions of objects</li>
+<li>Sharding by <code>object_id</code> makes the load more evenly distributed, but our queries will be slow</li>
+<li>We choose sharding by <code>hash(bucket_name, object_name)</code> since most queries are based on the object/bucket name.</li>
+</ul>
+<p>Even with this sharding scheme, though, listing objects in a bucket will be slow.</p>
+<h3 id="listing-objects-in-a-bucket"><strong>Listing objects in a bucket</strong></h3>
+<p>In a single database, listing an object based on its prefix (looks like a directory) works like this:</p>
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="text">Example</button></div><pre data-lang="text"><code>SELECT * FROM object WHERE bucket_id = &quot;123&quot; AND object_name LIKE `abc/%`
+</code></pre></div>
+<p>This is challenging to fulfill when the database is sharded. To achieve it, we can run the query on every shard and aggregate the results in-memory.
+This makes pagination challenging though, since different shards contain a different result size and we need to maintain separate limit/offset for each.</p>
+<p>We can leverage the fact that typically object stores are not optimized for listing objects, so we can sacrifice listing performance.
+We can also create a denormalized table for listing objects, sharded by bucket ID.
+That would make our listing query sufficiently fast as it's isolated to a single database instance.</p>
+<p><strong>The underlying tension is that the namespace is flat and users insist on treating it as a hierarchy.</strong> There are no directories in an object store; <code>photos/2021/june/img.jpg</code> is a single opaque key that merely contains slashes. &quot;Listing a directory&quot; is a prefix scan, and the folder structure you see in a console is an illusion reconstructed from key prefixes by splitting on <code>/</code>.</p>
+<p>That illusion is cheap in one database and expensive once sharded, and the two requirements pull in opposite directions:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Shard key</th>
+<th>Point lookup (<code>GET object</code>)</th>
+<th>Prefix listing</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hash(bucket_name, object_name)</code></td>
+<td><strong>Fast</strong> — one shard</td>
+<td><strong>Slow</strong> — scatter-gather across every shard</td>
+</tr>
+<tr>
+<td><code>bucket_id</code></td>
+<td>Fast</td>
+<td><strong>Fast</strong> — one shard</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>but a billion-object bucket is a hot shard</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The chosen resolution — hash-shard the authoritative table for lookups, and keep a <strong>separate denormalised listing table sharded by bucket</strong> — is the standard answer: maintain two differently-partitioned copies of the same facts, each optimised for one access pattern. The price is a second write per object and the usual consistency gap between the two tables, which is acceptable here precisely because listing is allowed to lag.</p>
+<p><strong>And note the pagination trap</strong>, which is the same one as <a href="11-news-feed-system.html#reading-the-feed-end-to-end">Chapter 11</a>: <code>LIMIT</code>/<code>OFFSET</code> cannot work across shards, because an offset is meaningless when results come from several independently-ordered sources. Listing must paginate with a <strong>continuation token</strong> that encodes the last key returned — which is exactly what S3's <code>continuation-token</code> is, and why the API has no concept of &quot;page 5&quot;.</p>
+<h3 id="object-versioning"><strong>Object versioning</strong></h3>
+<p>Versioning works by having another <code>object_version</code> column which is of type TIMEUUID, enabling us to sort records based on it.</p>
+<p>Each new version produces a new <code>object_id</code>:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/object-versioning.png" alt="object-versioning" data-width="500" style="max-width:500px" />
+</p>
+<p>The versioning design is the clearest expression of immutability in the chapter: <strong>a new version is a new object</strong>, with its own <code>object_id</code> and its own bytes, and the old one is untouched. Nothing is ever overwritten; the &quot;current&quot; version is simply the newest row.</p>
+<p>Deleting an object creates a new version with a special <code>object_id</code> indicating that the object was deleted. Queries for it return 404:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/deleting-versioned-object.png" alt="deleting-versioned-object" data-width="500" style="max-width:500px" />
+</p>
+<p>That special row is a <strong>delete marker</strong>, and it is the same device as the tombstone in <a href="06-key-value-store.html#gotchas--failure-modes">Chapter 6</a>: in a store where you cannot modify data, the only way to record an absence is to append a record saying so.</p>
+<p>Two consequences worth stating, because both surprise people in production:</p>
+<ul>
+<li><strong>Deleting does not free space, and may consume more.</strong> The bytes of every prior version remain, plus a new metadata row for the marker. A bucket with versioning enabled and no lifecycle policy grows monotonically no matter how much its users delete — and the bill reflects stored bytes, not visible ones.</li>
+<li><strong>&quot;Undelete&quot; is free, which is the point.</strong> Removing the delete marker restores the object, which is why versioning is the standard defence against the accidental-mass-deletion failure mode from <a href="15-google-drive.html#gotchas--failure-modes">Chapter 15</a>.</li>
+</ul>
+<p><strong>Lifecycle policies</strong> are therefore not optional at scale: expire non-current versions after N days, abort incomplete multipart uploads after N days, and transition cold objects to cheaper tiers. Without them, versioning is a slow storage leak with a legitimate-looking cause.</p>
+<h3 id="optimizing-uploads-of-large-files"><strong>Optimizing uploads of large files</strong></h3>
+<p>Uploading large files can be optimized by using multipart uploads - splitting a big file into several chunks, uploaded independently:</p>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/multipart-upload.png" alt="multipart-upload" data-width="500" style="max-width:500px" />
+</p>
+<ul>
+<li>Client calls service to initiate a multipart upload</li>
+<li>Data store returns an upload ID which uniquely identifies the upload</li>
+<li>Client splits the large file into several chunks, uploaded independently using the upload id</li>
+<li>When a chunk is uploaded, the data store returns an etag, which is a md5 checksum, identifying that upload chunk</li>
+<li>After all parts are uploaded, client sends a complete multipart upload request, which includes upload_id, part numbers and all etags</li>
+<li>Data store reassembles the object from its parts. The process can take a few minutes. After that, success response is returned to the client.</li>
+</ul>
+<p>Old parts, which are no longer useful can be removed at this point. We can introduce a garbage collector to deal with it.</p>
+<p><strong>Multipart upload buys four things</strong>, all of which matter for an object that may be hundreds of gigabytes: parts upload in <strong>parallel</strong>, a failed part is retried <strong>alone</strong> rather than restarting the whole transfer, the client can <strong>pause and resume</strong>, and the object's total size need not be known in advance. It is the same mechanism as the chunked uploads in <a href="14-youtube.html#speed-optimizations">Chapter 14</a> and <a href="15-google-drive.html">Chapter 15</a>, for the same reasons.</p>
+<p><strong>The ETag stops being an MD5, and this trips people up.</strong> For a single-part upload the ETag is the MD5 of the object, so clients can verify integrity by comparing hashes. For a multipart upload it is a <strong>hash of the concatenated part hashes, suffixed with the part count</strong> (<code>&quot;a1b2…-12&quot;</code>). It is still a valid integrity check, but it is no longer the MD5 of the object's bytes, so a client that recomputes MD5 locally and compares will see a mismatch on every large file — and the value depends on the part size chosen, so the same object uploaded with different part sizes gets different ETags.</p>
+<p><strong>And incomplete uploads cost money silently.</strong> A client that initiates a multipart upload, sends 90 parts and then disappears leaves those parts stored and billed, invisible in any object listing because the object was never completed. This is the single most common source of unexplained object-storage spend, and the fix is a lifecycle rule that aborts incomplete uploads after a few days.</p>
+<h3 id="garbage-collection"><strong>Garbage collection</strong></h3>
+<p>Garbage collection is the process of reclaiming storage space, which is no longer used. There are a few ways data becomes garbage:</p>
+<ul>
+<li><strong>lazy object deletion</strong> - object is marked as deleted without actually getting deleted</li>
+<li><strong>orphan data</strong> - eg an upload failed mid-flight and old parts need to be deleted</li>
+<li><strong>corrupted data</strong> - data which failed checksum verification</li>
+</ul>
+<p>The garbage collector is also responsible for reclaiming unused space in replicas.
+With replication, data is deleted from both primaries and replicas. With erasure coding (8+4), data is deleted from all 12 nodes.</p>
+<p>To facilitate the deletion, we'll use a process called compaction:</p>
+<ul>
+<li>Garbage collector copies objects which are not deleted from &quot;data/b&quot; to &quot;data/d&quot;</li>
+<li><code>object_mapping</code> table is updated once copying is complete using a database transaction</li>
+<li>To avoid making too many small files, compaction is done on files which grow beyond a certain threshold</li>
+</ul>
+<p align="left">
+    <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/compaction.png" alt="compaction" data-width="500" style="max-width:500px" />
+</p>
+<hr>
+</section>
+<section id="step-4-wrap-up">
+<h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
+<p>Things we covered:</p>
+<ul>
+<li>Designing an S3-like object storage</li>
+<li>Comparing differences between object, block and file storages</li>
+<li>Covered uploading, downloading, listing, versioning of objects in a bucket</li>
+<li>Deep dived in the design - data store and metadata store, replication and erasure coding, multipart uploads, sharding</li>
+</ul>
+<figure class="mermaid-fig">
+<svg id="mmd-4914623350670458" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1580.67px; background-color: transparent;" viewBox="0 0 1580.671875 718.1810302734375" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-4914623350670458{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-4914623350670458 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-4914623350670458 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-4914623350670458 .error-icon{fill:#f4f6f8;}#mmd-4914623350670458 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-4914623350670458 .edge-thickness-normal{stroke-width:1px;}#mmd-4914623350670458 .edge-thickness-thick{stroke-width:3.5px;}#mmd-4914623350670458 .edge-pattern-solid{stroke-dasharray:0;}#mmd-4914623350670458 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-4914623350670458 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-4914623350670458 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-4914623350670458 .marker{fill:#637381;stroke:#637381;}#mmd-4914623350670458 .marker.cross{stroke:#637381;}#mmd-4914623350670458 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-4914623350670458 p{margin:0;}#mmd-4914623350670458 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-4914623350670458 .cluster-label text{fill:#454f5b;}#mmd-4914623350670458 .cluster-label span{color:#454f5b;}#mmd-4914623350670458 .cluster-label span p{background-color:transparent;}#mmd-4914623350670458 .label text,#mmd-4914623350670458 span{fill:#161c24;color:#161c24;}#mmd-4914623350670458 .node rect,#mmd-4914623350670458 .node circle,#mmd-4914623350670458 .node ellipse,#mmd-4914623350670458 .node polygon,#mmd-4914623350670458 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-4914623350670458 .rough-node .label text,#mmd-4914623350670458 .node .label text,#mmd-4914623350670458 .image-shape .label,#mmd-4914623350670458 .icon-shape .label{text-anchor:middle;}#mmd-4914623350670458 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-4914623350670458 .rough-node .label,#mmd-4914623350670458 .node .label,#mmd-4914623350670458 .image-shape .label,#mmd-4914623350670458 .icon-shape .label{text-align:center;}#mmd-4914623350670458 .node.clickable{cursor:pointer;}#mmd-4914623350670458 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-4914623350670458 .arrowheadPath{fill:#000000;}#mmd-4914623350670458 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-4914623350670458 .flowchart-link{stroke:#637381;fill:none;}#mmd-4914623350670458 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-4914623350670458 .edgeLabel p{background-color:#ffffff;}#mmd-4914623350670458 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-4914623350670458 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-4914623350670458 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-4914623350670458 .cluster text{fill:#454f5b;}#mmd-4914623350670458 .cluster span{color:#454f5b;}#mmd-4914623350670458 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-4914623350670458 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-4914623350670458 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-4914623350670458 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-4914623350670458 rect.text{fill:none;stroke-width:0;}#mmd-4914623350670458 .icon-shape,#mmd-4914623350670458 .image-shape{background-color:#ffffff;text-align:center;}#mmd-4914623350670458 .icon-shape p,#mmd-4914623350670458 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-4914623350670458 .icon-shape .label rect,#mmd-4914623350670458 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-4914623350670458 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-4914623350670458 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-4914623350670458 .node .neo-node{stroke:#299a8d;}#mmd-4914623350670458 [data-look="neo"].node rect,#mmd-4914623350670458 [data-look="neo"].cluster rect,#mmd-4914623350670458 [data-look="neo"].node polygon{stroke:url(#mmd-4914623350670458-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-4914623350670458 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-4914623350670458 [data-look="neo"].node path{stroke:url(#mmd-4914623350670458-gradient);stroke-width:1px;}#mmd-4914623350670458 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-4914623350670458 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-4914623350670458 [data-look="neo"].node circle{stroke:url(#mmd-4914623350670458-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-4914623350670458 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-4914623350670458 [data-look="neo"].icon-shape .icon{fill:url(#mmd-4914623350670458-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-4914623350670458 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-4914623350670458-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-4914623350670458 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-4914623350670458_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-4914623350670458_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-4914623350670458_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-4914623350670458_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-4914623350670458_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-4914623350670458_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-4914623350670458_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-4914623350670458_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-4914623350670458_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-4914623350670458_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-4914623350670458_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-4914623350670458_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M430.313,53L430.313,57.167C430.313,61.333,430.313,69.667,430.313,77.333C430.313,85,430.313,92,430.313,95.5L430.313,99" id="mmd-4914623350670458-L_C_LB_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_LB_0" data-points="W3sieCI6NDMwLjMxMjUsInkiOjUzfSx7IngiOjQzMC4zMTI1LCJ5Ijo3OH0seyJ4Ijo0MzAuMzEyNSwieSI6MTAzfV0=" data-look="classic" marker-end="url(#mmd-4914623350670458_flowchart-v2-pointEnd)"/><path d="M430.313,148L430.313,152.167C430.313,156.333,430.313,164.667,430.313,172.333C430.313,180,430.313,187,430.313,190.5L430.313,194" id="mmd-4914623350670458-L_LB_API_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_LB_API_0" data-points="W3sieCI6NDMwLjMxMjUsInkiOjE0OH0seyJ4Ijo0MzAuMzEyNSwieSI6MTczfSx7IngiOjQzMC4zMTI1LCJ5IjoxOTh9XQ==" data-look="classic" marker-end="url(#mmd-4914623350670458_flowchart-v2-pointEnd)"/><path d="M334.359,233.991L294.046,239.659C253.732,245.327,173.104,256.664,132.79,272.264C92.477,287.864,92.477,307.727,92.477,317.659L92.477,327.591" id="mmd-4914623350670458-L_API_IAM_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_IAM_0" data-points="W3sieCI6MzM0LjM1OTM3NSwieSI6MjMzLjk5MTA4NTI2MjM1NDZ9LHsieCI6OTIuNDc2NTYyNSwieSI6MjY4fSx7IngiOjkyLjQ3NjU2MjUsInkiOjMzMS41OTA1MDc1MDczMjQyfV0=" data-look="classic" marker-end="url(#mmd-4914623350670458_flowchart-v2-pointEnd)"/><path d="M376.631,243L366.69,247.167C356.749,251.333,336.867,259.667,326.925,267.576C316.984,275.485,316.984,282.971,316.984,286.714L316.984,290.456" id="mmd-4914623350670458-L_API_MD_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_MD_0" data-points="W3sieCI6Mzc2LjYzMDc1NjU3ODk0NzQsInkiOjI0M30seyJ4IjozMTYuOTg0Mzc1LCJ5IjoyNjh9LHsieCI6MzE2Ljk4NDM3NSwieSI6Mjk0LjQ1NjIwNzI3NTM5MDZ9XQ==" data-look="classic" marker-end="url(#mmd-4914623350670458_flowchart-v2-pointEnd)"/><path d="M493.172,243L504.813,247.167C516.453,251.333,539.734,259.667,551.375,267.333C563.016,275,563.016,282,563.016,285.5L563.016,289" id="mmd-4914623350670458-L_API_LST_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_LST_0" data-points="W3sieCI6NDkzLjE3MTg3NSwieSI6MjQzfSx7IngiOjU2My4wMTU2MjUsInkiOjI2OH0seyJ4Ijo1NjMuMDE1NjI1LCJ5IjoyOTN9XQ==" data-look="classic" marker-end="url(#mmd-4914623350670458_flowchart-v2-pointEnd)"/><path d="M526.266,225.534L661.169,232.612C796.073,239.689,1065.88,253.845,1200.784,270.854C1335.688,287.864,1335.688,307.727,1335.688,317.659L1335.688,327.591" id="mmd-4914623350670458-L_API_DR_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_DR_0" data-points="W3sieCI6NTI2LjI2NTYyNSwieSI6MjI1LjUzNDEyNzc3ODU0NDh9LHsieCI6MTMzNS42ODc1LCJ5IjoyNjh9LHsieCI6MTMzNS42ODc1LCJ5IjozMzEuNTkwNTA3NTA3MzI0Mn1d" data-look="classic" marker-end="url(#mmd-4914623350670458_flowchart-v2-pointEnd)"/><path d="M1304.793,376.591L1290.24,387.189C1275.687,397.787,1246.582,418.984,1225.397,433.416C1204.212,447.847,1190.948,455.513,1184.315,459.346L1177.683,463.179" id="mmd-4914623350670458-L_DR_DN1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DR_DN1_0" data-points="W3sieCI6MTMwNC43OTI3MzM4ODk3Njc1LCJ5IjozNzYuNTkwNTA3NTA3MzI0Mn0seyJ4IjoxMjE3LjQ3NjU2MjUsInkiOjQ0MC4xODEwMTUwMTQ2NDg0NH0seyJ4IjoxMTc0LjIxOTgzMzQ4NTQwMTUsInkiOjQ2NS4xODEwMTUwMTQ2NDg0NH1d" data-look="classic" marker-end="url(#mmd-4914623350670458_flowchart-v2-pointEnd)"/><path d="M1335.688,376.591L1335.688,387.189C1335.688,397.787,1335.688,418.984,1335.688,436.583C1335.688,454.181,1335.688,468.181,1335.688,475.181L1335.688,482.181" id="mmd-4914623350670458-L_DR_DN2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DR_DN2_0" data-points="W3sieCI6MTMzNS42ODc1LCJ5IjozNzYuNTkwNTA3NTA3MzI0Mn0seyJ4IjoxMzM1LjY4NzUsInkiOjQ0MC4xODEwMTUwMTQ2NDg0NH0seyJ4IjoxMzM1LjY4NzUsInkiOjQ4Ni4xODEwMTUwMTQ2NDg0NH1d" data-look="classic" marker-end="url(#mmd-4914623350670458_flowchart-v2-pointEnd)"/><path d="M1381.347,376.591L1402.854,387.189C1424.361,397.787,1467.376,418.984,1488.883,436.583C1510.391,454.181,1510.391,468.181,1510.391,475.181L1510.391,482.181" id="mmd-4914623350670458-L_DR_DN3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DR_DN3_0" data-points="W3sieCI6MTM4MS4zNDY2NjA2NDc0OCwieSI6Mzc2LjU5MDUwNzUwNzMyNDJ9LHsieCI6MTUxMC4zOTA2MjUsInkiOjQ0MC4xODEwMTUwMTQ2NDg0NH0seyJ4IjoxNTEwLjM5MDYyNSwieSI6NDg2LjE4MTAxNTAxNDY0ODQ0fV0=" data-look="classic" marker-end="url(#mmd-4914623350670458_flowchart-v2-pointEnd)"/><path d="M1098.953,552.181L1098.953,556.348C1098.953,560.514,1098.953,568.848,1098.953,576.514C1098.953,584.181,1098.953,591.181,1098.953,594.681L1098.953,598.181" id="mmd-4914623350670458-L_DN1_EC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DN1_EC_0" data-points="W3sieCI6MTA5OC45NTMxMjUsInkiOjU1Mi4xODEwMTUwMTQ2NDg0fSx7IngiOjEwOTguOTUzMTI1LCJ5Ijo1NzcuMTgxMDE1MDE0NjQ4NH0seyJ4IjoxMDk4Ljk1MzEyNSwieSI6NjAyLjE4MTAxNTAxNDY0ODR9XQ==" data-look="classic" marker-end="url(#mmd-4914623350670458_flowchart-v2-pointEnd)"/><path d="M1098.641,397.591L1098.641,404.689C1098.641,411.787,1098.641,425.984,1098.657,436.583C1098.673,447.181,1098.704,454.181,1098.72,457.681L1098.736,461.181" id="mmd-4914623350670458-L_GC_DN1_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_GC_DN1_0" data-points="W3sieCI6MTA5OC42NDA2MjUsInkiOjM5Ny41OTA1MDc1MDczMjQyfSx7IngiOjEwOTguNjQwNjI1LCJ5Ijo0NDAuMTgxMDE1MDE0NjQ4NDR9LHsieCI6MTA5OC43NTQ2NzYwOTQ4OTA2LCJ5Ijo0NjUuMTgxMDE1MDE0NjQ4NDR9XQ==" data-look="classic" marker-end="url(#mmd-4914623350670458_flowchart-v2-pointEnd)"/><path d="M821.828,387.091L821.828,395.939C821.828,404.787,821.828,422.484,846.702,437.481C871.575,452.478,921.323,464.774,946.196,470.922L971.07,477.071" id="mmd-4914623350670458-L_SC_DN1_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SC_DN1_0" data-points="W3sieCI6ODIxLjgyODEyNSwieSI6Mzg3LjA5MDUwNzUwNzMyNDJ9LHsieCI6ODIxLjgyODEyNSwieSI6NDQwLjE4MTAxNTAxNDY0ODQ0fSx7IngiOjk3NC45NTMxMjUsInkiOjQ3OC4wMzA1ODY1MDc2NTd9XQ==" data-look="classic" marker-end="url(#mmd-4914623350670458_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_C_LB_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_LB_API_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_IAM_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_MD_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_LST_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_DR_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_DR_DN1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_DR_DN2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_DR_DN3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_DN1_EC_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_GC_DN1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_SC_DN1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-4914623350670458-flowchart-C-0" data-look="classic" transform="translate(430.3125, 30.5)"><rect class="basic label-container" style="" x="-41.59375" y="-22.5" width="83.1875" height="45"/><g class="label" style="" transform="translate(-17.59375, -10.5)"><rect/><foreignObject width="35.1875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>client</p></span></div></foreignObject></g></g><g class="node default" id="mmd-4914623350670458-flowchart-LB-1" data-look="classic" transform="translate(430.3125, 125.5)"><rect class="basic label-container" style="" x="-67.5234375" y="-22.5" width="135.046875" height="45"/><g class="label" style="" transform="translate(-43.5234375, -10.5)"><rect/><foreignObject width="87.046875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>load balancer</p></span></div></foreignObject></g></g><g class="node default" id="mmd-4914623350670458-flowchart-API-3" data-look="classic" transform="translate(430.3125, 220.5)"><rect class="basic label-container" style="" x="-95.953125" y="-22.5" width="191.90625" height="45"/><g class="label" style="" transform="translate(-71.953125, -10.5)"><rect/><foreignObject width="143.90625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>API service (stateless)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-4914623350670458-flowchart-IAM-5" data-look="classic" transform="translate(92.4765625, 354.0905075073242)"><rect class="basic label-container" style="" x="-84.4765625" y="-22.5" width="168.953125" height="45"/><g class="label" style="" transform="translate(-60.4765625, -10.5)"><rect/><foreignObject width="120.953125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>IAM — auth / authz</p></span></div></foreignObject></g></g><g class="node default" id="mmd-4914623350670458-flowchart-MD-7" data-look="classic" transform="translate(316.984375, 354.0905075073242)"><path d="M0,14.75619750051219 a90.03125,14.75619750051219 0,0,0 180.0625,0 a90.03125,14.75619750051219 0,0,0 -180.0625,0 l0,89.75619750051219 a90.03125,14.75619750051219 0,0,0 180.0625,0 l0,-89.75619750051219" class="basic label-container outer-path" style="" transform="translate(-90.03125, -59.63429625076829)"/><g class="label" style="" transform="translate(-84.03125, -23.5)"><rect/><foreignObject width="168.0625" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>metadata store<br />buckets, objects, versions<br />hash(bucket, object)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-4914623350670458-flowchart-LST-9" data-look="classic" transform="translate(563.015625, 354.0905075073242)"><path d="M0,15.72700296735905 a106,15.72700296735905 0,0,0 212,0 a106,15.72700296735905 0,0,0 -212,0 l0,90.72700296735906 a106,15.72700296735905 0,0,0 212,0 l0,-90.72700296735906" class="basic label-container outer-path" style="" transform="translate(-106, -61.090504451038576)"/><g class="label" style="" transform="translate(-100, -23.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>listing table<br />denormalised, sharded by bucket</p></span></div></foreignObject></g></g><g class="node default" id="mmd-4914623350670458-flowchart-DR-11" data-look="classic" transform="translate(1335.6875, 354.0905075073242)"><rect class="basic label-container" style="" x="-63.046875" y="-22.5" width="126.09375" height="45"/><g class="label" style="" transform="translate(-39.046875, -10.5)"><rect/><foreignObject width="78.09375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>data routing</p></span></div></foreignObject></g></g><g class="node default" id="mmd-4914623350670458-flowchart-DN1-13" data-look="classic" transform="translate(1098.953125, 508.68101501464844)"><rect class="basic label-container" style="" x="-124" y="-43.5" width="248" height="87"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>data node 1<br />packed file + local SQLite index</p></span></div></foreignObject></g></g><g class="node default" id="mmd-4914623350670458-flowchart-DN2-15" data-look="classic" transform="translate(1335.6875, 508.68101501464844)"><rect class="basic label-container" style="" x="-62.421875" y="-22.5" width="124.84375" height="45"/><g class="label" style="" transform="translate(-38.421875, -10.5)"><rect/><foreignObject width="76.84375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>data node 2</p></span></div></foreignObject></g></g><g class="node default" id="mmd-4914623350670458-flowchart-DN3-17" data-look="classic" transform="translate(1510.390625, 508.68101501464844)"><rect class="basic label-container" style="" x="-62.28125" y="-22.5" width="124.5625" height="45"/><g class="label" style="" transform="translate(-38.28125, -10.5)"><rect/><foreignObject width="76.5625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>data node n</p></span></div></foreignObject></g></g><g class="node default" id="mmd-4914623350670458-flowchart-EC-19" data-look="classic" transform="translate(1098.953125, 656.1810150146484)"><rect class="basic label-container" style="" x="-124" y="-54" width="248" height="108"/><g class="label" style="" transform="translate(-100, -42)"><rect/><foreignObject width="200" height="84"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>placement:<br />3x replication (hot/small)<br />or 8+4 erasure coding (cold/large)</p></span></div></foreignObject></g></g><g class="node default" id="mmd-4914623350670458-flowchart-GC-20" data-look="classic" transform="translate(1098.640625, 354.0905075073242)"><rect class="basic label-container" style="" x="-124" y="-43.5" width="248" height="87"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>garbage collector<br />compaction · orphan parts · delete markers</p></span></div></foreignObject></g></g><g class="node default" id="mmd-4914623350670458-flowchart-SC-22" data-look="classic" transform="translate(821.828125, 354.0905075073242)"><rect class="basic label-container" style="" x="-102.8125" y="-33" width="205.625" height="66"/><g class="label" style="" transform="translate(-78.8125, -21)"><rect/><foreignObject width="157.625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>scrubber<br />verify checksums, repair</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-4914623350670458-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-4914623350670458-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-4914623350670458-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p><strong>The two dotted boxes are the ones people forget to draw</strong>, and the design does not meet its durability target without either of them. The scrubber is what turns &quot;three copies exist&quot; into &quot;three <em>correct</em> copies exist&quot;, and the garbage collector is what keeps an immutable store from growing without bound. Both are background processes competing with live traffic for the same disks, which makes their scheduling a real design concern rather than an implementation detail.</p>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Erasure-coded reads are as slow as their slowest chunk.</strong> Replication reads the fastest of N copies; 8+4 waits for the slowest of 8. Use replication for anything latency-sensitive and EC for cold bulk.</li>
+<li><strong>Repairing an erasure-coded chunk reads 8× the lost data.</strong> Repair traffic competes with live reads, and since durability is a race between failure and repair, slow repair lowers durability.</li>
+<li><strong>Small objects must not be erasure-coded.</strong> Twelve chunks to store a kilobyte is all overhead. Pack first, then code.</li>
+<li><strong>Replicas in one failure domain are one replica.</strong> The <code>0.0081³</code> durability calculation is only valid under independence; rack, power and network isolation is what makes it true.</li>
+<li><strong>Silent corruption is the dangerous failure.</strong> A dead disk announces itself; a disk returning wrong bytes does not. Per-object checksums plus a <strong>background scrubber</strong> are required, otherwise cold data rots undetected and all copies may degrade before anyone reads it.</li>
+<li><strong>Delete does not free space.</strong> With versioning, deleting appends a marker and retains every prior version. Without lifecycle policies, a bucket grows forever while appearing to shrink.</li>
+<li><strong>Incomplete multipart uploads are billed and invisible.</strong> Parts of an abandoned upload do not appear in any object listing but do appear on the invoice. Expire them with a lifecycle rule.</li>
+<li><strong>A multipart ETag is not the object's MD5.</strong> It is a hash of part hashes with a part-count suffix, and it varies with part size. Clients verifying integrity by local MD5 will see spurious mismatches.</li>
+<li><strong>Listing is the operation object storage is worst at.</strong> A flat namespace sharded by <code>hash(bucket, object)</code> makes a prefix scan a scatter-gather across every shard. Hence a second, differently-sharded listing table — and the consistency gap that comes with it.</li>
+<li><strong><code>LIMIT</code>/<code>OFFSET</code> cannot paginate across shards.</strong> Offsets are meaningless over several independently-ordered sources. Use a continuation token encoding the last key returned.</li>
+<li><strong>A single bucket with a billion objects is a hot shard</strong> in the listing table, which is sharded by bucket precisely to make listing fast. The two goals conflict and one of them has to give.</li>
+<li><strong>Sequential key prefixes create hot partitions.</strong> If the metadata store partitions by key range, keys beginning with a timestamp send every new write to one partition — the time-ordered-ID problem from <a href="07-unique-id-generator.html#gotchas--failure-modes">Chapter 7</a>. Put high-entropy characters early in the key, or hash-partition.</li>
+<li><strong>Bucket names are a global namespace</strong>, which means a coordination point: uniqueness must be checked against every bucket that has ever existed, and the name becomes squattable and non-reusable.</li>
+<li><strong>Metadata must be committed after the data is durable.</strong> Commit first and you publish an object whose bytes are not safely stored — the same ordering requirement as <a href="15-google-drive.html#file-upload-flow">Chapter 15</a>. This ordering is also why strong read-after-write consistency was historically hard for object stores; S3 only became strongly consistent in late 2020.</li>
+<li><strong>Garbage collection races with readers.</strong> Compaction copies live objects to a new file and repoints the mapping table; a read in flight against the old file must still succeed. The mapping update has to be transactional and the old file retained until no reader can be using it.</li>
+<li><strong>Immutability means no append and no partial update.</strong> Changing one byte of a 1 TB object means rewriting the whole object. Applications that need in-place mutation want block storage, not this.</li>
+<li><strong>Packing objects into shared files serialises writes to that file.</strong> The chapter's fix — pinning files to specific cores — matters because the lock contention otherwise negates the benefit of packing.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0.68 billion objects on a filesystem</td>
+<td>Pack many objects into large append-only files; never one file per object</td>
+</tr>
+<tr>
+<td>Finding an object inside a packed file</td>
+<td><code>object_id → (file, offset, size)</code> mapping — an inode, one level up</td>
+</tr>
+<tr>
+<td>The mapping lookup not becoming a bottleneck</td>
+<td>Keep the index local to the data node (SQLite), partitioned by construction</td>
+</tr>
+<tr>
+<td>Metadata needing queries, data needing petabytes</td>
+<td>Separate metadata store from data store; scale independently</td>
+</tr>
+<tr>
+<td>6 nines durability</td>
+<td>3× replication across isolated failure domains, plus fast repair</td>
+</tr>
+<tr>
+<td>200% storage overhead</td>
+<td>8+4 erasure coding — 50% overhead, survives any 4 losses</td>
+</tr>
+<tr>
+<td>Latency-sensitive data under EC</td>
+<td>Keep hot and small objects replicated; erasure-code cold bulk</td>
+</tr>
+<tr>
+<td>Silent data corruption</td>
+<td>Per-object and per-file checksums, plus a background scrubber that repairs</td>
+</tr>
+<tr>
+<td>Point lookups by name</td>
+<td>Metadata sharded by <code>hash(bucket_name, object_name)</code></td>
+</tr>
+<tr>
+<td>Prefix listing on a flat namespace</td>
+<td>Denormalised listing table sharded by bucket</td>
+</tr>
+<tr>
+<td>Paginating a sharded listing</td>
+<td>Continuation token on the last key, never offset</td>
+</tr>
+<tr>
+<td>Multi-hundred-gigabyte uploads</td>
+<td>Multipart upload: parallel, retryable, resumable parts</td>
+</tr>
+<tr>
+<td>Mutating an immutable store</td>
+<td>Versioning — a new version is a new object; deletion is a delete marker</td>
+</tr>
+<tr>
+<td>Unbounded growth from versions and orphans</td>
+<td>Lifecycle policies plus a garbage collector</td>
+</tr>
+<tr>
+<td>Reclaiming space inside packed files</td>
+<td>Compaction: copy live objects to a new file, repoint the mapping transactionally</td>
+</tr>
+<tr>
+<td>Objects never visible without their bytes</td>
+<td>Commit metadata only after the data is durable</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>Which two properties generate the rest of this design, and what does each make possible?</li>
+<li>Why is one-file-per-object not merely inefficient but unworkable at 0.68 billion objects?</li>
+<li>Metadata is 0.68 TB against 100 PB of data. What does that ratio justify?</li>
+<li>Why is the object mapping table deployed on the data node rather than in a shared cluster? Give two reasons.</li>
+<li>Derive 6 nines of durability from a 0.81% annual failure rate. What two conditions does that calculation silently assume?</li>
+<li>For 100 PB of logical data, how much raw storage does 3× replication need, and how much does 8+4 erasure coding need?</li>
+<li>Name three costs of erasure coding, and say which one determines that hot data stays replicated.</li>
+<li>A disk starts returning wrong bytes instead of failing. What detects it, and why is detection-on-read not enough?</li>
+<li>Why does deleting objects in a versioned bucket sometimes increase storage?</li>
+<li>A client uploads 90 of 100 parts and vanishes. What happens to the data, the listing, and the bill?</li>
+<li>Why doesn't a multipart ETag match a locally computed MD5?</li>
+<li>Why is listing the operation object storage is worst at, and what are the two sharding options?</li>
+<li>Why can't a sharded listing API offer &quot;page 5&quot;?</li>
+<li>Object keys begin with a timestamp. What goes wrong, and which earlier chapter is this the same problem as?</li>
+<li>Why must metadata be committed after the data, and what consistency property does that ordering complicate?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Block / file / object storage</strong></td>
+<td>Raw devices; a filesystem over them; a flat HTTP key-value store of immutable blobs</td>
+</tr>
+<tr>
+<td><strong>Bucket / object / key</strong></td>
+<td>Globally-named container; an immutable blob; the object's full name within the bucket</td>
+</tr>
+<tr>
+<td><strong>Object immutability</strong></td>
+<td>Content never changes; a modification is a new object with a new ID</td>
+</tr>
+<tr>
+<td><strong>Metadata/data split</strong></td>
+<td>Small queryable metadata in a database, large content in the data store</td>
+</tr>
+<tr>
+<td><strong>Object mapping table</strong></td>
+<td><code>object_id → (filename, offset, size)</code> — the index into a packed file</td>
+</tr>
+<tr>
+<td><strong>Packed file / WAL</strong></td>
+<td>Large append-only file holding many objects, avoiding per-object files and inodes</td>
+</tr>
+<tr>
+<td><strong>Failure domain</strong></td>
+<td>A rack, power circuit, network or data centre whose failure correlates its members</td>
+</tr>
+<tr>
+<td><strong>Annual failure rate (AFR)</strong></td>
+<td>Probability a disk fails in a year; the input to durability maths</td>
+</tr>
+<tr>
+<td><strong>Erasure coding (n+m)</strong></td>
+<td><code>n</code> data plus <code>m</code> parity chunks; any <code>n</code> reconstruct the object</td>
+</tr>
+<tr>
+<td><strong>Reed-Solomon</strong></td>
+<td>The coding scheme normally used for the parity computation</td>
+</tr>
+<tr>
+<td><strong>Repair amplification</strong></td>
+<td>Reading <code>n</code> chunks to rebuild one — erasure coding's hidden repair cost</td>
+</tr>
+<tr>
+<td><strong>Scrubbing</strong></td>
+<td>Background verification of checksums with repair, which catches bit rot</td>
+</tr>
+<tr>
+<td><strong>Delete marker / tombstone</strong></td>
+<td>An appended record representing an absence, since data cannot be modified</td>
+</tr>
+<tr>
+<td><strong>Lifecycle policy</strong></td>
+<td>Rules expiring old versions, aborting stale uploads and tiering cold data</td>
+</tr>
+<tr>
+<td><strong>Multipart upload / ETag</strong></td>
+<td>Parallel resumable part uploads; the identifier that is a hash-of-hashes for them</td>
+</tr>
+<tr>
+<td><strong>Continuation token</strong></td>
+<td>Cursor-based pagination for listings, replacing offsets</td>
+</tr>
+<tr>
+<td><strong>Compaction</strong></td>
+<td>Copying live objects into a new file to reclaim space from deleted ones</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="15-google-drive.html">Chapter 15 – Design Google Drive</a> — the layer above: content-addressed blocks, delta sync, and the same metadata-commit ordering.</li>
+<li><a href="14-youtube.html">Chapter 14 – Design YouTube</a> — object storage as the backing store, plus the CDN tiering that sits in front of it.</li>
+<li><a href="06-key-value-store.html#gotchas--failure-modes">Chapter 6 – Design A Key-Value Store</a> — tombstones, compaction and the cost of deletion in an append-only world.</li>
+<li><a href="07-unique-id-generator.html#gotchas--failure-modes">Chapter 7 – Design A Unique ID Generator</a> — why timestamp-prefixed keys create a hot partition.</li>
+<li><a href="18-google-maps.html">Chapter 18 – Design Google Maps</a> — 70 PB of tiles, which is what a real customer of this system looks like.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

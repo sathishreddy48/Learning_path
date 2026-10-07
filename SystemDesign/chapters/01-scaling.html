@@ -1,0 +1,1184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 1: Scale from Zero to Millions of Users — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="01-scaling">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Foundations › Chapter 1 of 28</div>
+  <h1>Chapter 1: Scale from Zero to Millions of Users</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#section-1-single-server-setup">Section 1: Single Server Setup</a></li><li><a href="#section-2-database-separation">Section 2: Database Separation</a></li><li><a href="#section-3-vertical-vs-horizontal-scaling">Section 3: Vertical vs Horizontal Scaling</a></li><li><a href="#section-4-load-balancer">Section 4: Load Balancer</a></li><li><a href="#section-5-database-replication">Section 5: Database Replication</a></li><li><a href="#section-6-caching">Section 6: Caching</a></li><li><a href="#section-7-content-delivery-network-cdn">Section 7: Content Delivery Network (CDN)</a></li><li><a href="#section-8-stateless-web-tier">Section 8: Stateless Web Tier</a></li><li><a href="#section-9-multi-data-center-setup">Section 9: Multi-Data Center Setup</a></li><li><a href="#section-10-message-queue">Section 10: Message Queue</a></li><li><a href="#section-11-logging-metrics-and-automation">Section 11: Logging, Metrics, and Automation</a></li><li><a href="#section-12-database-scaling">Section 12: Database Scaling</a></li><li><a href="#conclusion">Conclusion</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>Scaling a system to support millions of users is a complex, iterative journey requiring refinement and optimization. This chapter outlines how to begin with a single server setup and scale the architecture step by step to handle millions of users.</p>
+<p>The single most useful way to read this chapter is as a <strong>story, not a checklist</strong>. Nobody designs a twelve-component architecture on day one. Each component below exists because something concrete broke, and almost every fix introduces a new problem that the next section solves. Every section here is therefore framed as:</p>
+<ul>
+<li><strong>What broke</strong> — the symptom that forced this change.</li>
+<li>The fix itself.</li>
+<li><strong>What it now costs you</strong> — the complexity, money, or correctness problem you just bought.</li>
+</ul>
+<p>If you can tell that story in an interview, you have demonstrated far more than someone who can name the same twelve boxes.</p>
+<h3 id="the-scaling-story-at-a-glance">The scaling story at a glance</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Roughly when</th>
+<th>The bottleneck that shows up</th>
+<th>The fix</th>
+<th>Section</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Day one</td>
+<td>Nothing — one box is genuinely fine</td>
+<td>Single server</td>
+<td><a href="#section-1-single-server-setup">§1</a></td>
+</tr>
+<tr>
+<td>First real traffic</td>
+<td>App and DB fight over the same CPU and RAM</td>
+<td>Separate the database tier</td>
+<td><a href="#section-2-database-separation">§2</a></td>
+</tr>
+<tr>
+<td>Server maxed out</td>
+<td>One machine has a hard ceiling</td>
+<td>Decide vertical vs horizontal</td>
+<td><a href="#section-3-vertical-vs-horizontal-scaling">§3</a></td>
+</tr>
+<tr>
+<td>Web tier saturated</td>
+<td>One web server = outage when it dies</td>
+<td>Load balancer + multiple web servers</td>
+<td><a href="#section-4-load-balancer">§4</a></td>
+</tr>
+<tr>
+<td>Reads saturate the DB</td>
+<td>Single DB serves every read and write</td>
+<td>Read replicas</td>
+<td><a href="#section-5-database-replication">§5</a></td>
+</tr>
+<tr>
+<td>Reads still slow</td>
+<td>Same expensive queries run over and over</td>
+<td>Cache tier</td>
+<td><a href="#section-6-caching">§6</a></td>
+</tr>
+<tr>
+<td>Users far away are slow</td>
+<td>Static assets cross oceans on every request</td>
+<td>CDN</td>
+<td><a href="#section-7-content-delivery-network-cdn">§7</a></td>
+</tr>
+<tr>
+<td>Can't auto-scale web tier</td>
+<td>Sessions pinned to specific servers</td>
+<td>Make the web tier stateless</td>
+<td><a href="#section-8-stateless-web-tier">§8</a></td>
+</tr>
+<tr>
+<td>Global users, regional outages</td>
+<td>One data center = one blast radius</td>
+<td>Multi-data-center</td>
+<td><a href="#section-9-multi-data-center-setup">§9</a></td>
+</tr>
+<tr>
+<td>Slow work blocks requests</td>
+<td>Expensive jobs run inside the request</td>
+<td>Message queue + workers</td>
+<td><a href="#section-10-message-queue">§10</a></td>
+</tr>
+<tr>
+<td>Flying blind</td>
+<td>No idea what is slow or broken</td>
+<td>Logging, metrics, automation</td>
+<td><a href="#section-11-logging-metrics-and-automation">§11</a></td>
+</tr>
+<tr>
+<td>Writes saturate the DB</td>
+<td>Replicas scale reads, not writes</td>
+<td>Shard the data tier</td>
+<td><a href="#section-12-database-scaling">§12</a></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>interviewers rarely want all twelve at once. They want to see you add complexity <em>only when prompted by a bottleneck</em>, and name the cost of each addition. Jumping straight to &quot;sharded, multi-region, event-driven&quot; on a problem with 10k users reads as over-engineering.</p>
+</div>
+<hr>
+</section>
+<section id="section-1-single-server-setup">
+<h2 id="section-1-single-server-setup">Section 1: Single Server Setup</h2>
+<p>Initially, all components (web app, database, cache) run on a single server.</p>
+<p align="left">
+   <img loading="lazy" decoding="async" alt="" src="../../system-design-notes/01.%20Scaling/images/single-server.png" data-width="400" style="max-width:400px" />
+</p>
+<p><strong>What broke:</strong> nothing yet. This is the correct starting point, and it is worth saying so out loud in an interview — a single modern server handles a surprising amount of traffic, often a few thousand requests per second for a simple application, which covers the first tens of thousands of users comfortably.</p>
+<h3 id="request-flow">Request Flow</h3>
+<ol>
+<li>Users access the application via domain names (e.g., <code>api.mysite.com</code>), resolved to IP addresses using DNS.</li>
+<li>IP address of the web-server is returned to the browser or mobile app.</li>
+<li>HTTP requests are sent to the web server, which returns HTML or JSON responses.</li>
+</ol>
+<figure class="mermaid-fig">
+<svg id="mmd-5ef16079b49a532a" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 637.172px; background-color: transparent;" viewBox="0 0 637.171875 198" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-5ef16079b49a532a{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-5ef16079b49a532a .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-5ef16079b49a532a .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-5ef16079b49a532a .error-icon{fill:#f4f6f8;}#mmd-5ef16079b49a532a .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-5ef16079b49a532a .edge-thickness-normal{stroke-width:1px;}#mmd-5ef16079b49a532a .edge-thickness-thick{stroke-width:3.5px;}#mmd-5ef16079b49a532a .edge-pattern-solid{stroke-dasharray:0;}#mmd-5ef16079b49a532a .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-5ef16079b49a532a .edge-pattern-dashed{stroke-dasharray:3;}#mmd-5ef16079b49a532a .edge-pattern-dotted{stroke-dasharray:2;}#mmd-5ef16079b49a532a .marker{fill:#637381;stroke:#637381;}#mmd-5ef16079b49a532a .marker.cross{stroke:#637381;}#mmd-5ef16079b49a532a svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-5ef16079b49a532a p{margin:0;}#mmd-5ef16079b49a532a .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-5ef16079b49a532a .cluster-label text{fill:#454f5b;}#mmd-5ef16079b49a532a .cluster-label span{color:#454f5b;}#mmd-5ef16079b49a532a .cluster-label span p{background-color:transparent;}#mmd-5ef16079b49a532a .label text,#mmd-5ef16079b49a532a span{fill:#161c24;color:#161c24;}#mmd-5ef16079b49a532a .node rect,#mmd-5ef16079b49a532a .node circle,#mmd-5ef16079b49a532a .node ellipse,#mmd-5ef16079b49a532a .node polygon,#mmd-5ef16079b49a532a .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-5ef16079b49a532a .rough-node .label text,#mmd-5ef16079b49a532a .node .label text,#mmd-5ef16079b49a532a .image-shape .label,#mmd-5ef16079b49a532a .icon-shape .label{text-anchor:middle;}#mmd-5ef16079b49a532a .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-5ef16079b49a532a .rough-node .label,#mmd-5ef16079b49a532a .node .label,#mmd-5ef16079b49a532a .image-shape .label,#mmd-5ef16079b49a532a .icon-shape .label{text-align:center;}#mmd-5ef16079b49a532a .node.clickable{cursor:pointer;}#mmd-5ef16079b49a532a .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-5ef16079b49a532a .arrowheadPath{fill:#000000;}#mmd-5ef16079b49a532a .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-5ef16079b49a532a .flowchart-link{stroke:#637381;fill:none;}#mmd-5ef16079b49a532a .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-5ef16079b49a532a .edgeLabel p{background-color:#ffffff;}#mmd-5ef16079b49a532a .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-5ef16079b49a532a .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-5ef16079b49a532a .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-5ef16079b49a532a .cluster text{fill:#454f5b;}#mmd-5ef16079b49a532a .cluster span{color:#454f5b;}#mmd-5ef16079b49a532a .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-5ef16079b49a532a .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-5ef16079b49a532a div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-5ef16079b49a532a .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-5ef16079b49a532a rect.text{fill:none;stroke-width:0;}#mmd-5ef16079b49a532a .icon-shape,#mmd-5ef16079b49a532a .image-shape{background-color:#ffffff;text-align:center;}#mmd-5ef16079b49a532a .icon-shape p,#mmd-5ef16079b49a532a .image-shape p{background-color:#ffffff;padding:2px;}#mmd-5ef16079b49a532a .icon-shape .label rect,#mmd-5ef16079b49a532a .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-5ef16079b49a532a .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-5ef16079b49a532a .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-5ef16079b49a532a .node .neo-node{stroke:#299a8d;}#mmd-5ef16079b49a532a [data-look="neo"].node rect,#mmd-5ef16079b49a532a [data-look="neo"].cluster rect,#mmd-5ef16079b49a532a [data-look="neo"].node polygon{stroke:url(#mmd-5ef16079b49a532a-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5ef16079b49a532a [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-5ef16079b49a532a [data-look="neo"].node path{stroke:url(#mmd-5ef16079b49a532a-gradient);stroke-width:1px;}#mmd-5ef16079b49a532a [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5ef16079b49a532a [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-5ef16079b49a532a [data-look="neo"].node circle{stroke:url(#mmd-5ef16079b49a532a-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5ef16079b49a532a [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-5ef16079b49a532a [data-look="neo"].icon-shape .icon{fill:url(#mmd-5ef16079b49a532a-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5ef16079b49a532a [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-5ef16079b49a532a-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-5ef16079b49a532a :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-5ef16079b49a532a_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5ef16079b49a532a_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5ef16079b49a532a_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5ef16079b49a532a_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5ef16079b49a532a_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5ef16079b49a532a_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5ef16079b49a532a_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5ef16079b49a532a_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5ef16079b49a532a_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5ef16079b49a532a_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-5ef16079b49a532a_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-5ef16079b49a532a_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M192.033,66L212.245,58.417C232.457,50.833,272.881,35.667,311.287,29.822C349.694,23.978,386.082,27.455,404.277,29.194L422.471,30.933" id="mmd-5ef16079b49a532a-L_U_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_U_D_0" data-points="W3sieCI6MTkyLjAzMzI0MDQ0NTg1OTg2LCJ5Ijo2Nn0seyJ4IjozMTMuMzA0Njg3NSwieSI6MjAuNX0seyJ4Ijo0MjYuNDUzMTI1LCJ5IjozMS4zMTMzMjYyOTIwMjAyNX1d" data-look="classic" marker-end="url(#mmd-5ef16079b49a532a_flowchart-v2-pointEnd)"/><path d="M426.453,58.72L407.595,62.016C388.737,65.313,351.021,71.907,313.968,76.986C276.916,82.065,240.526,85.631,222.332,87.414L204.137,89.196" id="mmd-5ef16079b49a532a-L_D_U_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_U_0" data-points="W3sieCI6NDI2LjQ1MzEyNSwieSI6NTguNzE5NTI1MDc1NTcyNzJ9LHsieCI6MzEzLjMwNDY4NzUsInkiOjc4LjV9LHsieCI6MjAwLjE1NjI1LCJ5Ijo4OS41ODYyNzM4NTA4NjQ0Mn1d" data-look="classic" marker-end="url(#mmd-5ef16079b49a532a_flowchart-v2-pointEnd)"/><path d="M200.156,108.414L219.014,110.261C237.872,112.109,275.589,115.805,315.975,121.416C356.361,127.027,399.417,134.554,420.946,138.318L442.474,142.081" id="mmd-5ef16079b49a532a-L_U_S_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_U_S_0" data-points="W3sieCI6MjAwLjE1NjI1LCJ5IjoxMDguNDEzNzI2MTQ5MTM1NTh9LHsieCI6MzEzLjMwNDY4NzUsInkiOjExOS41fSx7IngiOjQ0Ni40MTQwNjI1LCJ5IjoxNDIuNzcwMDIyMjE2NTU2OH1d" data-look="classic" marker-end="url(#mmd-5ef16079b49a532a_flowchart-v2-pointEnd)"/><path d="M446.414,164.779L424.229,166.899C402.044,169.019,357.674,173.26,315.902,168.031C274.129,162.802,234.954,148.103,215.366,140.754L195.778,133.405" id="mmd-5ef16079b49a532a-L_S_U_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_U_0" data-points="W3sieCI6NDQ2LjQxNDA2MjUsInkiOjE2NC43NzkwNTQ1MjE2MTU2Mn0seyJ4IjozMTMuMzA0Njg3NSwieSI6MTc3LjV9LHsieCI6MTkyLjAzMzI0MDQ0NTg1OTg2LCJ5IjoxMzJ9XQ==" data-look="classic" marker-end="url(#mmd-5ef16079b49a532a_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel" transform="translate(313.3046875, 20.5)"><g class="label" data-id="L_U_D_0" transform="translate(-87.6796875, -10.5)"><foreignObject width="175.359375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>1. where is api.mysite.com?</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(313.883, 78.3989)"><g class="label" data-id="L_D_U_0" transform="translate(-51.96875, -10.5)"><foreignObject width="103.9375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>2. 15.125.23.214</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(323.86347, 121.34587)"><g class="label" data-id="L_U_S_0" transform="translate(-83.734375, -10.5)"><foreignObject width="167.46875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>3. HTTP request to that IP</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(315.39005, 177.30071)"><g class="label" data-id="L_S_U_0" transform="translate(-88.1484375, -10.5)"><foreignObject width="176.296875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>4. HTML or JSON response</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-5ef16079b49a532a-flowchart-U-0" data-look="classic" transform="translate(104.078125, 99)"><rect class="basic label-container" style="" x="-96.078125" y="-33" width="192.15625" height="66"/><g class="label" style="" transform="translate(-72.078125, -21)"><rect/><foreignObject width="144.15625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>User<br />browser or mobile app</p></span></div></foreignObject></g></g><g class="node default" id="mmd-5ef16079b49a532a-flowchart-D-1" data-look="classic" transform="translate(527.8125, 41)"><rect class="basic label-container" style="" x="-101.359375" y="-33" width="202.71875" height="66"/><g class="label" style="" transform="translate(-77.359375, -21)"><rect/><foreignObject width="154.71875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>DNS<br />third-party, paid service</p></span></div></foreignObject></g></g><g class="node default" id="mmd-5ef16079b49a532a-flowchart-S-5" data-look="classic" transform="translate(527.8125, 157)"><rect class="basic label-container" style="" x="-81.3984375" y="-33" width="162.796875" height="66"/><g class="label" style="" transform="translate(-57.3984375, -21)"><rect/><foreignObject width="114.796875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Web Server<br />app + DB + cache</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-5ef16079b49a532a-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-5ef16079b49a532a-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-5ef16079b49a532a-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>Note that DNS is typically a <strong>third-party paid service</strong>, not something you run — which is why it does not appear as a box you own in later diagrams.</p>
+<h3 id="traffic-sources">Traffic Sources</h3>
+<ol>
+<li><strong>Web Applications:</strong> Use server-side languages (e.g., Python, Java) for business logic and client-side languages (e.g., JavaScript, HTML) for presentation.</li>
+<li><strong>Mobile Applications:</strong> Communicate with the web server using HTTP and JSON for lightweight data exchange.</li>
+</ol>
+<p><strong>What it now costs you:</strong> everything shares one fate. One bad deploy, one runaway query, or one hardware failure takes down the whole product, and there is no way to scale the app independently of the database.</p>
+<hr>
+</section>
+<section id="section-2-database-separation">
+<h2 id="section-2-database-separation">Section 2: Database Separation</h2>
+<p>As the user base grows, the database is moved to a dedicated server to allow independent scaling of web and database tiers.</p>
+<p align="left">
+   <img loading="lazy" decoding="async" alt="" src="../../system-design-notes/01.%20Scaling/images/database.png" data-width="400" style="max-width:400px" />
+</p>
+<p><strong>What broke:</strong> the web app and the database compete for the same CPU, RAM, and disk. A traffic spike starves the database; a heavy query starves the app. You also cannot tune one without hurting the other — web servers want CPU, databases want RAM and fast disk.</p>
+<p>Splitting them gives you two tiers that <strong>scale and fail independently</strong>, which is the precondition for everything that follows.</p>
+<h3 id="database-choices">Database Choices</h3>
+<ol>
+<li><strong>Relational Databases (SQL):</strong> Structured data stored in tables. Examples: MySQL, PostgreSQL.</li>
+<li><strong>Non-Relational Databases (NoSQL):</strong> Suitable for unstructured data or low-latency requirements. Categories include:
+<ul>
+<li>Key-Value Stores</li>
+<li>Graph Databases</li>
+<li>Column Stores</li>
+<li>Document Stores</li>
+</ul>
+</li>
+</ol>
+<ul>
+<li>Non-relational databases might be the right choice if:
+<ul>
+<li>application requires super-low latency.</li>
+<li>data is unstructured, or  there is no relational data.</li>
+<li>only need to serialize and deserialize data (JSON, XML, YAML, etc.).</li>
+<li>need to store a massive amount of data.</li>
+</ul>
+</li>
+</ul>
+<h3 id="choosing-between-them">Choosing between them</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Leans relational (SQL)</th>
+<th>Leans non-relational (NoSQL)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Shape of the data</td>
+<td>Well-known, stable, highly interrelated</td>
+<td>Varies per record, evolves fast, self-contained documents</td>
+</tr>
+<tr>
+<td>Query pattern</td>
+<td>Ad-hoc queries, joins, aggregations you can't predict</td>
+<td>A small set of known access patterns, usually by key</td>
+</tr>
+<tr>
+<td>Transactions</td>
+<td>Needs multi-row ACID (money, inventory, bookings)</td>
+<td>Single-record atomicity is enough</td>
+</tr>
+<tr>
+<td>Consistency</td>
+<td>Strong consistency required</td>
+<td>Eventual consistency acceptable</td>
+</tr>
+<tr>
+<td>Scale of writes</td>
+<td>Fits one primary, or shards you manage deliberately</td>
+<td>Designed to scale writes horizontally out of the box</td>
+</tr>
+<tr>
+<td>Typical examples</td>
+<td>MySQL, PostgreSQL</td>
+<td>DynamoDB, Cassandra, MongoDB, Redis, Neo4j</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Two corrections to common misconceptions worth knowing:</p>
+<ul>
+<li><strong>&quot;NoSQL means no schema&quot; is false.</strong> The schema moves from the database into your application code — <em>schema-on-read</em> instead of schema-on-write. The constraint still exists; it is just no longer enforced for you, which means old records in formats you forgot about are now your problem.</li>
+<li><strong>&quot;SQL doesn't scale&quot; is also false.</strong> Relational databases handle enormous load; what is genuinely hard is <em>distributing</em> them, because joins and transactions across machines are expensive. See <a href="#section-12-database-scaling">§12</a>.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>&quot;SQL or NoSQL?&quot; is almost never answerable in the abstract. Tie it to the access pattern you established in requirements — &quot;the feed is always read by <code>user_id</code> and never joined, so a key-value store fits; payments need multi-row transactions, so those stay relational.&quot; Picking different stores for different parts of one system is a strong answer, not a hedge.</p>
+</div>
+<p><strong>What it now costs you:</strong> a network hop between app and database, which is now on your latency budget, plus a second thing to operate, back up, and monitor.</p>
+<hr>
+</section>
+<section id="section-3-vertical-vs-horizontal-scaling">
+<h2 id="section-3-vertical-vs-horizontal-scaling">Section 3: Vertical vs Horizontal Scaling</h2>
+<h3 id="vertical-scaling">Vertical Scaling</h3>
+<ul>
+<li>Adds more resources (CPU, RAM) to existing servers.</li>
+<li>Limited by hardware constraints and lacks redundancy.</li>
+</ul>
+<h3 id="horizontal-scaling">Horizontal Scaling</h3>
+<ul>
+<li>Adds more servers to the pool, making it more suitable for large-scale systems.</li>
+<li>A load balancer is used to handle the request routing between the servers.</li>
+</ul>
+<p><strong>What broke:</strong> a single server hit its ceiling. Now you choose <em>how</em> to add capacity, and the two options differ in more than size.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Vertical (&quot;scale up&quot;)</th>
+<th>Horizontal (&quot;scale out&quot;)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>How</td>
+<td>Bigger machine — more CPU, RAM, faster disk</td>
+<td>More machines behind a load balancer</td>
+</tr>
+<tr>
+<td>Ceiling</td>
+<td>Hard — bounded by the largest machine available</td>
+<td>Effectively unbounded for stateless tiers</td>
+</tr>
+<tr>
+<td>Cost curve</td>
+<td>Superlinear — the top-end machine costs far more than 2× the mid-range one</td>
+<td>Roughly linear, on commodity hardware</td>
+</tr>
+<tr>
+<td>Failover</td>
+<td>None. The big machine is a single point of failure</td>
+<td>Built in — lose one node, the rest serve traffic</td>
+</tr>
+<tr>
+<td>Complexity</td>
+<td>Very low. No code changes, often just a restart</td>
+<td>Real. Needs a load balancer, stateless design, distributed debugging</td>
+</tr>
+<tr>
+<td>Scaling down</td>
+<td>Slow and usually requires downtime</td>
+<td>Fast, and makes auto-scaling possible</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Vertical scaling is genuinely the right answer more often than interview folklore suggests.</strong> It is the correct first move when traffic is modest, when the team is small, or — importantly — for the <strong>database tier</strong>, where scaling out is a one-way architectural door (see <a href="#section-12-database-scaling">§12</a>). The usual real-world shape is: scale the database up as far as is reasonable, and scale the stateless web tier out.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>don't dismiss vertical scaling as naive. Saying &quot;I'd scale the DB up first because sharding is irreversible, and scale the web tier out because it's stateless&quot; shows you understand that these are different tiers with different constraints.</p>
+</div>
+<p><strong>What it now costs you:</strong> choosing horizontal means every subsequent section in this chapter. That is the trade — capacity in exchange for distributed-systems complexity.</p>
+<hr>
+</section>
+<section id="section-4-load-balancer">
+<h2 id="section-4-load-balancer">Section 4: Load Balancer</h2>
+<p align="left">
+   <img loading="lazy" decoding="async" alt="" src="../../system-design-notes/01.%20Scaling/images/load-balancer.png" data-width="400" style="max-width:400px" />
+</p>
+<p><strong>What broke:</strong> a single web server is both a capacity limit and a single point of failure (SPOF). If it goes down, users see nothing; if it saturates, everyone's requests slow down together.</p>
+<p>A <strong>load balancer</strong> distributes traffic among multiple servers. Benefits include:</p>
+<ol>
+<li>Redundancy: If a server goes offline, traffic is rerouted.
+<ul>
+<li>If server 1 goes offline, all the traffic will be routed to server 2.</li>
+</ul>
+</li>
+<li>Scalability: Easily add servers to handle traffic spikes.
+<ul>
+<li>If the website traffic grows rapidly, subsequent servers can be added to handle the additional traffic.</li>
+</ul>
+</li>
+</ol>
+<p>An important detail: users resolve DNS to the <strong>load balancer's public IP</strong>, and the web servers move to <strong>private IPs</strong> reachable only inside the network. This is a security win as much as a scaling one — the web servers are no longer directly addressable from the internet.</p>
+<figure class="mermaid-fig">
+<svg id="mmd-10bb2ef11113c4c7" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 676.094px; background-color: transparent;" viewBox="0 0 676.09375 200.46121215820312" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-10bb2ef11113c4c7{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-10bb2ef11113c4c7 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-10bb2ef11113c4c7 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-10bb2ef11113c4c7 .error-icon{fill:#f4f6f8;}#mmd-10bb2ef11113c4c7 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-10bb2ef11113c4c7 .edge-thickness-normal{stroke-width:1px;}#mmd-10bb2ef11113c4c7 .edge-thickness-thick{stroke-width:3.5px;}#mmd-10bb2ef11113c4c7 .edge-pattern-solid{stroke-dasharray:0;}#mmd-10bb2ef11113c4c7 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-10bb2ef11113c4c7 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-10bb2ef11113c4c7 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-10bb2ef11113c4c7 .marker{fill:#637381;stroke:#637381;}#mmd-10bb2ef11113c4c7 .marker.cross{stroke:#637381;}#mmd-10bb2ef11113c4c7 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-10bb2ef11113c4c7 p{margin:0;}#mmd-10bb2ef11113c4c7 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-10bb2ef11113c4c7 .cluster-label text{fill:#454f5b;}#mmd-10bb2ef11113c4c7 .cluster-label span{color:#454f5b;}#mmd-10bb2ef11113c4c7 .cluster-label span p{background-color:transparent;}#mmd-10bb2ef11113c4c7 .label text,#mmd-10bb2ef11113c4c7 span{fill:#161c24;color:#161c24;}#mmd-10bb2ef11113c4c7 .node rect,#mmd-10bb2ef11113c4c7 .node circle,#mmd-10bb2ef11113c4c7 .node ellipse,#mmd-10bb2ef11113c4c7 .node polygon,#mmd-10bb2ef11113c4c7 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-10bb2ef11113c4c7 .rough-node .label text,#mmd-10bb2ef11113c4c7 .node .label text,#mmd-10bb2ef11113c4c7 .image-shape .label,#mmd-10bb2ef11113c4c7 .icon-shape .label{text-anchor:middle;}#mmd-10bb2ef11113c4c7 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-10bb2ef11113c4c7 .rough-node .label,#mmd-10bb2ef11113c4c7 .node .label,#mmd-10bb2ef11113c4c7 .image-shape .label,#mmd-10bb2ef11113c4c7 .icon-shape .label{text-align:center;}#mmd-10bb2ef11113c4c7 .node.clickable{cursor:pointer;}#mmd-10bb2ef11113c4c7 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-10bb2ef11113c4c7 .arrowheadPath{fill:#000000;}#mmd-10bb2ef11113c4c7 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-10bb2ef11113c4c7 .flowchart-link{stroke:#637381;fill:none;}#mmd-10bb2ef11113c4c7 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-10bb2ef11113c4c7 .edgeLabel p{background-color:#ffffff;}#mmd-10bb2ef11113c4c7 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-10bb2ef11113c4c7 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-10bb2ef11113c4c7 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-10bb2ef11113c4c7 .cluster text{fill:#454f5b;}#mmd-10bb2ef11113c4c7 .cluster span{color:#454f5b;}#mmd-10bb2ef11113c4c7 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-10bb2ef11113c4c7 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-10bb2ef11113c4c7 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-10bb2ef11113c4c7 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-10bb2ef11113c4c7 rect.text{fill:none;stroke-width:0;}#mmd-10bb2ef11113c4c7 .icon-shape,#mmd-10bb2ef11113c4c7 .image-shape{background-color:#ffffff;text-align:center;}#mmd-10bb2ef11113c4c7 .icon-shape p,#mmd-10bb2ef11113c4c7 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-10bb2ef11113c4c7 .icon-shape .label rect,#mmd-10bb2ef11113c4c7 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-10bb2ef11113c4c7 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-10bb2ef11113c4c7 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-10bb2ef11113c4c7 .node .neo-node{stroke:#299a8d;}#mmd-10bb2ef11113c4c7 [data-look="neo"].node rect,#mmd-10bb2ef11113c4c7 [data-look="neo"].cluster rect,#mmd-10bb2ef11113c4c7 [data-look="neo"].node polygon{stroke:url(#mmd-10bb2ef11113c4c7-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-10bb2ef11113c4c7 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-10bb2ef11113c4c7 [data-look="neo"].node path{stroke:url(#mmd-10bb2ef11113c4c7-gradient);stroke-width:1px;}#mmd-10bb2ef11113c4c7 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-10bb2ef11113c4c7 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-10bb2ef11113c4c7 [data-look="neo"].node circle{stroke:url(#mmd-10bb2ef11113c4c7-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-10bb2ef11113c4c7 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-10bb2ef11113c4c7 [data-look="neo"].icon-shape .icon{fill:url(#mmd-10bb2ef11113c4c7-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-10bb2ef11113c4c7 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-10bb2ef11113c4c7-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-10bb2ef11113c4c7 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-10bb2ef11113c4c7_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-10bb2ef11113c4c7_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-10bb2ef11113c4c7_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-10bb2ef11113c4c7_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-10bb2ef11113c4c7_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-10bb2ef11113c4c7_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-10bb2ef11113c4c7_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-10bb2ef11113c4c7_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-10bb2ef11113c4c7_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-10bb2ef11113c4c7_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-10bb2ef11113c4c7_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-10bb2ef11113c4c7_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M93.422,95.75L97.589,95.75C101.755,95.75,110.089,95.75,117.755,95.75C125.422,95.75,132.422,95.75,135.922,95.75L139.422,95.75" id="mmd-10bb2ef11113c4c7-L_U_LB_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_U_LB_0" data-points="W3sieCI6OTMuNDIxODc1LCJ5Ijo5NS43NX0seyJ4IjoxMTguNDIxODc1LCJ5Ijo5NS43NX0seyJ4IjoxNDMuNDIxODc1LCJ5Ijo5NS43NX1d" data-look="classic" marker-end="url(#mmd-10bb2ef11113c4c7_flowchart-v2-pointEnd)"/><path d="M283.141,68.055L303.974,59.796C324.807,51.537,366.474,35.018,407.643,29.48C448.811,23.941,489.482,29.382,509.817,32.103L530.153,34.823" id="mmd-10bb2ef11113c4c7-L_LB_S1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_LB_S1_0" data-points="W3sieCI6MjgzLjE0MDYyNSwieSI6NjguMDU0OTY3NTI0NjU3Mn0seyJ4Ijo0MDguMTQwNjI1LCJ5IjoxOC41fSx7IngiOjUzNC4xMTcxODc1LCJ5IjozNS4zNTM0NjIyNzIxOTIyM31d" data-look="classic" marker-end="url(#mmd-10bb2ef11113c4c7_flowchart-v2-pointEnd)"/><path d="M283.141,104.982L303.974,107.735C324.807,110.488,366.474,115.994,407.48,121.446C448.486,126.897,488.831,132.295,509.003,134.994L529.176,137.692" id="mmd-10bb2ef11113c4c7-L_LB_S2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_LB_S2_0" data-points="W3sieCI6MjgzLjE0MDYyNSwieSI6MTA0Ljk4MTY3NzQ5MTc4MDkzfSx7IngiOjQwOC4xNDA2MjUsInkiOjEyMS41fSx7IngiOjUzMy4xNDA2MjUsInkiOjEzOC4yMjI4MTUyNzc4MzQxNH1d" data-look="classic" marker-end="url(#mmd-10bb2ef11113c4c7_flowchart-v2-pointEnd)"/><path d="M283.141,86.518L303.974,83.765C324.807,81.012,366.474,75.506,407.643,70.033C448.811,64.559,489.482,59.118,509.817,56.397L530.153,53.677" id="mmd-10bb2ef11113c4c7-L_LB_S1_2" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_LB_S1_2" data-points="W3sieCI6MjgzLjE0MDYyNSwieSI6ODYuNTE4MzIyNTA4MjE5MDd9LHsieCI6NDA4LjE0MDYyNSwieSI6NzB9LHsieCI6NTM0LjExNzE4NzUsInkiOjUzLjE0NjUzNzcyNzgwNzc3fV0=" data-look="classic" marker-end="url(#mmd-10bb2ef11113c4c7_flowchart-v2-pointEnd)"/><path d="M283.141,123.445L303.974,131.704C324.807,139.963,366.474,156.482,407.48,162.042C448.486,167.603,488.831,162.205,509.003,159.506L529.176,156.808" id="mmd-10bb2ef11113c4c7-L_LB_S2_2" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_LB_S2_2" data-points="W3sieCI6MjgzLjE0MDYyNSwieSI6MTIzLjQ0NTAzMjQ3NTM0Mjh9LHsieCI6NDA4LjE0MDYyNSwieSI6MTczfSx7IngiOjUzMy4xNDA2MjUsInkiOjE1Ni4yNzcxODQ3MjIxNjU4Nn1d" data-look="classic" marker-end="url(#mmd-10bb2ef11113c4c7_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_U_LB_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(408.140625, 18.5)"><g class="label" data-id="L_LB_S1_0" transform="translate(-30.21875, -10.5)"><foreignObject width="60.4375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>private IP</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(408.15398, 121.50179)"><g class="label" data-id="L_LB_S2_0" transform="translate(-30.21875, -10.5)"><foreignObject width="60.4375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>private IP</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(408.140625, 70)"><g class="label" data-id="L_LB_S1_2" transform="translate(-100, -21)"><foreignObject width="200" height="42"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="edgeLabel"><p>health check every few seconds</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(404.2591, 171.46121)"><g class="label" data-id="L_LB_S2_2" transform="translate(-100, -21)"><foreignObject width="200" height="42"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="edgeLabel"><p>health check: no response → remove from pool</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-10bb2ef11113c4c7-flowchart-U-0" data-look="classic" transform="translate(50.7109375, 95.75)"><rect class="basic label-container" style="" x="-42.7109375" y="-22.5" width="85.421875" height="45"/><g class="label" style="" transform="translate(-18.7109375, -10.5)"><rect/><foreignObject width="37.421875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Users</p></span></div></foreignObject></g></g><g class="node default" id="mmd-10bb2ef11113c4c7-flowchart-LB-1" data-look="classic" transform="translate(213.28125, 95.75)"><rect class="basic label-container" style="" x="-69.859375" y="-33" width="139.71875" height="66"/><g class="label" style="" transform="translate(-45.859375, -21)"><rect/><foreignObject width="91.71875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Load Balancer<br />public IP</p></span></div></foreignObject></g></g><g class="node default" id="mmd-10bb2ef11113c4c7-flowchart-S1-3" data-look="classic" transform="translate(600.6171875, 44.25)"><rect class="basic label-container" style="" x="-66.5" y="-22.5" width="133" height="45"/><g class="label" style="" transform="translate(-42.5, -10.5)"><rect/><foreignObject width="85" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Web Server 1</p></span></div></foreignObject></g></g><g class="node default" id="mmd-10bb2ef11113c4c7-flowchart-S2-5" data-look="classic" transform="translate(600.6171875, 147.25)"><rect class="basic label-container" style="" x="-67.4765625" y="-22.5" width="134.953125" height="45"/><g class="label" style="" transform="translate(-43.4765625, -10.5)"><rect/><foreignObject width="86.953125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Web Server 2</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-10bb2ef11113c4c7-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-10bb2ef11113c4c7-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-10bb2ef11113c4c7-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<h3 id="layer-4-vs-layer-7">Layer 4 vs Layer 7</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>L4 (transport)</th>
+<th>L7 (application)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Decides on</td>
+<td>IP and port</td>
+<td>URL path, headers, cookies, method</td>
+</tr>
+<tr>
+<td>Can do</td>
+<td>Fast, protocol-agnostic forwarding</td>
+<td>Path-based routing, TLS termination, compression, caching, sticky sessions</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>Very low latency, cheap</td>
+<td>Must parse the request, so slightly more work per request</td>
+</tr>
+<tr>
+<td>Typical use</td>
+<td>Raw TCP throughput, non-HTTP protocols</td>
+<td>Normal HTTP APIs and websites</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="distribution-algorithms">Distribution algorithms</h3>
+<ul>
+<li><strong>Round robin</strong> — each server in turn. Fine when requests and servers are uniform.</li>
+<li><strong>Weighted round robin</strong> — bigger servers get a larger share. Useful with mixed hardware.</li>
+<li><strong>Least connections</strong> — send to whoever is least busy. Better when request durations vary a lot.</li>
+<li><strong>Consistent hashing on a key</strong> — the same key reliably lands on the same server, which matters for cache locality. See <a href="05-consistent-hashing.html">Chapter 5 – Consistent Hashing</a>.</li>
+</ul>
+<h3 id="health-checks">Health checks</h3>
+<p>The load balancer continuously probes each server and removes unhealthy ones from the pool. Two things to understand:</p>
+<ul>
+<li>A health check should test the things the request path actually needs (can it reach the database?), but <strong>not so deeply</strong> that one slow dependency makes every server report unhealthy at once and empties the pool.</li>
+<li>Removing a node is only half the job. In-flight requests need <strong>connection draining</strong> so you don't cut off users mid-request during a deploy or scale-down.</li>
+</ul>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>The load balancer is now the SPOF.</strong> In practice you run them in a redundant pair, or use a managed one; it is worth saying this out loud rather than pretending the box is magic.</li>
+<li><strong>Sticky sessions are a trap.</strong> L7 balancers can pin a user to one server so in-memory sessions keep working. This &quot;fixes&quot; session loss but breaks the thing you came for: you can no longer freely add, remove, or restart servers, and load becomes uneven. <a href="#section-8-stateless-web-tier">§8</a> removes the need for stickiness entirely — treat it as a smell, not a solution.</li>
+<li><strong>Uneven load despite round robin</strong> — long-lived connections (WebSockets, HTTP keep-alive) mean new servers may receive almost no traffic, because balancing happens at connection time, not request time.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>expect &quot;what happens when a server dies mid-request?&quot; and &quot;how does the LB know a server is healthy?&quot; Having an answer for connection draining and health-check depth separates experience from recall.</p>
+</div>
+<p><strong>What it now costs you:</strong> the web tier is now redundant, which exposes the next bottleneck — every one of those servers still hammers the same single database.</p>
+<hr>
+</section>
+<section id="section-5-database-replication">
+<h2 id="section-5-database-replication">Section 5: Database Replication</h2>
+<p align="left">
+   <img loading="lazy" decoding="async" alt="" src="../../system-design-notes/01.%20Scaling/images/database-replication.png" data-width="400" style="max-width:400px" />
+</p>
+<p><strong>What broke:</strong> all web servers read from one database. Reads dominate most workloads, so the database saturates long before the app tier does — and it is still a single point of failure for the entire product.</p>
+<h3 id="master-slave-model">Master-Slave Model</h3>
+<ul>
+<li><strong>Master Database:</strong> Handles write operations.
+<ul>
+<li>All the data-modifying commands like insert, delete, or update must be sent to the master database.</li>
+</ul>
+</li>
+<li><strong>Slave Databases:</strong> Handle read operations, improving performance and reliability.
+<ul>
+<li>Since the ratio of reads to writes is higher in most applications; thus, the number of slave
+databases in a system is usually larger than the number of master databases.</li>
+</ul>
+</li>
+</ul>
+<div class="callout callout-quote">
+<p>Terminology note: modern tooling and documentation use <strong>primary/replica</strong> (or leader/follower) for the same roles. The book's master/slave wording is kept here to match it, but primary/replica is what you will see in practice.</p>
+</div>
+<h3 id="benefits">Benefits</h3>
+<ol>
+<li>Improved performance through parallel read operations.</li>
+<li>High availability and data reliability through redundancy.</li>
+</ol>
+<h3 id="how-the-write-is-propagated">How the write is propagated</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>The write returns when…</th>
+<th>Risk</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Asynchronous</strong></td>
+<td>The master has committed. Replicas catch up later</td>
+<td>Replicas serve stale data; a master crash can lose recent writes</td>
+<td>Fast writes. The common default</td>
+</tr>
+<tr>
+<td><strong>Synchronous</strong></td>
+<td>Every replica has confirmed</td>
+<td>None of the above</td>
+<td>Write latency = the slowest replica. One slow replica stalls all writes</td>
+</tr>
+<tr>
+<td><strong>Semi-synchronous</strong></td>
+<td>At least one replica has confirmed</td>
+<td>Small — bounded data loss</td>
+<td>A sensible middle ground, widely used in production</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="gotchas--failure-modes-1" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<p><strong>Replication lag and read-your-own-writes.</strong> This is the single most common correctness bug introduced by replication. A user updates their profile, the write goes to the master, and the immediate page reload reads from a replica that hasn't received the change yet — so the user sees their <em>old</em> data and concludes the save failed.</p>
+<figure class="mermaid-fig">
+<svg id="mmd-ac9c045c3287f91b" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" style="max-width: 649px; background-color: transparent;" viewBox="-50 -10 649 395" role="graphics-document document" aria-roledescription="sequence"><g><rect x="399" y="309" fill="#eaeaea" stroke="#666" width="150" height="65" name="R" rx="3" ry="3" class="actor actor-bottom"/><text x="474" y="341.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="474" dy="0">Replica</tspan></text></g><g><rect x="209" y="309" fill="#eaeaea" stroke="#666" width="150" height="65" name="M" rx="3" ry="3" class="actor actor-bottom"/><text x="284" y="341.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="284" dy="0">Master</tspan></text></g><g><rect x="0" y="309" fill="#eaeaea" stroke="#666" width="150" height="65" name="U" rx="3" ry="3" class="actor actor-bottom"/><text x="75" y="341.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="75" dy="0">User</tspan></text></g><g><line id="actor2" x1="474" y1="65" x2="474" y2="309" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="R" data-et="life-line" data-id="R"/><g id="root-2" data-et="participant" data-type="participant" data-id="R"><rect x="399" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="R" rx="3" ry="3" class="actor actor-top"/><text x="474" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="474" dy="0">Replica</tspan></text></g></g><g><line id="actor1" x1="284" y1="65" x2="284" y2="309" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="M" data-et="life-line" data-id="M"/><g id="root-1" data-et="participant" data-type="participant" data-id="M"><rect x="209" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="M" rx="3" ry="3" class="actor actor-top"/><text x="284" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="284" dy="0">Master</tspan></text></g></g><g><line id="actor0" x1="75" y1="65" x2="75" y2="309" class="actor-line 200" stroke-width="0.5px" stroke="#999" name="U" data-et="life-line" data-id="U"/><g id="root-0" data-et="participant" data-type="participant" data-id="U"><rect x="0" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" name="U" rx="3" ry="3" class="actor actor-top"/><text x="75" y="32.5" dominant-baseline="central" alignment-baseline="central" class="actor actor-box" style="text-anchor: middle; font-size: 16px; font-weight: 400;"><tspan x="75" dy="0">User</tspan></text></g></g><style>#mmd-ac9c045c3287f91b{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-ac9c045c3287f91b .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-ac9c045c3287f91b .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-ac9c045c3287f91b .error-icon{fill:#f4f6f8;}#mmd-ac9c045c3287f91b .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-ac9c045c3287f91b .edge-thickness-normal{stroke-width:1px;}#mmd-ac9c045c3287f91b .edge-thickness-thick{stroke-width:3.5px;}#mmd-ac9c045c3287f91b .edge-pattern-solid{stroke-dasharray:0;}#mmd-ac9c045c3287f91b .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-ac9c045c3287f91b .edge-pattern-dashed{stroke-dasharray:3;}#mmd-ac9c045c3287f91b .edge-pattern-dotted{stroke-dasharray:2;}#mmd-ac9c045c3287f91b .marker{fill:#637381;stroke:#637381;}#mmd-ac9c045c3287f91b .marker.cross{stroke:#637381;}#mmd-ac9c045c3287f91b svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-ac9c045c3287f91b p{margin:0;}#mmd-ac9c045c3287f91b .actor{stroke:#299a8d;fill:#f1f7f6;stroke-width:1;}#mmd-ac9c045c3287f91b rect.actor.outer-path[data-look="neo"]{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-ac9c045c3287f91b rect.note[data-look="neo"]{stroke:#e76f51;fill:#fcf4f2;filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-ac9c045c3287f91b text.actor&gt;tspan{fill:#161c24;stroke:none;}#mmd-ac9c045c3287f91b .actor-line{stroke:#299a8d;}#mmd-ac9c045c3287f91b .innerArc{stroke-width:1.5;stroke-dasharray:none;}#mmd-ac9c045c3287f91b .messageLine0{stroke-width:1.5;stroke-dasharray:none;stroke:#454f5b;}#mmd-ac9c045c3287f91b .messageLine1{stroke-width:1.5;stroke-dasharray:2,2;stroke:#454f5b;}#mmd-ac9c045c3287f91b [id$="-arrowhead"] path{fill:#454f5b;stroke:#454f5b;}#mmd-ac9c045c3287f91b .sequenceNumber{fill:#ffffff;}#mmd-ac9c045c3287f91b [id$="-sequencenumber"]{fill:#454f5b;}#mmd-ac9c045c3287f91b [id$="-crosshead"] path{fill:#454f5b;stroke:#454f5b;}#mmd-ac9c045c3287f91b .messageText{fill:#161c24;stroke:none;}#mmd-ac9c045c3287f91b .labelBox{stroke:#299a8d;fill:#f1f7f6;filter:none;}#mmd-ac9c045c3287f91b .labelText,#mmd-ac9c045c3287f91b .labelText&gt;tspan{fill:#161c24;stroke:none;}#mmd-ac9c045c3287f91b .loopText,#mmd-ac9c045c3287f91b .loopText&gt;tspan{fill:#161c24;stroke:none;}#mmd-ac9c045c3287f91b .sectionTitle,#mmd-ac9c045c3287f91b .sectionTitle&gt;tspan{fill:#161c24;stroke:none;}#mmd-ac9c045c3287f91b .loopLine{stroke-width:2px;stroke-dasharray:2,2;stroke:#299a8d;fill:#299a8d;}#mmd-ac9c045c3287f91b .note{stroke:#e76f51;fill:#fcf4f2;}#mmd-ac9c045c3287f91b .noteText,#mmd-ac9c045c3287f91b .noteText&gt;tspan{fill:#161c24;stroke:none;font-weight:normal;}#mmd-ac9c045c3287f91b .activation0{fill:#b5e0dd;stroke:hsl(12, 62.5%, 86.862745098%);}#mmd-ac9c045c3287f91b .activation1{fill:#b5e0dd;stroke:hsl(12, 62.5%, 86.862745098%);}#mmd-ac9c045c3287f91b .activation2{fill:#b5e0dd;stroke:hsl(12, 62.5%, 86.862745098%);}#mmd-ac9c045c3287f91b .actorPopupMenu{position:absolute;}#mmd-ac9c045c3287f91b .actorPopupMenuPanel{position:absolute;fill:#f1f7f6;box-shadow:0px 8px 16px 0px rgba(0,0,0,0.2);filter:drop-shadow(3px 5px 2px rgb(0 0 0 / 0.4));}#mmd-ac9c045c3287f91b .actor-man circle,#mmd-ac9c045c3287f91b line{fill:#f1f7f6;stroke-width:2px;}#mmd-ac9c045c3287f91b g rect.rect{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));stroke:#299a8d;}#mmd-ac9c045c3287f91b .node .neo-node{stroke:#299a8d;}#mmd-ac9c045c3287f91b [data-look="neo"].node rect,#mmd-ac9c045c3287f91b [data-look="neo"].cluster rect,#mmd-ac9c045c3287f91b [data-look="neo"].node polygon{stroke:url(#mmd-ac9c045c3287f91b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-ac9c045c3287f91b [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-ac9c045c3287f91b [data-look="neo"].node path{stroke:url(#mmd-ac9c045c3287f91b-gradient);stroke-width:1px;}#mmd-ac9c045c3287f91b [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-ac9c045c3287f91b [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-ac9c045c3287f91b [data-look="neo"].node circle{stroke:url(#mmd-ac9c045c3287f91b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-ac9c045c3287f91b [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-ac9c045c3287f91b [data-look="neo"].icon-shape .icon{fill:url(#mmd-ac9c045c3287f91b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-ac9c045c3287f91b [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-ac9c045c3287f91b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-ac9c045c3287f91b :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g/><defs><symbol id="mmd-ac9c045c3287f91b-computer" width="24" height="24"><path transform="scale(.5)" d="M2 2v13h20v-13h-20zm18 11h-16v-9h16v9zm-10.228 6l.466-1h3.524l.467 1h-4.457zm14.228 3h-24l2-6h2.104l-1.33 4h18.45l-1.297-4h2.073l2 6zm-5-10h-14v-7h14v7z"/></symbol></defs><defs><symbol id="mmd-ac9c045c3287f91b-database" fill-rule="evenodd" clip-rule="evenodd"><path transform="scale(.5)" d="M12.258.001l.256.004.255.005.253.008.251.01.249.012.247.015.246.016.242.019.241.02.239.023.236.024.233.027.231.028.229.031.225.032.223.034.22.036.217.038.214.04.211.041.208.043.205.045.201.046.198.048.194.05.191.051.187.053.183.054.18.056.175.057.172.059.168.06.163.061.16.063.155.064.15.066.074.033.073.033.071.034.07.034.069.035.068.035.067.035.066.035.064.036.064.036.062.036.06.036.06.037.058.037.058.037.055.038.055.038.053.038.052.038.051.039.05.039.048.039.047.039.045.04.044.04.043.04.041.04.04.041.039.041.037.041.036.041.034.041.033.042.032.042.03.042.029.042.027.042.026.043.024.043.023.043.021.043.02.043.018.044.017.043.015.044.013.044.012.044.011.045.009.044.007.045.006.045.004.045.002.045.001.045v17l-.001.045-.002.045-.004.045-.006.045-.007.045-.009.044-.011.045-.012.044-.013.044-.015.044-.017.043-.018.044-.02.043-.021.043-.023.043-.024.043-.026.043-.027.042-.029.042-.03.042-.032.042-.033.042-.034.041-.036.041-.037.041-.039.041-.04.041-.041.04-.043.04-.044.04-.045.04-.047.039-.048.039-.05.039-.051.039-.052.038-.053.038-.055.038-.055.038-.058.037-.058.037-.06.037-.06.036-.062.036-.064.036-.064.036-.066.035-.067.035-.068.035-.069.035-.07.034-.071.034-.073.033-.074.033-.15.066-.155.064-.16.063-.163.061-.168.06-.172.059-.175.057-.18.056-.183.054-.187.053-.191.051-.194.05-.198.048-.201.046-.205.045-.208.043-.211.041-.214.04-.217.038-.22.036-.223.034-.225.032-.229.031-.231.028-.233.027-.236.024-.239.023-.241.02-.242.019-.246.016-.247.015-.249.012-.251.01-.253.008-.255.005-.256.004-.258.001-.258-.001-.256-.004-.255-.005-.253-.008-.251-.01-.249-.012-.247-.015-.245-.016-.243-.019-.241-.02-.238-.023-.236-.024-.234-.027-.231-.028-.228-.031-.226-.032-.223-.034-.22-.036-.217-.038-.214-.04-.211-.041-.208-.043-.204-.045-.201-.046-.198-.048-.195-.05-.19-.051-.187-.053-.184-.054-.179-.056-.176-.057-.172-.059-.167-.06-.164-.061-.159-.063-.155-.064-.151-.066-.074-.033-.072-.033-.072-.034-.07-.034-.069-.035-.068-.035-.067-.035-.066-.035-.064-.036-.063-.036-.062-.036-.061-.036-.06-.037-.058-.037-.057-.037-.056-.038-.055-.038-.053-.038-.052-.038-.051-.039-.049-.039-.049-.039-.046-.039-.046-.04-.044-.04-.043-.04-.041-.04-.04-.041-.039-.041-.037-.041-.036-.041-.034-.041-.033-.042-.032-.042-.03-.042-.029-.042-.027-.042-.026-.043-.024-.043-.023-.043-.021-.043-.02-.043-.018-.044-.017-.043-.015-.044-.013-.044-.012-.044-.011-.045-.009-.044-.007-.045-.006-.045-.004-.045-.002-.045-.001-.045v-17l.001-.045.002-.045.004-.045.006-.045.007-.045.009-.044.011-.045.012-.044.013-.044.015-.044.017-.043.018-.044.02-.043.021-.043.023-.043.024-.043.026-.043.027-.042.029-.042.03-.042.032-.042.033-.042.034-.041.036-.041.037-.041.039-.041.04-.041.041-.04.043-.04.044-.04.046-.04.046-.039.049-.039.049-.039.051-.039.052-.038.053-.038.055-.038.056-.038.057-.037.058-.037.06-.037.061-.036.062-.036.063-.036.064-.036.066-.035.067-.035.068-.035.069-.035.07-.034.072-.034.072-.033.074-.033.151-.066.155-.064.159-.063.164-.061.167-.06.172-.059.176-.057.179-.056.184-.054.187-.053.19-.051.195-.05.198-.048.201-.046.204-.045.208-.043.211-.041.214-.04.217-.038.22-.036.223-.034.226-.032.228-.031.231-.028.234-.027.236-.024.238-.023.241-.02.243-.019.245-.016.247-.015.249-.012.251-.01.253-.008.255-.005.256-.004.258-.001.258.001zm-9.258 20.499v.01l.001.021.003.021.004.022.005.021.006.022.007.022.009.023.01.022.011.023.012.023.013.023.015.023.016.024.017.023.018.024.019.024.021.024.022.025.023.024.024.025.052.049.056.05.061.051.066.051.07.051.075.051.079.052.084.052.088.052.092.052.097.052.102.051.105.052.11.052.114.051.119.051.123.051.127.05.131.05.135.05.139.048.144.049.147.047.152.047.155.047.16.045.163.045.167.043.171.043.176.041.178.041.183.039.187.039.19.037.194.035.197.035.202.033.204.031.209.03.212.029.216.027.219.025.222.024.226.021.23.02.233.018.236.016.24.015.243.012.246.01.249.008.253.005.256.004.259.001.26-.001.257-.004.254-.005.25-.008.247-.011.244-.012.241-.014.237-.016.233-.018.231-.021.226-.021.224-.024.22-.026.216-.027.212-.028.21-.031.205-.031.202-.034.198-.034.194-.036.191-.037.187-.039.183-.04.179-.04.175-.042.172-.043.168-.044.163-.045.16-.046.155-.046.152-.047.148-.048.143-.049.139-.049.136-.05.131-.05.126-.05.123-.051.118-.052.114-.051.11-.052.106-.052.101-.052.096-.052.092-.052.088-.053.083-.051.079-.052.074-.052.07-.051.065-.051.06-.051.056-.05.051-.05.023-.024.023-.025.021-.024.02-.024.019-.024.018-.024.017-.024.015-.023.014-.024.013-.023.012-.023.01-.023.01-.022.008-.022.006-.022.006-.022.004-.022.004-.021.001-.021.001-.021v-4.127l-.077.055-.08.053-.083.054-.085.053-.087.052-.09.052-.093.051-.095.05-.097.05-.1.049-.102.049-.105.048-.106.047-.109.047-.111.046-.114.045-.115.045-.118.044-.12.043-.122.042-.124.042-.126.041-.128.04-.13.04-.132.038-.134.038-.135.037-.138.037-.139.035-.142.035-.143.034-.144.033-.147.032-.148.031-.15.03-.151.03-.153.029-.154.027-.156.027-.158.026-.159.025-.161.024-.162.023-.163.022-.165.021-.166.02-.167.019-.169.018-.169.017-.171.016-.173.015-.173.014-.175.013-.175.012-.177.011-.178.01-.179.008-.179.008-.181.006-.182.005-.182.004-.184.003-.184.002h-.37l-.184-.002-.184-.003-.182-.004-.182-.005-.181-.006-.179-.008-.179-.008-.178-.01-.176-.011-.176-.012-.175-.013-.173-.014-.172-.015-.171-.016-.17-.017-.169-.018-.167-.019-.166-.02-.165-.021-.163-.022-.162-.023-.161-.024-.159-.025-.157-.026-.156-.027-.155-.027-.153-.029-.151-.03-.15-.03-.148-.031-.146-.032-.145-.033-.143-.034-.141-.035-.14-.035-.137-.037-.136-.037-.134-.038-.132-.038-.13-.04-.128-.04-.126-.041-.124-.042-.122-.042-.12-.044-.117-.043-.116-.045-.113-.045-.112-.046-.109-.047-.106-.047-.105-.048-.102-.049-.1-.049-.097-.05-.095-.05-.093-.052-.09-.051-.087-.052-.085-.053-.083-.054-.08-.054-.077-.054v4.127zm0-5.654v.011l.001.021.003.021.004.021.005.022.006.022.007.022.009.022.01.022.011.023.012.023.013.023.015.024.016.023.017.024.018.024.019.024.021.024.022.024.023.025.024.024.052.05.056.05.061.05.066.051.07.051.075.052.079.051.084.052.088.052.092.052.097.052.102.052.105.052.11.051.114.051.119.052.123.05.127.051.131.05.135.049.139.049.144.048.147.048.152.047.155.046.16.045.163.045.167.044.171.042.176.042.178.04.183.04.187.038.19.037.194.036.197.034.202.033.204.032.209.03.212.028.216.027.219.025.222.024.226.022.23.02.233.018.236.016.24.014.243.012.246.01.249.008.253.006.256.003.259.001.26-.001.257-.003.254-.006.25-.008.247-.01.244-.012.241-.015.237-.016.233-.018.231-.02.226-.022.224-.024.22-.025.216-.027.212-.029.21-.03.205-.032.202-.033.198-.035.194-.036.191-.037.187-.039.183-.039.179-.041.175-.042.172-.043.168-.044.163-.045.16-.045.155-.047.152-.047.148-.048.143-.048.139-.05.136-.049.131-.05.126-.051.123-.051.118-.051.114-.052.11-.052.106-.052.101-.052.096-.052.092-.052.088-.052.083-.052.079-.052.074-.051.07-.052.065-.051.06-.05.056-.051.051-.049.023-.025.023-.024.021-.025.02-.024.019-.024.018-.024.017-.024.015-.023.014-.023.013-.024.012-.022.01-.023.01-.023.008-.022.006-.022.006-.022.004-.021.004-.022.001-.021.001-.021v-4.139l-.077.054-.08.054-.083.054-.085.052-.087.053-.09.051-.093.051-.095.051-.097.05-.1.049-.102.049-.105.048-.106.047-.109.047-.111.046-.114.045-.115.044-.118.044-.12.044-.122.042-.124.042-.126.041-.128.04-.13.039-.132.039-.134.038-.135.037-.138.036-.139.036-.142.035-.143.033-.144.033-.147.033-.148.031-.15.03-.151.03-.153.028-.154.028-.156.027-.158.026-.159.025-.161.024-.162.023-.163.022-.165.021-.166.02-.167.019-.169.018-.169.017-.171.016-.173.015-.173.014-.175.013-.175.012-.177.011-.178.009-.179.009-.179.007-.181.007-.182.005-.182.004-.184.003-.184.002h-.37l-.184-.002-.184-.003-.182-.004-.182-.005-.181-.007-.179-.007-.179-.009-.178-.009-.176-.011-.176-.012-.175-.013-.173-.014-.172-.015-.171-.016-.17-.017-.169-.018-.167-.019-.166-.02-.165-.021-.163-.022-.162-.023-.161-.024-.159-.025-.157-.026-.156-.027-.155-.028-.153-.028-.151-.03-.15-.03-.148-.031-.146-.033-.145-.033-.143-.033-.141-.035-.14-.036-.137-.036-.136-.037-.134-.038-.132-.039-.13-.039-.128-.04-.126-.041-.124-.042-.122-.043-.12-.043-.117-.044-.116-.044-.113-.046-.112-.046-.109-.046-.106-.047-.105-.048-.102-.049-.1-.049-.097-.05-.095-.051-.093-.051-.09-.051-.087-.053-.085-.052-.083-.054-.08-.054-.077-.054v4.139zm0-5.666v.011l.001.02.003.022.004.021.005.022.006.021.007.022.009.023.01.022.011.023.012.023.013.023.015.023.016.024.017.024.018.023.019.024.021.025.022.024.023.024.024.025.052.05.056.05.061.05.066.051.07.051.075.052.079.051.084.052.088.052.092.052.097.052.102.052.105.051.11.052.114.051.119.051.123.051.127.05.131.05.135.05.139.049.144.048.147.048.152.047.155.046.16.045.163.045.167.043.171.043.176.042.178.04.183.04.187.038.19.037.194.036.197.034.202.033.204.032.209.03.212.028.216.027.219.025.222.024.226.021.23.02.233.018.236.017.24.014.243.012.246.01.249.008.253.006.256.003.259.001.26-.001.257-.003.254-.006.25-.008.247-.01.244-.013.241-.014.237-.016.233-.018.231-.02.226-.022.224-.024.22-.025.216-.027.212-.029.21-.03.205-.032.202-.033.198-.035.194-.036.191-.037.187-.039.183-.039.179-.041.175-.042.172-.043.168-.044.163-.045.16-.045.155-.047.152-.047.148-.048.143-.049.139-.049.136-.049.131-.051.126-.05.123-.051.118-.052.114-.051.11-.052.106-.052.101-.052.096-.052.092-.052.088-.052.083-.052.079-.052.074-.052.07-.051.065-.051.06-.051.056-.05.051-.049.023-.025.023-.025.021-.024.02-.024.019-.024.018-.024.017-.024.015-.023.014-.024.013-.023.012-.023.01-.022.01-.023.008-.022.006-.022.006-.022.004-.022.004-.021.001-.021.001-.021v-4.153l-.077.054-.08.054-.083.053-.085.053-.087.053-.09.051-.093.051-.095.051-.097.05-.1.049-.102.048-.105.048-.106.048-.109.046-.111.046-.114.046-.115.044-.118.044-.12.043-.122.043-.124.042-.126.041-.128.04-.13.039-.132.039-.134.038-.135.037-.138.036-.139.036-.142.034-.143.034-.144.033-.147.032-.148.032-.15.03-.151.03-.153.028-.154.028-.156.027-.158.026-.159.024-.161.024-.162.023-.163.023-.165.021-.166.02-.167.019-.169.018-.169.017-.171.016-.173.015-.173.014-.175.013-.175.012-.177.01-.178.01-.179.009-.179.007-.181.006-.182.006-.182.004-.184.003-.184.001-.185.001-.185-.001-.184-.001-.184-.003-.182-.004-.182-.006-.181-.006-.179-.007-.179-.009-.178-.01-.176-.01-.176-.012-.175-.013-.173-.014-.172-.015-.171-.016-.17-.017-.169-.018-.167-.019-.166-.02-.165-.021-.163-.023-.162-.023-.161-.024-.159-.024-.157-.026-.156-.027-.155-.028-.153-.028-.151-.03-.15-.03-.148-.032-.146-.032-.145-.033-.143-.034-.141-.034-.14-.036-.137-.036-.136-.037-.134-.038-.132-.039-.13-.039-.128-.041-.126-.041-.124-.041-.122-.043-.12-.043-.117-.044-.116-.044-.113-.046-.112-.046-.109-.046-.106-.048-.105-.048-.102-.048-.1-.05-.097-.049-.095-.051-.093-.051-.09-.052-.087-.052-.085-.053-.083-.053-.08-.054-.077-.054v4.153zm8.74-8.179l-.257.004-.254.005-.25.008-.247.011-.244.012-.241.014-.237.016-.233.018-.231.021-.226.022-.224.023-.22.026-.216.027-.212.028-.21.031-.205.032-.202.033-.198.034-.194.036-.191.038-.187.038-.183.04-.179.041-.175.042-.172.043-.168.043-.163.045-.16.046-.155.046-.152.048-.148.048-.143.048-.139.049-.136.05-.131.05-.126.051-.123.051-.118.051-.114.052-.11.052-.106.052-.101.052-.096.052-.092.052-.088.052-.083.052-.079.052-.074.051-.07.052-.065.051-.06.05-.056.05-.051.05-.023.025-.023.024-.021.024-.02.025-.019.024-.018.024-.017.023-.015.024-.014.023-.013.023-.012.023-.01.023-.01.022-.008.022-.006.023-.006.021-.004.022-.004.021-.001.021-.001.021.001.021.001.021.004.021.004.022.006.021.006.023.008.022.01.022.01.023.012.023.013.023.014.023.015.024.017.023.018.024.019.024.02.025.021.024.023.024.023.025.051.05.056.05.06.05.065.051.07.052.074.051.079.052.083.052.088.052.092.052.096.052.101.052.106.052.11.052.114.052.118.051.123.051.126.051.131.05.136.05.139.049.143.048.148.048.152.048.155.046.16.046.163.045.168.043.172.043.175.042.179.041.183.04.187.038.191.038.194.036.198.034.202.033.205.032.21.031.212.028.216.027.22.026.224.023.226.022.231.021.233.018.237.016.241.014.244.012.247.011.25.008.254.005.257.004.26.001.26-.001.257-.004.254-.005.25-.008.247-.011.244-.012.241-.014.237-.016.233-.018.231-.021.226-.022.224-.023.22-.026.216-.027.212-.028.21-.031.205-.032.202-.033.198-.034.194-.036.191-.038.187-.038.183-.04.179-.041.175-.042.172-.043.168-.043.163-.045.16-.046.155-.046.152-.048.148-.048.143-.048.139-.049.136-.05.131-.05.126-.051.123-.051.118-.051.114-.052.11-.052.106-.052.101-.052.096-.052.092-.052.088-.052.083-.052.079-.052.074-.051.07-.052.065-.051.06-.05.056-.05.051-.05.023-.025.023-.024.021-.024.02-.025.019-.024.018-.024.017-.023.015-.024.014-.023.013-.023.012-.023.01-.023.01-.022.008-.022.006-.023.006-.021.004-.022.004-.021.001-.021.001-.021-.001-.021-.001-.021-.004-.021-.004-.022-.006-.021-.006-.023-.008-.022-.01-.022-.01-.023-.012-.023-.013-.023-.014-.023-.015-.024-.017-.023-.018-.024-.019-.024-.02-.025-.021-.024-.023-.024-.023-.025-.051-.05-.056-.05-.06-.05-.065-.051-.07-.052-.074-.051-.079-.052-.083-.052-.088-.052-.092-.052-.096-.052-.101-.052-.106-.052-.11-.052-.114-.052-.118-.051-.123-.051-.126-.051-.131-.05-.136-.05-.139-.049-.143-.048-.148-.048-.152-.048-.155-.046-.16-.046-.163-.045-.168-.043-.172-.043-.175-.042-.179-.041-.183-.04-.187-.038-.191-.038-.194-.036-.198-.034-.202-.033-.205-.032-.21-.031-.212-.028-.216-.027-.22-.026-.224-.023-.226-.022-.231-.021-.233-.018-.237-.016-.241-.014-.244-.012-.247-.011-.25-.008-.254-.005-.257-.004-.26-.001-.26.001z"/></symbol></defs><defs><symbol id="mmd-ac9c045c3287f91b-clock" width="24" height="24"><path transform="scale(.5)" d="M12 2c5.514 0 10 4.486 10 10s-4.486 10-10 10-10-4.486-10-10 4.486-10 10-10zm0-2c-6.627 0-12 5.373-12 12s5.373 12 12 12 12-5.373 12-12-5.373-12-12-12zm5.848 12.459c.202.038.202.333.001.372-1.907.361-6.045 1.111-6.547 1.111-.719 0-1.301-.582-1.301-1.301 0-.512.77-5.447 1.125-7.445.034-.192.312-.181.343.014l.985 6.238 5.394 1.011z"/></symbol></defs><defs><marker id="mmd-ac9c045c3287f91b-arrowhead" refX="7.9" refY="5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M -1 0 L 10 5 L 0 10 z"/></marker></defs><defs><marker id="mmd-ac9c045c3287f91b-crosshead" markerWidth="15" markerHeight="8" orient="auto" refX="4" refY="4.5"><path fill="none" stroke="#000000" stroke-width="1pt" d="M 1,2 L 6,7 M 6,2 L 1,7" style="stroke-dasharray: 0, 0;"/></marker></defs><defs><marker id="mmd-ac9c045c3287f91b-filled-head" refX="15.5" refY="7" markerWidth="20" markerHeight="28" orient="auto"><path d="M 18,7 L9,13 L14,7 L9,1 Z"/></marker></defs><defs><marker id="mmd-ac9c045c3287f91b-sequencenumber" refX="15" refY="15" markerWidth="60" markerHeight="40" orient="auto"><circle cx="15" cy="15" r="6"/></marker></defs><defs><marker id="mmd-ac9c045c3287f91b-solidTopArrowHead" refX="7.9" refY="7.25" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 10 8 L 0 8 z"/></marker></defs><defs><marker id="mmd-ac9c045c3287f91b-solidBottomArrowHead" refX="7.9" refY="0.75" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 10 0 L 0 8 z"/></marker></defs><defs><marker id="mmd-ac9c045c3287f91b-stickTopArrowHead" refX="7.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 7 7" stroke="black" stroke-width="1.5" fill="none"/></marker></defs><defs><marker id="mmd-ac9c045c3287f91b-stickBottomArrowHead" refX="7.5" refY="0" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 7 L 7 0" stroke="black" stroke-width="1.5" fill="none"/></marker></defs><g data-et="note" data-id="i2"><rect x="264" y="163" fill="#EDF2AE" stroke="#666" width="230" height="38" class="note"/><text x="379" y="168" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="noteText" dy="1em" style="font-size: 16px; font-weight: 400;"><tspan x="379">async replication lag, typically 10-100ms</tspan></text></g><text x="178" y="80" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">write new profile name</text><line x1="76" y1="109" x2="280" y2="109" class="messageLine0" data-et="message" data-id="i0" data-from="U" data-to="M" stroke-width="2" stroke="none" marker-end="url(#mmd-ac9c045c3287f91b-arrowhead)" style="fill: none;"/><text x="181" y="124" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">200 OK</text><line x1="283" y1="153" x2="79" y2="153" class="messageLine1" data-et="message" data-id="i1" data-from="M" data-to="U" stroke-width="2" stroke="none" marker-end="url(#mmd-ac9c045c3287f91b-arrowhead)" style="stroke-dasharray: 3, 3; fill: none;"/><text x="273" y="216" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">read profile immediately after</text><line x1="76" y1="245" x2="470" y2="245" class="messageLine0" data-et="message" data-id="i3" data-from="U" data-to="R" stroke-width="2" stroke="none" marker-end="url(#mmd-ac9c045c3287f91b-arrowhead)" style="fill: none;"/><text x="276" y="260" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" class="messageText" dy="1em" style="font-size: 16px; font-weight: 400;">OLD name - stale read</text><line x1="473" y1="289" x2="79" y2="289" class="messageLine1" data-et="message" data-id="i4" data-from="R" data-to="U" stroke-width="2" stroke="none" marker-end="url(#mmd-ac9c045c3287f91b-arrowhead)" style="stroke-dasharray: 3, 3; fill: none;"/></svg>
+</figure>
+<p>Standard mitigations, roughly in order of preference:</p>
+<ul>
+<li><strong>Read from the master for that user</strong> for a short window after their own write.</li>
+<li><strong>Route reads within a session to the same replica</strong> so the user at least sees monotonic data.</li>
+<li><strong>Track a write timestamp or log position</strong> in the session and wait for the replica to reach it before reading.</li>
+<li>Accept the staleness where it genuinely doesn't matter — a view counter, not a bank balance.</li>
+</ul>
+<p><strong>Split-brain.</strong> If the old master is actually alive but unreachable (a network partition, not a crash), promoting a replica gives you <strong>two nodes accepting writes</strong>, and the two histories diverge. Real failover therefore needs <strong>fencing</strong> — conclusively taking the old master out of service, often via a quorum of observers rather than a single health check. &quot;I'd promote a replica&quot; is an incomplete answer; &quot;I'd promote a replica and fence the old master&quot; is the complete one.</p>
+<p><strong>Replicas scale reads, not writes.</strong> Every replica receives every write. Adding the tenth replica does nothing for write capacity and in fact adds replication load to the master. Write scaling is <a href="#section-12-database-scaling">§12</a>.</p>
+<h3 id="failure-handling">Failure Handling</h3>
+<ul>
+<li>If only one slave database is available and it goes offline, read operations will be directed
+to the master database temporarily.</li>
+<li>In case multiple slave databases are available, read operations are
+redirected to other healthy slave databases and a new server will replace the old one.</li>
+<li>If the master database goes offline, a slave database will be promoted to be the new
+master.</li>
+<li>In production system the chosen slave database might not be up to date, hence data needs to be updated by running data
+recovery scripts (methods like multi-masters and circular replication could help).</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>&quot;where do reads go?&quot; and &quot;what does the user see right after they write?&quot; are near-guaranteed follow-ups. Naming replication lag unprompted is a strong signal.</p>
+</div>
+<p><strong>What it now costs you:</strong> eventual consistency on reads, failover machinery to get right, and a read path that still touches disk on every request — which the next section addresses.</p>
+<hr>
+</section>
+<section id="section-6-caching">
+<h2 id="section-6-caching">Section 6: Caching</h2>
+<p>A <strong>cache</strong> stores frequently accessed data in memory to reduce database load. The cache tier is a temporary data store layer, much faster than the database.</p>
+<p align="left">
+   <img loading="lazy" decoding="async" alt="" src="../../system-design-notes/01.%20Scaling/images/cache.png" data-width="500" style="max-width:500px" />
+</p>
+<p><strong>What broke:</strong> the same expensive queries run thousands of times per second for data that barely changes. Even with replicas, every read costs a network hop plus disk work. An in-memory cache hit is <strong>orders of magnitude</strong> cheaper than a database query — see the latency table in <a href="02-back-of-the-envelope-estimation.html">Chapter 2</a> for why that gap is so large.</p>
+<h3 id="the-cache-aside-pattern">The cache-aside pattern</h3>
+<p>This is the default, and the one the diagram above shows. The application — not the database — owns the cache:</p>
+<figure class="mermaid-fig">
+<svg id="mmd-710d8efa7e2fe444" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 430.578px; background-color: transparent;" viewBox="0 7.844959259033203 430.578125 233.4962921142578" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-710d8efa7e2fe444{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-710d8efa7e2fe444 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-710d8efa7e2fe444 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-710d8efa7e2fe444 .error-icon{fill:#f4f6f8;}#mmd-710d8efa7e2fe444 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-710d8efa7e2fe444 .edge-thickness-normal{stroke-width:1px;}#mmd-710d8efa7e2fe444 .edge-thickness-thick{stroke-width:3.5px;}#mmd-710d8efa7e2fe444 .edge-pattern-solid{stroke-dasharray:0;}#mmd-710d8efa7e2fe444 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-710d8efa7e2fe444 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-710d8efa7e2fe444 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-710d8efa7e2fe444 .marker{fill:#637381;stroke:#637381;}#mmd-710d8efa7e2fe444 .marker.cross{stroke:#637381;}#mmd-710d8efa7e2fe444 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-710d8efa7e2fe444 p{margin:0;}#mmd-710d8efa7e2fe444 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-710d8efa7e2fe444 .cluster-label text{fill:#454f5b;}#mmd-710d8efa7e2fe444 .cluster-label span{color:#454f5b;}#mmd-710d8efa7e2fe444 .cluster-label span p{background-color:transparent;}#mmd-710d8efa7e2fe444 .label text,#mmd-710d8efa7e2fe444 span{fill:#161c24;color:#161c24;}#mmd-710d8efa7e2fe444 .node rect,#mmd-710d8efa7e2fe444 .node circle,#mmd-710d8efa7e2fe444 .node ellipse,#mmd-710d8efa7e2fe444 .node polygon,#mmd-710d8efa7e2fe444 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-710d8efa7e2fe444 .rough-node .label text,#mmd-710d8efa7e2fe444 .node .label text,#mmd-710d8efa7e2fe444 .image-shape .label,#mmd-710d8efa7e2fe444 .icon-shape .label{text-anchor:middle;}#mmd-710d8efa7e2fe444 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-710d8efa7e2fe444 .rough-node .label,#mmd-710d8efa7e2fe444 .node .label,#mmd-710d8efa7e2fe444 .image-shape .label,#mmd-710d8efa7e2fe444 .icon-shape .label{text-align:center;}#mmd-710d8efa7e2fe444 .node.clickable{cursor:pointer;}#mmd-710d8efa7e2fe444 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-710d8efa7e2fe444 .arrowheadPath{fill:#000000;}#mmd-710d8efa7e2fe444 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-710d8efa7e2fe444 .flowchart-link{stroke:#637381;fill:none;}#mmd-710d8efa7e2fe444 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-710d8efa7e2fe444 .edgeLabel p{background-color:#ffffff;}#mmd-710d8efa7e2fe444 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-710d8efa7e2fe444 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-710d8efa7e2fe444 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-710d8efa7e2fe444 .cluster text{fill:#454f5b;}#mmd-710d8efa7e2fe444 .cluster span{color:#454f5b;}#mmd-710d8efa7e2fe444 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-710d8efa7e2fe444 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-710d8efa7e2fe444 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-710d8efa7e2fe444 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-710d8efa7e2fe444 rect.text{fill:none;stroke-width:0;}#mmd-710d8efa7e2fe444 .icon-shape,#mmd-710d8efa7e2fe444 .image-shape{background-color:#ffffff;text-align:center;}#mmd-710d8efa7e2fe444 .icon-shape p,#mmd-710d8efa7e2fe444 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-710d8efa7e2fe444 .icon-shape .label rect,#mmd-710d8efa7e2fe444 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-710d8efa7e2fe444 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-710d8efa7e2fe444 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-710d8efa7e2fe444 .node .neo-node{stroke:#299a8d;}#mmd-710d8efa7e2fe444 [data-look="neo"].node rect,#mmd-710d8efa7e2fe444 [data-look="neo"].cluster rect,#mmd-710d8efa7e2fe444 [data-look="neo"].node polygon{stroke:url(#mmd-710d8efa7e2fe444-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-710d8efa7e2fe444 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-710d8efa7e2fe444 [data-look="neo"].node path{stroke:url(#mmd-710d8efa7e2fe444-gradient);stroke-width:1px;}#mmd-710d8efa7e2fe444 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-710d8efa7e2fe444 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-710d8efa7e2fe444 [data-look="neo"].node circle{stroke:url(#mmd-710d8efa7e2fe444-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-710d8efa7e2fe444 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-710d8efa7e2fe444 [data-look="neo"].icon-shape .icon{fill:url(#mmd-710d8efa7e2fe444-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-710d8efa7e2fe444 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-710d8efa7e2fe444-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-710d8efa7e2fe444 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-710d8efa7e2fe444_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-710d8efa7e2fe444_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-710d8efa7e2fe444_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-710d8efa7e2fe444_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-710d8efa7e2fe444_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-710d8efa7e2fe444_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-710d8efa7e2fe444_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-710d8efa7e2fe444_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-710d8efa7e2fe444_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-710d8efa7e2fe444_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-710d8efa7e2fe444_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-710d8efa7e2fe444_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M108.728,82.829L127.45,72.108C146.173,61.386,183.618,39.943,216.757,35.301C249.896,30.658,278.73,42.816,293.147,48.895L307.564,54.974" id="mmd-710d8efa7e2fe444-L_A_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_C_0" data-points="W3sieCI6MTA4LjcyNzkxNjg2MjExOTMyLCJ5Ijo4Mi44MjkzNzkwODE3MjYwN30seyJ4IjoyMjEuMDYyNSwieSI6MTguNX0seyJ4IjozMTEuMjUsInkiOjU2LjUyODYwMzU2NzQxMTIyfV0=" data-look="classic" marker-end="url(#mmd-710d8efa7e2fe444_flowchart-v2-pointEnd)"/><path d="M311.25,87.824L296.219,89.936C281.188,92.049,251.125,96.275,221.729,98.845C192.333,101.415,163.603,102.33,149.238,102.788L134.873,103.245" id="mmd-710d8efa7e2fe444-L_C_A_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_A_0" data-points="W3sieCI6MzExLjI1LCJ5Ijo4Ny44MjM3OTg4MTA4NjI5M30seyJ4IjoyMjEuMDYyNSwieSI6MTAwLjV9LHsieCI6MTMwLjg3NSwieSI6MTAzLjM3MjU0NDkzNjA4MDI2fV0=" data-look="classic" marker-end="url(#mmd-710d8efa7e2fe444_flowchart-v2-pointEnd)"/><path d="M311.25,103.471L296.219,109.809C281.188,116.148,251.125,128.824,221.711,131.731C192.297,134.638,163.531,127.776,149.149,124.345L134.766,120.914" id="mmd-710d8efa7e2fe444-L_C_A_2" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_A_2" data-points="W3sieCI6MzExLjI1LCJ5IjoxMDMuNDcxMzk2NDMyNTg4Nzl9LHsieCI6MjIxLjA2MjUsInkiOjE0MS41fSx7IngiOjEzMC44NzUsInkiOjExOS45ODU0ODgwNTIzMjA5OX1d" data-look="classic" marker-end="url(#mmd-710d8efa7e2fe444_flowchart-v2-pointEnd)"/><path d="M113.646,127.829L131.548,136.941C149.451,146.053,185.257,164.276,220.712,175.855C256.167,187.434,291.271,192.368,308.823,194.835L326.375,197.302" id="mmd-710d8efa7e2fe444-L_A_DB_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_DB_0" data-points="W3sieCI6MTEzLjY0NTU0NzgyMTg5MDAyLCJ5IjoxMjcuODI5Mzc5MDgxNzI2MDd9LHsieCI6MjIxLjA2MjUsInkiOjE4Mi41fSx7IngiOjMzMC4zMzU5Mzc1LCJ5IjoxOTcuODU4ODAzMzYzODY1MjN9XQ==" data-look="classic" marker-end="url(#mmd-710d8efa7e2fe444_flowchart-v2-pointEnd)"/><path d="M330.336,208.141L312.124,210.701C293.911,213.261,257.487,218.38,219.341,205.405C181.196,192.429,141.329,161.359,121.396,145.824L101.462,130.288" id="mmd-710d8efa7e2fe444-L_DB_A_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DB_A_0" data-points="W3sieCI6MzMwLjMzNTkzNzUsInkiOjIwOC4xNDExOTY2MzYxMzQ3N30seyJ4IjoyMjEuMDYyNSwieSI6MjIzLjV9LHsieCI6OTguMzA3MzAyNjA4MjA4NDcsInkiOjEyNy44MjkzNzkwODE3MjYwN31d" data-look="classic" marker-end="url(#mmd-710d8efa7e2fe444_flowchart-v2-pointEnd)"/><path d="M130.875,86.76L145.906,82.216C160.938,77.673,191,68.587,220.402,66.063C249.805,63.54,278.547,67.58,292.918,69.6L307.289,71.619" id="mmd-710d8efa7e2fe444-L_A_C_2" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_C_2" data-points="W3sieCI6MTMwLjg3NSwieSI6ODYuNzU5NjAxODE5ODM5NTV9LHsieCI6MjIxLjA2MjUsInkiOjU5LjV9LHsieCI6MzExLjI1LCJ5Ijo3Mi4xNzYyMDExODkxMzcwN31d" data-look="classic" marker-end="url(#mmd-710d8efa7e2fe444_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel" transform="translate(207.36332, 26.34496)"><g class="label" data-id="L_A_C_0" transform="translate(-33.5390625, -10.5)"><foreignObject width="67.078125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>1. GET key</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(221.0625, 100.5)"><g class="label" data-id="L_C_A_0" transform="translate(-65.1875, -10.5)"><foreignObject width="130.375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>2a. HIT: return value</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(223.43939, 140.49776)"><g class="label" data-id="L_C_A_2" transform="translate(-28.8203125, -10.5)"><foreignObject width="57.640625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>2b. MISS</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(221.0625, 182.5)"><g class="label" data-id="L_A_DB_0" transform="translate(-53.0859375, -10.5)"><foreignObject width="106.171875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>3. query on miss</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(203.20302, 209.58102)"><g class="label" data-id="L_DB_A_0" transform="translate(-19.8515625, -10.5)"><foreignObject width="39.703125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>4. row</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(219.55814, 59.9547)"><g class="label" data-id="L_A_C_2" transform="translate(-63.703125, -10.5)"><foreignObject width="127.40625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>5. SET key with TTL</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-710d8efa7e2fe444-flowchart-A-0" data-look="classic" transform="translate(69.4375, 105.32937908172607)"><rect class="basic label-container" style="" x="-61.4375" y="-22.5" width="122.875" height="45"/><g class="label" style="" transform="translate(-37.4375, -10.5)"><rect/><foreignObject width="74.875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Web Server</p></span></div></foreignObject></g></g><g class="node default" id="mmd-710d8efa7e2fe444-flowchart-C-1" data-look="classic" transform="translate(366.9140625, 80)"><rect class="basic label-container" style="" x="-55.6640625" y="-33" width="111.328125" height="66"/><g class="label" style="" transform="translate(-31.6640625, -21)"><rect/><foreignObject width="63.328125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Cache<br />e.g. Redis</p></span></div></foreignObject></g></g><g class="node default" id="mmd-710d8efa7e2fe444-flowchart-DB-7" data-look="classic" transform="translate(366.9140625, 203)"><path d="M0,9.229616779687747 a36.578125,9.229616779687747 0,0,0 73.15625,0 a36.578125,9.229616779687747 0,0,0 -73.15625,0 l0,42.229616779687746 a36.578125,9.229616779687747 0,0,0 73.15625,0 l0,-42.229616779687746" class="basic label-container outer-path" style="" transform="translate(-36.578125, -30.34442516953162)"/><g class="label" style="" transform="translate(-30.578125, -2.5)"><rect/><foreignObject width="61.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Database</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-710d8efa7e2fe444-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-710d8efa7e2fe444-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-710d8efa7e2fe444-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<h3 id="caching-strategies">Caching strategies</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>How it works</th>
+<th>Best for</th>
+<th>Watch out for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Cache-aside</strong> (lazy loading)</td>
+<td>App checks cache, falls back to DB, then populates cache</td>
+<td>The general default; read-heavy workloads</td>
+<td>Every miss costs a full round trip; first request after expiry is slow</td>
+</tr>
+<tr>
+<td><strong>Read-through</strong></td>
+<td>Cache itself fetches from the DB on a miss</td>
+<td>Keeping fetch logic in one place</td>
+<td>Same cold-start cost; needs cache-provider support</td>
+</tr>
+<tr>
+<td><strong>Write-through</strong></td>
+<td>Write to cache and DB together, synchronously</td>
+<td>Read-after-write consistency</td>
+<td>Adds latency to every write; caches data that may never be read</td>
+</tr>
+<tr>
+<td><strong>Write-back</strong> (write-behind)</td>
+<td>Write to cache, flush to DB asynchronously</td>
+<td>Write-heavy workloads</td>
+<td><strong>Data loss if the cache dies before flushing</strong></td>
+</tr>
+<tr>
+<td><strong>Write-around</strong></td>
+<td>Writes go only to the DB; cache populates on read</td>
+<td>Data written far more often than read</td>
+<td>First read after a write is always a miss</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="caching-considerations">Caching considerations</h3>
+<ol>
+<li><strong>Use case</strong>: Consider using cache when data is read frequently but modified infrequently.</li>
+<li><strong>Expiration Policies:</strong> Once cached data is expired, it is removed from the cache. When there is no expiration policy, cached
+data will be stored in the memory permanently.</li>
+<li><strong>Consistency:</strong> This means keeping the data store and the cache in sync. Inconsistency
+can happen because data-modifying operations on the data store and cache are not in a single transaction.</li>
+<li><strong>Mitigating failures</strong>: A single cache server represents a potential single point of failure, multiple
+cache servers across different data centers are recommended to avoid SPOF.</li>
+<li><strong>Eviction Policies:</strong>: Once the cache is full, items need to be evicted to free up memory. LRU is the most popular cache eviction policy.</li>
+</ol>
+<h3 id="choosing-a-ttl">Choosing a TTL</h3>
+<p>TTL is a direct trade between staleness and database load, and there is no universally right value:</p>
+<ul>
+<li><strong>Too short</strong> → high miss rate, so the cache stops protecting the database.</li>
+<li><strong>Too long</strong> → users see stale data, and memory fills with entries nobody reads.</li>
+</ul>
+<p>A practical approach is to set TTL from how stale the data is <em>allowed</em> to be by the product, then invalidate explicitly on writes for the cases that matter. A useful sizing heuristic: traffic is usually heavily skewed (the classic 80/20 shape), so caching a small fraction of the hottest keys often removes the large majority of database reads — you rarely need to cache everything.</p>
+<h3 id="eviction-policies">Eviction policies</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Policy</th>
+<th>Evicts</th>
+<th>Good when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>LRU</strong> (least recently used)</td>
+<td>The item untouched for longest</td>
+<td>General purpose — the usual default</td>
+</tr>
+<tr>
+<td><strong>LFU</strong> (least frequently used)</td>
+<td>The item requested least often</td>
+<td>Stable hot set; resists one-off scans polluting the cache</td>
+</tr>
+<tr>
+<td><strong>FIFO</strong></td>
+<td>The oldest inserted item</td>
+<td>Order of arrival matters more than access pattern</td>
+</tr>
+<tr>
+<td><strong>TTL-only</strong></td>
+<td>Whatever expired</td>
+<td>Data with a natural freshness lifetime</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="gotchas--failure-modes-2" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Cache stampede / thundering herd.</strong> A popular key expires, and the thousands of concurrent requests that were being served from it <em>all</em> miss simultaneously and hit the database at once — which can take the database down, precisely at peak traffic. Mitigations: <strong>jittered TTLs</strong> so keys don't expire in lockstep, <strong>request coalescing</strong> (a single in-flight fetch per key while others wait), a short <strong>lock</strong> on the recompute, or <strong>proactive refresh</strong> just before expiry.</li>
+<li><strong>Cache penetration.</strong> Requests for keys that don't exist in the database either (often a scraper or an attack) miss the cache every time and pass straight through. Mitigations: <strong>cache the negative result</strong> with a short TTL, or front the cache with a <strong>Bloom filter</strong> that can cheaply say &quot;definitely not present&quot;.</li>
+<li><strong>Hot key.</strong> One key — a celebrity, a viral post — gets so much traffic that the single cache node holding it saturates, even though the cluster as a whole is idle. Mitigations: replicate that key across nodes, or add a small local in-process cache in front of the shared cache.</li>
+<li><strong>The cache becomes load-bearing.</strong> Once the database can only cope <em>because</em> the cache is absorbing 95% of reads, a cold cache after a restart means the database gets 100% of traffic and falls over — so the system cannot recover. This is a real outage pattern. Mitigations: warm the cache before taking traffic, restart nodes gradually, and keep enough database headroom to survive a partial cache loss.</li>
+<li><strong>Invalidation is genuinely hard.</strong> Deleting the cache entry <em>after</em> the DB write is the common ordering, but concurrent readers can still repopulate a stale value in the gap. Accept the small window, or use versioned keys so a write makes old entries unreachable rather than needing deletion.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>&quot;what happens when your cache goes down?&quot; is an extremely common probe, and the honest answer — the database is suddenly exposed to full traffic — is where cache warming and headroom come in. Also expect &quot;how do you invalidate?&quot;</p>
+</div>
+<p><strong>What it now costs you:</strong> a third tier to operate, a consistency window between cache and database, and a new dependency your database now quietly relies on.</p>
+<hr>
+</section>
+<section id="section-7-content-delivery-network-cdn">
+<h2 id="section-7-content-delivery-network-cdn">Section 7: Content Delivery Network (CDN)</h2>
+<p>A <strong>CDN</strong> improves load times by caching static content (images, CSS, JavaScript) on geographically distributed servers.</p>
+<p align="left">
+   <img loading="lazy" decoding="async" alt="" src="../../system-design-notes/01.%20Scaling/images/cdn.png" data-width="400" style="max-width:400px" />
+</p>
+<p><strong>What broke:</strong> caching helped your database, but it did nothing about <strong>distance</strong>. A user in Sydney hitting a server in Virginia pays well over 100 ms of round-trip latency <em>per request</em> that no amount of server-side optimization can remove — and a page pulling 50 assets pays it repeatedly. The only fix is to move the bytes physically closer.</p>
+<h3 id="workflow">Workflow</h3>
+<ol>
+<li>User requests content from the nearest CDN server.</li>
+<li>If unavailable, content is fetched from the origin server and cached.</li>
+</ol>
+<h3 id="push-vs-pull">Push vs pull</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>Pull CDN</strong></th>
+<th><strong>Push CDN</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>How content arrives</td>
+<td>Fetched from your origin on the first request for it</td>
+<td>You upload it to the CDN ahead of time</td>
+</tr>
+<tr>
+<td>First request</td>
+<td>Slow — a cache miss goes to origin</td>
+<td>Fast — already there</td>
+</tr>
+<tr>
+<td>Best for</td>
+<td>Large catalogs, frequently changing content</td>
+<td>Small, stable sets of large files</td>
+</tr>
+<tr>
+<td>Operational burden</td>
+<td>Low — content self-manages</td>
+<td>You own publishing and expiry</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="cdn-considerations">CDN considerations</h3>
+<ol>
+<li><strong>Cost:</strong> CDNs are run by third-party providers which charge for data transfers in and out of the CDN.</li>
+<li><strong>Cache Expiry:</strong> The cache expiry time should neither be too long nor too short.</li>
+<li><strong>CDN fallback:</strong> If there is a temporary CDN outage, clients should be able to detect the problem
+and request resources from the origin.</li>
+<li><strong>Invalidating files:</strong> If files are updated the cache should be invalidated to point to the updated files.</li>
+</ol>
+<h3 id="making-updates-actually-take-effect">Making updates actually take effect</h3>
+<p>Invalidation APIs exist, but they are slow and imprecise across hundreds of edge locations. The technique used in practice is <strong>versioned filenames</strong> (<code>app.a1b2c3.js</code>, <code>logo.v2.png</code>): the URL changes when the content changes, so a new URL can never serve an old cached file, and you can set a very long TTL without fear. This is why build tools fingerprint asset filenames by default.</p>
+<p>For content that must stay private, <strong>signed URLs</strong> let the CDN serve a file only to someone holding a time-limited token — the standard pattern for paid downloads or private media.</p>
+<h3 id="what-not-to-put-behind-a-cdn">What not to put behind a CDN</h3>
+<ul>
+<li>Anything <strong>personalized per user</strong> — a CDN caching one user's dashboard and serving it to another is a serious data leak, not just a bug.</li>
+<li><strong>Frequently changing API responses</strong>, where the TTL would be too short to earn a hit.</li>
+<li><strong>Small, rarely requested</strong> files, where the per-request cost outweighs the saving.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>mention that a CDN does more than cache — it also terminates TLS near the user and keeps connections warm, which removes handshake round trips. And expect &quot;how do you ship a CSS change?&quot; — versioned filenames is the expected answer.</p>
+</div>
+<p><strong>What it now costs you:</strong> a third-party bill proportional to traffic, and a cache you only partially control.</p>
+<hr>
+</section>
+<section id="section-8-stateless-web-tier">
+<h2 id="section-8-stateless-web-tier">Section 8: Stateless Web Tier</h2>
+<p>By moving session data to a shared datastore, web servers become stateless. This allows:</p>
+<ol>
+<li>Easier horizontal scaling.</li>
+<li>Auto-scaling based on traffic.</li>
+</ol>
+<p><strong>What broke:</strong> this is the bill from <a href="#section-4-load-balancer">§4</a>. When a web server keeps session data in its own memory, every subsequent request from that user <em>must</em> return to that same server. That forces sticky sessions, which means you cannot scale down, cannot deploy without logging people out, and cannot balance load evenly.</p>
+<p>Here is the stateful arrangement being replaced — session state living inside each server:</p>
+<p align="left">
+   <img loading="lazy" decoding="async" alt="" src="../../system-design-notes/01.%20Scaling/images/statefull.png" data-width="400" style="max-width:400px" />
+</p>
+<p>And the stateless version, with session state moved to a shared store that every server can reach:</p>
+<p align="left">
+   <img loading="lazy" decoding="async" alt="" src="../../system-design-notes/01.%20Scaling/images/stateless.png" data-width="400" style="max-width:400px" />
+</p>
+<p>The important shift is that <strong>any server can now serve any request</strong>. That single property is what makes auto-scaling, zero-downtime deploys, and instant failover possible — which is why &quot;keep the web tier stateless&quot; is the first item in this chapter's takeaways.</p>
+<h3 id="where-to-put-the-session">Where to put the session</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>How it works</th>
+<th>Pros</th>
+<th>Cons</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Sticky sessions</strong></td>
+<td>LB pins each user to one server</td>
+<td>No code change</td>
+<td>Blocks scale-down and clean deploys; uneven load; losing a server logs its users out</td>
+</tr>
+<tr>
+<td><strong>Shared session store</strong> (Redis, Memcached, DynamoDB)</td>
+<td>Every server reads and writes session state centrally</td>
+<td>Truly stateless servers; revoking a session is instant</td>
+<td>A network hop per request; the store becomes critical infrastructure</td>
+</tr>
+<tr>
+<td><strong>Signed token in a cookie</strong> (e.g. JWT)</td>
+<td>State lives in the client; the server only verifies a signature</td>
+<td>No session store at all; scales trivially</td>
+<td><strong>Revocation is hard</strong>; token size on every request; stale claims until expiry</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="gotchas--failure-modes-3" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Token revocation.</strong> With self-contained tokens, &quot;log out everywhere&quot; and &quot;ban this user right now&quot; don't work — the token stays valid until it expires, because nothing is consulted to verify it. The usual compromise is short-lived access tokens plus a refresh token checked against a server-side store, which reintroduces a small amount of state on purpose.</li>
+<li><strong>&quot;Stateless&quot; doesn't mean no state anywhere.</strong> It means no <em>session affinity</em> — the state moved to a shared tier. Uploaded files, in-memory caches, and background job state all need the same treatment, and local disk writes are the most commonly forgotten one.</li>
+<li><strong>Don't put large objects in the session.</strong> It is now fetched over the network on every request.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>this is the step that enables auto-scaling, so interviewers often ask it as &quot;how do you handle traffic spikes?&quot; The chain is: stateless tier → any server serves any request → add and remove servers freely.</p>
+</div>
+<p><strong>What it now costs you:</strong> a shared session store on the critical path, and a revocation story you have to design deliberately.</p>
+<hr>
+</section>
+<section id="section-9-multi-data-center-setup">
+<h2 id="section-9-multi-data-center-setup">Section 9: Multi-Data Center Setup</h2>
+<p>Deploying across multiple data centers improves availability and reduces latency. Strategies include:</p>
+<p align="left">
+   <img loading="lazy" decoding="async" alt="" src="../../system-design-notes/01.%20Scaling/images/data-center.png" data-width="400" style="max-width:400px" />
+</p>
+<p><strong>What broke:</strong> one data center is one blast radius. A regional power, network, or provider failure takes the whole product offline no matter how many servers you run inside it — and users on the far side of the planet still pay the latency.</p>
+<ol>
+<li><strong>GeoDNS Routing:</strong> Direct users to the nearest data center.</li>
+<li><strong>Data Replication:</strong> Synchronize data across centers to prevent inconsistencies.</li>
+</ol>
+<h3 id="active-active-vs-active-passive">Active-active vs active-passive</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>Active-active</strong></th>
+<th><strong>Active-passive</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Traffic</td>
+<td>All regions serve users</td>
+<td>One serves; the other stands by</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Better — users hit a nearby region</td>
+<td>Unchanged for distant users</td>
+</tr>
+<tr>
+<td>Failover</td>
+<td>Shift traffic by reweighting DNS</td>
+<td>Promote the standby, which takes time</td>
+</tr>
+<tr>
+<td>Hard part</td>
+<td><strong>Write conflicts</strong> when two regions accept writes to the same data</td>
+<td>Idle capacity you pay for; failover is rarely tested</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>Highest</td>
+<td>Lower</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="key-considerations">Key considerations</h3>
+<ul>
+<li><strong>Traffic redirection:</strong> Effective tools are needed to direct traffic to the correct data center.</li>
+<li><strong>Data synchronization:</strong> A common strategy is to replicate data across multiple data centers.</li>
+<li><strong>Test and deployment:</strong>  Automated deployment tools are vital to keep services consistent through all the data centers.</li>
+</ul>
+<p>The deployment point deserves more weight than it usually gets: with multiple regions, <strong>every</strong> change must roll out consistently to all of them, and a half-deployed state across regions is its own class of outage. This is why multi-region is as much an operational commitment as an architectural one.</p>
+<h3 id="gotchas--failure-modes-4" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Cross-region latency is physics.</strong> Inter-region round trips run to roughly 100 ms and more. Any design that makes a synchronous cross-region call <em>per request</em> has already lost, which is why active-active setups push hard toward asynchronous replication.</li>
+<li><strong>Write conflicts.</strong> If two regions accept a write to the same record, something must resolve the divergence — last-write-wins (simple, silently loses data), version vectors, or CRDTs. Alternatively, partition by <strong>home region</strong> so each record has exactly one region that may write it, which sidesteps conflicts entirely.</li>
+<li><strong>DNS failover is not instant.</strong> Clients and intermediate resolvers cache DNS beyond the TTL you set, so some traffic keeps arriving at a dead region for minutes. Health-check-driven routing at the load-balancer or anycast layer reacts faster.</li>
+<li><strong>Untested failover is not failover.</strong> A standby region that has never taken real traffic will have drifted — stale configuration, missing capacity, expired credentials.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>ask whether the requirements actually demand multi-region. It is justified by an availability SLO or by global latency, not by ambition — and saying so demonstrates judgment.</p>
+</div>
+<p><strong>What it now costs you:</strong> conflict resolution, a far more complex deployment pipeline, and a large bill.</p>
+<hr>
+</section>
+<section id="section-10-message-queue">
+<h2 id="section-10-message-queue">Section 10: Message Queue</h2>
+<p>A <strong>message queue</strong> is a durable component, stored in memory, that supports asynchronous
+communication. It serves as a buffer and distributes asynchronous requests.</p>
+<p align="left">
+   <img loading="lazy" decoding="async" alt="" src="../../system-design-notes/01.%20Scaling/images/message-queue.png" data-width="500" style="max-width:500px" />
+</p>
+<p><strong>What broke:</strong> some work is simply too slow to do inside a request — encoding a video, applying filters to a photo, sending email, generating a report. Done synchronously it holds a web server thread for seconds or minutes, so a burst of uploads exhausts the web tier and users stare at a spinner or time out.</p>
+<ul>
+<li>Input services, called producers/publishers, create messages, and publish them to a message queue.</li>
+<li>Other services called consumers/subscribers, connect to the queue, and perform actions defined by the messages.</li>
+</ul>
+<figure class="mermaid-fig">
+<svg id="mmd-0e690f1a3b120749" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 373.035px; background-color: transparent;" viewBox="0 0 373.03515625 696" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-0e690f1a3b120749{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-0e690f1a3b120749 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-0e690f1a3b120749 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-0e690f1a3b120749 .error-icon{fill:#f4f6f8;}#mmd-0e690f1a3b120749 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-0e690f1a3b120749 .edge-thickness-normal{stroke-width:1px;}#mmd-0e690f1a3b120749 .edge-thickness-thick{stroke-width:3.5px;}#mmd-0e690f1a3b120749 .edge-pattern-solid{stroke-dasharray:0;}#mmd-0e690f1a3b120749 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-0e690f1a3b120749 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-0e690f1a3b120749 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-0e690f1a3b120749 .marker{fill:#637381;stroke:#637381;}#mmd-0e690f1a3b120749 .marker.cross{stroke:#637381;}#mmd-0e690f1a3b120749 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-0e690f1a3b120749 p{margin:0;}#mmd-0e690f1a3b120749 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-0e690f1a3b120749 .cluster-label text{fill:#454f5b;}#mmd-0e690f1a3b120749 .cluster-label span{color:#454f5b;}#mmd-0e690f1a3b120749 .cluster-label span p{background-color:transparent;}#mmd-0e690f1a3b120749 .label text,#mmd-0e690f1a3b120749 span{fill:#161c24;color:#161c24;}#mmd-0e690f1a3b120749 .node rect,#mmd-0e690f1a3b120749 .node circle,#mmd-0e690f1a3b120749 .node ellipse,#mmd-0e690f1a3b120749 .node polygon,#mmd-0e690f1a3b120749 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-0e690f1a3b120749 .rough-node .label text,#mmd-0e690f1a3b120749 .node .label text,#mmd-0e690f1a3b120749 .image-shape .label,#mmd-0e690f1a3b120749 .icon-shape .label{text-anchor:middle;}#mmd-0e690f1a3b120749 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-0e690f1a3b120749 .rough-node .label,#mmd-0e690f1a3b120749 .node .label,#mmd-0e690f1a3b120749 .image-shape .label,#mmd-0e690f1a3b120749 .icon-shape .label{text-align:center;}#mmd-0e690f1a3b120749 .node.clickable{cursor:pointer;}#mmd-0e690f1a3b120749 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-0e690f1a3b120749 .arrowheadPath{fill:#000000;}#mmd-0e690f1a3b120749 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-0e690f1a3b120749 .flowchart-link{stroke:#637381;fill:none;}#mmd-0e690f1a3b120749 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-0e690f1a3b120749 .edgeLabel p{background-color:#ffffff;}#mmd-0e690f1a3b120749 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-0e690f1a3b120749 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-0e690f1a3b120749 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-0e690f1a3b120749 .cluster text{fill:#454f5b;}#mmd-0e690f1a3b120749 .cluster span{color:#454f5b;}#mmd-0e690f1a3b120749 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-0e690f1a3b120749 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-0e690f1a3b120749 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-0e690f1a3b120749 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-0e690f1a3b120749 rect.text{fill:none;stroke-width:0;}#mmd-0e690f1a3b120749 .icon-shape,#mmd-0e690f1a3b120749 .image-shape{background-color:#ffffff;text-align:center;}#mmd-0e690f1a3b120749 .icon-shape p,#mmd-0e690f1a3b120749 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-0e690f1a3b120749 .icon-shape .label rect,#mmd-0e690f1a3b120749 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-0e690f1a3b120749 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-0e690f1a3b120749 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-0e690f1a3b120749 .node .neo-node{stroke:#299a8d;}#mmd-0e690f1a3b120749 [data-look="neo"].node rect,#mmd-0e690f1a3b120749 [data-look="neo"].cluster rect,#mmd-0e690f1a3b120749 [data-look="neo"].node polygon{stroke:url(#mmd-0e690f1a3b120749-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-0e690f1a3b120749 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-0e690f1a3b120749 [data-look="neo"].node path{stroke:url(#mmd-0e690f1a3b120749-gradient);stroke-width:1px;}#mmd-0e690f1a3b120749 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-0e690f1a3b120749 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-0e690f1a3b120749 [data-look="neo"].node circle{stroke:url(#mmd-0e690f1a3b120749-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-0e690f1a3b120749 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-0e690f1a3b120749 [data-look="neo"].icon-shape .icon{fill:url(#mmd-0e690f1a3b120749-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-0e690f1a3b120749 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-0e690f1a3b120749-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-0e690f1a3b120749 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-0e690f1a3b120749_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-0e690f1a3b120749_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-0e690f1a3b120749_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-0e690f1a3b120749_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-0e690f1a3b120749_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-0e690f1a3b120749_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-0e690f1a3b120749_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-0e690f1a3b120749_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-0e690f1a3b120749_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-0e690f1a3b120749_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-0e690f1a3b120749_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-0e690f1a3b120749_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"/><g class="edgeLabels"/><g class="nodes"><g class="root" transform="translate(41.267578125, 0)"><g class="clusters"><g class="cluster" id="mmd-0e690f1a3b120749-A" data-look="classic"><rect style="" x="8" y="8" width="274.5" height="261"/><g class="cluster-label" transform="translate(92.2109375, 8)"><foreignObject width="106.078125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5;"><span class="nodeLabel"><p>Without a queue</p></span></div></foreignObject></g></g></g><g class="edgePaths"><path d="M145.25,90.5L145.25,96.75C145.25,103,145.25,115.5,145.25,127.333C145.25,139.167,145.25,150.333,145.25,155.917L145.25,161.5" id="mmd-0e690f1a3b120749-L_W1_P1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_W1_P1_0" data-points="W3sieCI6MTQ1LjI1LCJ5Ijo5MC41fSx7IngiOjE0NS4yNSwieSI6MTI4fSx7IngiOjE0NS4yNSwieSI6MTY1LjV9XQ==" data-look="classic" marker-end="url(#mmd-0e690f1a3b120749_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_W1_P1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-0e690f1a3b120749-flowchart-W1-6" data-look="classic" transform="translate(145.25, 68)"><rect class="basic label-container" style="" x="-61.4375" y="-22.5" width="122.875" height="45"/><g class="label" style="" transform="translate(-37.4375, -10.5)"><rect/><foreignObject width="74.875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Web Server</p></span></div></foreignObject></g></g><g class="node default" id="mmd-0e690f1a3b120749-flowchart-P1-7" data-look="classic" transform="translate(145.25, 198.5)"><rect class="basic label-container" style="" x="-102.25" y="-33" width="204.5" height="66"/><g class="label" style="" transform="translate(-78.25, -21)"><rect/><foreignObject width="156.5" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Photo processing<br />blocks the request ~30s</p></span></div></foreignObject></g></g></g></g><g class="root" transform="translate(0, 311)"><g class="clusters"><g class="cluster" id="mmd-0e690f1a3b120749-B" data-look="classic"><rect style="" x="8" y="8" width="357.03515625" height="369"/><g class="cluster-label" transform="translate(144.017578125, 8)"><foreignObject width="85" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5;"><span class="nodeLabel"><p>With a queue</p></span></div></foreignObject></g></g></g><g class="edgePaths"><path d="M186.273,111.5L186.273,117.75C186.273,124,186.273,136.5,186.348,148.417C186.423,160.333,186.572,171.667,186.646,177.334L186.721,183" id="mmd-0e690f1a3b120749-L_W2_Q_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_W2_Q_0" data-points="W3sieCI6MTg2LjI3MzQzNzUsInkiOjExMS41fSx7IngiOjE4Ni4yNzM0Mzc1LCJ5IjoxNDl9LHsieCI6MTg2Ljc3MzQzNzUsInkiOjE4N31d" data-look="classic" marker-end="url(#mmd-0e690f1a3b120749_flowchart-v2-pointEnd)"/><path d="M163.051,220L153.982,226.167C144.913,232.333,126.775,244.667,117.706,256.417C108.637,268.167,108.637,279.333,108.637,284.917L108.637,290.5" id="mmd-0e690f1a3b120749-L_Q_K1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q_K1_0" data-points="W3sieCI6MTYzLjA1MTEwNjc3MDgzMzM0LCJ5IjoyMjB9LHsieCI6MTA4LjYzNjcxODc1LCJ5IjoyNTd9LHsieCI6MTA4LjYzNjcxODc1LCJ5IjoyOTQuNX1d" data-look="classic" marker-end="url(#mmd-0e690f1a3b120749_flowchart-v2-pointEnd)"/><path d="M210.496,220L219.398,226.167C228.301,232.333,246.105,244.667,255.008,256.417C263.91,268.167,263.91,279.333,263.91,284.917L263.91,290.5" id="mmd-0e690f1a3b120749-L_Q_K2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q_K2_0" data-points="W3sieCI6MjEwLjQ5NTc2ODIyOTE2NjY2LCJ5IjoyMjB9LHsieCI6MjYzLjkxMDE1NjI1LCJ5IjoyNTd9LHsieCI6MjYzLjkxMDE1NjI1LCJ5IjoyOTQuNX1d" data-look="classic" marker-end="url(#mmd-0e690f1a3b120749_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_W2_Q_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_Q_K1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_Q_K2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-0e690f1a3b120749-flowchart-W2-0" data-look="classic" transform="translate(186.2734375, 78.5)"><rect class="basic label-container" style="" x="-79.125" y="-33" width="158.25" height="66"/><g class="label" style="" transform="translate(-55.125, -21)"><rect/><foreignObject width="110.25" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Web Server<br />returns in ~50ms</p></span></div></foreignObject></g></g><g class="node default" id="mmd-0e690f1a3b120749-flowchart-Q-1" data-look="classic" transform="translate(186.2734375, 203)"><polygon points="0,0 116.125,0 116.125,-33 0,-33 0,0 -8,0 124.125,0 124.125,-33 -8,-33 -8,0" class="label-container" transform="translate(-58.0625,16.5)"/><g class="label" style="" transform="translate(-52.0625, -10.5)"><rect/><foreignObject width="104.125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Message Queue</p></span></div></foreignObject></g></g><g class="node default" id="mmd-0e690f1a3b120749-flowchart-K1-3" data-look="classic" transform="translate(108.63671875, 317)"><rect class="basic label-container" style="" x="-52.1484375" y="-22.5" width="104.296875" height="45"/><g class="label" style="" transform="translate(-28.1484375, -10.5)"><rect/><foreignObject width="56.296875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Worker 1</p></span></div></foreignObject></g></g><g class="node default" id="mmd-0e690f1a3b120749-flowchart-K2-5" data-look="classic" transform="translate(263.91015625, 317)"><rect class="basic label-container" style="" x="-53.125" y="-22.5" width="106.25" height="45"/><g class="label" style="" transform="translate(-29.125, -10.5)"><rect/><foreignObject width="58.25" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Worker 2</p></span></div></foreignObject></g></g></g></g></g></g></g><defs><filter id="mmd-0e690f1a3b120749-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-0e690f1a3b120749-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-0e690f1a3b120749-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>The queue buys you two distinct things that are worth naming separately:</p>
+<ul>
+<li><strong>Decoupling.</strong> The producer doesn't need to know who consumes, how many consumers exist, or whether any are running right now. Workers can be deployed, restarted, or scaled independently of the web tier.</li>
+<li><strong>Buffering / load levelling.</strong> A traffic spike grows the queue instead of overwhelming the workers. You now scale workers on <strong>queue depth</strong> — a far better signal than CPU — and a backlog degrades latency gracefully rather than dropping requests.</li>
+</ul>
+<h3 id="gotchas--failure-modes-5" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Delivery guarantees.</strong> <em>At-most-once</em> can drop messages. <em>At-least-once</em> is the common default and can deliver duplicates. <em>Exactly-once</em> is mostly unachievable end-to-end; what is practical is at-least-once delivery plus <strong>idempotent consumers</strong> — handlers safe to run twice, usually via a deduplication key. Design for duplicates rather than assuming they can't happen.</li>
+<li><strong>Poison messages and the dead-letter queue.</strong> One malformed message that crashes its consumer gets redelivered forever and blocks everything behind it. A <strong>DLQ</strong> parks messages after N failures so the rest of the queue keeps moving — and the DLQ needs an alert, or failures pile up silently.</li>
+<li><strong>Ordering is not free.</strong> Most queues guarantee order only within a partition or key, and the moment you run multiple consumers in parallel, global ordering is gone. If order matters, partition by a key (e.g. <code>user_id</code>) so related messages stay sequential.</li>
+<li><strong>Backpressure.</strong> If producers are permanently faster than consumers, the queue grows without bound until it hits its limit and starts rejecting or dropping. A queue smooths <em>spikes</em>; it cannot fix a sustained capacity shortfall.</li>
+<li><strong>The user-visible contract changes.</strong> &quot;Your upload is being processed&quot; is a different product experience from &quot;done&quot;, and the client needs some way to learn about completion — polling, a webhook, or a push notification.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>proposing a queue invites &quot;what if a worker crashes halfway through?&quot; The expected answer involves retries, visibility timeouts, idempotency, and a DLQ.</p>
+</div>
+<p>Covered in much more depth in <a href="19-distributed-message-queue.html">Chapter 19 – Distributed Message Queue</a>.</p>
+<p><strong>What it now costs you:</strong> eventual completion instead of immediate results, duplicate handling, and another piece of infrastructure to monitor.</p>
+<hr>
+</section>
+<section id="section-11-logging-metrics-and-automation">
+<h2 id="section-11-logging-metrics-and-automation">Section 11: Logging, Metrics, and Automation</h2>
+<p align="left">
+   <img loading="lazy" decoding="async" alt="" src="../../system-design-notes/01.%20Scaling/images/logging.png" data-width="400" style="max-width:400px" />
+</p>
+<p><strong>What broke:</strong> with a dozen components across multiple regions, &quot;the site is slow&quot; is no longer a question you can answer by reading one log file over SSH. You cannot operate what you cannot see.</p>
+<h3 id="importance">Importance</h3>
+<ol>
+<li><strong>Logging:</strong> Tracks errors and system health.</li>
+<li><strong>Metrics:</strong> Provides insights into performance and user activity.</li>
+<li><strong>Automation:</strong> Streamlines testing, deployment, and scaling.</li>
+</ol>
+<h3 id="the-three-pillars">The three pillars</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Pillar</th>
+<th>Answers</th>
+<th>Shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Metrics</strong></td>
+<td>&quot;Is something wrong, and since when?&quot;</td>
+<td>Cheap numeric time series — rates, errors, durations, saturation</td>
+</tr>
+<tr>
+<td><strong>Logs</strong></td>
+<td>&quot;What exactly happened in this case?&quot;</td>
+<td>Expensive, high-detail events. Aggregate centrally; local log files are useless at this scale</td>
+</tr>
+<tr>
+<td><strong>Traces</strong></td>
+<td>&quot;Which of the twelve components is the slow one?&quot;</td>
+<td>One request followed across services via a propagated trace ID</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Metrics are usefully grouped by level:</p>
+<ul>
+<li><strong>Host</strong> — CPU, memory, disk, network per machine.</li>
+<li><strong>Aggregated tier</strong> — database query latency, cache hit rate, queue depth, pool utilisation.</li>
+<li><strong>Business</strong> — signups, revenue, daily active users. These are the ones that tell you whether an incident actually mattered.</li>
+</ul>
+<h3 id="gotchas--failure-modes-6" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Averages hide outages.</strong> A mean response time looks fine while 5% of users time out. Alert and design against <strong>percentiles</strong> — p95, p99 — not averages.</li>
+<li><strong>Alert on symptoms, not causes.</strong> &quot;Error rate above 1% for 5 minutes&quot; is actionable; &quot;CPU above 80%&quot; fires constantly and trains everyone to ignore alerts. Alert fatigue is a real failure mode.</li>
+<li><strong>Logs without a correlation ID are nearly unusable</strong> once a request crosses several services. Generate a request ID at the edge and propagate it everywhere.</li>
+</ul>
+<p><strong>What it now costs you:</strong> real spend on observability — it is common for log and metric volume to rival application traffic — plus the discipline to keep alerts meaningful.</p>
+<hr>
+</section>
+<section id="section-12-database-scaling">
+<h2 id="section-12-database-scaling">Section 12: Database Scaling</h2>
+<h3 id="vertical-scaling-1">Vertical Scaling</h3>
+<ul>
+<li>Adds hardware resources but has physical and cost limitations.</li>
+<li>Has multiple drawbacks:
+<ul>
+<li>Greater risk of single point of failures.</li>
+<li>Overall cost of vertical scaling is high</li>
+</ul>
+</li>
+</ul>
+<p><strong>What broke:</strong> replicas scaled reads; caches scaled reads further. But <strong>every write still lands on one master</strong>, and no amount of replication changes that. When write throughput or raw data volume exceeds what one machine can hold, the data tier has to be split.</p>
+<h3 id="horizontal-scaling-sharding">Horizontal Scaling (Sharding)</h3>
+<p align="left">
+   <img loading="lazy" decoding="async" alt="" src="../../system-design-notes/01.%20Scaling/images/horizontal-scaling.png" data-width="400" style="max-width:400px" />
+</p>
+<ul>
+<li>Divides data across multiple shards using keys (e.g., <code>user_id</code>).
+<ul>
+<li>Sharding separates large databases into smaller, more easily managed parts called shards.</li>
+<li>Each shard shares the same schema, though the actual data on each shard is unique to the shard.</li>
+</ul>
+</li>
+<li>Sharding key is critical when implementing a sharding strategy. When choosing a sharding key it is important to choose a key that can evenly distribute data.</li>
+</ul>
+<h3 id="sharding-strategies">Sharding strategies</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>How the shard is chosen</th>
+<th>Pros</th>
+<th>Cons</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Range</strong></td>
+<td>By key ranges (A–F, G–M…)</td>
+<td>Range scans stay on one shard</td>
+<td>Hotspots — sequential keys like timestamps all land on the newest shard</td>
+</tr>
+<tr>
+<td><strong>Hash</strong></td>
+<td><code>hash(key) % N</code></td>
+<td>Even distribution, trivial to compute</td>
+<td>Changing <code>N</code> reshuffles nearly all data</td>
+</tr>
+<tr>
+<td><strong>Consistent hashing</strong></td>
+<td>Key and nodes placed on a hash ring</td>
+<td>Adding or removing a node moves only a small slice of keys</td>
+<td>More machinery. See <a href="05-consistent-hashing.html">Chapter 5</a></td>
+</tr>
+<tr>
+<td><strong>Directory / lookup</strong></td>
+<td>An explicit key → shard mapping table</td>
+<td>Maximum flexibility; move individual keys at will</td>
+<td>The lookup table is a new dependency and potential SPOF</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="choosing-a-sharding-key">Choosing a sharding key</h3>
+<p>The sharding key determines everything downstream, and it is hard to change later. A good key:</p>
+<ul>
+<li><strong>Distributes evenly</strong> — no shard holds a disproportionate share of data or traffic.</li>
+<li><strong>Appears in your common queries</strong>, so most requests reach a single shard. A query without the shard key must fan out to <em>every</em> shard and wait for the slowest — which is how a sharded system ends up slower than the single database it replaced.</li>
+<li><strong>Keeps related data together</strong> — co-locating a user's rows on one shard keeps their transactions and joins local.</li>
+</ul>
+<h4 id="challenges">Challenges</h4>
+<ol>
+<li>
+<p><strong>Resharding data:</strong> Resharding data is needed when:</p>
+<ul>
+<li>Single shard could no longer hold more data due to rapid growth.</li>
+<li>Certain shards might experience shard exhaustion faster than others due to uneven data distribution.</li>
+<li>Consistent Hashing is used to overcome these problems</li>
+</ul>
+<p>Resharding is a genuinely difficult live migration: data must move while reads and writes continue, usually via dual writes and a backfill, with a careful cutover. A common way to make it cheaper later is to shard into many more <strong>logical</strong> shards than you have physical machines from the start, so growth means relocating whole logical shards rather than rehashing individual rows.</p>
+</li>
+<li>
+<p><strong>Celebrity problem:</strong>  Excessive access to a specific shard could cause server overload.</p>
+<ul>
+<li>To solve this problem, we may need to allocate a shard for each celebrity.</li>
+</ul>
+<p>Also called the <strong>hot shard</strong> problem, and it is the usual reason an evenly <em>sized</em> sharding scheme still fails — data is balanced but <em>traffic</em> is not. Beyond dedicating shards, options are caching those keys hard (<a href="#section-6-caching">§6</a>) or splitting the hot key's data across shards with a composite key.</p>
+</li>
+<li>
+<p><strong>Join and de-normalization:</strong> Once a database has been sharded across multiple servers, it is hard to perform join operations across database shards.</p>
+<ul>
+<li>A common workaround is to de-normalize the database so that queries can be performed in a single table.</li>
+</ul>
+</li>
+<li>
+<p><strong>Cross-shard transactions.</strong> ACID guarantees stop at the shard boundary. A transaction spanning shards needs two-phase commit (slow, and it blocks on failures) or a saga of compensating actions. The usual answer is to design so transactions never cross shards — which is itself a sharding-key decision.</p>
+</li>
+<li>
+<p><strong>Unique IDs.</strong> <code>AUTO_INCREMENT</code> is per-shard, so primary keys collide across shards. You need globally unique IDs instead — see <a href="07-unique-id-generator.html">Chapter 7 – Unique ID Generator</a>.</p>
+</li>
+</ol>
+<div class="callout callout-quote">
+<p><strong>Shard last.</strong> Sharding is close to a one-way door: it changes your data model, your queries, and your operations permanently. Exhaust the cheaper options first — add indexes and fix slow queries, cache harder, add replicas, scale the master up, archive cold data to a separate store, and move high-volume non-relational data out to a store built for it. Many systems that &quot;need sharding&quot; actually need one missing index.</p>
+</div>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>the strongest answer names the sharding key <em>and</em> what breaks because of it — &quot;shard by <code>user_id</code>, so a user's own data is one shard, but 'all orders yesterday across users' now fans out, which is why that query goes to an analytics store instead.&quot;</p>
+</div>
+<p>Sharded storage is the subject of <a href="06-key-value-store.html">Chapter 6 – Key-Value Store</a>.</p>
+<hr>
+</section>
+<section id="conclusion">
+<h2 id="conclusion">Conclusion</h2>
+<h3 id="key-takeaways">Key Takeaways</h3>
+<ol>
+<li>Keep the web tier stateless.</li>
+<li>Build redundancy at every tier.</li>
+<li>Use caching and CDNs to optimize performance.</li>
+<li>Scale the data tier with sharding.</li>
+<li>Decouple components for flexibility.</li>
+</ol>
+<h3 id="the-whole-chapter-in-one-table">The whole chapter in one table</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Bottleneck</th>
+<th>Fix</th>
+<th>What you pay for it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>App and DB contend for resources</td>
+<td>Separate the tiers</td>
+<td>An extra network hop; a second system to operate</td>
+</tr>
+<tr>
+<td>One server's hard ceiling</td>
+<td>Scale up, or scale out</td>
+<td>Scaling out requires everything below</td>
+</tr>
+<tr>
+<td>Web tier is a SPOF and saturates</td>
+<td>Load balancer + multiple servers</td>
+<td>The LB itself; sticky-session temptation</td>
+</tr>
+<tr>
+<td>Reads saturate the database</td>
+<td>Read replicas</td>
+<td>Replication lag; stale reads; failover complexity</td>
+</tr>
+<tr>
+<td>Repeated expensive reads</td>
+<td>Cache tier</td>
+<td>A consistency window; a cold cache can now cause an outage</td>
+</tr>
+<tr>
+<td>Distance to users</td>
+<td>CDN</td>
+<td>Third-party cost; a cache you don't fully control</td>
+</tr>
+<tr>
+<td>Sessions pinned to servers</td>
+<td>Stateless web tier + shared session store</td>
+<td>A session store on the critical path; revocation design</td>
+</tr>
+<tr>
+<td>Regional outages, global latency</td>
+<td>Multi-data-center</td>
+<td>Write conflicts; much harder deployments; big bill</td>
+</tr>
+<tr>
+<td>Slow work inside requests</td>
+<td>Queue + workers</td>
+<td>Eventual completion; duplicates; backpressure</td>
+</tr>
+<tr>
+<td>No visibility</td>
+<td>Logs, metrics, traces</td>
+<td>Real spend; alert discipline</td>
+</tr>
+<tr>
+<td>Writes saturate the database</td>
+<td>Sharding</td>
+<td>Cross-shard joins and transactions; resharding; a near-irreversible decision</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="interview-self-check">Interview self-check</h3>
+<p>If you can answer these from memory, this chapter has done its job:</p>
+<ol>
+<li>Why does separating the database come before adding a load balancer?</li>
+<li>When is vertical scaling the <em>better</em> choice?</li>
+<li>A user updates their profile and immediately sees the old value. What happened, and how would you fix it?</li>
+<li>Your cache cluster restarts cold at peak traffic. What happens next, and how do you survive it?</li>
+<li>How do you ship a CSS change when the old file has a one-year CDN TTL?</li>
+<li>What specifically becomes possible once the web tier is stateless?</li>
+<li>A worker crashes halfway through processing a message. What stops the job being lost, and what stops it running twice?</li>
+<li>You shard by <code>user_id</code>. Which queries just got expensive?</li>
+<li>Why can't you simply add more replicas to handle more writes?</li>
+<li>Your p99 latency doubled but the average is unchanged. What does that tell you?</li>
+</ol>
+<h3 id="glossary">Glossary</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>QPS</strong></td>
+<td>Queries per second. The standard unit of traffic in estimations</td>
+</tr>
+<tr>
+<td><strong>SPOF</strong></td>
+<td>Single point of failure — a component whose loss takes the system down</td>
+</tr>
+<tr>
+<td><strong>Vertical / horizontal scaling</strong></td>
+<td>A bigger machine / more machines</td>
+</tr>
+<tr>
+<td><strong>Stateless</strong></td>
+<td>A server holding no per-user state, so any server can serve any request</td>
+</tr>
+<tr>
+<td><strong>Replication lag</strong></td>
+<td>The delay before a write on the primary is visible on a replica</td>
+</tr>
+<tr>
+<td><strong>Split-brain</strong></td>
+<td>Two nodes both believing they are the primary, accepting divergent writes</td>
+</tr>
+<tr>
+<td><strong>Shard</strong></td>
+<td>One partition of a dataset, holding the same schema but different rows</td>
+</tr>
+<tr>
+<td><strong>Hot key / hot shard</strong></td>
+<td>A single key or shard receiving disproportionate traffic</td>
+</tr>
+<tr>
+<td><strong>Cache stampede</strong></td>
+<td>Many simultaneous misses on one expired key overwhelming the database</td>
+</tr>
+<tr>
+<td><strong>Idempotent</strong></td>
+<td>Safe to execute more than once with the same result</td>
+</tr>
+<tr>
+<td><strong>DLQ</strong></td>
+<td>Dead-letter queue — where repeatedly failing messages are parked</td>
+</tr>
+<tr>
+<td><strong>Eventual consistency</strong></td>
+<td>Replicas converge on the same value, but not immediately</td>
+</tr>
+<tr>
+<td><strong>p95 / p99</strong></td>
+<td>The latency 95% / 99% of requests come in under</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="where-to-go-next">Where to go next</h3>
+<ul>
+<li><a href="02-back-of-the-envelope-estimation.html">Chapter 2 – Back-of-the-envelope Estimation</a> — how to decide <em>which</em> of these steps your numbers actually justify.</li>
+<li><a href="03-system-design-framework.html">Chapter 3 – A Framework for System Design Interviews</a> — how to deploy this toolbox under time pressure.</li>
+</ul>
+<p>This chapter provides a solid foundation for building scalable systems that can handle millions of users.</p>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

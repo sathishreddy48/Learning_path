@@ -1,0 +1,294 @@
+/* ==========================================================================
+   site-additions.css — appended to the DotNet stylesheet by the build
+   --------------------------------------------------------------------------
+   Everything above this line is DotNet/assets/css/site.css verbatim. These
+   rules cover what the System Design site has and the C# site does not:
+   the notes' raw <img> diagrams, pre-rendered Mermaid SVGs, section accents,
+   pull-quotes, and the interactive explainer panels.
+   ========================================================================== */
+
+/* ---- diagrams from the notes -------------------------------------------- */
+/* The notes carry authored width="450" attributes, which the build converts to
+   an inline max-width. These rules keep that intent but let the image shrink
+   on a narrow screen rather than forcing a horizontal scroll. */
+.main img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius);
+  background: var(--grey-0);
+}
+.main p[align="center"],
+.main p[align="left"] {
+  margin: 1rem 0;
+}
+.main p[align="center"] { text-align: center; }
+.main p[align="center"] img,
+.main p[align="left"] img {
+  border: 1px solid var(--border);
+  padding: .35rem;
+}
+
+/* ---- pre-rendered Mermaid ----------------------------------------------- */
+/* The SVGs are rendered once at build time with the light palette baked in,
+   so the panel stays light in dark mode too. That is deliberate and matches
+   how the notes' PNG diagrams already behave (--grey-0 is not redefined for
+   dark); the alternative is shipping two renders of all 40 diagrams. */
+figure.mermaid-fig {
+  margin: 1.25rem 0;
+  padding: 1rem .75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--grey-0);
+  overflow-x: auto;
+  text-align: center;
+}
+figure.mermaid-fig svg {
+  max-width: 100%;
+  height: auto;
+  display: inline-block;
+}
+
+/* ---- a plain pull-quote (a blockquote with no "Label:" lead-in) --------- */
+.callout-quote {
+  border-left-color: var(--primary-lighter);
+  background: var(--bg-alt);
+  font-size: .94rem;
+}
+
+/* ---- recurring section accents ------------------------------------------ */
+/* data-kind is set by the build from the H2's slug, so these follow the notes'
+   own conventions without the build rearranging any prose. */
+section[data-kind="self-check"] > h2::before { content: "？"; }
+section[data-kind="glossary"] > h2::before { content: "§"; }
+section[data-kind="further"] > h2::before { content: "→"; }
+section[data-kind] > h2::before {
+  display: inline-block;
+  width: 1.5rem;
+  margin-left: -1.5rem;
+  color: var(--text-faint);
+  font-weight: 400;
+}
+
+section[data-kind="self-check"] > ol,
+section[data-kind="self-check"] > ul {
+  border-left: 3px solid var(--success);
+  background: var(--success-lightest);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  margin: 1rem 0;
+  padding: .85rem 1rem .85rem 2.4rem;
+}
+section[data-kind="glossary"] { font-size: .92rem; }
+section[data-kind="further"] ul { font-size: .9rem; }
+
+/* "Gotchas & failure modes" — the production-bites sections */
+h3.h-gotchas,
+h4.h-gotchas {
+  color: var(--warning-dark);
+  border-left: 3px solid var(--warning);
+  padding-left: .6rem;
+  margin-left: -.75rem;
+}
+
+/* ---- interactive explainers --------------------------------------------- */
+figure.anim {
+  margin: 1.75rem 0;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-top: 3px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+.anim-head {
+  display: block;
+  padding: .85rem 1rem .75rem;
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--border);
+}
+.anim-title {
+  display: block;
+  font-size: .72rem;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  font-weight: 700;
+  color: var(--accent-dark);
+  margin-bottom: .25rem;
+}
+.anim-caption {
+  display: block;
+  font-size: .86rem;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+.anim-stage { padding: 1rem; }
+.anim-fallback { font-size: .88rem; color: var(--text-muted); margin: 0; }
+
+/* controls */
+.anim-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+  align-items: center;
+  margin-bottom: .9rem;
+}
+.anim-btn {
+  font: inherit;
+  font-size: .82rem;
+  padding: .4rem .7rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.anim-btn:hover:not(:disabled) { border-color: var(--primary); background: var(--primary-lightest); }
+.anim-btn:active:not(:disabled) { background: var(--primary-subtle); }
+.anim-btn:disabled { opacity: .45; cursor: not-allowed; }
+.anim-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.anim-btn.primary { border-color: var(--primary); background: var(--primary); color: #fff; }
+.anim-btn.primary:hover:not(:disabled) { background: var(--primary-dark); border-color: var(--primary-dark); }
+.anim-btn.danger { border-color: var(--border-strong); color: var(--accent-dark); }
+.anim-btn.danger:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-lightest); }
+
+.anim-seg {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.anim-seg button {
+  font: inherit;
+  font-size: .82rem;
+  padding: .4rem .7rem;
+  border: 0;
+  background: var(--surface);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.anim-seg button + button { border-left: 1px solid var(--border); }
+.anim-seg button[aria-pressed="true"] { background: var(--primary); color: #fff; font-weight: 600; }
+.anim-seg button:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+
+.anim-spacer { flex: 1 1 auto; }
+.anim-hint { font-size: .78rem; color: var(--text-faint); }
+
+/* readouts */
+.anim-readout {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+  margin-bottom: .9rem;
+}
+.anim-stat {
+  flex: 1 1 7rem;
+  padding: .5rem .65rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-alt);
+}
+.anim-stat dt {
+  margin: 0 0 .15rem;
+  font-size: .68rem;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-faint);
+}
+.anim-stat dd {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.anim-stat.is-bad dd { color: var(--accent-dark); }
+.anim-stat.is-good dd { color: var(--success-dark); }
+
+.anim-note {
+  margin: .75rem 0 0;
+  font-size: .85rem;
+  color: var(--text-muted);
+  line-height: 1.55;
+}
+.anim-note strong { color: var(--text); }
+
+/* svg stage */
+.anim-svg { display: block; width: 100%; height: auto; }
+.anim-svg text { font-family: inherit; }
+
+/* rate-limiter panel grid */
+.anim-panels {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: .75rem;
+}
+.anim-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-alt);
+  padding: .65rem .7rem .7rem;
+}
+.anim-panel h4 {
+  margin: 0 0 .1rem;
+  font-size: .82rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: .5rem;
+}
+.anim-panel .panel-score {
+  font-size: .74rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+.anim-panel .panel-score .ok { color: var(--success-dark); }
+.anim-panel .panel-score .no { color: var(--accent-dark); }
+.anim-panel p.panel-sub {
+  margin: 0 0 .5rem;
+  font-size: .74rem;
+  color: var(--text-faint);
+  line-height: 1.4;
+}
+
+/* the shared request track */
+.anim-track {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+  padding: .6rem .7rem;
+  margin-bottom: .9rem;
+}
+.anim-track h4 {
+  margin: 0 0 .4rem;
+  font-size: .7rem;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-faint);
+  font-weight: 700;
+}
+
+/* reduced motion: the explainers stay fully usable, they just stop animating
+   on their own — every control still works step by step. */
+@media (prefers-reduced-motion: reduce) {
+  .anim-svg * { transition: none !important; animation: none !important; }
+}
+
+/* ---- narrow screens ----------------------------------------------------- */
+@media (max-width: 700px) {
+  .anim-stage { padding: .7rem; }
+  .anim-stat { flex: 1 1 5.5rem; }
+  .anim-stat dd { font-size: 1rem; }
+  .anim-controls { gap: .4rem; }
+  .anim-btn, .anim-seg button { font-size: .78rem; padding: .35rem .55rem; }
+  .main p[align="center"] img,
+  .main p[align="left"] img { padding: .2rem; }
+  section[data-kind] > h2::before { display: none; }
+  section[data-kind="self-check"] > ol,
+  section[data-kind="self-check"] > ul { padding-left: 1.6rem; }
+}
+
+/* ---- print -------------------------------------------------------------- */
+@media print {
+  figure.anim { break-inside: avoid; }
+  .anim-controls { display: none; }
+}

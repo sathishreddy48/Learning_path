@@ -1,0 +1,16 @@
+{
+  "name": "learning-path-tools",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Build scripts for the Learning_path static sites. Dev-only; the generated sites have no runtime dependencies.",
+  "type": "module",
+  "scripts": {
+    "build": "node build-system-design.mjs"
+  },
+  "dependencies": {
+    "markdown-it": "^14.1.0"
+  },
+  "devDependencies": {
+    "@mermaid-js/mermaid-cli": "^11.4.2"
+  }
+}

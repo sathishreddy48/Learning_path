@@ -1,0 +1,668 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 10: Design a Notification System — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="10-notification-system">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 1 Systems › Chapter 10 of 28</div>
+  <h1>Chapter 10: Design a Notification System</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#step-1-understanding-the-problem">Step 1: Understanding the Problem</a></li><li><a href="#step-2-high-level-design">Step 2: High-Level Design</a></li><li><a href="#step-3-design-deep-dive">Step 3: Design Deep Dive</a></li><li><a href="#key-optimizations">Key Optimizations</a></li><li><a href="#the-design-as-problem-and-technique">The design, as problem and technique</a></li><li><a href="#self-check">Self-check</a></li><li><a href="#glossary">Glossary</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>A <strong>notification system</strong> is essential for modern applications, providing timely updates like product notifications, events, offers, and alerts. Notifications can be sent through:</p>
+<ol>
+<li><strong>Push notifications</strong> (mobile or desktop),</li>
+<li><strong>SMS messages</strong>, and</li>
+<li><strong>Emails</strong>.</li>
+</ol>
+<p>The chapter focuses on designing a scalable system capable of sending millions of notifications daily.</p>
+<p><strong>The one-sentence version:</strong> a notification system owns almost none of the delivery — APNS, Twilio and SendGrid do the actual sending — so the design is not about transport but about everything around an unreliable, rate-limited, third-party boundary: <strong>queue the work, retry it correctly, never send it twice, and never send so much that the user turns you off.</strong></p>
+<p>The two failure modes worth fearing are opposite in character. Losing a password-reset email is a support ticket; sending the same push notification four million times is an incident, a flood of uninstalls, and possibly a regulatory problem. A good design is defensive in both directions at once.</p>
+<hr>
+</section>
+<section id="step-1-understanding-the-problem">
+<h2 id="step-1-understanding-the-problem">Step 1: Understanding the Problem</h2>
+<h3 id="requirements">Requirements</h3>
+<ul>
+<li><strong>Notification Types:</strong> Push notifications, SMS, and Emails.</li>
+<li><strong>Delivery:</strong> Soft real-time system with minimal delays.</li>
+<li><strong>Platforms:</strong> iOS, Android, and desktop.</li>
+<li><strong>Triggers:</strong> Notifications can be triggered by client applications or scheduled on servers.</li>
+<li><strong>Scale:</strong>
+<ul>
+<li><strong>Push Notifications:</strong> 10 million/day,</li>
+<li><strong>SMS:</strong> 1 million/day,</li>
+<li><strong>Emails:</strong> 5 million/day.</li>
+</ul>
+</li>
+<li><strong>Opt-out Support:</strong> Users can disable specific notification types.</li>
+</ul>
+<h3 id="what-the-scale-numbers-really-say">What the scale numbers really say</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Channel</th>
+<th>Volume/day</th>
+<th>Average rate</th>
+<th>Approximate unit cost</th>
+<th>Daily cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Push</td>
+<td>10 M</td>
+<td>~116/sec</td>
+<td>~free</td>
+<td>~0</td>
+</tr>
+<tr>
+<td>Email</td>
+<td>5 M</td>
+<td>~58/sec</td>
+<td>~$0.0005</td>
+<td>~$2,500</td>
+</tr>
+<tr>
+<td>SMS</td>
+<td>1 M</td>
+<td>~12/sec</td>
+<td>~$0.0075</td>
+<td><strong>~$7,500</strong></td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td><strong>16 M</strong></td>
+<td><strong>~185/sec</strong></td>
+<td></td>
+<td><strong>~$10,000/day</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Two observations that change the design:</p>
+<p><strong>185 notifications/second is trivially small — and completely misleading.</strong> Notifications are not uniform; they arrive in blasts. A single marketing campaign pushing 10 million notifications over ten minutes is <strong>~16,600/sec</strong>, roughly 90× the average. The system is therefore sized for a burst it experiences occasionally, which is exactly the case a queue exists to absorb: workers drain at a sustainable rate while the queue holds the spike.</p>
+<p><strong>The lowest-volume channel is the most expensive.</strong> SMS is 6% of the volume and roughly 75% of the cost — about $2.7 M/year at this rate. That makes per-channel rate limiting, deduplication, and retry policy a <em>financial</em> control, not just a technical one. A retry bug that doubles SMS sends costs real money the same day.</p>
+<h3 id="the-three-channels-are-not-interchangeable">The three channels are not interchangeable</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Push</th>
+<th>SMS</th>
+<th>Email</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Requires</td>
+<td>App installed, token granted</td>
+<td>Phone number</td>
+<td>Address</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>Effectively free</td>
+<td>Highest</td>
+<td>Low</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Seconds</td>
+<td>Seconds</td>
+<td>Seconds to minutes</td>
+</tr>
+<tr>
+<td>Payload</td>
+<td>Small (APNS ~4 KB)</td>
+<td>160 chars/segment</td>
+<td>Unbounded, rich</td>
+</tr>
+<tr>
+<td>Delivery confirmation</td>
+<td>Accepted by APNS/FCM ≠ shown to user</td>
+<td>Carrier receipt, sometimes</td>
+<td>Accepted ≠ inbox ≠ read</td>
+</tr>
+<tr>
+<td>User can silence it</td>
+<td>OS settings, instantly</td>
+<td>Carrier/<code>STOP</code></td>
+<td>Spam folder</td>
+</tr>
+<tr>
+<td>Regulated by</td>
+<td>Platform policy</td>
+<td>TCPA and equivalents — consent is mandatory</td>
+<td>CAN-SPAM, GDPR — unsubscribe is mandatory</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The row that matters most is <strong>delivery confirmation</strong>: for every channel, the provider confirms it <em>accepted</em> the message, not that it reached a human. A notification system can never truthfully report delivery, only acceptance — which is why engagement tracking exists further down the chapter.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>derive the burst rate (a 10-minute campaign is ~90× the average) and name SMS as the cost centre. Both show you are reasoning about the system rather than reciting its diagram, and both lead naturally into the queue and the rate limiter.</p>
+</div>
+<hr>
+</section>
+<section id="step-2-high-level-design">
+<h2 id="step-2-high-level-design">Step 2: High-Level Design</h2>
+<h3 id="components">Components</h3>
+<ol>
+<li>
+<p><strong>Notification Types:</strong></p>
+<ul>
+<li><strong>iOS Push Notifications:</strong> Use <strong>Apple Push Notification Service (APNS)</strong>.</li>
+<li><strong>Android Push Notifications:</strong> Use <strong>Firebase Cloud Messaging (FCM)</strong>.</li>
+<li><strong>SMS Messages:</strong> Third-party services like Twilio or Nexmo.</li>
+<li><strong>Emails:</strong> Commercial email services like SendGrid or Mailchimp.</li>
+</ul>
+</li>
+<li>
+<p><strong>Contact Info Gathering:</strong></p>
+<p align="left">
+   <img loading="lazy" decoding="async" src="../../system-design-notes/10.%20Notification%20System/images/contact-info-gathering.png" alt="Contact Info Gathering" data-width="500" style="max-width:500px">
+</p>
+<ul>
+<li>Collect device tokens, phone numbers, or email addresses during app installation or signup.</li>
+<li>Store contact info in the database:
+<ul>
+<li><strong>Device Tokens Table:</strong> For push notifications.</li>
+<li><strong>User Table:</strong> For emails and phone numbers.</li>
+</ul>
+</li>
+</ul>
+<p>A device token is a <strong>per-device, per-install</strong> credential, so the tables are one-to-many: one user, several devices, several tokens. Tokens also <strong>expire and get revoked</strong> — an app uninstall, a device reset, or a platform rotation invalidates one. APNS and FCM report this back as a per-token error, and that feedback must be acted on: prune the dead token. A system that ignores it accumulates an ever-growing set of tokens that can never succeed, wastes a slot in every fan-out, and eventually gets throttled by the provider for persistently sending to invalid destinations.</p>
+</li>
+<li>
+<p><strong>Notification Sending Flow:</strong></p>
+<p align="left">
+   <img loading="lazy" decoding="async" src="../../system-design-notes/10.%20Notification%20System/images/high-level-design.png" alt="High Level Design" data-width="500" style="max-width:500px">
+</p>
+<ul>
+<li><strong>Trigger Services:</strong>
+<ul>
+<li>Generate events to initiate notifications (e.g., billing reminders, shipping updates).</li>
+<li>A service can be a micro-service, a cron job, or a distributed system that triggers notification sending events.</li>
+</ul>
+</li>
+<li><strong>Notification Server:</strong>
+<ul>
+<li>Provide APIs for services to send notifications.</li>
+<li>Carry out basic validations to verify emails, phone numbers.</li>
+<li>Query the database or cache to fetch data needed to render a notification.</li>
+</ul>
+</li>
+<li><strong>Third-Party Services:</strong> Deliver notifications to users.</li>
+</ul>
+</li>
+</ol>
+<p><strong>The boundary to keep in view.</strong> Everything to the left of the third-party services is yours and can be made as reliable as you like. Everything to the right is a network call to a system that will, routinely: time out, return 429, go down for an hour, accept a message and never deliver it, and change its rate limits without warning. The architecture that follows is almost entirely a response to that fact.</p>
+<h3 id="challenges-in-initial-design">Challenges in Initial Design</h3>
+<ul>
+<li><strong>Single Point of Failure (SPOF):</strong> One notification server can crash the entire system.</li>
+<li><strong>Scalability Issues:</strong> Hard to scale databases, caches, and processing components independently.</li>
+<li><strong>Performance Bottlenecks:</strong> High resource demands for sending notifications.</li>
+</ul>
+<h3 id="improved-design">Improved Design</h3>
+   <p align="left">
+      <img loading="lazy" decoding="async" src="../../system-design-notes/10.%20Notification%20System/images/improved-design.png" alt="Improved Design" data-width="500" style="max-width:500px">
+   </p>
+<ul>
+<li>Move databases and caches out of the notification server.</li>
+<li>Introduce <strong>horizontal scaling</strong> with multiple notification servers.</li>
+<li>Use <strong>message queues</strong> to decouple system components.
+<ul>
+<li>Message queues serve as buffers when high volumes of notifications are to be sent out.</li>
+</ul>
+</li>
+<li>Add workers that pull notification events from message queues and send them to corresponding third party services.</li>
+</ul>
+<p><strong>What broke:</strong> a synchronous notification server calls the third party inline, so its latency is the provider's latency and its availability is the product of every provider's availability. When APNS slows down, requests pile up, threads are consumed, and the trigger services calling your API start timing out — a provider's bad day becomes your outage.</p>
+<p><strong>The fix, and why it is specifically a queue.</strong> Accepting the request, persisting it, and returning immediately converts a synchronous dependency into an asynchronous one. The queue then does three distinct jobs that are easy to conflate:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Job</th>
+<th>What it means here</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Buffering</strong></td>
+<td>Absorbs the 16,600/sec campaign burst while workers drain at a sustainable rate</td>
+</tr>
+<tr>
+<td><strong>Isolation</strong></td>
+<td>Separate queues per channel mean an SMS provider outage cannot block push notifications</td>
+</tr>
+<tr>
+<td><strong>Retry substrate</strong></td>
+<td>A message stays in the queue (or returns to it) until acknowledged, which is what makes retries possible at all</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Why one queue per channel, not one queue.</strong> With a single shared queue, a stalled provider's messages sit at the head and block everything behind them — <strong>head-of-line blocking</strong>. Per-channel queues confine the damage to that channel. The same argument then applies one level further: transactional notifications (one-time passcodes, password resets) must not queue behind a marketing campaign, so they need their own high-priority path with its own workers. A user waiting on an OTP experiences queue depth as a broken login.</p>
+<p><strong>What it now costs you:</strong> the API can no longer tell the caller whether delivery succeeded, only that the request was accepted. Delivery outcome becomes an asynchronous fact, which is why the notification log and event tracking below are not optional extras — they are the only way anyone can answer &quot;did it go out?&quot;.</p>
+<figure class="mermaid-fig">
+<svg id="mmd-149fe534f5f66739" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1177.41px; background-color: transparent;" viewBox="0 0 1177.40625 530.9888916015625" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd-149fe534f5f66739{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-149fe534f5f66739 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-149fe534f5f66739 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-149fe534f5f66739 .error-icon{fill:#f4f6f8;}#mmd-149fe534f5f66739 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-149fe534f5f66739 .edge-thickness-normal{stroke-width:1px;}#mmd-149fe534f5f66739 .edge-thickness-thick{stroke-width:3.5px;}#mmd-149fe534f5f66739 .edge-pattern-solid{stroke-dasharray:0;}#mmd-149fe534f5f66739 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-149fe534f5f66739 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-149fe534f5f66739 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-149fe534f5f66739 .marker{fill:#637381;stroke:#637381;}#mmd-149fe534f5f66739 .marker.cross{stroke:#637381;}#mmd-149fe534f5f66739 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-149fe534f5f66739 p{margin:0;}#mmd-149fe534f5f66739 .label{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#161c24;}#mmd-149fe534f5f66739 .cluster-label text{fill:#454f5b;}#mmd-149fe534f5f66739 .cluster-label span{color:#454f5b;}#mmd-149fe534f5f66739 .cluster-label span p{background-color:transparent;}#mmd-149fe534f5f66739 .label text,#mmd-149fe534f5f66739 span{fill:#161c24;color:#161c24;}#mmd-149fe534f5f66739 .node rect,#mmd-149fe534f5f66739 .node circle,#mmd-149fe534f5f66739 .node ellipse,#mmd-149fe534f5f66739 .node polygon,#mmd-149fe534f5f66739 .node path{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-149fe534f5f66739 .rough-node .label text,#mmd-149fe534f5f66739 .node .label text,#mmd-149fe534f5f66739 .image-shape .label,#mmd-149fe534f5f66739 .icon-shape .label{text-anchor:middle;}#mmd-149fe534f5f66739 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd-149fe534f5f66739 .rough-node .label,#mmd-149fe534f5f66739 .node .label,#mmd-149fe534f5f66739 .image-shape .label,#mmd-149fe534f5f66739 .icon-shape .label{text-align:center;}#mmd-149fe534f5f66739 .node.clickable{cursor:pointer;}#mmd-149fe534f5f66739 .root .anchor path{fill:#637381!important;stroke-width:0;stroke:#637381;}#mmd-149fe534f5f66739 .arrowheadPath{fill:#000000;}#mmd-149fe534f5f66739 .edgePaths .path{stroke:#637381;stroke-width:1px;}#mmd-149fe534f5f66739 .flowchart-link{stroke:#637381;fill:none;}#mmd-149fe534f5f66739 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-149fe534f5f66739 .edgeLabel p{background-color:#ffffff;}#mmd-149fe534f5f66739 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-149fe534f5f66739 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd-149fe534f5f66739 .cluster rect{fill:#f9fafb;stroke:#dfe3e8;stroke-width:1px;}#mmd-149fe534f5f66739 .cluster text{fill:#454f5b;}#mmd-149fe534f5f66739 .cluster span{color:#454f5b;}#mmd-149fe534f5f66739 .node .collapsed-indicator{fill:#dfe3e8;stroke:none;opacity:0.6;}#mmd-149fe534f5f66739 .node .collapsed-separator{stroke:#dfe3e8;stroke-width:0.75px;}#mmd-149fe534f5f66739 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:12px;background:#f4f6f8;border:1px solid #c4cdd5;border-radius:2px;pointer-events:none;z-index:100;}#mmd-149fe534f5f66739 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-149fe534f5f66739 rect.text{fill:none;stroke-width:0;}#mmd-149fe534f5f66739 .icon-shape,#mmd-149fe534f5f66739 .image-shape{background-color:#ffffff;text-align:center;}#mmd-149fe534f5f66739 .icon-shape p,#mmd-149fe534f5f66739 .image-shape p{background-color:#ffffff;padding:2px;}#mmd-149fe534f5f66739 .icon-shape .label rect,#mmd-149fe534f5f66739 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-149fe534f5f66739 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd-149fe534f5f66739 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd-149fe534f5f66739 .node .neo-node{stroke:#299a8d;}#mmd-149fe534f5f66739 [data-look="neo"].node rect,#mmd-149fe534f5f66739 [data-look="neo"].cluster rect,#mmd-149fe534f5f66739 [data-look="neo"].node polygon{stroke:url(#mmd-149fe534f5f66739-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-149fe534f5f66739 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-149fe534f5f66739 [data-look="neo"].node path{stroke:url(#mmd-149fe534f5f66739-gradient);stroke-width:1px;}#mmd-149fe534f5f66739 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-149fe534f5f66739 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-149fe534f5f66739 [data-look="neo"].node circle{stroke:url(#mmd-149fe534f5f66739-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-149fe534f5f66739 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-149fe534f5f66739 [data-look="neo"].icon-shape .icon{fill:url(#mmd-149fe534f5f66739-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-149fe534f5f66739 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-149fe534f5f66739-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-149fe534f5f66739 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd-149fe534f5f66739_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-149fe534f5f66739_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-149fe534f5f66739_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-149fe534f5f66739_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-149fe534f5f66739_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-149fe534f5f66739_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-149fe534f5f66739_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-149fe534f5f66739_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-149fe534f5f66739_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-149fe534f5f66739_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd-149fe534f5f66739_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd-149fe534f5f66739_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M159.5,219.577L163.667,219.577C167.833,219.577,176.167,219.577,183.833,219.577C191.5,219.577,198.5,219.577,202,219.577L205.5,219.577" id="mmd-149fe534f5f66739-L_TS_API_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_TS_API_0" data-points="W3sieCI6MTU5LjUsInkiOjIxOS41NzY5MTk1NTU2NjQwNn0seyJ4IjoxODQuNSwieSI6MjE5LjU3NjkxOTU1NTY2NDA2fSx7IngiOjIwOS41LCJ5IjoyMTkuNTc2OTE5NTU1NjY0MDZ9XQ==" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M344.385,186.577L362.608,162.786C380.83,138.995,417.274,91.414,438.997,67.623C460.719,43.832,467.719,43.832,471.219,43.832L474.719,43.832" id="mmd-149fe534f5f66739-L_API_DB_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_DB_0" data-points="W3sieCI6MzQ0LjM4NTMzNzExMjM3NDgsInkiOjE4Ni41NzY5MTk1NTU2NjQwNn0seyJ4Ijo0NTMuNzE4NzUsInkiOjQzLjgzMjQ5NjY0MzA2NjQwNn0seyJ4Ijo0NzguNzE4NzUsInkiOjQzLjgzMjQ5NjY0MzA2NjQwNn1d" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M385.004,186.577L396.457,180.842C407.909,175.106,430.814,163.636,446.553,157.9C462.292,152.165,470.865,152.165,475.151,152.165L479.438,152.165" id="mmd-149fe534f5f66739-L_API_QP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_QP_0" data-points="W3sieCI6Mzg1LjAwNDM4MjMyMDIwNjgsInkiOjE4Ni41NzY5MTk1NTU2NjQwNn0seyJ4Ijo0NTMuNzE4NzUsInkiOjE1Mi4xNjQ5OTMyODYxMzI4fSx7IngiOjQ4My40Mzc1LCJ5IjoxNTIuMTY0OTkzMjg2MTMyOH1d" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M351.223,252.577L368.306,270.131C385.388,287.685,419.554,322.793,441.363,340.347C463.172,357.901,472.625,357.901,477.352,357.901L482.078,357.901" id="mmd-149fe534f5f66739-L_API_QS_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_QS_0" data-points="W3sieCI6MzUxLjIyMzIwOTk4NTUxMzgsInkiOjI1Mi41NzY5MTk1NTU2NjQwNn0seyJ4Ijo0NTMuNzE4NzUsInkiOjM1Ny45MDA3NzIwOTQ3MjY1Nn0seyJ4Ijo0ODYuMDc4MTI1LCJ5IjozNTcuOTAwNzcyMDk0NzI2NTZ9XQ==" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M338.148,252.577L357.41,285.964C376.671,319.352,415.195,386.126,438.536,419.513C461.878,452.901,470.036,452.901,474.116,452.901L478.195,452.901" id="mmd-149fe534f5f66739-L_API_QE_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_API_QE_0" data-points="W3sieCI6MzM4LjE0Nzc2MDE3NDM0MTgsInkiOjI1Mi41NzY5MTk1NTU2NjQwNn0seyJ4Ijo0NTMuNzE4NzUsInkiOjQ1Mi45MDA3NzIwOTQ3MjY1Nn0seyJ4Ijo0ODIuMTk1MzEyNSwieSI6NDUyLjkwMDc3MjA5NDcyNjU2fV0=" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M607.016,152.165L618.691,152.165C630.367,152.165,653.719,152.165,675.823,152.165C697.927,152.165,718.784,152.165,729.212,152.165L739.641,152.165" id="mmd-149fe534f5f66739-L_QP_WP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_QP_WP_0" data-points="W3sieCI6NjA3LjAxNTYyNSwieSI6MTUyLjE2NDk5MzI4NjEzMjh9LHsieCI6Njc3LjA3MDMxMjUsInkiOjE1Mi4xNjQ5OTMyODYxMzI4fSx7IngiOjc0My42NDA2MjUsInkiOjE1Mi4xNjQ5OTMyODYxMzI4fV0=" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M878.016,152.165L891.855,152.165C905.695,152.165,933.375,152.165,960.195,154.737C987.015,157.31,1012.975,162.454,1025.956,165.026L1038.936,167.599" id="mmd-149fe534f5f66739-L_WP_P3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_WP_P3_0" data-points="W3sieCI6ODc4LjAxNTYyNSwieSI6MTUyLjE2NDk5MzI4NjEzMjh9LHsieCI6OTYxLjA1NDY4NzUsInkiOjE1Mi4xNjQ5OTMyODYxMzI4fSx7IngiOjEwNDIuODU5Mzc1LCJ5IjoxNjguMzc2MTUzNzYwMDE1NDN9XQ==" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M604.375,357.901L616.491,357.901C628.607,357.901,652.839,357.901,675.824,357.901C698.81,357.901,720.549,357.901,731.419,357.901L742.289,357.901" id="mmd-149fe534f5f66739-L_QS_WS_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_QS_WS_0" data-points="W3sieCI6NjA0LjM3NSwieSI6MzU3LjkwMDc3MjA5NDcyNjU2fSx7IngiOjY3Ny4wNzAzMTI1LCJ5IjozNTcuOTAwNzcyMDk0NzI2NTZ9LHsieCI6NzQ2LjI4OTA2MjUsInkiOjM1Ny45MDA3NzIwOTQ3MjY1Nn1d" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M875.367,378.345L889.648,382.869C903.93,387.393,932.492,396.441,963.232,400.965C993.971,405.489,1026.888,405.489,1043.346,405.489L1059.805,405.489" id="mmd-149fe534f5f66739-L_WS_S3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_WS_S3_0" data-points="W3sieCI6ODc1LjM2NzE4NzUsInkiOjM3OC4zNDUxNTY5ODY2ODE1Nn0seyJ4Ijo5NjEuMDU0Njg3NSwieSI6NDA1LjQ4ODg0NTgyNTE5NTN9LHsieCI6MTA2My44MDQ2ODc1LCJ5Ijo0MDUuNDg4ODQ1ODI1MTk1M31d" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M608.258,452.901L619.727,452.901C631.195,452.901,654.133,452.901,675.824,452.901C697.516,452.901,717.961,452.901,728.184,452.901L738.406,452.901" id="mmd-149fe534f5f66739-L_QE_WE_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_QE_WE_0" data-points="W3sieCI6NjA4LjI1NzgxMjUsInkiOjQ1Mi45MDA3NzIwOTQ3MjY1Nn0seyJ4Ijo2NzcuMDcwMzEyNSwieSI6NDUyLjkwMDc3MjA5NDcyNjU2fSx7IngiOjc0Mi40MDYyNSwieSI6NDUyLjkwMDc3MjA5NDcyNjU2fV0=" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M879.25,474.575L892.884,478.894C906.518,483.213,933.786,491.851,961.906,496.17C990.026,500.489,1018.997,500.489,1033.483,500.489L1047.969,500.489" id="mmd-149fe534f5f66739-L_WE_E3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_WE_E3_0" data-points="W3sieCI6ODc5LjI1LCJ5Ijo0NzQuNTc1MTM2MzIyMjcwNn0seyJ4Ijo5NjEuMDU0Njg3NSwieSI6NTAwLjQ4ODg0NTgyNTE5NTN9LHsieCI6MTA1MS45Njg3NSwieSI6NTAwLjQ4ODg0NTgyNTE5NTN9XQ==" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M849.238,174.665L867.874,185.582C886.51,196.498,923.783,218.332,955.504,236.113C987.226,253.894,1013.396,267.622,1026.482,274.487L1039.567,281.351" id="mmd-149fe534f5f66739-L_WP_DLQ_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_WP_DLQ_0" data-points="W3sieCI6ODQ5LjIzODMyNTYzOTIwNDUsInkiOjE3NC42NjQ5OTMyODYxMzI4fSx7IngiOjk2MS4wNTQ2ODc1LCJ5IjoyNDAuMTY0OTkzMjg2MTMyOH0seyJ4IjoxMDQzLjEwOTM3NSwieSI6MjgzLjIwOTE0Njg0OTUwMTF9XQ==" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M863.788,335.401L879.999,328.513C896.21,321.626,928.632,307.852,957.853,300.964C987.073,294.077,1013.091,294.077,1026.1,294.077L1039.109,294.077" id="mmd-149fe534f5f66739-L_WS_DLQ_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_WS_DLQ_0" data-points="W3sieCI6ODYzLjc4NzkxMjMxNzQ2NSwieSI6MzM1LjQwMDc3MjA5NDcyNjU2fSx7IngiOjk2MS4wNTQ2ODc1LCJ5IjoyOTQuMDc2OTE5NTU1NjY0MDZ9LHsieCI6MTA0My4xMDkzNzUsInkiOjI5NC4wNzY5MTk1NTU2NjQwNn1d" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M844.187,430.401L863.665,417.263C883.143,404.126,922.099,377.852,954.668,357.523C987.238,337.194,1013.421,322.812,1026.512,315.62L1039.603,308.429" id="mmd-149fe534f5f66739-L_WE_DLQ_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_WE_DLQ_0" data-points="W3sieCI6ODQ0LjE4NzQ3Mjk4NzE1NzMsInkiOjQzMC40MDA3NzIwOTQ3MjY1Nn0seyJ4Ijo5NjEuMDU0Njg3NSwieSI6MzUxLjU3NjkxOTU1NTY2NDA2fSx7IngiOjEwNDMuMTA5Mzc1LCJ5IjozMDYuNTAzMzg4NTg4MzU4NjN9XQ==" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/><path d="M1042.859,193.454L1029.225,196.156C1015.591,198.858,988.323,204.261,949.651,206.963C910.979,209.665,860.904,209.665,813.573,209.665C766.242,209.665,721.656,209.665,677.389,209.665C633.122,209.665,589.174,209.665,551.949,209.665C514.724,209.665,484.221,209.665,465.468,209.923C446.715,210.181,439.712,210.696,436.21,210.954L432.708,211.212" id="mmd-149fe534f5f66739-L_P3_API_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_P3_API_0" data-points="W3sieCI6MTA0Mi44NTkzNzUsInkiOjE5My40NTM4MzI4MTIyNTAyfSx7IngiOjk2MS4wNTQ2ODc1LCJ5IjoyMDkuNjY0OTkzMjg2MTMyOH0seyJ4Ijo4MTAuODI4MTI1LCJ5IjoyMDkuNjY0OTkzMjg2MTMyOH0seyJ4Ijo2NzcuMDcwMzEyNSwieSI6MjA5LjY2NDk5MzI4NjEzMjh9LHsieCI6NTQ1LjIyNjU2MjUsInkiOjIwOS42NjQ5OTMyODYxMzI4fSx7IngiOjQ1My43MTg3NSwieSI6MjA5LjY2NDk5MzI4NjEzMjh9LHsieCI6NDI4LjcxODc1LCJ5IjoyMTEuNTA1ODYxNzc0OTYwNDR9XQ==" data-look="classic" marker-end="url(#mmd-149fe534f5f66739_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_TS_API_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_DB_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_QP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_QS_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_API_QE_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_QP_WP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_WP_P3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_QS_WS_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_WS_S3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_QE_WE_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_WE_E3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(945.12247, 230.83219)"><g class="label" data-id="L_WP_DLQ_0" transform="translate(-56.8046875, -10.5)"><foreignObject width="113.609375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>permanent failure</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_WS_DLQ_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_WE_DLQ_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(677.0703125, 209.6649932861328)"><g class="label" data-id="L_P3_API_0" transform="translate(-40.3359375, -10.5)"><foreignObject width="80.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>invalid token</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-149fe534f5f66739-flowchart-TS-0" data-look="classic" transform="translate(83.75, 219.57691955566406)"><rect class="basic label-container" style="" x="-75.75" y="-22.5" width="151.5" height="45"/><g class="label" style="" transform="translate(-51.75, -10.5)"><rect/><foreignObject width="103.5" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Trigger services</p></span></div></foreignObject></g></g><g class="node default" id="mmd-149fe534f5f66739-flowchart-API-1" data-look="classic" transform="translate(319.109375, 219.57691955566406)"><rect class="basic label-container" style="" x="-109.609375" y="-33" width="219.21875" height="66"/><g class="label" style="" transform="translate(-85.609375, -21)"><rect/><foreignObject width="171.21875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Notification servers<br />validate · dedup · template</p></span></div></foreignObject></g></g><g class="node default" id="mmd-149fe534f5f66739-flowchart-DB-3" data-look="classic" transform="translate(545.2265625, 43.832496643066406)"><path d="M0,12.888330406346515 a66.5078125,12.888330406346515 0,0,0 133.015625,0 a66.5078125,12.888330406346515 0,0,0 -133.015625,0 l0,45.88833040634651 a66.5078125,12.888330406346515 0,0,0 133.015625,0 l0,-45.88833040634651" class="basic label-container outer-path" style="" transform="translate(-66.5078125, -35.83249560951977)"/><g class="label" style="" transform="translate(-60.5078125, -2.5)"><rect/><foreignObject width="121.015625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Notification log DB</p></span></div></foreignObject></g></g><g class="node default" id="mmd-149fe534f5f66739-flowchart-QP-5" data-look="classic" transform="translate(545.2265625, 152.1649932861328)"><rect class="basic label-container" style="" x="-61.7890625" y="-22.5" width="123.578125" height="45"/><g class="label" style="" transform="translate(-37.7890625, -10.5)"><rect/><foreignObject width="75.578125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>push queue</p></span></div></foreignObject></g></g><g class="node default" id="mmd-149fe534f5f66739-flowchart-QS-7" data-look="classic" transform="translate(545.2265625, 357.90077209472656)"><rect class="basic label-container" style="" x="-59.1484375" y="-22.5" width="118.296875" height="45"/><g class="label" style="" transform="translate(-35.1484375, -10.5)"><rect/><foreignObject width="70.296875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>sms queue</p></span></div></foreignObject></g></g><g class="node default" id="mmd-149fe534f5f66739-flowchart-QE-9" data-look="classic" transform="translate(545.2265625, 452.90077209472656)"><rect class="basic label-container" style="" x="-63.03125" y="-22.5" width="126.0625" height="45"/><g class="label" style="" transform="translate(-39.03125, -10.5)"><rect/><foreignObject width="78.0625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>email queue</p></span></div></foreignObject></g></g><g class="node default" id="mmd-149fe534f5f66739-flowchart-WP-11" data-look="classic" transform="translate(810.828125, 152.1649932861328)"><rect class="basic label-container" style="" x="-67.1875" y="-22.5" width="134.375" height="45"/><g class="label" style="" transform="translate(-43.1875, -10.5)"><rect/><foreignObject width="86.375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>push workers</p></span></div></foreignObject></g></g><g class="node default" id="mmd-149fe534f5f66739-flowchart-P3-12" data-look="classic" transform="translate(1106.1328125, 180.9149932861328)"><rect class="basic label-container" style="" x="-63.2734375" y="-22.5" width="126.546875" height="45"/><g class="label" style="" transform="translate(-39.2734375, -10.5)"><rect/><foreignObject width="78.546875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>APNS / FCM</p></span></div></foreignObject></g></g><g class="node default" id="mmd-149fe534f5f66739-flowchart-WS-14" data-look="classic" transform="translate(810.828125, 357.90077209472656)"><rect class="basic label-container" style="" x="-64.5390625" y="-22.5" width="129.078125" height="45"/><g class="label" style="" transform="translate(-40.5390625, -10.5)"><rect/><foreignObject width="81.078125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>sms workers</p></span></div></foreignObject></g></g><g class="node default" id="mmd-149fe534f5f66739-flowchart-S3-15" data-look="classic" transform="translate(1106.1328125, 405.4888458251953)"><rect class="basic label-container" style="" x="-42.328125" y="-22.5" width="84.65625" height="45"/><g class="label" style="" transform="translate(-18.328125, -10.5)"><rect/><foreignObject width="36.65625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Twilio</p></span></div></foreignObject></g></g><g class="node default" id="mmd-149fe534f5f66739-flowchart-WE-17" data-look="classic" transform="translate(810.828125, 452.90077209472656)"><rect class="basic label-container" style="" x="-68.421875" y="-22.5" width="136.84375" height="45"/><g class="label" style="" transform="translate(-44.421875, -10.5)"><rect/><foreignObject width="88.84375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>email workers</p></span></div></foreignObject></g></g><g class="node default" id="mmd-149fe534f5f66739-flowchart-E3-18" data-look="classic" transform="translate(1106.1328125, 500.4888458251953)"><rect class="basic label-container" style="" x="-54.1640625" y="-22.5" width="108.328125" height="45"/><g class="label" style="" transform="translate(-30.1640625, -10.5)"><rect/><foreignObject width="60.328125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>SendGrid</p></span></div></foreignObject></g></g><g class="node default" id="mmd-149fe534f5f66739-flowchart-DLQ-20" data-look="classic" transform="translate(1106.1328125, 294.07691955566406)"><path d="M0,12.552125474575215 a63.0234375,12.552125474575215 0,0,0 126.046875,0 a63.0234375,12.552125474575215 0,0,0 -126.046875,0 l0,45.55212547457521 a63.0234375,12.552125474575215 0,0,0 126.046875,0 l0,-45.55212547457521" class="basic label-container outer-path" style="" transform="translate(-63.0234375, -35.32818821186282)"/><g class="label" style="" transform="translate(-57.0234375, -2.5)"><rect/><foreignObject width="114.046875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>dead letter queue</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd-149fe534f5f66739-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-149fe534f5f66739-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-149fe534f5f66739-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<hr>
+</section>
+<section id="step-3-design-deep-dive">
+<h2 id="step-3-design-deep-dive">Step 3: Design Deep Dive</h2>
+<h3 id="reliability">Reliability</h3>
+<ol>
+<li>
+<p><strong>Prevent Data Loss:</strong></p>
+<p align="left">
+<img loading="lazy" decoding="async" src="../../system-design-notes/10.%20Notification%20System/images/data-loss.png" alt="Data Loss" data-width="400" style="max-width:400px">
+</p>
+<ul>
+<li>Persist notification data in a database and implement a retry mechanism.</li>
+<li>The Notification log database is included for data persistence.</li>
+</ul>
+</li>
+<li>
+<p><strong>Deduplication:</strong></p>
+<ul>
+<li>Check event IDs to avoid sending duplicate notifications.</li>
+<li>When a notification event first arrives, check if it is seen before by checking the event ID.
+If seen before discard it, otherwise send out the notification.</li>
+</ul>
+</li>
+</ol>
+<p><strong>Why duplicates are guaranteed, not hypothetical.</strong> Message queues deliver <strong>at least once</strong>. A worker that sends a notification and then crashes before acknowledging the message will see that message again — the send already happened, and nothing in the queue knows it. Add client retries on the ingest API and provider-level retries, and duplicates arrive from three independent directions.</p>
+<p><strong>Exactly-once delivery is not available</strong>, and claiming it is a red flag. What is achievable is <em>at-least-once delivery plus idempotent processing</em>, which produces exactly-once <strong>effects</strong> most of the time:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Mechanism</th>
+<th>What it gives you</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Event ID supplied by the caller</td>
+<td>Lets the <em>caller's</em> retry be recognised as the same logical notification</td>
+</tr>
+<tr>
+<td>Dedup store (<code>seen event IDs</code>, with TTL)</td>
+<td>Rejects a repeat within the window</td>
+</tr>
+<tr>
+<td>Atomic check-and-set</td>
+<td>Prevents two workers from both passing the check concurrently</td>
+</tr>
+<tr>
+<td>Provider idempotency key</td>
+<td>Lets the provider reject the duplicate even if yours slipped through</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The dedup store cannot grow forever, so it holds a <strong>window</strong> — hours or days. That makes deduplication best-effort by construction: a duplicate arriving after the window expires will be sent. The honest statement is &quot;duplicates are suppressed within a bounded window&quot;, and the window is a deliberate choice between memory and safety.</p>
+<p><strong>The check must be atomic.</strong> A read-then-write (&quot;have I seen this? no — record it, then send&quot;) lets two workers processing the same message both read &quot;no&quot;. Use a single conditional write — <code>SETNX</code> in Redis, an insert against a unique constraint — so exactly one worker wins and the loser discards.</p>
+<h3 id="retries-the-part-that-is-usually-wrong">Retries: the part that is usually wrong</h3>
+<p>Retrying is easy; retrying <em>correctly</em> requires classifying the failure first.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Provider response</th>
+<th>Class</th>
+<th>Correct action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Timeout, connection reset, 5xx</td>
+<td>Transient</td>
+<td>Retry with exponential backoff and jitter</td>
+</tr>
+<tr>
+<td>429 / rate limited</td>
+<td>Transient, self-inflicted</td>
+<td>Back off, and lower the send rate — not just this message</td>
+</tr>
+<tr>
+<td>Invalid device token, unsubscribed, invalid number</td>
+<td><strong>Permanent</strong></td>
+<td>Do not retry. Prune the contact and stop</td>
+</tr>
+<tr>
+<td>4xx malformed request</td>
+<td><strong>Permanent</strong></td>
+<td>Do not retry. This is a bug; alert on it</td>
+</tr>
+<tr>
+<td>Accepted (2xx)</td>
+<td>Success, provisionally</td>
+<td>Record acceptance — not delivery</td>
+</tr>
+</tbody>
+</table>
+</div>
+<figure class="mermaid-fig">
+<svg id="mmd-f148a01690209fd0" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="statediagram" style="max-width: 530.652px; background-color: transparent;" viewBox="0 0 530.65234375 505" role="graphics-document document" aria-roledescription="stateDiagram"><style>#mmd-f148a01690209fd0{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;fill:#161c24;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd-f148a01690209fd0 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd-f148a01690209fd0 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd-f148a01690209fd0 .error-icon{fill:#f4f6f8;}#mmd-f148a01690209fd0 .error-text{fill:#454f5b;stroke:#454f5b;}#mmd-f148a01690209fd0 .edge-thickness-normal{stroke-width:1px;}#mmd-f148a01690209fd0 .edge-thickness-thick{stroke-width:3.5px;}#mmd-f148a01690209fd0 .edge-pattern-solid{stroke-dasharray:0;}#mmd-f148a01690209fd0 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd-f148a01690209fd0 .edge-pattern-dashed{stroke-dasharray:3;}#mmd-f148a01690209fd0 .edge-pattern-dotted{stroke-dasharray:2;}#mmd-f148a01690209fd0 .marker{fill:#637381;stroke:#637381;}#mmd-f148a01690209fd0 .marker.cross{stroke:#637381;}#mmd-f148a01690209fd0 svg{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;}#mmd-f148a01690209fd0 p{margin:0;}#mmd-f148a01690209fd0 defs [id$="-barbEnd"]{fill:#637381;stroke:#637381;}#mmd-f148a01690209fd0 g.stateGroup text{fill:#299a8d;stroke:none;font-size:10px;}#mmd-f148a01690209fd0 g.stateGroup text{fill:#161c24;stroke:none;font-size:10px;}#mmd-f148a01690209fd0 g.stateGroup .state-title{font-weight:bolder;fill:#161c24;}#mmd-f148a01690209fd0 g.stateGroup rect{fill:#f1f7f6;stroke:#299a8d;}#mmd-f148a01690209fd0 g.stateGroup line{stroke:#637381;stroke-width:1;}#mmd-f148a01690209fd0 .transition{stroke:#637381;stroke-width:1;fill:none;}#mmd-f148a01690209fd0 .stateGroup .composit{fill:#ffffff;border-bottom:1px;}#mmd-f148a01690209fd0 .stateGroup .alt-composit{fill:#e0e0e0;border-bottom:1px;}#mmd-f148a01690209fd0 .state-note{stroke:#e76f51;fill:#fcf4f2;}#mmd-f148a01690209fd0 .state-note text{fill:#161c24;stroke:none;font-size:10px;}#mmd-f148a01690209fd0 .stateLabel .box{stroke:none;stroke-width:0;fill:#f1f7f6;opacity:0.5;}#mmd-f148a01690209fd0 .edgeLabel .label rect{fill:#f1f7f6;opacity:0.5;}#mmd-f148a01690209fd0 .edgeLabel{background-color:#ffffff;text-align:center;}#mmd-f148a01690209fd0 .edgeLabel p{background-color:#ffffff;}#mmd-f148a01690209fd0 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd-f148a01690209fd0 .edgeLabel .label text{fill:#161c24;}#mmd-f148a01690209fd0 .label div .edgeLabel{color:#161c24;}#mmd-f148a01690209fd0 .stateLabel text{fill:#161c24;font-size:10px;font-weight:bold;}#mmd-f148a01690209fd0 .node circle.state-start{fill:#637381;stroke:#637381;}#mmd-f148a01690209fd0 .node .fork-join{fill:#637381;stroke:#637381;}#mmd-f148a01690209fd0 .node circle.state-end{fill:#299a8d;stroke:#ffffff;stroke-width:1.5;}#mmd-f148a01690209fd0 .end-state-inner{fill:#ffffff;stroke-width:1.5;}#mmd-f148a01690209fd0 .node rect{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-f148a01690209fd0 .node polygon{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-f148a01690209fd0 [id$="-barbEnd"]{fill:#637381;}#mmd-f148a01690209fd0 .statediagram-cluster rect{fill:#f1f7f6;stroke:#299a8d;stroke-width:1px;}#mmd-f148a01690209fd0 .cluster-label,#mmd-f148a01690209fd0 .nodeLabel{color:#161c24;}#mmd-f148a01690209fd0 .statediagram-cluster rect.outer{rx:5px;ry:5px;}#mmd-f148a01690209fd0 .statediagram-state .divider{stroke:#299a8d;}#mmd-f148a01690209fd0 .statediagram-state .title-state{rx:5px;ry:5px;}#mmd-f148a01690209fd0 .statediagram-cluster.statediagram-cluster .inner{fill:#ffffff;}#mmd-f148a01690209fd0 .statediagram-cluster.statediagram-cluster-alt .inner{fill:#f4f6f8;}#mmd-f148a01690209fd0 .statediagram-cluster .inner{rx:0;ry:0;}#mmd-f148a01690209fd0 .statediagram-state rect.basic{rx:5px;ry:5px;}#mmd-f148a01690209fd0 .statediagram-state rect.divider{stroke-dasharray:10,10;fill:#f4f6f8;}#mmd-f148a01690209fd0 .note-edge{stroke-dasharray:5;}#mmd-f148a01690209fd0 .statediagram-note rect{fill:#fcf4f2;stroke:#e76f51;stroke-width:1px;rx:0;ry:0;}#mmd-f148a01690209fd0 .statediagram-note rect{fill:#fcf4f2;stroke:#e76f51;stroke-width:1px;rx:0;ry:0;}#mmd-f148a01690209fd0 .statediagram-note text{fill:#161c24;}#mmd-f148a01690209fd0 .statediagram-note .nodeLabel{color:#161c24;}#mmd-f148a01690209fd0 .statediagram .edgeLabel{color:red;}#mmd-f148a01690209fd0 [id$="-dependencyStart"],#mmd-f148a01690209fd0 [id$="-dependencyEnd"]{fill:#637381;stroke:#637381;stroke-width:1;}#mmd-f148a01690209fd0 .statediagramTitleText{text-anchor:middle;font-size:18px;fill:#161c24;}#mmd-f148a01690209fd0 [data-look="neo"].statediagram-cluster rect{fill:#f1f7f6;stroke:url(#mmd-f148a01690209fd0-gradient);stroke-width:1;}#mmd-f148a01690209fd0 [data-look="neo"].statediagram-cluster rect.outer{rx:5px;ry:5px;filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-f148a01690209fd0 .node .neo-node{stroke:#299a8d;}#mmd-f148a01690209fd0 [data-look="neo"].node rect,#mmd-f148a01690209fd0 [data-look="neo"].cluster rect,#mmd-f148a01690209fd0 [data-look="neo"].node polygon{stroke:url(#mmd-f148a01690209fd0-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-f148a01690209fd0 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd-f148a01690209fd0 [data-look="neo"].node path{stroke:url(#mmd-f148a01690209fd0-gradient);stroke-width:1px;}#mmd-f148a01690209fd0 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-f148a01690209fd0 [data-look="neo"].node .neo-line path{stroke:#299a8d;filter:none;}#mmd-f148a01690209fd0 [data-look="neo"].node circle{stroke:url(#mmd-f148a01690209fd0-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-f148a01690209fd0 [data-look="neo"].node circle .state-start{fill:#000000;}#mmd-f148a01690209fd0 [data-look="neo"].icon-shape .icon{fill:url(#mmd-f148a01690209fd0-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-f148a01690209fd0 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd-f148a01690209fd0-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd-f148a01690209fd0 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><defs><marker id="mmd-f148a01690209fd0_stateDiagram-barbEnd" refX="19" refY="7" markerWidth="20" markerHeight="14" markerUnits="userSpaceOnUse" orient="auto"><path d="M 19,7 L9,13 L14,7 L9,1 Z"/></marker></defs><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M306.23,22L306.23,26.167C306.23,30.333,306.23,38.667,306.23,47C306.23,55.333,306.23,63.667,306.23,67.833L306.23,72" id="mmd-f148a01690209fd0-edge0" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge0" data-points="W3sieCI6MzA2LjIzMDQ2ODc1LCJ5IjoyMn0seyJ4IjozMDYuMjMwNDY4NzUsInkiOjQ3fSx7IngiOjMwNi4yMzA0Njg3NSwieSI6NzJ9XQ==" data-look="classic" marker-end="url(#mmd-f148a01690209fd0_stateDiagram-barbEnd)"/><path d="M306.23,109L306.23,113.167C306.23,117.333,306.23,125.667,306.23,134C306.23,142.333,306.23,150.667,306.23,154.833L306.23,159" id="mmd-f148a01690209fd0-edge1" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge1" data-points="W3sieCI6MzA2LjIzMDQ2ODc1LCJ5IjoxMDl9LHsieCI6MzA2LjIzMDQ2ODc1LCJ5IjoxMzR9LHsieCI6MzA2LjIzMDQ2ODc1LCJ5IjoxNTl9XQ==" data-look="classic" marker-end="url(#mmd-f148a01690209fd0_stateDiagram-barbEnd)"/><path d="M340.629,188.236L363.733,195.446C386.837,202.657,433.046,217.079,456.15,233.289C479.254,249.5,479.254,267.5,479.254,285.5C479.254,303.5,479.254,321.5,479.254,336.417C479.254,351.333,479.254,363.167,479.254,369.083L479.254,375" id="mmd-f148a01690209fd0-edge2" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge2" data-points="W3sieCI6MzQwLjYyODkwNjI1LCJ5IjoxODguMjM1NjMwMTA3OTE1Mjh9LHsieCI6NDc5LjI1MzkwNjI1LCJ5IjoyMzEuNX0seyJ4Ijo0NzkuMjUzOTA2MjUsInkiOjI4NS41fSx7IngiOjQ3OS4yNTM5MDYyNSwieSI6MzM5LjV9LHsieCI6NDc5LjI1MzkwNjI1LCJ5IjozNzV9XQ==" data-look="classic" marker-end="url(#mmd-f148a01690209fd0_stateDiagram-barbEnd)"/><path d="M281.397,196L273.454,201.917C265.512,207.833,249.627,219.667,249.627,231.5C249.627,243.333,265.512,255.167,273.454,261.083L281.397,267" id="mmd-f148a01690209fd0-edge3" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge3" data-points="W3sieCI6MjgxLjM5NjUyMDU0Mzk4MTQ3LCJ5IjoxOTZ9LHsieCI6MjMzLjc0MjE4NzUsInkiOjIzMS41fSx7IngiOjI4MS4zOTY1MjA1NDM5ODE0NywieSI6MjY3fV0=" data-look="classic" marker-end="url(#mmd-f148a01690209fd0_stateDiagram-barbEnd)"/><path d="M331.064,267L339.007,261.083C346.949,255.167,362.834,243.333,362.834,231.5C362.834,219.667,346.949,207.833,339.007,201.917L331.064,196" id="mmd-f148a01690209fd0-edge4" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge4" data-points="W3sieCI6MzMxLjA2NDQxNjk1NjAxODUzLCJ5IjoyNjd9LHsieCI6Mzc4LjcxODc1LCJ5IjoyMzEuNX0seyJ4IjozMzEuMDY0NDE2OTU2MDE4NTMsInkiOjE5Nn1d" data-look="classic" marker-end="url(#mmd-f148a01690209fd0_stateDiagram-barbEnd)"/><path d="M306.23,304L306.23,309.917C306.23,315.833,306.23,327.667,306.23,339.5C306.23,351.333,306.23,363.167,306.23,369.083L306.23,375" id="mmd-f148a01690209fd0-edge5" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge5" data-points="W3sieCI6MzA2LjIzMDQ2ODc1LCJ5IjozMDR9LHsieCI6MzA2LjIzMDQ2ODc1LCJ5IjozMzkuNX0seyJ4IjozMDYuMjMwNDY4NzUsInkiOjM3NX1d" data-look="classic" marker-end="url(#mmd-f148a01690209fd0_stateDiagram-barbEnd)"/><path d="M271.832,186.423L242.872,193.936C213.911,201.449,155.991,216.474,127.031,232.987C98.07,249.5,98.07,267.5,98.07,285.5C98.07,303.5,98.07,321.5,98.07,336.417C98.07,351.333,98.07,363.167,98.07,369.083L98.07,375" id="mmd-f148a01690209fd0-edge6" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge6" data-points="W3sieCI6MjcxLjgzMjAzMTI1LCJ5IjoxODYuNDIzNDkyNjUzMjY4MDN9LHsieCI6OTguMDcwMzEyNSwieSI6MjMxLjV9LHsieCI6OTguMDcwMzEyNSwieSI6Mjg1LjV9LHsieCI6OTguMDcwMzEyNSwieSI6MzM5LjV9LHsieCI6OTguMDcwMzEyNSwieSI6Mzc1fV0=" data-look="classic" marker-end="url(#mmd-f148a01690209fd0_stateDiagram-barbEnd)"/><path d="M98.07,412L98.07,417.917C98.07,423.833,98.07,435.667,131.62,448.433C165.169,461.199,232.267,474.899,265.816,481.749L299.365,488.598" id="mmd-f148a01690209fd0-edge7" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge7" data-points="W3sieCI6OTguMDcwMzEyNSwieSI6NDEyfSx7IngiOjk4LjA3MDMxMjUsInkiOjQ0Ny41fSx7IngiOjI5OS4zNjU0NDY0Mzc3MTEyLCJ5Ijo0ODguNTk4MzcwMzQzNjQxMjV9XQ==" data-look="classic" marker-end="url(#mmd-f148a01690209fd0_stateDiagram-barbEnd)"/><path d="M306.23,412L306.23,417.917C306.23,423.833,306.23,435.667,306.23,447.499C306.23,459.331,306.23,471.162,306.23,477.078L306.23,482.993" id="mmd-f148a01690209fd0-edge8" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge8" data-points="W3sieCI6MzA2LjIzMDQ2ODc1LCJ5Ijo0MTJ9LHsieCI6MzA2LjIzMDQ2ODc1LCJ5Ijo0NDcuNX0seyJ4IjozMDYuMjMwNDY4NzUsInkiOjQ4Mi45OTMzNTMzNjY4NTE4fV0=" data-look="classic" marker-end="url(#mmd-f148a01690209fd0_stateDiagram-barbEnd)"/><path d="M479.254,412L479.254,417.917C479.254,423.833,479.254,435.667,451.551,448.388C423.848,461.11,368.441,474.719,340.738,481.524L313.035,488.329" id="mmd-f148a01690209fd0-edge9" class="edge-thickness-normal edge-pattern-solid transition" style="fill:none;;;fill:none" data-edge="true" data-et="edge" data-id="edge9" data-points="W3sieCI6NDc5LjI1MzkwNjI1LCJ5Ijo0MTJ9LHsieCI6NDc5LjI1MzkwNjI1LCJ5Ijo0NDcuNX0seyJ4IjozMTMuMDM0ODUxMDIzOTYyMjMsInkiOjQ4OC4zMjg2Mjk2MzA2MzM3fV0=" data-look="classic" marker-end="url(#mmd-f148a01690209fd0_stateDiagram-barbEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="edge0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="edge1" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(479.25390625, 285.5)"><g class="label" data-id="edge2" transform="translate(-43.3984375, -10.5)"><foreignObject width="86.796875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>2xx accepted</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(233.7421875, 231.5)"><g class="label" data-id="edge3" transform="translate(-60.6953125, -10.5)"><foreignObject width="121.390625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>timeout / 5xx / 429</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(378.71875, 231.5)"><g class="label" data-id="edge4" transform="translate(-64.28125, -10.5)"><foreignObject width="128.5625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>after backoff + jitter</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(306.23046875, 339.5)"><g class="label" data-id="edge5" transform="translate(-64.0390625, -10.5)"><foreignObject width="128.078125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>attempts exhausted</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(98.0703125, 285.5)"><g class="label" data-id="edge6" transform="translate(-90.0703125, -10.5)"><foreignObject width="180.140625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>invalid token / unsubscribed</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(98.0703125, 447.5)"><g class="label" data-id="edge7" transform="translate(-74.265625, -10.5)"><foreignObject width="148.53125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>prune contact, no retry</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(306.23046875, 447.5)"><g class="label" data-id="edge8" transform="translate(-96.3828125, -10.5)"><foreignObject width="192.765625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>alert, inspect, replay manually</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="edge9" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmd-f148a01690209fd0-state-root_start-0" data-look="classic" transform="translate(306.23046875, 15)"><circle class="state-start" r="7" width="14" height="14"/></g><g class="node  statediagram-state" id="mmd-f148a01690209fd0-state-Queued-1" data-look="classic" transform="translate(306.23046875, 90.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-33.421875" y="-18.5" width="66.84375" height="37"/><g class="label" style="" transform="translate(-25.421875, -10.5)"><rect/><foreignObject width="50.84375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>Queued</p></span></div></foreignObject></g></g><g class="node  statediagram-state" id="mmd-f148a01690209fd0-state-Sending-6" data-look="classic" transform="translate(306.23046875, 177.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-34.3984375" y="-18.5" width="68.796875" height="37"/><g class="label" style="" transform="translate(-26.3984375, -10.5)"><rect/><foreignObject width="52.796875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>Sending</p></span></div></foreignObject></g></g><g class="node  statediagram-state" id="mmd-f148a01690209fd0-state-Sent-9" data-look="classic" transform="translate(479.25390625, 393.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-22.7890625" y="-18.5" width="45.578125" height="37"/><g class="label" style="" transform="translate(-14.7890625, -10.5)"><rect/><foreignObject width="29.578125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>Sent</p></span></div></foreignObject></g></g><g class="node  statediagram-state" id="mmd-f148a01690209fd0-state-Retrying-5" data-look="classic" transform="translate(306.23046875, 285.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-34.9921875" y="-18.5" width="69.984375" height="37"/><g class="label" style="" transform="translate(-26.9921875, -10.5)"><rect/><foreignObject width="53.984375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>Retrying</p></span></div></foreignObject></g></g><g class="node  statediagram-state" id="mmd-f148a01690209fd0-state-DeadLetter-8" data-look="classic" transform="translate(306.23046875, 393.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-44" y="-18.5" width="88" height="37"/><g class="label" style="" transform="translate(-36, -10.5)"><rect/><foreignObject width="72" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>DeadLetter</p></span></div></foreignObject></g></g><g class="node  statediagram-state" id="mmd-f148a01690209fd0-state-Failed-7" data-look="classic" transform="translate(98.0703125, 393.5)"><rect class="basic label-container" style="" rx="5" ry="5" x="-26.9765625" y="-18.5" width="53.953125" height="37"/><g class="label" style="" transform="translate(-18.9765625, -10.5)"><rect/><foreignObject width="37.953125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel markdown-node-label"><p>Failed</p></span></div></foreignObject></g></g><g class="node default" id="mmd-f148a01690209fd0-state-root_end-9" data-look="classic" transform="translate(306.23046875, 490)"><g class="outer-path"><path d="M7 0 C7 0.40517908122283747, 6.964012880168563 0.816513743121899, 6.893654271085456 1.2155372436685123 C6.823295662002349 1.6145607442151257, 6.716427752933756 2.013397210557766, 6.5778483455013586 2.394141003279681 C6.439268938068961 2.7748847960015954, 6.26476736710249 3.149104622578984, 6.062177826491071 3.4999999999999996 C5.859588285879653 3.8508953774210153, 5.622755194947063 4.189128084166967, 5.362311101832846 4.499513267805774 C5.10186700871863 4.809898451444582, 4.809898451444583 5.10186700871863, 4.499513267805775 5.362311101832846 C4.189128084166968 5.622755194947063, 3.8508953774210166 5.859588285879652, 3.500000000000001 6.06217782649107 C3.149104622578985 6.264767367102489, 2.7748847960015963 6.439268938068961, 2.3941410032796817 6.5778483455013586 C2.013397210557767 6.716427752933756, 1.6145607442151264 6.823295662002349, 1.2155372436685128 6.893654271085456 C0.8165137431218992 6.964012880168563, 0.4051790812228379 7, 4.286263797015736e-16 7 C-0.405179081222837 7, -0.8165137431218985 6.964012880168563, -1.2155372436685121 6.893654271085456 C-1.6145607442151257 6.823295662002349, -2.0133972105577667 6.716427752933756, -2.394141003279681 6.5778483455013586 C-2.774884796001595 6.439268938068961, -3.149104622578983 6.26476736710249, -3.4999999999999982 6.062177826491071 C-3.8508953774210135 5.859588285879653, -4.189128084166966 5.6227551949470636, -4.499513267805773 5.362311101832848 C-4.809898451444581 5.101867008718632, -5.101867008718628 4.809898451444586, -5.3623111018328435 4.499513267805779 C-5.622755194947059 4.189128084166971, -5.859588285879649 3.8508953774210206, -6.062177826491068 3.5000000000000053 C-6.264767367102486 3.14910462257899, -6.439268938068958 2.774884796001602, -6.577848345501356 2.394141003279688 C-6.716427752933754 2.0133972105577738, -6.823295662002347 1.614560744215134, -6.893654271085454 1.215537243668521 C-6.9640128801685615 0.816513743121908, -6.999999999999999 0.4051790812228472, -7 1.0183126166254463e-14 C-7.000000000000001 -0.40517908122282686, -6.964012880168565 -0.8165137431218878, -6.893654271085459 -1.215537243668501 C-6.823295662002352 -1.6145607442151142, -6.716427752933759 -2.0133972105577542, -6.577848345501363 -2.394141003279669 C-6.439268938068967 -2.7748847960015834, -6.264767367102496 -3.149104622578972, -6.062177826491078 -3.4999999999999876 C-5.859588285879661 -3.8508953774210033, -5.6227551949470715 -4.1891280841669545, -5.362311101832856 -4.499513267805763 C-5.10186700871864 -4.809898451444571, -4.809898451444594 -5.10186700871862, -4.499513267805787 -5.362311101832836 C-4.189128084166979 -5.622755194947053, -3.850895377421028 -5.859588285879643, -3.5000000000000133 -6.062177826491062 C-3.1491046225789985 -6.264767367102482, -2.774884796001611 -6.439268938068954, -2.3941410032796973 -6.577848345501353 C-2.0133972105577835 -6.716427752933752, -1.6145607442151435 -6.823295662002345, -1.2155372436685306 -6.893654271085453 C-0.8165137431219176 -6.9640128801685615, -0.40517908122285695 -6.999999999999999, -1.9937625952807352e-14 -7 C0.4051790812228171 -7.000000000000001, 0.8165137431218781 -6.964012880168565, 1.2155372436684913 -6.89365427108546 C1.6145607442151044 -6.823295662002354, 2.013397210557745 -6.716427752933763, 2.3941410032796595 -6.5778483455013665 C2.774884796001574 -6.43926893806897, 3.149104622578963 -6.2647673671025, 3.499999999999979 -6.062177826491083 C3.8508953774209953 -5.859588285879665, 4.189128084166947 -5.622755194947077, 4.499513267805756 -5.362311101832862 C4.809898451444564 -5.1018670087186475, 5.101867008718613 -4.809898451444602, 5.362311101832829 -4.499513267805796 C5.622755194947046 -4.189128084166989, 5.859588285879637 -3.8508953774210393, 6.062177826491056 -3.500000000000025 C6.2647673671024755 -3.1491046225790105, 6.439268938068949 -2.774884796001623, 6.577848345501348 -2.3941410032797092 C6.716427752933747 -2.0133972105577955, 6.823295662002342 -1.6145607442151562, 6.893654271085451 -1.2155372436685434 C6.96401288016856 -0.8165137431219307, 6.982275711847575 -0.2025895406114567, 7 -3.2800750208310675e-14 C7.017724288152425 0.2025895406113911, 7.017724288152424 -0.2025895406114242, 7 0" stroke="none" stroke-width="0" fill="#f1f7f6" style=""/><path d="M7 0 C7 0.40517908122283747, 6.964012880168563 0.816513743121899, 6.893654271085456 1.2155372436685123 C6.823295662002349 1.6145607442151257, 6.716427752933756 2.013397210557766, 6.5778483455013586 2.394141003279681 C6.439268938068961 2.7748847960015954, 6.26476736710249 3.149104622578984, 6.062177826491071 3.4999999999999996 C5.859588285879653 3.8508953774210153, 5.622755194947063 4.189128084166967, 5.362311101832846 4.499513267805774 C5.10186700871863 4.809898451444582, 4.809898451444583 5.10186700871863, 4.499513267805775 5.362311101832846 C4.189128084166968 5.622755194947063, 3.8508953774210166 5.859588285879652, 3.500000000000001 6.06217782649107 C3.149104622578985 6.264767367102489, 2.7748847960015963 6.439268938068961, 2.3941410032796817 6.5778483455013586 C2.013397210557767 6.716427752933756, 1.6145607442151264 6.823295662002349, 1.2155372436685128 6.893654271085456 C0.8165137431218992 6.964012880168563, 0.4051790812228379 7, 4.286263797015736e-16 7 C-0.405179081222837 7, -0.8165137431218985 6.964012880168563, -1.2155372436685121 6.893654271085456 C-1.6145607442151257 6.823295662002349, -2.0133972105577667 6.716427752933756, -2.394141003279681 6.5778483455013586 C-2.774884796001595 6.439268938068961, -3.149104622578983 6.26476736710249, -3.4999999999999982 6.062177826491071 C-3.8508953774210135 5.859588285879653, -4.189128084166966 5.6227551949470636, -4.499513267805773 5.362311101832848 C-4.809898451444581 5.101867008718632, -5.101867008718628 4.809898451444586, -5.3623111018328435 4.499513267805779 C-5.622755194947059 4.189128084166971, -5.859588285879649 3.8508953774210206, -6.062177826491068 3.5000000000000053 C-6.264767367102486 3.14910462257899, -6.439268938068958 2.774884796001602, -6.577848345501356 2.394141003279688 C-6.716427752933754 2.0133972105577738, -6.823295662002347 1.614560744215134, -6.893654271085454 1.215537243668521 C-6.9640128801685615 0.816513743121908, -6.999999999999999 0.4051790812228472, -7 1.0183126166254463e-14 C-7.000000000000001 -0.40517908122282686, -6.964012880168565 -0.8165137431218878, -6.893654271085459 -1.215537243668501 C-6.823295662002352 -1.6145607442151142, -6.716427752933759 -2.0133972105577542, -6.577848345501363 -2.394141003279669 C-6.439268938068967 -2.7748847960015834, -6.264767367102496 -3.149104622578972, -6.062177826491078 -3.4999999999999876 C-5.859588285879661 -3.8508953774210033, -5.6227551949470715 -4.1891280841669545, -5.362311101832856 -4.499513267805763 C-5.10186700871864 -4.809898451444571, -4.809898451444594 -5.10186700871862, -4.499513267805787 -5.362311101832836 C-4.189128084166979 -5.622755194947053, -3.850895377421028 -5.859588285879643, -3.5000000000000133 -6.062177826491062 C-3.1491046225789985 -6.264767367102482, -2.774884796001611 -6.439268938068954, -2.3941410032796973 -6.577848345501353 C-2.0133972105577835 -6.716427752933752, -1.6145607442151435 -6.823295662002345, -1.2155372436685306 -6.893654271085453 C-0.8165137431219176 -6.9640128801685615, -0.40517908122285695 -6.999999999999999, -1.9937625952807352e-14 -7 C0.4051790812228171 -7.000000000000001, 0.8165137431218781 -6.964012880168565, 1.2155372436684913 -6.89365427108546 C1.6145607442151044 -6.823295662002354, 2.013397210557745 -6.716427752933763, 2.3941410032796595 -6.5778483455013665 C2.774884796001574 -6.43926893806897, 3.149104622578963 -6.2647673671025, 3.499999999999979 -6.062177826491083 C3.8508953774209953 -5.859588285879665, 4.189128084166947 -5.622755194947077, 4.499513267805756 -5.362311101832862 C4.809898451444564 -5.1018670087186475, 5.101867008718613 -4.809898451444602, 5.362311101832829 -4.499513267805796 C5.622755194947046 -4.189128084166989, 5.859588285879637 -3.8508953774210393, 6.062177826491056 -3.500000000000025 C6.2647673671024755 -3.1491046225790105, 6.439268938068949 -2.774884796001623, 6.577848345501348 -2.3941410032797092 C6.716427752933747 -2.0133972105577955, 6.823295662002342 -1.6145607442151562, 6.893654271085451 -1.2155372436685434 C6.96401288016856 -0.8165137431219307, 6.982275711847575 -0.2025895406114567, 7 -3.2800750208310675e-14 C7.017724288152425 0.2025895406113911, 7.017724288152424 -0.2025895406114242, 7 0" stroke="#637381" stroke-width="2" fill="none" stroke-dasharray="0 0" style=""/><g><path d="M2.5 0 C2.5 0.14470681472244193, 2.487147457203058 0.29161205111496386, 2.46201938253052 0.4341204441673258 C2.436891307857982 0.5766288372196877, 2.3987241974763416 0.7190704323420595, 2.3492315519647713 0.8550503583141718 C2.299738906453201 0.991030284286284, 2.2374169168223177 1.124680222349637, 2.165063509461097 1.2499999999999998 C2.092710102099876 1.3753197776503625, 2.0081268553382365 1.496117172916774, 1.915111107797445 1.6069690242163481 C1.8220953602566536 1.7178208755159223, 1.7178208755159226 1.8220953602566536, 1.6069690242163484 1.915111107797445 C1.4961171729167742 2.0081268553382365, 1.375319777650363 2.0927101020998755, 1.2500000000000002 2.1650635094610964 C1.1246802223496375 2.2374169168223172, 0.9910302842862845 2.2997389064532, 0.8550503583141721 2.349231551964771 C0.7190704323420597 2.3987241974763416, 0.576628837219688 2.436891307857982, 0.43412044416732604 2.46201938253052 C0.291612051114964 2.487147457203058, 0.14470681472244212 2.5, 1.5308084989341916e-16 2.5 C-0.1447068147224418 2.5, -0.2916120511149638 2.487147457203058, -0.43412044416732576 2.46201938253052 C-0.5766288372196877 2.436891307857982, -0.7190704323420595 2.3987241974763416, -0.8550503583141718 2.3492315519647713 C-0.991030284286284 2.299738906453201, -1.124680222349637 2.2374169168223177, -1.2499999999999996 2.165063509461097 C-1.375319777650362 2.092710102099876, -1.4961171729167733 2.008126855338237, -1.6069690242163475 1.9151111077974459 C-1.7178208755159217 1.8220953602566548, -1.822095360256653 1.7178208755159234, -1.9151111077974443 1.6069690242163495 C-2.0081268553382357 1.4961171729167755, -2.0927101020998746 1.3753197776503645, -2.1650635094610955 1.250000000000002 C-2.2374169168223164 1.1246802223496395, -2.2997389064531992 0.9910302842862865, -2.34923155196477 0.8550503583141743 C-2.3987241974763407 0.7190704323420621, -2.436891307857981 0.5766288372196907, -2.4620193825305194 0.434120444167329 C-2.487147457203058 0.29161205111496724, -2.5 0.14470681472244545, -2.5 3.636830773662308e-15 C-2.5 -0.14470681472243818, -2.4871474572030587 -0.2916120511149599, -2.4620193825305208 -0.4341204441673218 C-2.436891307857983 -0.5766288372196837, -2.398724197476343 -0.7190704323420553, -2.3492315519647726 -0.8550503583141675 C-2.2997389064532023 -0.9910302842862798, -2.23741691682232 -1.1246802223496328, -2.165063509461099 -1.2499999999999956 C-2.092710102099878 -1.3753197776503583, -2.00812685533824 -1.4961171729167695, -1.9151111077974488 -1.606969024216344 C-1.8220953602566576 -1.7178208755159183, -1.7178208755159263 -1.82209536025665, -1.6069690242163523 -1.9151111077974416 C-1.4961171729167784 -2.0081268553382334, -1.3753197776503672 -2.0927101020998724, -1.2500000000000047 -2.1650635094610937 C-1.1246802223496422 -2.237416916822315, -0.9910302842862897 -2.299738906453198, -0.8550503583141776 -2.3492315519647686 C-0.7190704323420656 -2.3987241974763394, -0.5766288372196942 -2.4368913078579806, -0.43412044416733236 -2.462019382530519 C-0.29161205111497057 -2.4871474572030574, -0.1447068147224489 -2.4999999999999996, -7.120580697431198e-15 -2.5 C0.14470681472243463 -2.5000000000000004, 0.29161205111495647 -2.487147457203059, 0.4341204441673183 -2.4620193825305217 C0.5766288372196802 -2.436891307857984, 0.7190704323420518 -2.3987241974763442, 0.8550503583141642 -2.349231551964774 C0.9910302842862766 -2.2997389064532037, 1.1246802223496295 -2.2374169168223212, 1.2499999999999925 -2.165063509461101 C1.3753197776503554 -2.0927101020998804, 1.4961171729167668 -2.008126855338242, 1.6069690242163412 -1.915111107797451 C1.7178208755159157 -1.82209536025666, 1.8220953602566472 -1.7178208755159294, 1.915111107797439 -1.6069690242163557 C2.0081268553382308 -1.496117172916782, 2.09271010209987 -1.3753197776503712, 2.1650635094610915 -1.2500000000000089 C2.237416916822313 -1.1246802223496466, 2.299738906453196 -0.9910302842862939, 2.3492315519647673 -0.855050358314182 C2.3987241974763385 -0.71907043234207, 2.4368913078579792 -0.5766288372196986, 2.462019382530518 -0.4341204441673369 C2.487147457203057 -0.29161205111497523, 2.4936698970884197 -0.07235340736123454, 2.5 -1.1714553645825241e-14 C2.5063301029115803 0.07235340736121111, 2.50633010291158 -0.07235340736122292, 2.5 0" stroke="none" stroke-width="0" fill="#299a8d" style=""/><path d="M2.5 0 C2.5 0.14470681472244193, 2.487147457203058 0.29161205111496386, 2.46201938253052 0.4341204441673258 C2.436891307857982 0.5766288372196877, 2.3987241974763416 0.7190704323420595, 2.3492315519647713 0.8550503583141718 C2.299738906453201 0.991030284286284, 2.2374169168223177 1.124680222349637, 2.165063509461097 1.2499999999999998 C2.092710102099876 1.3753197776503625, 2.0081268553382365 1.496117172916774, 1.915111107797445 1.6069690242163481 C1.8220953602566536 1.7178208755159223, 1.7178208755159226 1.8220953602566536, 1.6069690242163484 1.915111107797445 C1.4961171729167742 2.0081268553382365, 1.375319777650363 2.0927101020998755, 1.2500000000000002 2.1650635094610964 C1.1246802223496375 2.2374169168223172, 0.9910302842862845 2.2997389064532, 0.8550503583141721 2.349231551964771 C0.7190704323420597 2.3987241974763416, 0.576628837219688 2.436891307857982, 0.43412044416732604 2.46201938253052 C0.291612051114964 2.487147457203058, 0.14470681472244212 2.5, 1.5308084989341916e-16 2.5 C-0.1447068147224418 2.5, -0.2916120511149638 2.487147457203058, -0.43412044416732576 2.46201938253052 C-0.5766288372196877 2.436891307857982, -0.7190704323420595 2.3987241974763416, -0.8550503583141718 2.3492315519647713 C-0.991030284286284 2.299738906453201, -1.124680222349637 2.2374169168223177, -1.2499999999999996 2.165063509461097 C-1.375319777650362 2.092710102099876, -1.4961171729167733 2.008126855338237, -1.6069690242163475 1.9151111077974459 C-1.7178208755159217 1.8220953602566548, -1.822095360256653 1.7178208755159234, -1.9151111077974443 1.6069690242163495 C-2.0081268553382357 1.4961171729167755, -2.0927101020998746 1.3753197776503645, -2.1650635094610955 1.250000000000002 C-2.2374169168223164 1.1246802223496395, -2.2997389064531992 0.9910302842862865, -2.34923155196477 0.8550503583141743 C-2.3987241974763407 0.7190704323420621, -2.436891307857981 0.5766288372196907, -2.4620193825305194 0.434120444167329 C-2.487147457203058 0.29161205111496724, -2.5 0.14470681472244545, -2.5 3.636830773662308e-15 C-2.5 -0.14470681472243818, -2.4871474572030587 -0.2916120511149599, -2.4620193825305208 -0.4341204441673218 C-2.436891307857983 -0.5766288372196837, -2.398724197476343 -0.7190704323420553, -2.3492315519647726 -0.8550503583141675 C-2.2997389064532023 -0.9910302842862798, -2.23741691682232 -1.1246802223496328, -2.165063509461099 -1.2499999999999956 C-2.092710102099878 -1.3753197776503583, -2.00812685533824 -1.4961171729167695, -1.9151111077974488 -1.606969024216344 C-1.8220953602566576 -1.7178208755159183, -1.7178208755159263 -1.82209536025665, -1.6069690242163523 -1.9151111077974416 C-1.4961171729167784 -2.0081268553382334, -1.3753197776503672 -2.0927101020998724, -1.2500000000000047 -2.1650635094610937 C-1.1246802223496422 -2.237416916822315, -0.9910302842862897 -2.299738906453198, -0.8550503583141776 -2.3492315519647686 C-0.7190704323420656 -2.3987241974763394, -0.5766288372196942 -2.4368913078579806, -0.43412044416733236 -2.462019382530519 C-0.29161205111497057 -2.4871474572030574, -0.1447068147224489 -2.4999999999999996, -7.120580697431198e-15 -2.5 C0.14470681472243463 -2.5000000000000004, 0.29161205111495647 -2.487147457203059, 0.4341204441673183 -2.4620193825305217 C0.5766288372196802 -2.436891307857984, 0.7190704323420518 -2.3987241974763442, 0.8550503583141642 -2.349231551964774 C0.9910302842862766 -2.2997389064532037, 1.1246802223496295 -2.2374169168223212, 1.2499999999999925 -2.165063509461101 C1.3753197776503554 -2.0927101020998804, 1.4961171729167668 -2.008126855338242, 1.6069690242163412 -1.915111107797451 C1.7178208755159157 -1.82209536025666, 1.8220953602566472 -1.7178208755159294, 1.915111107797439 -1.6069690242163557 C2.0081268553382308 -1.496117172916782, 2.09271010209987 -1.3753197776503712, 2.1650635094610915 -1.2500000000000089 C2.237416916822313 -1.1246802223496466, 2.299738906453196 -0.9910302842862939, 2.3492315519647673 -0.855050358314182 C2.3987241974763385 -0.71907043234207, 2.4368913078579792 -0.5766288372196986, 2.462019382530518 -0.4341204441673369 C2.487147457203057 -0.29161205111497523, 2.4936698970884197 -0.07235340736123454, 2.5 -1.1714553645825241e-14 C2.5063301029115803 0.07235340736121111, 2.50633010291158 -0.07235340736122292, 2.5 0" stroke="#299a8d" stroke-width="2" fill="none" stroke-dasharray="0 0" style=""/></g></g></g></g></g></g><defs><filter id="mmd-f148a01690209fd0-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd-f148a01690209fd0-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd-f148a01690209fd0-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#299a8d" stop-opacity="1"/><stop offset="100%" stop-color="#e76f51" stop-opacity="1"/></linearGradient></svg>
+</figure>
+<p>Three details carry most of the value:</p>
+<ul>
+<li><strong>Jitter, not just backoff.</strong> Without randomisation, every worker that failed during a provider blip retries at the same instant, reproducing the spike that caused the failure. This is the thundering herd, and jitter is the one-line fix.</li>
+<li><strong>A bounded attempt count plus a dead letter queue.</strong> Infinite retries turn one broken message into permanent worker consumption. After N attempts, park it, alert, and move on — DLQ depth is one of the most useful alarms in the whole system.</li>
+<li><strong>Retrying a permanent failure is the classic bug.</strong> An invalid token will never become valid. Retrying it burns quota, pollutes metrics, and on paid channels costs money per attempt.</li>
+</ul>
+<p>A <strong>circuit breaker</strong> sits above all of this: once a provider's failure rate crosses a threshold, stop calling it, let the queue hold the backlog, and probe periodically. That converts &quot;hammer a dying provider with retries&quot; into &quot;wait for it to come back&quot;, which is both faster to recover and less likely to prolong the outage.</p>
+<h3 id="additional-components">Additional Components</h3>
+   <p align="left">
+   <img loading="lazy" decoding="async" src="../../system-design-notes/10.%20Notification%20System/images/events-tracking.png" alt="Events Tracking" data-width="400" style="max-width:400px">
+   </p>
+<ol>
+<li><strong>Notification Templates:</strong> Preformatted templates for consistent and efficient notifications.</li>
+<li><strong>Notification Settings:</strong>
+<ul>
+<li>Users can opt-in or opt-out for specific channels (push, SMS, or email).</li>
+<li>Stored in a dedicated notification settings table.</li>
+</ul>
+</li>
+<li><strong>Rate Limiting:</strong> Cap the frequency of notifications sent to users.</li>
+<li><strong>Retry Mechanism:</strong> Retry sending notifications if third-party services fail.</li>
+<li><strong>Monitoring Queues:</strong> Track queued notifications to scale workers dynamically.</li>
+<li><strong>Event Tracking:</strong> Collect metrics like open rate, click rate, and engagement.</li>
+</ol>
+<p>Each of these is doing more work than its one line suggests:</p>
+<p><strong>Templates</strong> exist for consistency, but their real value is that the <em>content</em> and the <em>trigger</em> evolve separately. A template is also the natural place for localisation — language, date and currency formats, and right-to-left layout — and for enforcing per-channel limits (an APNS payload has roughly 4 KB; an SMS segments at 160 characters and each segment is billed).</p>
+<p><strong>Settings are a hard gate, not a preference.</strong> The opt-out check must be enforced on the send path, immediately before dispatch, not at the moment the event was created — a user who unsubscribes while a campaign is draining from the queue must not receive the rest of it. For SMS and email this is a legal requirement in most jurisdictions (TCPA, CAN-SPAM, GDPR), with per-message penalties, which makes it the one check that should fail closed.</p>
+<p><strong>Rate limiting operates at three distinct levels</strong>, and conflating them is a common design error:</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Level</th>
+<th>Purpose</th>
+<th>Consequence of omitting it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per user, per channel</td>
+<td>Protect attention — nobody wants 40 pushes an hour</td>
+<td>Uninstalls and OS-level muting, which silence you permanently</td>
+</tr>
+<tr>
+<td>Per provider</td>
+<td>Stay inside the provider's quota</td>
+<td>429s, throttling, possible account suspension</td>
+</tr>
+<tr>
+<td>Global</td>
+<td>Cap total spend and blast radius</td>
+<td>A runaway loop bills you for millions of SMS before anyone notices</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The global limit doubles as a <strong>kill switch</strong>, and that is its most important role. Alongside it, an anomaly alarm on send volume (&quot;push sends are 20× the trailing hour&quot;) is what turns a catastrophe into an inconvenience.</p>
+<p><strong>Scheduling is part of the product.</strong> Notification time must be computed in the <em>recipient's</em> timezone, with quiet hours respected, or you will wake a continent at 3 a.m. Low-urgency notifications should be <strong>batched into a digest</strong> rather than sent individually — which is a throughput optimisation and an attention optimisation at the same time.</p>
+<p><strong>Queue depth is the system's primary health signal.</strong> It is the one metric that distinguishes &quot;working fine&quot; from &quot;workers are dying&quot; long before users notice, and it is the input to autoscaling the worker pool.</p>
+<p><strong>Event tracking is how delivery is observed at all.</strong> Since providers only confirm acceptance, open and click rates are the only evidence that notifications are reaching humans. The volume is high — one event per open and per click, well above the send volume — so it belongs in an asynchronous analytics pipeline (<a href="21-ad-click-event-aggregation.html">Chapter 21</a>), not in the notification database.</p>
+<h3 id="security">Security</h3>
+<ul>
+<li>Use <strong>AppKey</strong> and <strong>AppSecret</strong> to authenticate and secure APIs for push notifications.</li>
+</ul>
+<p>Two more that matter in review:</p>
+<ul>
+<li><strong>Only verified clients may call the send API.</strong> An internal notification API reachable without authentication is a spam cannon pointed at your own users, and it damages the sending reputation that email and SMS deliverability depend on.</li>
+<li><strong>Push payloads are not private.</strong> They render on a locked screen and pass through APNS or FCM. Never put a passcode, balance, medical detail, or full message body in one — send a neutral prompt and let the app fetch the content after the user authenticates.</li>
+</ul>
+<h3 id="notification-flow">Notification Flow</h3>
+   <p align="left">
+   <img loading="lazy" decoding="async" src="../../system-design-notes/10.%20Notification%20System/images/updated-design.png" alt="Updated Design" data-width="500" style="max-width:500px">
+   </p>
+<ol>
+<li>Trigger services call APIs to send notifications.</li>
+<li>Notification servers validate requests and fetch metadata from caches or databases.</li>
+<li>Notification events are sent to message queues.</li>
+<li>Workers process events and interact with third-party services.</li>
+<li>Third-party services deliver notifications to users.</li>
+</ol>
+<hr>
+</section>
+<section id="key-optimizations">
+<h2 id="key-optimizations">Key Optimizations</h2>
+<ol>
+<li><strong>Horizontal Scaling:</strong> Add more notification servers for load distribution.</li>
+<li><strong>Message Queues:</strong> Decouple processing to handle high volumes.</li>
+<li><strong>Caching:</strong> Reduce latency by caching frequently accessed data.</li>
+<li><strong>Geographic Distribution:</strong> Optimize message delivery geographically for better performance.</li>
+</ol>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>the three follow-ups that matter are &quot;how do you avoid sending the same notification twice?&quot; (at-least-once delivery plus an atomic, windowed idempotency check — <em>not</em> exactly-once), &quot;a provider starts returning 500s, what happens?&quot; (classify, backoff with jitter, circuit breaker, DLQ), and &quot;how do you stop a bug from sending four million duplicate pushes?&quot; (per-user and global rate limits, volume anomaly alarm, kill switch). Each answer is about the third-party boundary, which is where this system actually lives.</p>
+</div>
+<hr>
+<h3 id="gotchas--failure-modes" class="h-gotchas">Gotchas &amp; failure modes</h3>
+<ul>
+<li><strong>Exactly-once delivery does not exist.</strong> The queue is at-least-once, so duplicates are inevitable. You get exactly-once <em>effects</em> only by making processing idempotent, and only within the dedup window.</li>
+<li><strong>A read-then-write dedup check races.</strong> Two workers handling the same message both see &quot;not seen&quot;. Only an atomic conditional write (<code>SETNX</code>, unique-constraint insert) actually deduplicates.</li>
+<li><strong>Retrying a permanent failure forever.</strong> Invalid tokens and unsubscribed addresses never recover. Classify responses before retrying, or waste quota and money on guaranteed failures.</li>
+<li><strong>Retry without jitter recreates the outage.</strong> Synchronised retries after a provider blip arrive as one spike, which trips the provider again. Exponential backoff <em>with</em> randomisation.</li>
+<li><strong>Unbounded retries consume the workers.</strong> A bounded attempt count plus a dead letter queue keeps one poisonous message from degrading the whole channel. Alert on DLQ depth.</li>
+<li><strong>A single shared queue causes head-of-line blocking.</strong> One stalled provider stops every channel. Separate queues per channel, and a separate priority path for transactional notifications — an OTP stuck behind a marketing blast is a broken login.</li>
+<li><strong>Dead tokens accumulate silently.</strong> Uninstalls invalidate tokens, and providers report it per message. Ignoring that feedback inflates your fan-out and eventually gets you throttled.</li>
+<li><strong>The notification storm is the worst-case incident.</strong> A retry loop or a bad campaign query can send millions of unwanted messages in minutes. The damage is irreversible — you cannot unsend — so the controls must be preventive: global rate limit, volume anomaly alarm, and a kill switch somebody can actually find at 2 a.m.</li>
+<li><strong>Opt-out checked at the wrong time.</strong> Filtering at event-creation time lets a long-draining campaign keep sending to users who unsubscribed ten minutes ago. Check immediately before dispatch.</li>
+<li><strong>&quot;Delivered&quot; is a lie.</strong> Providers confirm acceptance. Reporting acceptance as delivery hides real failures — silent discards, spam folders, OS-level muting.</li>
+<li><strong>Sensitive data in push payloads.</strong> Lock-screen previews and third-party relays make the payload semi-public. Send a prompt, not the content.</li>
+<li><strong>Timezone-naive scheduling.</strong> Sending on server time wakes people up, and the resulting notification-permission revocation cannot be undone by an apology.</li>
+<li><strong>Cost is a failure mode.</strong> SMS at roughly $0.0075 per message means a duplicate-send bug has an immediate, five-figure daily price. Rate limits are a financial control.</li>
+<li><strong>Fan-out multiplies everything.</strong> One logical notification to a user with four devices is four provider calls. Scale, cost, and rate-limit arithmetic are per <em>destination</em>, not per notification.</li>
+</ul>
+<hr>
+</section>
+<section id="the-design-as-problem-and-technique">
+<h2 id="the-design-as-problem-and-technique">The design, as problem and technique</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Goal / problem</th>
+<th>Technique</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Provider latency and outages leaking into your API</td>
+<td>Accept, persist, enqueue, return immediately</td>
+</tr>
+<tr>
+<td>A 90× campaign burst</td>
+<td>Queue as a buffer; workers drain at a sustainable rate</td>
+</tr>
+<tr>
+<td>One provider's outage stopping all channels</td>
+<td>A separate queue and worker pool per channel</td>
+</tr>
+<tr>
+<td>Transactional notifications stuck behind marketing</td>
+<td>Priority queue with dedicated workers</td>
+</tr>
+<tr>
+<td>Duplicate sends from at-least-once delivery</td>
+<td>Caller-supplied event ID plus an atomic, windowed dedup check</td>
+</tr>
+<tr>
+<td>Transient provider failures</td>
+<td>Exponential backoff with jitter, bounded attempts</td>
+</tr>
+<tr>
+<td>Permanent failures</td>
+<td>Classify responses; prune the contact; never retry</td>
+</tr>
+<tr>
+<td>A provider failing persistently</td>
+<td>Circuit breaker, plus a dead letter queue with alarms</td>
+</tr>
+<tr>
+<td>Losing notifications on a crash</td>
+<td>Notification log database written before enqueue</td>
+</tr>
+<tr>
+<td>Notification fatigue</td>
+<td>Per-user, per-channel rate limits; digests; quiet hours</td>
+</tr>
+<tr>
+<td>Runaway spend or a storm</td>
+<td>Global rate limit, volume anomaly alarm, kill switch</td>
+</tr>
+<tr>
+<td>Legal opt-out compliance</td>
+<td>Settings checked at dispatch time, failing closed</td>
+</tr>
+<tr>
+<td>Knowing whether anything arrived</td>
+<td>Open/click event tracking in an async analytics pipeline</td>
+</tr>
+<tr>
+<td>Invalid device tokens</td>
+<td>Act on per-message provider feedback; prune tokens</td>
+</tr>
+<tr>
+<td>Consistent, localised content</td>
+<td>Templates with per-channel payload limits</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="self-check" data-kind="self-check">
+<h2 id="self-check">Self-check</h2>
+<ol>
+<li>The average rate is ~185 notifications/sec. Why is sizing the system for that wrong, and what number should you use instead?</li>
+<li>Which channel is 6% of the volume and most of the cost, and what does that imply about retry policy?</li>
+<li>Why can this system never honestly report &quot;delivered&quot;?</li>
+<li>Name the three independent sources of duplicate notifications.</li>
+<li>Why is &quot;exactly-once delivery&quot; the wrong thing to promise, and what is the right formulation?</li>
+<li>What goes wrong with a dedup check implemented as &quot;read, then write, then send&quot;?</li>
+<li>Classify these and give the correct action: HTTP 429, invalid device token, connection timeout, HTTP 400.</li>
+<li>Why does exponential backoff need jitter?</li>
+<li>All channels share one queue and Twilio stops responding. What happens to push notifications, and why?</li>
+<li>A one-time passcode takes 90 seconds to arrive during a marketing campaign. What is the design flaw?</li>
+<li>A bug sends four million duplicate pushes. Which three controls would have limited the damage, and why can't you fix it afterwards?</li>
+<li>At what point in the pipeline must the opt-out check run, and why not earlier?</li>
+</ol>
+</section>
+<section id="glossary" data-kind="glossary">
+<h2 id="glossary">Glossary</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>APNS / FCM</strong></td>
+<td>Apple's and Google's push services; the only route to a mobile device's notification tray</td>
+</tr>
+<tr>
+<td><strong>Device token</strong></td>
+<td>A per-device, per-install credential for push; expires and can be revoked</td>
+</tr>
+<tr>
+<td><strong>Trigger service</strong></td>
+<td>Any service, cron job or pipeline that asks for a notification to be sent</td>
+</tr>
+<tr>
+<td><strong>At-least-once delivery</strong></td>
+<td>The queue's guarantee: a message may be processed more than once, never zero times</td>
+</tr>
+<tr>
+<td><strong>Idempotent processing</strong></td>
+<td>Handling the same message twice with the same net effect — how duplicates are neutralised</td>
+</tr>
+<tr>
+<td><strong>Dedup window</strong></td>
+<td>The bounded period over which repeated event IDs are remembered and suppressed</td>
+</tr>
+<tr>
+<td><strong>Exponential backoff + jitter</strong></td>
+<td>Growing, randomised retry delays that avoid synchronised retry spikes</td>
+</tr>
+<tr>
+<td><strong>Dead letter queue (DLQ)</strong></td>
+<td>Where messages go after exhausting retries; its depth is a primary alarm</td>
+</tr>
+<tr>
+<td><strong>Circuit breaker</strong></td>
+<td>Stopping calls to a failing provider until a probe shows recovery</td>
+</tr>
+<tr>
+<td><strong>Head-of-line blocking</strong></td>
+<td>A stalled message at a queue's head delaying everything behind it</td>
+</tr>
+<tr>
+<td><strong>Fan-out</strong></td>
+<td>Expanding one logical notification into one message per device, address or number</td>
+</tr>
+<tr>
+<td><strong>Notification log</strong></td>
+<td>The durable record written before enqueue, enabling replay and auditing</td>
+</tr>
+<tr>
+<td><strong>Quiet hours</strong></td>
+<td>Recipient-timezone windows in which notifications are withheld</td>
+</tr>
+<tr>
+<td><strong>Kill switch</strong></td>
+<td>An operator control that halts all sending immediately</td>
+</tr>
+<tr>
+<td><strong>Transactional vs marketing</strong></td>
+<td>Latency-critical, user-awaited notifications vs bulk campaigns; different queues and priorities</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="01-scaling.html#section-10-message-queue">Chapter 1 §10 – Message Queue</a> — the decoupling argument this whole chapter rests on.</li>
+<li><a href="04-rate-limiter.html">Chapter 4 – Design A Rate Limiter</a> — the algorithms behind the per-user, per-provider and global limits.</li>
+<li><a href="19-distributed-message-queue.html">Chapter 19 – Distributed Message Queue</a> — how the queue itself provides at-least-once delivery, and why exactly-once is so hard.</li>
+<li><a href="21-ad-click-event-aggregation.html">Chapter 21 – Ad Click Event Aggregation</a> — the pipeline that open and click events feed into.</li>
+<li><a href="11-news-feed-system.html">Chapter 11 – Design A News Feed System</a> — fan-out at a larger scale, where the same push-vs-pull question dominates.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>
