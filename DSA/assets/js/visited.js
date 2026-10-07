@@ -5,7 +5,7 @@
    localStorage on file:// pages, so we probe once and fall back to an
    in-memory store (the page still works, state just does not persist).
 
-   Any page with <body data-topic="core-concepts"> is marked visited on load.
+   Any page with <body data-topic="dsa-trees"> is marked visited on load.
    Exposes window.VISITED = { all, isVisited, mark, reset, count, storageOk }
    and fires a "visited:change" event on document whenever state changes.
    ========================================================================== */
@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  var KEY = 'learningPath.v1.visited';
+  var KEY = 'dsa.v1.visited';
   var memory = null;
 
   var storageOk = (function () {
@@ -40,21 +40,30 @@
     try { document.dispatchEvent(new CustomEvent('visited:change')); } catch (e) { /* old browsers */ }
   }
 
+  /* One-time carry-over. The DSA pages used to live in the C# site and shared
+     its `learningPath.v1.visited` store; copy any marks for them into this
+     site's store on first load, then never look again. The old store is left
+     untouched — the C# site ignores ids it has no page for. */
+  (function importLegacy() {
+    if (!storageOk) return;
+    var FLAG = 'dsa.v1.importedFromLearningPath';
+    try {
+      if (window.localStorage.getItem(FLAG)) return;
+      var old = JSON.parse(window.localStorage.getItem('learningPath.v1.visited') || '{}') || {};
+      var mine = load(), changed = false;
+      Object.keys(old).forEach(function (id) {
+        if (/^dsa(-|$)/.test(id) && !mine[id]) { mine[id] = old[id]; changed = true; }
+      });
+      if (changed) save(mine);
+      window.localStorage.setItem(FLAG, new Date().toISOString());
+    } catch (e) { /* no storage, or malformed JSON — nothing to carry over */ }
+  })();
+
   var api = {
     storageOk: storageOk,
     all: function () { return load(); },
     isVisited: function (id) { return Object.prototype.hasOwnProperty.call(load(), id); },
-    count: function () {
-      var s = load();
-      var C = window.CURRICULUM;
-      if (!C || !C.topics) return Object.keys(s).length;
-      /* Only count ids this site still has a page for. The DSA topics moved to
-         their own site and their old marks are left in place for it to import,
-         so counting raw keys here would report more visited than there are. */
-      return C.topics.filter(function (t) {
-        return Object.prototype.hasOwnProperty.call(s, t.id);
-      }).length;
-    },
+    count: function () { return Object.keys(load()).length; },
     mark: function (id) {
       if (!id) return;
       var s = load();

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard — DSA</title>
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body data-root="">
+<div class="layout">
+<main class="main">
+
+  <h1>DSA</h1>
+  <p class="lede">A self-paced study site for the <strong>coding round</strong> — one page per pattern, each with its
+  canonical problems worked through in <strong>C#</strong> with the equivalent <strong>Python</strong> alongside.
+  Seven pages, 50 sections. The sidebar has two menus — <em>Foundations</em> and <em>Patterns</em>; pages you have
+  opened turn <span class="badge badge-visited">✓ visited</span>.</p>
+
+  <div class="storage-banner"></div>
+
+  <div class="stats-row">
+    <div class="progress">
+      <span>Visited</span>
+      <span class="progress-bar"><span class="progress-fill" data-progress-fill></span></span>
+      <span class="progress-num" data-progress-num>0 / 0</span>
+    </div>
+    <button type="button" class="btn btn-danger btn-sm" data-reset-visited>Reset visited topics</button>
+  </div>
+
+  <div class="callout callout-note">
+    <span class="callout-title">How to use this site</span>
+    <ul>
+      <li><strong>Start with Foundations &amp; Complexity.</strong> It is not a pattern — it is how to run the 45 minutes, what the Big-O numbers mean when you say them out loud, what every collection costs, and how to read a problem statement and know which of the six pattern pages it belongs to.</li>
+      <li>Then take the <strong>Patterns</strong> menu in order. Arrays and hashing carry the techniques the later pages assume.</li>
+      <li>Every code sample has a <strong>C# | Python</strong> tab bar. Switch tabs to see the same algorithm in the other language; <strong>Copy</strong> grabs whatever tab is showing.</li>
+      <li>Each section ends with a <strong>Practice</strong> box. Solve it on paper or in an editor <em>before</em> reading the solution — recognition is not the same as recall.</li>
+      <li><strong>Interview angle</strong> boxes call out the follow-up question an interviewer reaches for once your first solution works.</li>
+      <li>Visited state lives in your browser only, separate from the C# and System Design sites.</li>
+    </ul>
+  </div>
+
+  <h2 id="topics">Topics</h2>
+  <div data-topic-groups></div>
+
+  <h2 id="order">Suggested order</h2>
+  <p>Go in sidebar order: <strong>foundations</strong> (1) → <strong>the linear patterns</strong> (2–4) →
+  <strong>search &amp; sort</strong> (5) → <strong>hierarchies and graphs</strong> (6–7). If you are short on time, the
+  highest-yield pages are Arrays/Windows, Hashing and Trees — those three cover most of what gets asked. Graphs is
+  the one people skip and then get caught by.</p>
+
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Phase</th><th>Pages</th><th>You should be able to…</th></tr></thead>
+    <tbody>
+      <tr><td>Framing</td><td>Foundations &amp; Complexity</td><td>Run the interview as a structured 45 minutes: clarify, example, state the brute force and its complexity, improve it, code it, test it out loud — and name the cost of every collection you reach for.</td></tr>
+      <tr><td>Linear data</td><td>Arrays, Strings &amp; Windows · Hashing, Sets &amp; Counting · Stacks, Queues &amp; Lists</td><td>Recognise two pointers, sliding window, prefix sums and intervals from the wording; trade space for time with a dictionary; and reach for a monotonic stack when the question asks for a next-greater anything.</td></tr>
+      <tr><td>Ordering</td><td>Binary Search &amp; Sorting</td><td>Write binary search without an off-by-one, and spot the problems that are really "binary search the answer" in disguise.</td></tr>
+      <tr><td>Hierarchies</td><td>Trees, Tries &amp; Heaps</td><td>Traverse a tree four ways from memory, use a heap for top-K and streaming medians, and know when a trie beats a hash map.</td></tr>
+      <tr><td>Graphs</td><td>Graphs &amp; Shortest Paths</td><td>Model a problem as a graph, pick BFS vs DFS vs Dijkstra for the right reason, and handle cycles, topological order and disconnected components.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p class="footer-note">Personal study site · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="assets/js/curriculum.js"></script>
+<script src="assets/js/visited.js"></script>
+<script src="assets/js/nav.js"></script>
+<script src="assets/js/code-tabs.js"></script>
+<script>
+/* Dashboard: topic cards + progress, kept in sync with visited state */
+(function () {
+  'use strict';
+  var C = window.CURRICULUM, V = window.VISITED;
+  if (!C || !V) return;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
+    });
+  }
+
+  function cardHtml(t) {
+    var i = C.topics.indexOf(t);
+    var visited = V.isVisited(t.id);
+    return '<div class="card' + (visited ? ' visited' : '') + '">' +
+      '<h3><span class="card-num">' + (visited ? '✓' : (i + 1)) + '</span><a href="' + t.href + '">' + esc(t.label) + '</a></h3>' +
+      '<p>' + esc(t.blurb) + '</p>' +
+      '<div class="card-foot"><span>' + t.sections.length + ' sections</span>' +
+      (visited ? '<span class="badge badge-visited">Visited</span>' : (i === 0 ? '<span class="badge badge-start">Start here</span>' : '')) +
+      '</div></div>';
+  }
+
+  function render() {
+    var host = document.querySelector('[data-topic-groups]');
+    if (host) {
+      host.innerHTML = C.groups.map(function (g) {
+        var done = g.topics.filter(function (t) { return V.isVisited(t.id); }).length;
+        return '<div class="group-head" id="group-' + esc(g.id) + '"><h3>' + esc(g.label) + '</h3>' +
+          '<span class="group-count">' + done + ' / ' + g.topics.length + ' visited</span></div>' +
+          '<p class="group-blurb">' + esc(g.blurb) + '</p>' +
+          '<div class="cards">' + g.topics.map(cardHtml).join('') + '</div>';
+      }).join('');
+    }
+    var n = V.count(), total = C.topics.length;
+    var fill = document.querySelector('[data-progress-fill]');
+    var num = document.querySelector('[data-progress-num]');
+    if (fill) fill.style.width = (total ? Math.round(n / total * 100) : 0) + '%';
+    if (num) num.textContent = n + ' / ' + total;
+  }
+
+  document.addEventListener('DOMContentLoaded', render);
+  document.addEventListener('visited:change', render);
+})();
+</script>
+</body>
+</html>
