@@ -7,6 +7,21 @@ Check the notes here: https://pagefy.io/system-design/system-design-interview-by
 **Note:** These notes are a work in progress. 
 
 
+## How these notes are organized
+
+Chapters are being progressively expanded beyond plain summaries. The ones that have had that pass use a few consistent conventions:
+
+- **"What broke" / "What it now costs you"** — each design step is framed by the problem that forced it and the new problem it introduces, so a chapter reads as a causal story rather than a list of components.
+- **Trade-off tables** — side-by-side comparisons instead of prose, for choices like vertical vs horizontal scaling or SQL vs NoSQL.
+- **`Gotchas & failure modes`** — the things that bite in production: replication lag, cache stampede, hot shards, split-brain.
+- **`> **Interview angle:**`** callouts — what an interviewer is usually probing for in that section.
+- **Mermaid diagrams** alongside the book's images. These render on GitHub; where they don't render, the surrounding tables and prose carry the same information.
+- **Self-check questions** and a glossary at the end of the longer chapters.
+
+Chapters 1-6 have had this pass and are the current reference for the format.
+
+## Chapters
+
  * [Chapter 1 - Scale From Zero To Millions Of Users](./01.%20Scaling/)
  * [Chapter 2 - Back-of-the-envelope Estimation](./02.%20Back%20Of%20the%20Envelope%20Estimation/)
  * [Chapter 3 - A Framework For System Design Interviews](./03.%20System%20Design%20Framework/)
