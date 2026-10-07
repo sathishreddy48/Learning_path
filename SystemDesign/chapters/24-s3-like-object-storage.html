@@ -576,6 +576,16 @@ With replication, data is deleted from both primaries and replicas. With erasure
     <img loading="lazy" decoding="async" src="../../system-design-notes/24.%20S3-like%20Object%20Storage/images/compaction.png" alt="compaction" data-width="500" style="max-width:500px" />
 </p>
 <hr>
+
+<figure class="anim" id="anim-erasure" data-anim="anim-erasure">
+  <figcaption class="anim-head">
+    <span class="anim-title">Try it: erasure coding against replication</span>
+    <span class="anim-caption">Click a node to kill it. Any k of the k+m shards rebuild the object, so the same durability costs far less storage than three full copies — until you look at what a repair has to read.</span>
+  </figcaption>
+  <div class="anim-stage" data-anim-stage>
+    <noscript><p class="anim-fallback">This interactive explainer needs JavaScript. The surrounding text and diagrams carry the same information.</p></noscript>
+  </div>
+</figure>
 </section>
 <section id="step-4-wrap-up">
 <h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
@@ -815,6 +825,7 @@ With replication, data is deleted from both primaries and replicas. With erasure
 <script src="../assets/js/visited.js"></script>
 <script src="../assets/js/nav.js"></script>
 <script src="../assets/js/code-tabs.js"></script>
-
+<script src="../assets/js/anim-kit.js"></script>
+<script src="../assets/js/anim-erasure.js"></script>
 </body>
 </html>

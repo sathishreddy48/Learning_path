@@ -377,6 +377,16 @@ WHERE geohash LIKE '9q9hvu%';     -- one contiguous range scan
 <li>Geofencing also allows to define parameters that surround the area of interest.</li>
 <li>Another advantage is that instead of a fixed level of precision, S2 lets you specify min level, max level and max cells.</li>
 </ul>
+
+<figure class="anim" id="anim-geohash" data-anim="anim-geohash">
+  <figcaption class="anim-head">
+    <span class="anim-title">Try it: geohash precision and the boundary problem</span>
+    <span class="anim-caption">Drag the two pins. A shared prefix means a shared cell — but two points a metre apart can share no prefix at all, which is why neighbour cells have to be queried too.</span>
+  </figcaption>
+  <div class="anim-stage" data-anim-stage>
+    <noscript><p class="anim-fallback">This interactive explainer needs JavaScript. The surrounding text and diagrams carry the same information.</p></noscript>
+  </div>
+</figure>
 </section>
 <section id="tradeoff-comparison">
 <h2 id="tradeoff-comparison">Tradeoff Comparison</h2>
@@ -845,6 +855,7 @@ WHERE geohash LIKE '9q9hvu%';     -- one contiguous range scan
 <script src="../assets/js/visited.js"></script>
 <script src="../assets/js/nav.js"></script>
 <script src="../assets/js/code-tabs.js"></script>
-
+<script src="../assets/js/anim-kit.js"></script>
+<script src="../assets/js/anim-geohash.js"></script>
 </body>
 </html>

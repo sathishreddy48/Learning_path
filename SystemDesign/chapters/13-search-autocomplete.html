@@ -388,6 +388,16 @@
 <p>The fix is to derive boundaries from the <strong>measured distribution</strong> rather than from the alphabet: build the shard map from the historical frequency table so each shard holds a comparable share of <em>traffic</em>, and split hot ranges further (<code>sa-sg</code>, <code>sh-sn</code>, …) until they balance. That map must then be versioned and distributed to every client of the service — which is why a shard map manager is a named component rather than a configuration file, and the same ring-distribution problem as <a href="05-consistent-hashing.html#gotchas--failure-modes">Chapter 5</a>.</p>
 <p>Two things make this easier here than in most sharded systems: the data is <strong>read-only between rebuilds</strong>, so rebalancing can happen at build time with no live migration, and it is small enough (~10 GB) to <strong>replicate every shard</strong> rather than partition at all, trading memory for the elimination of the whole problem. For a service this read-heavy, full replication is often the right answer.</p>
 <hr>
+
+<figure class="anim" id="anim-trie" data-anim="anim-trie">
+  <figcaption class="anim-head">
+    <span class="anim-title">Try it: the walk is cheap, the ranking is not</span>
+    <span class="anim-caption">Type a prefix and watch where the work actually goes. Then turn on the cached top-k and watch the subtree scan disappear.</span>
+  </figcaption>
+  <div class="anim-stage" data-anim-stage>
+    <noscript><p class="anim-fallback">This interactive explainer needs JavaScript. The surrounding text and diagrams carry the same information.</p></noscript>
+  </div>
+</figure>
 </section>
 <section id="step-4-advanced-features">
 <h2 id="step-4-advanced-features">Step 4: Advanced Features</h2>
@@ -634,6 +644,7 @@
 <script src="../assets/js/visited.js"></script>
 <script src="../assets/js/nav.js"></script>
 <script src="../assets/js/code-tabs.js"></script>
-
+<script src="../assets/js/anim-kit.js"></script>
+<script src="../assets/js/anim-trie.js"></script>
 </body>
 </html>

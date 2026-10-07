@@ -496,9 +496,11 @@ function pageHtml({ title, topicId, breadcrumb, h1, lede, toc, body, animModules
         .map((s) => `<li><a href="#${s.id}">${escapeHtml(s.label)}</a></li>`)
         .join('')}</ol>\n  </div>\n`
     : '';
-  const animScripts = (animModules || [])
-    .map((m) => `<script src="../assets/js/${m}"></script>`)
-    .join('\n');
+  const animScripts = (animModules || []).length
+    ? ['anim-kit.js', ...animModules]
+        .map((m) => `<script src="../assets/js/${m}"></script>`)
+        .join('\n')
+    : '';
 
   return `<!doctype html>
 <html lang="en">
@@ -772,8 +774,11 @@ function writeAssets() {
   const extra = fs.readFileSync(path.join(HERE, 'site-additions.css'), 'utf8');
   fs.writeFileSync(path.join(OUT, 'assets', 'css', 'site.css'), `${base}\n${extra}`, 'utf8');
 
-  // the two animation modules
-  for (const f of ['anim-consistent-hashing.js', 'anim-rate-limiter.js']) {
+  /* the shared kit plus every explainer module in anim/ ("_kit.js" is
+     published as anim-kit.js and must load before any module) */
+  fs.copyFileSync(path.join(HERE, 'anim', '_kit.js'), path.join(jsOut, 'anim-kit.js'));
+  for (const f of fs.readdirSync(path.join(HERE, 'anim'))) {
+    if (!f.endsWith('.js') || f.startsWith('_')) continue;
     fs.copyFileSync(path.join(HERE, 'anim', f), path.join(jsOut, f));
   }
 }

@@ -1,5 +1,5 @@
 {
-  "_comment": "Where each animated explainer is injected. Keyed by output page slug. 'afterSection' is the GitHub anchor slug of the H2 section the figure is appended to; the markdown is never edited. If afterSection does not match a real section the build fails loudly rather than silently dropping the animation.",
+  "_comment": "Where each animated explainer is injected. Keyed by output page slug. 'afterSection' is the GitHub anchor slug of the H2 section the figure is appended to; the markdown is never edited. If afterSection does not match a real section the build fails loudly rather than silently dropping the animation. 'title' is plain text and is HTML-escaped by the build, so write literal characters (> not &gt;); 'caption' is injected as HTML so it may contain tags such as <code>.",
   "05-consistent-hashing": [
     {
       "afterSection": "affected-keys",
@@ -16,6 +16,105 @@
       "mount": "anim-rate-limiter",
       "title": "Try it: the five algorithms on one traffic stream",
       "caption": "Every panel sees exactly the same requests. Send a steady trickle, then a burst, then a burst that straddles a window boundary, and watch where each algorithm accepts and where it rejects."
+    }
+  ],
+  "06-key-value-store": [
+    {
+      "afterSection": "system-components",
+      "module": "anim-quorum.js",
+      "mount": "anim-quorum",
+      "title": "Try it: why W + R > N is the whole rule",
+      "caption": "Move the sliders and watch the write set and the read set overlap \u2014 or come apart. The guarantee is pigeonhole, not magic."
+    }
+  ],
+  "07-unique-id-generator": [
+    {
+      "afterSection": "step-3-design-deep-dive--spending-the-64-bits",
+      "module": "anim-snowflake.js",
+      "mount": "anim-snowflake",
+      "title": "Try it: spend the 64 bits yourself",
+      "caption": "Every bit you give one field is taken from another. Change the split and see what it costs you in epoch length, machine count and IDs per millisecond."
+    }
+  ],
+  "11-news-feed-system": [
+    {
+      "afterSection": "step-3-design-deep-dive",
+      "module": "anim-fanout.js",
+      "mount": "anim-fanout",
+      "title": "Try it: fan-out on write vs on read",
+      "caption": "Post as an ordinary user, then as the pop star, under each strategy. The same total work lands on opposite sides of the system \u2014 and one of the two sides falls over."
+    }
+  ],
+  "13-search-autocomplete": [
+    {
+      "afterSection": "step-3-design-deep-dive",
+      "module": "anim-trie.js",
+      "mount": "anim-trie",
+      "title": "Try it: the walk is cheap, the ranking is not",
+      "caption": "Type a prefix and watch where the work actually goes. Then turn on the cached top-k and watch the subtree scan disappear."
+    }
+  ],
+  "16-proximity-service": [
+    {
+      "afterSection": "step-3-algorithms-for-fetching-nearby-businesses",
+      "module": "anim-geohash.js",
+      "mount": "anim-geohash",
+      "title": "Try it: geohash precision and the boundary problem",
+      "caption": "Drag the two pins. A shared prefix means a shared cell \u2014 but two points a metre apart can share no prefix at all, which is why neighbour cells have to be queried too."
+    }
+  ],
+  "21-ad-click-event-aggregation": [
+    {
+      "afterSection": "step-3-design-deep-dive",
+      "module": "anim-windows.js",
+      "mount": "anim-windows",
+      "title": "Try it: event time, watermarks and late events",
+      "caption": "Every event has a time it happened and a later time it arrived. Move the watermark lag and watch the trade between completeness and latency play out."
+    }
+  ],
+  "25-real-time-gaming-leaderboard": [
+    {
+      "afterSection": "step-3-design-deep-dive",
+      "module": "anim-skiplist.js",
+      "mount": "anim-skiplist",
+      "title": "Try it: how a skip list finds a score",
+      "caption": "Search runs along the sparse upper lanes and drops a level whenever the next hop would overshoot. That is the whole algorithm behind a Redis sorted set."
+    }
+  ],
+  "19-distributed-message-queue": [
+    {
+      "afterSection": "step-3-design-deep-dive",
+      "module": "anim-partitions.js",
+      "mount": "anim-partitions",
+      "title": "Try it: partitions are the ceiling on parallelism",
+      "caption": "Add consumers past the partition count and watch them go idle. A partition goes to at most one consumer in a group, so the topic's partition count caps how fast the group can ever read."
+    }
+  ],
+  "24-s3-like-object-storage": [
+    {
+      "afterSection": "step-3-design-deep-dive",
+      "module": "anim-erasure.js",
+      "mount": "anim-erasure",
+      "title": "Try it: erasure coding against replication",
+      "caption": "Click a node to kill it. Any k of the k+m shards rebuild the object, so the same durability costs far less storage than three full copies \u2014 until you look at what a repair has to read."
+    }
+  ],
+  "27-digital-wallet": [
+    {
+      "afterSection": "step-3-design-deep-dive",
+      "module": "anim-saga.js",
+      "mount": "anim-saga",
+      "title": "Try it: 2PC, TCC and Saga under the same failure",
+      "caption": "All three look identical when nothing goes wrong. Inject a failure at each step and watch them diverge \u2014 blocked locks, cancelled reservations, or compensation for something everyone has already seen."
+    }
+  ],
+  "28-stock-exchange": [
+    {
+      "afterSection": "step-3-design-deep-dive",
+      "module": "anim-orderbook.js",
+      "mount": "anim-orderbook",
+      "title": "Try it: price-time priority is the whole matching rule",
+      "caption": "Send orders into the book. Anything priced across the spread trades immediately against the best resting order, oldest first; the remainder rests and becomes the new best price."
     }
   ]
 }

@@ -788,6 +788,16 @@ For example, we might submit a payment verification check for 30m from now, whic
 <li>The timing function can be achieved using dedicated delay queues or a <a href="http://www.cs.columbia.edu/~nahum/w6998/papers/sosp87-timing-wheels.pdf" target="_blank" rel="noopener">hierarchical time wheel</a></li>
 </ul>
 <hr>
+
+<figure class="anim" id="anim-partitions" data-anim="anim-partitions">
+  <figcaption class="anim-head">
+    <span class="anim-title">Try it: partitions are the ceiling on parallelism</span>
+    <span class="anim-caption">Add consumers past the partition count and watch them go idle. A partition goes to at most one consumer in a group, so the topic's partition count caps how fast the group can ever read.</span>
+  </figcaption>
+  <div class="anim-stage" data-anim-stage>
+    <noscript><p class="anim-fallback">This interactive explainer needs JavaScript. The surrounding text and diagrams carry the same information.</p></noscript>
+  </div>
+</figure>
 </section>
 <section id="step-4-wrap-up">
 <h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
@@ -1072,6 +1082,7 @@ For example, we might submit a payment verification check for 30m from now, whic
 <script src="../assets/js/visited.js"></script>
 <script src="../assets/js/nav.js"></script>
 <script src="../assets/js/code-tabs.js"></script>
-
+<script src="../assets/js/anim-kit.js"></script>
+<script src="../assets/js/anim-partitions.js"></script>
 </body>
 </html>

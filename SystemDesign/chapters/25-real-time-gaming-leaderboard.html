@@ -512,6 +512,16 @@ It also enables usage of global secondary indexes when we need to query fields n
 90th percentile = score &lt; 6500
 </code></pre></div>
 <hr>
+
+<figure class="anim" id="anim-skiplist" data-anim="anim-skiplist">
+  <figcaption class="anim-head">
+    <span class="anim-title">Try it: how a skip list finds a score</span>
+    <span class="anim-caption">Search runs along the sparse upper lanes and drops a level whenever the next hop would overshoot. That is the whole algorithm behind a Redis sorted set.</span>
+  </figcaption>
+  <div class="anim-stage" data-anim-stage>
+    <noscript><p class="anim-fallback">This interactive explainer needs JavaScript. The surrounding text and diagrams carry the same information.</p></noscript>
+  </div>
+</figure>
 </section>
 <section id="step-4-wrap-up">
 <h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
@@ -710,6 +720,7 @@ It also enables usage of global secondary indexes when we need to query fields n
 <script src="../assets/js/visited.js"></script>
 <script src="../assets/js/nav.js"></script>
 <script src="../assets/js/code-tabs.js"></script>
-
+<script src="../assets/js/anim-kit.js"></script>
+<script src="../assets/js/anim-skiplist.js"></script>
 </body>
 </html>

@@ -282,6 +282,16 @@
 <p><strong>Why the message queue is load-bearing.</strong> Fanout is bursty and slow; the publish request must not wait for it. Enqueueing the <code>(post_id, follower_batch)</code> work lets the author's <code>POST</code> return in milliseconds while workers grind through 46,000 cache writes per second in the background. The queue also absorbs event-driven spikes — a World Cup goal produces a fanout surge that would otherwise time out every publish request on the platform. The cost is that the feed is <strong>eventually consistent</strong>: two friends refreshing at the same moment can legitimately see different feeds.</p>
 </li>
 </ol>
+
+<figure class="anim" id="anim-fanout" data-anim="anim-fanout">
+  <figcaption class="anim-head">
+    <span class="anim-title">Try it: fan-out on write vs on read</span>
+    <span class="anim-caption">Post as an ordinary user, then as the pop star, under each strategy. The same total work lands on opposite sides of the system — and one of the two sides falls over.</span>
+  </figcaption>
+  <div class="anim-stage" data-anim-stage>
+    <noscript><p class="anim-fallback">This interactive explainer needs JavaScript. The surrounding text and diagrams carry the same information.</p></noscript>
+  </div>
+</figure>
 </section>
 <section id="news-feed-retrieval-deep-dive">
 <h2 id="news-feed-retrieval-deep-dive">News Feed Retrieval Deep Dive</h2>
@@ -626,6 +636,7 @@
 <script src="../assets/js/visited.js"></script>
 <script src="../assets/js/nav.js"></script>
 <script src="../assets/js/code-tabs.js"></script>
-
+<script src="../assets/js/anim-kit.js"></script>
+<script src="../assets/js/anim-fanout.js"></script>
 </body>
 </html>

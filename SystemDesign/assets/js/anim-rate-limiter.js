@@ -17,8 +17,7 @@
 
 (function () {
   'use strict';
-
-  var MOUNT = 'anim-rate-limiter';
+  var K = window.ANIMKIT;
 
   var LIMIT = 5;          /* requests allowed ... */
   var WINDOW = 10000;     /* ... per this many ms */
@@ -205,20 +204,13 @@
     }
   };
 
-  function esc(s) {
-    return String(s).replace(/[&<>"]/g, function (c) {
-      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
-    });
-  }
+  var esc = K.esc;
 
   /* ======================================================================
      mount
      ====================================================================== */
-  function mount(fig) {
-    var stage = fig.querySelector('[data-anim-stage]');
-    if (!stage) return;
-
-    var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  K.register('anim-rate-limiter', function (stage, fig) {
+    var reduceMotion = K.reduceMotion;
 
     var now = 0;              /* simulated clock, ms */
     var pending = [];         /* request arrival times not yet processed */
@@ -422,26 +414,12 @@
 
     /* Pause while off-screen: no point animating what nobody is looking at. */
     var wasRunning = false;
-    if (window.IntersectionObserver) {
-      new window.IntersectionObserver(function (entries) {
-        entries.forEach(function (en) {
-          if (en.isIntersecting) {
-            if (wasRunning) setRunning(true);
-          } else {
-            wasRunning = running;
-            if (running) setRunning(false);
-          }
-        });
-      }, { threshold: 0.05 }).observe(fig);
-    }
+    K.onVisible(fig,
+      function () { if (wasRunning) setRunning(true); },
+      function () { wasRunning = running; if (running) setRunning(false); });
 
     render();
     /* Reduced motion: wait for an explicit Run or Step rather than ticking. */
     if (!reduceMotion) setRunning(true);
-  }
-
-  document.addEventListener('DOMContentLoaded', function () {
-    var fig = document.querySelector('[data-anim="' + MOUNT + '"]');
-    if (fig) mount(fig);
   });
 })();

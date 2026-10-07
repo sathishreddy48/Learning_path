@@ -244,6 +244,16 @@
 </div>
 <p><strong>Sanity-check the headroom.</strong> The requirement is 10,000 IDs/sec. A <em>single</em> Snowflake node sustains 4.096 million IDs/sec — about 400× the requirement — and 1024 nodes give a theoretical 4.19 billion/sec. The timestamp, not throughput, is the scarce resource.</p>
 <p><strong>Why a custom epoch matters.</strong> The 69.7 years is counted from whatever epoch you choose, not from 1970. Using the Unix epoch burns 40 of those years before you start; Twitter's epoch of Nov 2010 means its IDs run out around 2080. Pick an epoch near your launch date, write it down somewhere permanent, and understand that it can never be changed — every existing ID is interpreted relative to it.</p>
+
+<figure class="anim" id="anim-snowflake" data-anim="anim-snowflake">
+  <figcaption class="anim-head">
+    <span class="anim-title">Try it: spend the 64 bits yourself</span>
+    <span class="anim-caption">Every bit you give one field is taken from another. Change the split and see what it costs you in epoch length, machine count and IDs per millisecond.</span>
+  </figcaption>
+  <div class="anim-stage" data-anim-stage>
+    <noscript><p class="anim-fallback">This interactive explainer needs JavaScript. The surrounding text and diagrams carry the same information.</p></noscript>
+  </div>
+</figure>
 </section>
 <section id="step-4-additional-considerations">
 <h2 id="step-4-additional-considerations">Step 4: Additional Considerations</h2>
@@ -585,6 +595,7 @@
 <script src="../assets/js/visited.js"></script>
 <script src="../assets/js/nav.js"></script>
 <script src="../assets/js/code-tabs.js"></script>
-
+<script src="../assets/js/anim-kit.js"></script>
+<script src="../assets/js/anim-snowflake.js"></script>
 </body>
 </html>

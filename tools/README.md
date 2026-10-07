@@ -81,10 +81,55 @@ heading's GitHub anchor slug. **The markdown is never edited to make room for
 them**, and if `afterSection` does not match a real section the build fails
 loudly rather than dropping the animation silently.
 
-Animation sources live in `anim/` and are copied to
-`SystemDesign/assets/js/` by the build. Both are plain IIFEs with no shared
-framework, honour `prefers-reduced-motion`, are keyboard-operable, and pause
-when scrolled out of view.
+`title` is plain text and is HTML-escaped by the build, so write literal
+characters (`>`, not `&gt;`). `caption` is injected as HTML and may contain
+tags such as `<code>`.
+
+Sources live in `anim/` and every `*.js` there is published automatically;
+`_kit.js` is special and becomes `anim-kit.js`, loaded before any module on
+pages that have one. Thirteen chapters currently carry one:
+
+| Chapter | Explainer | What it makes visible |
+|---|---|---|
+| 4 Rate Limiter | five algorithms, one request stream | the fixed window passing 2× the budget across a boundary |
+| 5 Consistent Hashing | the ring | ~1/N keys move on the ring vs ~(N−1)/N with `hash % N` |
+| 6 Key-Value Store | quorum N/W/R | why `W + R > N` is just pigeonhole |
+| 7 Unique ID Generator | the 64-bit budget | every bit one field gains, another loses |
+| 11 News Feed | fan-out on write vs read | one celebrity post costing 40M writes |
+| 13 Search Autocomplete | trie + cached top-k | the walk is cheap, the subtree scan is not |
+| 16 Proximity Service | geohash cells | two points 1.5 km apart sharing no prefix |
+| 19 Message Queue | partitions & consumer groups | partition count as a hard ceiling on parallelism |
+| 21 Ad Click Aggregation | event time & watermarks | completeness traded against latency |
+| 24 Object Storage | erasure coding vs replication | same durability, half the storage |
+| 25 Leaderboard | skip list search | 7.3 average comparisons against 12.0 |
+| 27 Digital Wallet | 2PC vs TCC vs Saga | identical on the happy path, divergent under failure |
+| 28 Stock Exchange | order book matching | price-time priority as the only rule |
+
+### Writing another one
+
+Add `anim/anim-<name>.js`, then an entry in `animations.json`. The module is a
+plain IIFE with no build step:
+
+```js
+(function () {
+  'use strict';
+  var K = window.ANIMKIT;
+  K.register('anim-<mount>', function (stage, fig) {
+    stage.innerHTML = '…';
+    // K.esc, K.t, K.svg, K.btn, K.seg, K.stat, K.outs, K.onClick,
+    // K.onVisible, K.clamp, K.reduceMotion
+  });
+})();
+```
+
+`K.register` contains anything the module throws, so a bug in one explainer
+shows a fallback line in that figure instead of blanking the chapter.
+
+Conventions that matter: colours come from CSS variables (`var(--primary)`,
+not a hex) so the figures follow the light and dark themes; anything that
+ticks pauses off-screen via `K.onVisible` and does not auto-run under
+`prefers-reduced-motion`; and the numbers on screen should be computed, not
+asserted — the point of these is that the chapter's claim can be checked.
 
 ## .claude/launch.json
 

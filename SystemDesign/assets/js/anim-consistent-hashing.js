@@ -14,8 +14,8 @@
 
 (function () {
   'use strict';
+  var K = window.ANIMKIT;
 
-  var MOUNT = 'anim-consistent-hashing';
   var RING = 1 << 16;           /* a 16-bit ring keeps the numbers readable */
   var VNODES = 40;              /* virtual nodes per server when enabled */
   var SERVER_NAMES = ['s0', 's1', 's2', 's3', 's4', 's5', 's6', 's7'];
@@ -133,11 +133,7 @@
     return i === -1 ? 'var(--text-faint)' : COLORS[i % COLORS.length];
   }
 
-  function esc(s) {
-    return String(s).replace(/[&<>"]/g, function (c) {
-      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
-    });
-  }
+  var esc = K.esc;
 
   function svgRing(model, owners) {
     var parts = [];
@@ -253,10 +249,7 @@
   /* ======================================================================
      mount
      ====================================================================== */
-  function mount(fig) {
-    var stage = fig.querySelector('[data-anim-stage]');
-    if (!stage) return;
-
+  K.register('anim-consistent-hashing', function (stage) {
     var model = createModel();
     addKeys(model, 24);
 
@@ -397,10 +390,5 @@
     });
 
     render();
-  }
-
-  document.addEventListener('DOMContentLoaded', function () {
-    var fig = document.querySelector('[data-anim="' + MOUNT + '"]');
-    if (fig) mount(fig);
   });
 })();

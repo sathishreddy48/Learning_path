@@ -640,6 +640,16 @@ As long as more than half of the nodes are up, the system continues running.</p>
 <p><strong>Note what the phase status table is doing: it makes the saga itself event-sourced.</strong> The coordinator records each step's outcome durably before proceeding, so a coordinator that dies mid-transfer can be replaced by one that reads the table and continues — or compensates. Without it, a crashed coordinator leaves a transfer half-applied with nobody knowing which half. It is the same &quot;persisted to-do list&quot; device as the <code>ledger_updated</code> / <code>wallet_updated</code> flags in <a href="26-payment-system.html#payment-service-data-model">Chapter 26</a>, applied to a distributed transaction.</p>
 <p><strong>And here is the limitation the sharded design cannot remove: a hot account.</strong> A popular merchant's wallet receives transfers from everyone, but its balance lives in exactly one Raft group with exactly one leader, so all of those writes serialise through one node. You cannot shard a single account's balance, because the invariant being protected — the balance — <em>is</em> the thing you would be splitting. This is the same wall as the hot inventory row in <a href="22-hotel-reservation-system.html#the-deadlock-the-chapter-does-not-mention">Chapter 22</a> and the hot ad in <a href="21-ad-click-event-aggregation.html#scale-the-system">Chapter 21</a>, and the available responses are the same three: serialise deliberately and accept the ceiling, batch many transfers into one update, or split the account into sub-balances and sum them — at which point &quot;what is my balance&quot; becomes a scatter-gather and the simple invariant is gone.</p>
 <hr>
+
+<figure class="anim" id="anim-saga" data-anim="anim-saga">
+  <figcaption class="anim-head">
+    <span class="anim-title">Try it: 2PC, TCC and Saga under the same failure</span>
+    <span class="anim-caption">All three look identical when nothing goes wrong. Inject a failure at each step and watch them diverge — blocked locks, cancelled reservations, or compensation for something everyone has already seen.</span>
+  </figcaption>
+  <div class="anim-stage" data-anim-stage>
+    <noscript><p class="anim-fallback">This interactive explainer needs JavaScript. The surrounding text and diagrams carry the same information.</p></noscript>
+  </div>
+</figure>
 </section>
 <section id="step-4-wrap-up">
 <h2 id="step-4-wrap-up">Step 4: Wrap Up</h2>
@@ -881,6 +891,7 @@ As long as more than half of the nodes are up, the system continues running.</p>
 <script src="../assets/js/visited.js"></script>
 <script src="../assets/js/nav.js"></script>
 <script src="../assets/js/code-tabs.js"></script>
-
+<script src="../assets/js/anim-kit.js"></script>
+<script src="../assets/js/anim-saga.js"></script>
 </body>
 </html>
