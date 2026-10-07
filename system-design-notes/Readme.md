@@ -18,7 +18,7 @@ Chapters are being progressively expanded beyond plain summaries. The ones that 
 - **Mermaid diagrams** alongside the book's images. These render on GitHub; where they don't render, the surrounding tables and prose carry the same information.
 - **Self-check questions** and a glossary at the end of the longer chapters.
 
-Chapters 1-10 have had this pass and are the current reference for the format.
+Chapters 1-14 have had this pass and are the current reference for the format.
 
 ## Chapters
 
