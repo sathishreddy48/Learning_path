@@ -299,5 +299,5 @@ Two practical habits:
 ### Where to go next
 - [Chapter 1 – Scale From Zero To Millions Of Users](../01.%20Scaling/) — the toolbox Steps 2 and 3 draw on.
 - [Chapter 2 – Back-of-the-envelope Estimation](../02.%20Back%20Of%20the%20Envelope%20Estimation/) — how to decide which tools the problem justifies.
-- [Recurring Patterns](../Patterns.md) — the dozen ideas that reappear across the design chapters. Worth skimming before an interview: naming the pattern in Step 1 tells you which chapters to borrow from in Steps 2 and 3.
+- [Recurring Patterns](../Patterns.md) — an index of the ideas that recur across the design chapters, each cross-referenced to the chapters covering it. Useful between Step 1 and Step 2, once the requirements tell you which pattern you are in.
 - Chapters 4 onward apply this framework to one problem each.

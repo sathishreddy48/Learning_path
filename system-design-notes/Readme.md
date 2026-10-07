@@ -23,7 +23,7 @@ Every chapter has been expanded beyond a plain summary of the book, using a few 
 
 ## Start here
 
-- **[Recurring Patterns](./Patterns.md)** — the dozen ideas that reappear across all 28 chapters: fan-out on write vs on read, an immutable log plus a derived view, idempotency instead of exactly-once, hot keys that partitioning cannot fix, and whether a shard key contains the transaction. Read it after the chapters, or skim it before an interview — recognising the pattern tells you which chapters to borrow from.
+- **[Recurring Patterns](./Patterns.md)** — an index of the dozen ideas that reappear across the 28 chapters: fan-out on write vs on read, an immutable log plus a derived view, at-least-once delivery with idempotent processing, hot keys that partitioning does not fix, and whether a shard key contains the transaction. Each entry links to the chapters that work the pattern through, so recognising one points you at where it is already covered.
 - [Chapter 3 – A Framework For System Design Interviews](./03.%20System%20Design%20Framework/) — the process, and a one-page cheat sheet.
 - [Chapter 2 – Back-of-the-envelope Estimation](./02.%20Back%20Of%20the%20Envelope%20Estimation/) — powers of two, latency numbers, and the estimation recipe.
 
