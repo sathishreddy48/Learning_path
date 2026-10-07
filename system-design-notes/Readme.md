@@ -4,12 +4,12 @@ These notes are based on the System Design Interview books - [Vol 1 and Vol 2 2n
 
 Check the notes here: https://pagefy.io/system-design/system-design-interview-by-alex-xu
 
-**Note:** These notes are a work in progress. 
+**Note:** All 28 chapters are written up; wording and diagrams are still being refined. 
 
 
 ## How these notes are organized
 
-Chapters are being progressively expanded beyond plain summaries. The ones that have had that pass use a few consistent conventions:
+Every chapter has been expanded beyond a plain summary of the book, using a few consistent conventions:
 
 - **"What broke" / "What it now costs you"** — each design step is framed by the problem that forced it and the new problem it introduces, so a chapter reads as a causal story rather than a list of components.
 - **Trade-off tables** — side-by-side comparisons instead of prose, for choices like vertical vs horizontal scaling or SQL vs NoSQL.
@@ -20,6 +20,12 @@ Chapters are being progressively expanded beyond plain summaries. The ones that 
 - **Cross-links between chapters**, because the same few ideas recur: fan-out on write vs on read, an immutable log plus a derived view, idempotency instead of exactly-once delivery, and hot keys that partitioning cannot fix.
 
 **All 28 chapters have now had this pass.** Chapters 5, 6 and 11 are good places to see the format at its fullest.
+
+## Start here
+
+- **[Recurring Patterns](./Patterns.md)** — the dozen ideas that reappear across all 28 chapters: fan-out on write vs on read, an immutable log plus a derived view, idempotency instead of exactly-once, hot keys that partitioning cannot fix, and whether a shard key contains the transaction. Read it after the chapters, or skim it before an interview — recognising the pattern tells you which chapters to borrow from.
+- [Chapter 3 – A Framework For System Design Interviews](./03.%20System%20Design%20Framework/) — the process, and a one-page cheat sheet.
+- [Chapter 2 – Back-of-the-envelope Estimation](./02.%20Back%20Of%20the%20Envelope%20Estimation/) — powers of two, latency numbers, and the estimation recipe.
 
 ## Chapters
 
