@@ -1,0 +1,1492 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clean Architecture &amp; Domain-Driven Design — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="architecture-ddd">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › C# &amp; .NET › Topic 11 of 36</div>
+  <h1>Clean Architecture &amp; Domain-Driven Design</h1>
+  <p class="lede"><a href="design-patterns.html">Design Patterns &amp; SOLID</a> is about the shape of a class; this is about the shape of a solution. It is the hardest area to answer well because the vocabulary is easy and the judgement is not — anyone can define an aggregate, and the interview question is always "where would you draw the boundary here, and what did that cost you". Every section ends with the argument against, because an architecture answer without trade-offs reads as something you have read rather than something you have shipped.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#layers">Layered, Onion, Hexagonal and Clean — one idea, four names</a></li><li><a href="#entities-values">Entities, value objects and invariants</a></li><li><a href="#aggregates">Aggregates and aggregate roots</a></li><li><a href="#bounded-contexts">Bounded contexts, ubiquitous language and context mapping</a></li><li><a href="#domain-events">Domain events and integration events</a></li><li><a href="#application-services">Application services, use cases and the MediatR shape</a></li><li><a href="#cqrs">CQRS: separate models, and how far to take it</a></li><li><a href="#event-sourcing">Event sourcing: streams, projections and snapshots</a></li><li><a href="#vertical-slice">Vertical slice architecture, and the case against layers</a></li><li><a href="#persistence">Persisting the domain without leaking it</a></li></ol>
+  </div>
+
+<section id="layers"><h2 id="layers">Layered, Onion, Hexagonal and Clean — one idea, four names</h2><p>These are the same idea drawn differently, and saying so is a better answer than describing any one of them. The idea: <strong>dependencies point inward, toward the domain, and the domain depends on nothing</strong>. Everything else — the database, HTTP, the message bus, the clock — is a detail that plugs in from outside.</p><p>The mechanism is dependency inversion. The domain defines the interface it needs (<code>IOrderRepository</code>); infrastructure implements it; composition at startup wires them together. That is the whole trick, and it is why the domain project has no package references.</p><p>Classic <strong>layered</strong> architecture differs on one point only: its dependencies point <em>down</em>, so the business layer references the data layer and your domain ends up knowing about EF Core. Onion, Hexagonal (ports and adapters) and Clean all invert that last arrow.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># The layout, and the project references are the architecture
+src/
+  Shop.Domain/                 # entities, value objects, domain events, interfaces
+    Orders/Order.cs
+    Orders/IOrderRepository.cs       # the PORT: defined by the domain
+    Common/Money.cs
+    -&gt; references: NOTHING. No EF, no ASP.NET, no MediatR, no JSON.
+
+  Shop.Application/            # use cases, orchestration
+    Orders/PlaceOrder.cs
+    Abstractions/IClock.cs
+    -&gt; references: Shop.Domain
+
+  Shop.Infrastructure/         # the ADAPTERS: EF, HTTP clients, the bus, the clock
+    Persistence/AppDbContext.cs
+    Persistence/OrderRepository.cs   # implements Shop.Domain.IOrderRepository
+    -&gt; references: Shop.Domain, Shop.Application
+
+  Shop.Api/                    # HTTP, DI composition, configuration
+    Program.cs
+    Endpoints/OrderEndpoints.cs
+    -&gt; references: Application, Infrastructure  (composition root only)
+
+tests/
+  Shop.Domain.Tests/           # no database, no mocks, milliseconds
+
+# Enforce it, or it decays within a quarter. An architecture test is a unit test:
+dotnet add tests/Shop.ArchitectureTests package NetArchTest.Rules</code></pre><pre data-lang="csharp" hidden><code>// The port lives with the domain, in the domain&#x27;s language
+namespace Shop.Domain.Orders;
+
+public interface IOrderRepository          // no IQueryable, no DbSet, no SaveChanges
+{
+    Task&lt;Order?&gt; Get(OrderId id, CancellationToken ct);
+    Task Add(Order order, CancellationToken ct);
+}
+
+// The adapter lives in infrastructure and knows about EF
+namespace Shop.Infrastructure.Persistence;
+
+public class OrderRepository(AppDbContext db) : IOrderRepository
+{
+    public async Task&lt;Order?&gt; Get(OrderId id, CancellationToken ct)
+        =&gt; await db.Orders.Include(o =&gt; o.Lines)
+                          .SingleOrDefaultAsync(o =&gt; o.Id == id, ct);
+
+    public async Task Add(Order order, CancellationToken ct)
+        =&gt; await db.Orders.AddAsync(order, ct);
+}
+
+// Composition: the ONLY place that knows both sides
+builder.Services.AddScoped&lt;IOrderRepository, OrderRepository&gt;();
+builder.Services.AddScoped&lt;IClock, SystemClock&gt;();
+
+// Enforcing the rule as a test - this is what stops the decay
+public class ArchitectureTests
+{
+    [Fact]
+    public void Domain_depends_on_nothing()
+    {
+        var result = Types.InAssembly(typeof(Order).Assembly)
+            .ShouldNot()
+            .HaveDependencyOnAny(&quot;Microsoft.EntityFrameworkCore&quot;,
+                                 &quot;Microsoft.AspNetCore&quot;,
+                                 &quot;Shop.Infrastructure&quot;,
+                                 &quot;Shop.Application&quot;)
+            .GetResult();
+
+        result.IsSuccessful.Should().BeTrue(
+            string.Join(&quot;, &quot;, result.FailingTypeNames ?? []));
+    }
+
+    [Fact]
+    public void Application_does_not_know_about_infrastructure()
+        =&gt; Types.InAssembly(typeof(PlaceOrder).Assembly)
+            .ShouldNot().HaveDependencyOn(&quot;Shop.Infrastructure&quot;)
+            .GetResult().IsSuccessful.Should().BeTrue();
+}
+
+// The leak that defeats the whole thing: returning IQueryable from a repository.
+// The caller can now write EF-specific LINQ, so the domain depends on EF again
+// through a type it does not reference.
+public interface ILeakyRepository
+{
+    IQueryable&lt;Order&gt; Query();      // &lt;- do not do this
+}</code></pre><pre data-lang="python" hidden><code># The same rule, enforced by package structure rather than project references
+
+# shop/domain/orders.py  - imports nothing from shop.infrastructure
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+class OrderRepository(ABC):              # the port, in the domain
+    @abstractmethod
+    async def get(self, order_id: &quot;OrderId&quot;) -&gt; &quot;Order | None&quot;: ...
+    @abstractmethod
+    async def add(self, order: &quot;Order&quot;) -&gt; None: ...
+
+# shop/infrastructure/persistence.py  - the adapter, knows SQLAlchemy
+from shop.domain.orders import OrderRepository, Order
+
+class SqlOrderRepository(OrderRepository):
+    def __init__(self, session) -&gt; None:
+        self._session = session
+
+    async def get(self, order_id):
+        return await self._session.get(Order, order_id)
+
+    async def add(self, order) -&gt; None:
+        self._session.add(order)
+
+# shop/api/main.py - composition root
+from fastapi import Depends
+def get_repo(session = Depends(get_session)) -&gt; OrderRepository:
+    return SqlOrderRepository(session)
+
+# Enforcing it: import-linter, the NetArchTest equivalent
+# setup.cfg / .importlinter:
+#
+#   [importlinter]
+#   root_package = shop
+#
+#   [importlinter:contract:layers]
+#   name = Layered architecture
+#   type = layers
+#   layers =
+#       shop.api
+#       shop.infrastructure
+#       shop.application
+#       shop.domain
+#
+# then in CI:  lint-imports</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The best answer collapses the four names into one rule and then gets concrete: "dependencies point inward, the domain references nothing, infrastructure implements interfaces the domain declares". Expect the pushback — "isn't that a lot of ceremony for a CRUD app?" — and agree where it is true: for a service that is mostly mapping HTTP to SQL, the layers are overhead and a vertical slice is better. The detail that lands: an architecture test, because without one the dependency rule is a convention that survives about two sprints.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Add an architecture test asserting your domain project has no infrastructure dependency; see whether it passes today.</li><li>Find an <code>IQueryable</code> leaking out of a repository and work out what it lets callers do.</li><li>Write down what would have to change to swap EF Core for Dapper, and check whether the answer is "one project".</li></ul></div></section>
+<section id="entities-values"><h2 id="entities-values">Entities, value objects and invariants</h2><p>The distinction is identity. An <strong>entity</strong> has one and is the same thing over time even as its data changes — two orders with identical contents are different orders. A <strong>value object</strong> has no identity and is defined entirely by its values — two <code>Money(10, "USD")</code> are interchangeable. Value objects are immutable, compared by value, and are where you put validation so an invalid value cannot be constructed at all.</p><p>The point of both is the <strong>invariant</strong>: a rule that must always hold. An anaemic model with public setters cannot hold an invariant, because any caller can break it between two valid states. The fix is a private setter and a method that expresses the operation.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// VALUE OBJECT: no identity, immutable, validated at construction, compared by value
+public readonly record struct Money
+{
+    public decimal Amount { get; }
+    public string Currency { get; }
+
+    public Money(decimal amount, string currency)
+    {
+        if (amount &lt; 0) throw new ArgumentOutOfRangeException(nameof(amount));
+        if (currency is not { Length: 3 })
+            throw new ArgumentException(&quot;ISO 4217 code required&quot;, nameof(currency));
+        (Amount, Currency) = (amount, currency.ToUpperInvariant());
+    }
+
+    // Operations return new instances; the rule lives here, not in a service
+    public static Money operator +(Money a, Money b) =&gt;
+        a.Currency == b.Currency
+            ? new(a.Amount + b.Amount, a.Currency)
+            : throw new InvalidOperationException(&quot;cannot add different currencies&quot;);
+
+    public static Money Zero(string currency) =&gt; new(0, currency);
+}
+
+// A strongly-typed id is a value object too, and it removes a whole class of bug
+public readonly record struct OrderId(Guid Value)
+{
+    public static OrderId New() =&gt; new(Guid.NewGuid());
+    public override string ToString() =&gt; Value.ToString();
+}
+// void Ship(OrderId order, CustomerId customer)  &lt;- cannot transpose the arguments
+
+// ENTITY: has identity, protects its invariants, exposes behaviour not setters
+public class Order
+{
+    private readonly List&lt;OrderLine&gt; _lines = [];
+
+    public OrderId Id { get; private init; }
+    public OrderStatus Status { get; private set; }
+    public IReadOnlyList&lt;OrderLine&gt; Lines =&gt; _lines;     // expose read-only
+    public Money Total =&gt; _lines.Aggregate(Money.Zero(&quot;USD&quot;), (t, l) =&gt; t + l.Subtotal);
+
+    private Order() { }                                  // EF needs one; keep it private
+
+    public static Order Place(CustomerId customer, IEnumerable&lt;OrderLine&gt; lines)
+    {
+        var list = lines.ToList();
+        if (list.Count == 0) throw new DomainException(&quot;an order needs at least one line&quot;);
+
+        var order = new Order { Id = OrderId.New(), CustomerId = customer,
+                                Status = OrderStatus.Pending };
+        order._lines.AddRange(list);
+        return order;
+    }
+
+    // Behaviour, with the rule attached to it
+    public void AddLine(Sku sku, int quantity, Money unitPrice)
+    {
+        if (Status != OrderStatus.Pending)
+            throw new DomainException(&quot;cannot change a submitted order&quot;);
+        if (quantity &lt;= 0)
+            throw new DomainException(&quot;quantity must be positive&quot;);
+
+        var existing = _lines.FirstOrDefault(l =&gt; l.Sku == sku);
+        if (existing is not null) existing.Increase(quantity);
+        else _lines.Add(new OrderLine(sku, quantity, unitPrice));
+    }
+
+    public void Pay()
+    {
+        if (Status != OrderStatus.Pending) throw new DomainException(&quot;already paid&quot;);
+        if (_lines.Count == 0) throw new DomainException(&quot;nothing to pay for&quot;);
+        Status = OrderStatus.Paid;
+    }
+}
+
+// THE ANAEMIC VERSION - what most &quot;domain models&quot; actually are
+public class AnaemicOrder
+{
+    public Guid Id { get; set; }
+    public string Status { get; set; } = &quot;&quot;;       // any caller can set &quot;banana&quot;
+    public List&lt;OrderLine&gt; Lines { get; set; } = []; // any caller can empty it
+    public decimal Total { get; set; }              // and can disagree with Lines
+}
+// The rules now live in an OrderService, so nothing prevents a second caller
+// from mutating the object without them. That is the actual argument.</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import NewType
+import uuid
+
+# VALUE OBJECT: frozen dataclass, validated in __post_init__
+@dataclass(frozen=True)
+class Money:
+    amount: Decimal
+    currency: str
+
+    def __post_init__(self) -&gt; None:
+        if self.amount &lt; 0:
+            raise ValueError(&quot;amount must be non-negative&quot;)
+        if len(self.currency) != 3:
+            raise ValueError(&quot;ISO 4217 code required&quot;)
+        object.__setattr__(self, &quot;currency&quot;, self.currency.upper())   # frozen workaround
+
+    def __add__(self, other: &quot;Money&quot;) -&gt; &quot;Money&quot;:
+        if self.currency != other.currency:
+            raise ValueError(&quot;cannot add different currencies&quot;)
+        return Money(self.amount + other.amount, self.currency)
+
+    @staticmethod
+    def zero(currency: str) -&gt; &quot;Money&quot;:
+        return Money(Decimal(0), currency)
+
+# Strongly-typed ids: NewType is checked statically, free at runtime
+OrderId    = NewType(&quot;OrderId&quot;, uuid.UUID)
+CustomerId = NewType(&quot;CustomerId&quot;, uuid.UUID)
+# def ship(order: OrderId, customer: CustomerId) -&gt; None: ...
+#   ship(customer_id, order_id)   # mypy error, even though both are UUIDs
+
+# ENTITY: identity, private state by convention, behaviour not setters
+class Order:
+    def __init__(self, id: OrderId, customer: CustomerId) -&gt; None:
+        self._id = id
+        self._customer = customer
+        self._status = &quot;pending&quot;
+        self._lines: list[&quot;OrderLine&quot;] = []
+
+    @property
+    def id(self) -&gt; OrderId: return self._id
+
+    @property
+    def lines(self) -&gt; tuple[&quot;OrderLine&quot;, ...]:
+        return tuple(self._lines)                  # read-only view
+
+    @property
+    def total(self) -&gt; Money:
+        return sum((l.subtotal for l in self._lines), Money.zero(&quot;USD&quot;))
+
+    @classmethod
+    def place(cls, customer: CustomerId, lines: list[&quot;OrderLine&quot;]) -&gt; &quot;Order&quot;:
+        if not lines:
+            raise DomainError(&quot;an order needs at least one line&quot;)
+        order = cls(OrderId(uuid.uuid4()), customer)
+        order._lines.extend(lines)
+        return order
+
+    def add_line(self, sku: str, quantity: int, unit_price: Money) -&gt; None:
+        if self._status != &quot;pending&quot;:
+            raise DomainError(&quot;cannot change a submitted order&quot;)
+        if quantity &lt;= 0:
+            raise DomainError(&quot;quantity must be positive&quot;)
+        for line in self._lines:
+            if line.sku == sku:
+                line.increase(quantity)
+                return
+        self._lines.append(OrderLine(sku, quantity, unit_price))
+
+    def pay(self) -&gt; None:
+        if self._status != &quot;pending&quot;:
+            raise DomainError(&quot;already paid&quot;)
+        self._status = &quot;paid&quot;
+
+# Python cannot truly prevent `order._status = &quot;banana&quot;`, so the discipline is
+# conventional. The design intent is identical; the enforcement is weaker.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"What is the difference between an entity and a value object?" is the definitional question; identity is the one-word answer. The one that actually probes understanding is "what is an anaemic domain model and why is it a problem?" — public setters mean the invariant lives outside the object, so it holds only as long as every caller remembers it, and nothing in the type system enforces that. Have a concrete invariant ready (an order cannot be modified after payment) and show the method that owns it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take a class with public setters and move one real rule into a method with a private setter.</li><li>Build a <code>Money</code> value object that refuses to add two currencies, and write the test.</li><li>Introduce a strongly-typed id and find the transposed-arguments bug it would have caught.</li></ul></div></section>
+<section id="aggregates"><h2 id="aggregates">Aggregates and aggregate roots</h2><p>An <strong>aggregate</strong> is a cluster of objects treated as one unit for data changes, with one entity as its <strong>root</strong>. Everything outside holds a reference only to the root, and the root enforces the rules for everything inside it. The aggregate is also the <strong>transactional boundary</strong>: one aggregate, one transaction.</p><p>Four rules that answer most aggregate questions: <strong>reference other aggregates by id</strong>, never by object; <strong>one transaction changes one aggregate</strong>; <strong>keep aggregates small</strong> — a big one is a concurrency bottleneck and a loading cost on every operation; <strong>use eventual consistency between aggregates</strong>, through domain events.</p><p>The classic mistake is making the aggregate too big — <code>Customer</code> containing every <code>Order</code> containing every <code>OrderLine</code> — so placing one order loads and locks the customer's entire history.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The aggregate root is the ONLY entry point. OrderLine has no public constructor
+// reachable from outside and no repository of its own.
+public class Order : AggregateRoot&lt;OrderId&gt;
+{
+    private readonly List&lt;OrderLine&gt; _lines = [];
+
+    public CustomerId CustomerId { get; private init; }     // &lt;- an ID, not a Customer
+    public IReadOnlyList&lt;OrderLine&gt; Lines =&gt; _lines;
+
+    // Rules that span the whole aggregate live on the root
+    public void AddLine(Sku sku, int quantity, Money price)
+    {
+        if (_lines.Count &gt;= 100)
+            throw new DomainException(&quot;an order cannot exceed 100 lines&quot;);
+        if (Total + price * quantity &gt; Money.Limit)
+            throw new DomainException(&quot;order exceeds the value limit&quot;);
+
+        _lines.Add(new OrderLine(sku, quantity, price));     // internal ctor
+        Raise(new OrderLineAdded(Id, sku, quantity));
+    }
+
+    public void RemoveLine(Sku sku)
+    {
+        var line = _lines.FirstOrDefault(l =&gt; l.Sku == sku)
+                   ?? throw new DomainException(&quot;no such line&quot;);
+        if (_lines.Count == 1) throw new DomainException(&quot;an order needs a line&quot;);
+        _lines.Remove(line);
+    }
+}
+
+// Rule 1: reference other aggregates by ID. This is the one people break first.
+public class Order
+{
+    public CustomerId CustomerId { get; private init; }     // GOOD
+    // public Customer Customer { get; set; }               // BAD: now one transaction
+    //   can change both, the object graph has no edge, and loading an order drags
+    //   a customer (and whatever the customer drags) into memory.
+}
+
+// Rule 2: one transaction, one aggregate
+public async Task Handle(PlaceOrder cmd, CancellationToken ct)
+{
+    var order = Order.Place(cmd.CustomerId, cmd.Lines);
+    await _orders.Add(order, ct);
+    await _uow.SaveChanges(ct);          // ONE aggregate saved here
+
+    // NOT: also mutate the Customer&#x27;s loyalty points in this transaction.
+    // That is a second aggregate -&gt; a domain event and a separate transaction.
+}
+
+// Rule 3: small. The size test is &quot;what must be consistent IMMEDIATELY?&quot;
+//   Must an order&#x27;s total match its lines at every instant?      yes -&gt; same aggregate
+//   Must a customer&#x27;s lifetime value match instantly?            no  -&gt; separate
+
+// Rule 4: eventual consistency between aggregates, via events
+public class OrderPlacedHandler(ICustomerRepository customers, IUnitOfWork uow)
+    : INotificationHandler&lt;OrderPlaced&gt;
+{
+    public async Task Handle(OrderPlaced e, CancellationToken ct)
+    {
+        var customer = await customers.Get(e.CustomerId, ct);
+        customer!.AddLoyaltyPoints(e.Total);         // a SECOND transaction
+        await uow.SaveChanges(ct);
+    }
+}
+
+// Concurrency: the version lives on the ROOT, so any change inside the aggregate
+// conflicts with any other change to it. That is the point - and it is why a
+// large aggregate becomes a contention hotspot.
+public abstract class AggregateRoot&lt;TId&gt;
+{
+    public TId Id { get; protected init; } = default!;
+    [Timestamp] public byte[] Version { get; private set; } = [];
+
+    private readonly List&lt;IDomainEvent&gt; _events = [];
+    public IReadOnlyList&lt;IDomainEvent&gt; DomainEvents =&gt; _events;
+    protected void Raise(IDomainEvent e) =&gt; _events.Add(e);
+    public void ClearEvents() =&gt; _events.Clear();
+}</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass, field
+from typing import Generic, TypeVar
+import uuid
+
+TId = TypeVar(&quot;TId&quot;)
+
+class AggregateRoot(Generic[TId]):
+    def __init__(self, id: TId) -&gt; None:
+        self._id = id
+        self._events: list[&quot;DomainEvent&quot;] = []
+        self.version = 0                       # optimistic concurrency, on the ROOT
+
+    @property
+    def id(self) -&gt; TId: return self._id
+
+    @property
+    def domain_events(self) -&gt; tuple: return tuple(self._events)
+
+    def _raise(self, event: &quot;DomainEvent&quot;) -&gt; None: self._events.append(event)
+    def clear_events(self) -&gt; None: self._events.clear()
+
+
+class Order(AggregateRoot[OrderId]):
+    MAX_LINES = 100
+
+    def __init__(self, id: OrderId, customer_id: CustomerId) -&gt; None:
+        super().__init__(id)
+        self.customer_id = customer_id         # an ID, not a Customer object
+        self._lines: list[OrderLine] = []
+
+    @property
+    def lines(self) -&gt; tuple[OrderLine, ...]: return tuple(self._lines)
+
+    def add_line(self, sku: str, quantity: int, price: Money) -&gt; None:
+        if len(self._lines) &gt;= self.MAX_LINES:
+            raise DomainError(&quot;an order cannot exceed 100 lines&quot;)
+        self._lines.append(OrderLine(sku, quantity, price))
+        self._raise(OrderLineAdded(self.id, sku, quantity))
+
+    def remove_line(self, sku: str) -&gt; None:
+        if len(self._lines) == 1:
+            raise DomainError(&quot;an order needs a line&quot;)
+        self._lines = [l for l in self._lines if l.sku != sku]
+
+
+# One transaction, one aggregate
+async def place_order(cmd, orders: OrderRepository, uow) -&gt; None:
+    order = Order.place(cmd.customer_id, cmd.lines)
+    await orders.add(order)
+    await uow.commit()                         # ONE aggregate
+
+# The second aggregate changes in its own transaction, driven by the event
+async def on_order_placed(event: OrderPlaced, customers, uow) -&gt; None:
+    customer = await customers.get(event.customer_id)
+    customer.add_loyalty_points(event.total)
+    await uow.commit()                         # SECOND transaction</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"How do you decide aggregate boundaries?" The answer that shows judgement is the consistency question: what must be true at every instant, versus what can be true a second later. Immediate consistency goes inside one aggregate; everything else becomes a domain event and a second transaction. Then name the cost of getting it wrong in both directions — too large means lock contention and loading a graph you do not need; too small means you cannot enforce a rule that genuinely spans the pieces, and it leaks into a service.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take a model you know and justify each aggregate boundary with a specific invariant.</li><li>Find an aggregate holding a reference to another aggregate and replace it with an id; see what breaks.</li><li>Work out which operations in your system would contend on the same aggregate version under load.</li></ul></div></section>
+<section id="bounded-contexts"><h2 id="bounded-contexts">Bounded contexts, ubiquitous language and context mapping</h2><p>A <strong>bounded context</strong> is the scope within which a model and its language are consistent. The insight behind it is that "Customer" means different things in different parts of a business — to Sales it is a pipeline with a probability, to Billing an account with a payment method, to Support a person with a ticket history — and trying to build one <code>Customer</code> class that serves all three produces a type with forty properties of which each consumer uses six.</p><p>The decision is to let each context have its own model and translate at the boundary. This is also the most defensible way to draw service boundaries — see <a href="microservices.html#boundaries">Microservices</a> — and the <strong>anti-corruption layer</strong> is how you stop someone else's model leaking into yours.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Three contexts, three Customers, and that is correct - not duplication to remove
+
+namespace Shop.Sales.Domain;
+public class Customer                       // Sales cares about the pipeline
+{
+    public CustomerId Id { get; init; }
+    public string Name { get; init; } = &quot;&quot;;
+    public LeadScore Score { get; private set; }
+    public DateOnly? LastContacted { get; private set; }
+}
+
+namespace Shop.Billing.Domain;
+public class Customer                       // Billing cares about money
+{
+    public CustomerId Id { get; init; }
+    public BillingAddress Address { get; private set; } = default!;
+    public PaymentMethod Method { get; private set; } = default!;
+    public Money OutstandingBalance { get; private set; }
+}
+
+namespace Shop.Support.Domain;
+public class Customer                       // Support cares about history
+{
+    public CustomerId Id { get; init; }
+    public SupportTier Tier { get; private set; }
+    public IReadOnlyList&lt;TicketId&gt; OpenTickets { get; private set; } = [];
+}
+
+// The shared id is the ONLY thing in common. That is the integration point.
+
+// ANTI-CORRUPTION LAYER: translate at the boundary so their model does not
+// become yours. This is where you absorb a legacy schema or a third-party API.
+namespace Shop.Billing.Infrastructure;
+
+public class LegacyBillingGateway(ILegacyErpClient erp) : IBillingGateway
+{
+    public async Task&lt;Invoice&gt; GetInvoice(InvoiceId id, CancellationToken ct)
+    {
+        // Their shape: flat, cryptic, nullable everywhere, amounts in cents as strings
+        var dto = await erp.GetDoc(id.Value, &quot;INV&quot;, ct);
+
+        // Translate INTO our language. The ERP&#x27;s vocabulary stops here.
+        return new Invoice(
+            Id:       id,
+            Customer: new CustomerId(Guid.Parse(dto.CUST_REF!)),
+            Amount:   new Money(decimal.Parse(dto.AMT_CENTS!) / 100m, dto.CURR ?? &quot;USD&quot;),
+            Status:   dto.STAT switch
+            {
+                &quot;O&quot; =&gt; InvoiceStatus.Open,
+                &quot;P&quot; =&gt; InvoiceStatus.Paid,
+                &quot;V&quot; =&gt; InvoiceStatus.Void,
+                _   =&gt; throw new IntegrationException($&quot;unknown status {dto.STAT}&quot;),
+            });
+    }
+}
+
+// CONTEXT MAP relationships, which is the vocabulary to have ready:
+//   Shared Kernel        - two contexts share a small model; both must agree to change
+//   Customer/Supplier    - downstream has influence over upstream&#x27;s roadmap
+//   Conformist           - downstream just accepts upstream&#x27;s model (no ACL)
+//   Anti-Corruption Layer- downstream translates, protecting its own model
+//   Open Host Service    - upstream publishes a stable API for many consumers
+//   Published Language   - a shared format (events, a schema) everyone speaks
+//   Separate Ways        - no integration at all; duplicate rather than couple
+
+// A &quot;shared kernel&quot; in practice - keep it tiny, and version it deliberately
+namespace Shop.SharedKernel;
+public readonly record struct CustomerId(Guid Value);
+public readonly record struct Money(decimal Amount, string Currency);
+// The temptation is to grow this into a Shop.Common with everything in it.
+// At that point every context is coupled to every other and you have one model
+// again, with extra project references.</code></pre><pre data-lang="python" hidden><code># Three contexts, three Customers - separate packages, no shared model
+
+# shop/sales/domain.py
+@dataclass
+class Customer:                        # Sales: the pipeline
+    id: CustomerId
+    name: str
+    lead_score: int
+    last_contacted: date | None
+
+# shop/billing/domain.py
+@dataclass
+class Customer:                        # Billing: money
+    id: CustomerId
+    address: BillingAddress
+    payment_method: PaymentMethod
+    outstanding: Money
+
+# shop/support/domain.py
+@dataclass
+class Customer:                        # Support: history
+    id: CustomerId
+    tier: str
+    open_tickets: tuple[TicketId, ...]
+
+
+# ANTI-CORRUPTION LAYER
+# shop/billing/infrastructure/legacy_gateway.py
+from decimal import Decimal
+
+class LegacyBillingGateway(BillingGateway):
+    _STATUS = {&quot;O&quot;: &quot;open&quot;, &quot;P&quot;: &quot;paid&quot;, &quot;V&quot;: &quot;void&quot;}
+
+    def __init__(self, erp: &quot;LegacyErpClient&quot;) -&gt; None:
+        self._erp = erp
+
+    async def get_invoice(self, invoice_id: InvoiceId) -&gt; Invoice:
+        dto = await self._erp.get_doc(str(invoice_id), &quot;INV&quot;)
+
+        try:
+            status = self._STATUS[dto[&quot;STAT&quot;]]
+        except KeyError:
+            raise IntegrationError(f&quot;unknown status {dto[&#x27;STAT&#x27;]}&quot;) from None
+
+        return Invoice(                       # translated into OUR language
+            id=invoice_id,
+            customer=CustomerId(uuid.UUID(dto[&quot;CUST_REF&quot;])),
+            amount=Money(Decimal(dto[&quot;AMT_CENTS&quot;]) / 100, dto.get(&quot;CURR&quot;, &quot;USD&quot;)),
+            status=status,
+        )
+
+# Enforce that contexts do not import each other&#x27;s internals - import-linter again
+#
+#   [importlinter:contract:contexts]
+#   name = Bounded contexts are independent
+#   type = independence
+#   modules =
+#       shop.sales
+#       shop.billing
+#       shop.support</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A strong, non-obvious answer to "should these services share a Customer model?" is no — and the reason is that the same word means different things to different parts of the business, so one shared model becomes a type nobody can change without coordinating three teams. Mention the anti-corruption layer by name when integration comes up; "we wrapped the legacy ERP in an ACL so its vocabulary stopped at the boundary" is a sentence that reads as experience. Expect the pushback about duplication and have the answer ready: the duplication is three small models that change independently, which is cheaper than one model three teams must agree on.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Find a word in a system you know that means different things to two teams, and model both.</li><li>Write an anti-corruption layer over a third-party API and keep its DTOs out of your domain.</li><li>Draw the context map for a system you have worked on and label each relationship.</li></ul></div></section>
+<section id="domain-events"><h2 id="domain-events">Domain events and integration events</h2><p>A <strong>domain event</strong> is something that happened in the domain, named in the past tense, raised by an aggregate and handled <em>inside the same process and usually the same transaction</em>. An <strong>integration event</strong> is what you publish to other services, after the transaction commits.</p><p>Confusing the two causes the most common bug in this area: publishing to a message bus inside the transaction. If the transaction then rolls back you have told the world about something that did not happen; if you publish after commit without an outbox, a crash between the two loses the event. The <strong>transactional outbox</strong> — covered on <a href="microservices.html#saga-outbox">Microservices</a> — writes the event to a table in the same transaction and a separate process publishes it.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// DOMAIN EVENT: past tense, raised by the aggregate, carries the domain&#x27;s language
+public record OrderPlaced(OrderId OrderId, CustomerId CustomerId, Money Total)
+    : IDomainEvent;
+
+public class Order : AggregateRoot&lt;OrderId&gt;
+{
+    public static Order Place(CustomerId customer, IEnumerable&lt;OrderLine&gt; lines)
+    {
+        var order = new Order { /* ... */ };
+        order.Raise(new OrderPlaced(order.Id, customer, order.Total));
+        return order;                       // raised, not published - nothing has
+    }                                       // happened until SaveChanges succeeds
+}
+
+// Dispatch at the transaction boundary, from the DbContext
+public class AppDbContext(DbContextOptions options, IPublisher publisher)
+    : DbContext(options)
+{
+    public override async Task&lt;int&gt; SaveChangesAsync(CancellationToken ct = default)
+    {
+        var aggregates = ChangeTracker.Entries&lt;IHasDomainEvents&gt;()
+            .Where(e =&gt; e.Entity.DomainEvents.Count &gt; 0)
+            .Select(e =&gt; e.Entity)
+            .ToList();
+
+        var events = aggregates.SelectMany(a =&gt; a.DomainEvents).ToList();
+        aggregates.ForEach(a =&gt; a.ClearEvents());      // clear BEFORE dispatch, or a
+                                                       // handler that saves re-raises
+        // Option A: dispatch BEFORE save - handlers join the same transaction,
+        // so everything commits or nothing does. Handlers must not do external I/O.
+        foreach (var e in events) await publisher.Publish(e, ct);
+
+        var result = await base.SaveChangesAsync(ct);
+
+        // Option B: dispatch AFTER save - handlers see committed state, but a
+        // handler failure cannot roll back the write. Pick deliberately.
+        return result;
+    }
+}
+
+// INTEGRATION EVENT: for other services. Versioned, serialisable, no domain types.
+public record OrderPlacedIntegrationEvent(
+    Guid OrderId, Guid CustomerId, decimal Total, string Currency, DateTime OccurredAt)
+{
+    public const string Type = &quot;shop.order.placed.v1&quot;;
+}
+
+// The outbox: written in the SAME transaction as the aggregate
+public class OrderPlacedHandler(AppDbContext db) : INotificationHandler&lt;OrderPlaced&gt;
+{
+    public Task Handle(OrderPlaced e, CancellationToken ct)
+    {
+        db.OutboxMessages.Add(new OutboxMessage
+        {
+            Id        = Guid.NewGuid(),
+            Type      = OrderPlacedIntegrationEvent.Type,
+            Payload   = JsonSerializer.Serialize(new OrderPlacedIntegrationEvent(
+                            e.OrderId.Value, e.CustomerId.Value,
+                            e.Total.Amount, e.Total.Currency, DateTime.UtcNow)),
+            OccurredAt = DateTime.UtcNow,
+        });
+        return Task.CompletedTask;          // no bus call here. That is the point.
+    }
+}
+
+// A separate process publishes and marks them sent - at-least-once, so consumers
+// must be idempotent.
+public class OutboxPublisher(IServiceScopeFactory scopes, IBus bus) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        while (await timer.WaitForNextTickAsync(ct))
+        {
+            using var scope = scopes.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService&lt;AppDbContext&gt;();
+
+            var batch = await db.OutboxMessages
+                .Where(m =&gt; m.ProcessedAt == null)
+                .OrderBy(m =&gt; m.OccurredAt).Take(100).ToListAsync(ct);
+
+            foreach (var m in batch)
+            {
+                await bus.Publish(m.Type, m.Payload, ct);
+                m.ProcessedAt = DateTime.UtcNow;
+            }
+            await db.SaveChangesAsync(ct);
+        }
+    }
+}
+
+// THE BUG this all exists to prevent:
+public async Task Handle(PlaceOrder cmd, CancellationToken ct)
+{
+    var order = Order.Place(cmd.CustomerId, cmd.Lines);
+    await _orders.Add(order, ct);
+    await _bus.Publish(new OrderPlacedIntegrationEvent(...), ct);   // published
+    await _uow.SaveChanges(ct);                                     // ...then fails
+}   // the world now believes an order exists that does not</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass
+from datetime import datetime, timezone
+import json, uuid
+
+# DOMAIN EVENT
+@dataclass(frozen=True)
+class OrderPlaced:
+    order_id: OrderId
+    customer_id: CustomerId
+    total: Money
+
+# Raised by the aggregate, dispatched at the transaction boundary
+from sqlalchemy import event
+from sqlalchemy.orm import Session
+
+def collect_events(session: Session) -&gt; list:
+    events = []
+    for obj in list(session.new) + list(session.dirty):
+        if isinstance(obj, AggregateRoot):
+            events.extend(obj.domain_events)
+            obj.clear_events()
+        return events
+
+async def commit_with_events(session: Session, publisher) -&gt; None:
+    events = collect_events(session)
+    for e in events:                       # before commit: same transaction
+        await publisher.publish(e)
+    session.commit()
+
+# INTEGRATION EVENT + OUTBOX, written in the same transaction
+@dataclass(frozen=True)
+class OrderPlacedIntegrationEvent:
+    TYPE = &quot;shop.order.placed.v1&quot;
+    order_id: str
+    customer_id: str
+    total: str
+    currency: str
+    occurred_at: str
+
+async def on_order_placed(e: OrderPlaced, session: Session) -&gt; None:
+    session.add(OutboxMessage(
+        id=uuid.uuid4(),
+        type=OrderPlacedIntegrationEvent.TYPE,
+        payload=json.dumps({
+            &quot;order_id&quot;: str(e.order_id), &quot;customer_id&quot;: str(e.customer_id),
+            &quot;total&quot;: str(e.total.amount), &quot;currency&quot;: e.total.currency,
+            &quot;occurred_at&quot;: datetime.now(timezone.utc).isoformat(),
+        }),
+    ))
+    # no bus call here
+
+# The relay, as a background task
+async def outbox_publisher(session_factory, bus, stopping) -&gt; None:
+    while not stopping.is_set():
+        with session_factory() as session, session.begin():
+            batch = session.execute(
+                select(OutboxMessage).where(OutboxMessage.processed_at.is_(None))
+                .order_by(OutboxMessage.occurred_at).limit(100)
+                .with_for_update(skip_locked=True)      # several relays, no overlap
+            ).scalars().all()
+            for m in batch:
+                await bus.publish(m.type, m.payload)
+                m.processed_at = datetime.now(timezone.utc)
+        await asyncio.sleep(1)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A reliable deep question: "you save an order and publish an event — what can go wrong?" The dual-write problem, in both directions (publish-then-fail tells the world about something that did not happen; commit-then-crash loses the event), and the outbox as the fix. Make the domain/integration distinction explicitly — a domain event can carry domain types and stays in-process, an integration event is a versioned contract other teams depend on — and finish with the consequence: the outbox is at-least-once, so every consumer must be idempotent.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement an outbox table and a relay, then kill the process between commit and publish and confirm nothing is lost.</li><li>Dispatch domain events before and after <code>SaveChanges</code> and work out which failures each ordering survives.</li><li>Write a consumer that is idempotent against the same event delivered three times.</li></ul></div></section>
+<section id="application-services"><h2 id="application-services">Application services, use cases and the MediatR shape</h2><p>The application layer orchestrates: load the aggregate, call a method on it, save, return. It holds <em>no</em> business rules — if a rule appears here it belongs on the entity. That is the whole test for whether something is in the right layer.</p><p>Most .NET teams express a use case as a command plus a handler, dispatched through MediatR, with cross-cutting concerns (validation, logging, transactions) as pipeline behaviours. The thing to be able to discuss is <strong>whether the indirection earns its keep</strong>: it buys you a uniform pipeline and small testable handlers, and it costs you the ability to find the handler from the call site.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The use case: a command, a handler, and nothing else
+public record PlaceOrder(CustomerId CustomerId, IReadOnlyList&lt;OrderLineDto&gt; Lines)
+    : IRequest&lt;OrderId&gt;;
+
+public class PlaceOrderHandler(
+    IOrderRepository orders, IProductCatalogue catalogue, IUnitOfWork uow)
+    : IRequestHandler&lt;PlaceOrder, OrderId&gt;
+{
+    public async Task&lt;OrderId&gt; Handle(PlaceOrder cmd, CancellationToken ct)
+    {
+        // 1. gather what the domain needs (I/O lives here, not in the entity)
+        var prices = await catalogue.GetPrices(cmd.Lines.Select(l =&gt; l.Sku), ct);
+
+        var lines = cmd.Lines
+            .Select(l =&gt; new OrderLine(l.Sku, l.Quantity, prices[l.Sku]))
+            .ToList();
+
+        // 2. let the DOMAIN make the decision - no rules in this method
+        var order = Order.Place(cmd.CustomerId, lines);
+
+        // 3. persist
+        await orders.Add(order, ct);
+        await uow.SaveChanges(ct);
+
+        return order.Id;
+    }
+}
+// If you find `if (lines.Count == 0) throw` in this handler, it belongs in
+// Order.Place. That is the entire layering test.
+
+// Cross-cutting concerns as pipeline behaviours - written once, applied to all
+public class ValidationBehaviour&lt;TReq, TRes&gt;(IEnumerable&lt;IValidator&lt;TReq&gt;&gt; validators)
+    : IPipelineBehavior&lt;TReq, TRes&gt; where TReq : notnull
+{
+    public async Task&lt;TRes&gt; Handle(TReq request,
+        RequestHandlerDelegate&lt;TRes&gt; next, CancellationToken ct)
+    {
+        var failures = validators
+            .Select(v =&gt; v.Validate(new ValidationContext&lt;TReq&gt;(request)))
+            .SelectMany(r =&gt; r.Errors)
+            .Where(f =&gt; f is not null)
+            .ToList();
+
+        if (failures.Count &gt; 0) throw new ValidationException(failures);
+        return await next();
+    }
+}
+
+public class TransactionBehaviour&lt;TReq, TRes&gt;(AppDbContext db)
+    : IPipelineBehavior&lt;TReq, TRes&gt; where TReq : ICommand
+{
+    public async Task&lt;TRes&gt; Handle(TReq request,
+        RequestHandlerDelegate&lt;TRes&gt; next, CancellationToken ct)
+    {
+        if (db.Database.CurrentTransaction is not null) return await next();
+
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        var response = await next();
+        await tx.CommitAsync(ct);
+        return response;
+    }
+}
+
+// Registration: order matters - the pipeline runs outside-in
+builder.Services.AddMediatR(c =&gt;
+{
+    c.RegisterServicesFromAssemblyContaining&lt;PlaceOrder&gt;();
+    c.AddOpenBehavior(typeof(LoggingBehaviour&lt;,&gt;));
+    c.AddOpenBehavior(typeof(ValidationBehaviour&lt;,&gt;));
+    c.AddOpenBehavior(typeof(TransactionBehaviour&lt;,&gt;));
+});
+
+// The endpoint stays thin: translate HTTP to a command and back
+app.MapPost(&quot;/orders&quot;, async (PlaceOrderRequest req, ISender sender, CancellationToken ct) =&gt;
+{
+    var id = await sender.Send(new PlaceOrder(new CustomerId(req.CustomerId),
+                                              req.Lines), ct);
+    return Results.Created($&quot;/orders/{id}&quot;, new { id });
+});
+
+// THE ARGUMENT AGAINST: the call site says `sender.Send(cmd)` and gives you no
+// way to navigate to the handler. For a small service, injecting the handler
+// directly costs nothing and keeps F12 working:
+app.MapPost(&quot;/orders&quot;, async (PlaceOrderRequest req, PlaceOrderHandler handler,
+    CancellationToken ct) =&gt; Results.Ok(await handler.Handle(req.ToCommand(), ct)));</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass
+from typing import Protocol
+
+# The use case: a command and a handler
+@dataclass(frozen=True)
+class PlaceOrder:
+    customer_id: CustomerId
+    lines: list[&quot;OrderLineDto&quot;]
+
+class PlaceOrderHandler:
+    def __init__(self, orders: OrderRepository, catalogue: ProductCatalogue, uow) -&gt; None:
+        self._orders, self._catalogue, self._uow = orders, catalogue, uow
+
+    async def handle(self, cmd: PlaceOrder) -&gt; OrderId:
+        prices = await self._catalogue.get_prices([l.sku for l in cmd.lines])
+        lines = [OrderLine(l.sku, l.quantity, prices[l.sku]) for l in cmd.lines]
+
+        order = Order.place(cmd.customer_id, lines)      # the DOMAIN decides
+
+        await self._orders.add(order)
+        await self._uow.commit()
+        return order.id
+
+# Cross-cutting concerns: decorators are the pipeline-behaviour equivalent,
+# and they are more visible at the call site than a mediator is.
+import functools, logging
+
+def validated(validator):
+    def decorator(fn):
+        @functools.wraps(fn)
+        async def wrapper(self, cmd, *a, **kw):
+            errors = validator(cmd)
+            if errors:
+                raise ValidationError(errors)
+            return await fn(self, cmd, *a, **kw)
+        return wrapper
+    return decorator
+
+def transactional(fn):
+    @functools.wraps(fn)
+    async def wrapper(self, cmd, *a, **kw):
+        async with self._uow.transaction():
+            return await fn(self, cmd, *a, **kw)
+    return wrapper
+
+class PlaceOrderHandler:
+    @validated(validate_place_order)
+    @transactional
+    async def handle(self, cmd: PlaceOrder) -&gt; OrderId:
+        ...
+
+# The endpoint stays thin
+@app.post(&quot;/orders&quot;, status_code=201)
+async def place_order(req: PlaceOrderRequest,
+                      handler: PlaceOrderHandler = Depends(get_handler)):
+    order_id = await handler.handle(req.to_command())
+    return {&quot;id&quot;: str(order_id)}
+
+# Python has no widespread MediatR equivalent, and the decorator approach keeps
+# the call graph navigable - which is precisely the criticism of MediatR.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The layering test is the thing to say out loud: if a business rule appears in a handler, it belongs on the entity, and the handler should read as load / call / save. On MediatR, give an opinion with a boundary rather than enthusiasm — it earns its place when you have many use cases and want one validation/logging/transaction pipeline; it is pure indirection in a service with eight endpoints, where injecting the handler keeps go-to-definition working. Being able to name the cost of a popular library is a better signal than liking it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Find a business rule living in an application service and move it onto the entity.</li><li>Write a validation pipeline behaviour and confirm it runs for every command without per-handler code.</li><li>Implement one use case with MediatR and one with a directly injected handler, and compare.</li></ul></div></section>
+<section id="cqrs"><h2 id="cqrs">CQRS: separate models, and how far to take it</h2><p>CQRS separates the model you write through from the model you read through. The justification is that they have genuinely different needs: writes need invariants, aggregates and transactions; reads need joins, projections and shapes that match a screen. Forcing both through one model means either your reads load aggregates they do not need or your aggregates flatten to serve reads.</p><p>There are three levels and they are often conflated. <strong>Level 1</strong>: separate command and query <em>code paths</em> against one database — writes go through aggregates, reads use Dapper or projected LINQ straight to DTOs. This is cheap and usually enough. <strong>Level 2</strong>: separate read <em>models</em> (denormalised tables or views) in the same database. <strong>Level 3</strong>: a separate read <em>store</em>, updated asynchronously — maximum scale, eventual consistency, and a materially harder system to operate.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// LEVEL 1: one database, two code paths. Start here; it is usually enough.
+
+// Write side: through the aggregate, with the invariants
+public class PlaceOrderHandler(IOrderRepository orders, IUnitOfWork uow)
+    : IRequestHandler&lt;PlaceOrder, OrderId&gt;
+{
+    public async Task&lt;OrderId&gt; Handle(PlaceOrder cmd, CancellationToken ct)
+    {
+        var order = Order.Place(cmd.CustomerId, cmd.Lines);
+        await orders.Add(order, ct);
+        await uow.SaveChanges(ct);
+        return order.Id;
+    }
+}
+
+// Read side: straight to the DTO the screen needs. No aggregate, no tracking,
+// no repository - the query IS the model.
+public record OrderListItem(Guid Id, string Customer, decimal Total, string Status,
+                            DateTime PlacedAt);
+
+public class ListOrdersHandler(IDbConnection conn)
+    : IRequestHandler&lt;ListOrders, IReadOnlyList&lt;OrderListItem&gt;&gt;
+{
+    public async Task&lt;IReadOnlyList&lt;OrderListItem&gt;&gt; Handle(
+        ListOrders q, CancellationToken ct)
+    {
+        var rows = await conn.QueryAsync&lt;OrderListItem&gt;(@&quot;
+            SELECT o.id, c.name AS customer, o.total, o.status, o.placed_at
+            FROM   orders o
+            JOIN   customers c ON c.id = o.customer_id
+            WHERE  o.customer_id = @CustomerId
+            ORDER  BY o.placed_at DESC
+            OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY&quot;,
+            new { q.CustomerId, q.Skip, q.Take });
+        return rows.ToList();
+    }
+}
+// Or with EF, projecting so only the needed columns are selected:
+//   db.Orders.AsNoTracking().Select(o =&gt; new OrderListItem(...)).ToListAsync(ct)
+
+// LEVEL 2: a denormalised read table in the same database, kept current in the
+// same transaction. Still strongly consistent; no new infrastructure.
+public class OrderSummaryProjection(AppDbContext db) : INotificationHandler&lt;OrderPlaced&gt;
+{
+    public async Task Handle(OrderPlaced e, CancellationToken ct)
+        =&gt; db.OrderSummaries.Add(new OrderSummary
+        {
+            OrderId = e.OrderId.Value, CustomerName = e.CustomerName,
+            Total = e.Total.Amount, PlacedAt = DateTime.UtcNow,
+        });
+}
+
+// LEVEL 3: a separate read store, updated asynchronously from integration events.
+// You have now bought eventual consistency - and the UI problem that comes with
+// it, where a user places an order and does not see it in the list.
+public class OrderSearchProjection(ISearchIndex index)
+    : IConsumer&lt;OrderPlacedIntegrationEvent&gt;
+{
+    public async Task Consume(ConsumeContext&lt;OrderPlacedIntegrationEvent&gt; ctx)
+        =&gt; await index.Upsert(new OrderDocument(ctx.Message.OrderId, /* ... */));
+}
+
+// Mitigations for the read-your-own-writes problem, worth naming unprompted:
+//   - return the created resource from the command so the UI can render it
+//   - read the write side for the user&#x27;s own recent items
+//   - a version token the client passes until the projection catches up
+//   - just show &quot;processing&quot; and poll</code></pre><pre data-lang="python" hidden><code># LEVEL 1: two code paths, one database
+
+# Write side: through the aggregate
+class PlaceOrderHandler:
+    async def handle(self, cmd: PlaceOrder) -&gt; OrderId:
+        order = Order.place(cmd.customer_id, cmd.lines)
+        await self._orders.add(order)
+        await self._uow.commit()
+        return order.id
+
+# Read side: SQL straight to the shape the screen wants
+@dataclass(frozen=True)
+class OrderListItem:
+    id: str
+    customer: str
+    total: Decimal
+    status: str
+    placed_at: datetime
+
+async def list_orders(conn, customer_id, skip=0, take=20) -&gt; list[OrderListItem]:
+    rows = await conn.fetch_all(
+        &quot;&quot;&quot;
+        SELECT o.id, c.name AS customer, o.total, o.status, o.placed_at
+        FROM   orders o JOIN customers c ON c.id = o.customer_id
+        WHERE  o.customer_id = :cid
+        ORDER  BY o.placed_at DESC
+        LIMIT  :take OFFSET :skip
+        &quot;&quot;&quot;,
+        {&quot;cid&quot;: customer_id, &quot;take&quot;: take, &quot;skip&quot;: skip},
+    )
+    return [OrderListItem(**dict(r)) for r in rows]
+
+# LEVEL 2: a denormalised table maintained in the same transaction
+async def on_order_placed(e: OrderPlaced, session) -&gt; None:
+    session.add(OrderSummary(order_id=e.order_id, customer_name=e.customer_name,
+                             total=e.total.amount))
+
+# LEVEL 3: a separate store, updated from integration events
+async def project_to_search(event: dict, index) -&gt; None:
+    await index.upsert({&quot;id&quot;: event[&quot;order_id&quot;], &quot;total&quot;: event[&quot;total&quot;]})
+
+# The read-your-own-writes problem is identical, and so are the mitigations.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The strongest CQRS answer separates the three levels, because most people treat CQRS and event sourcing as one thing. Say that level 1 — separate code paths against one database — gives most of the benefit for almost no cost, and that you only go further when a read pattern genuinely cannot be served by the write store. Then name the consequence of level 3 unprompted: eventual consistency reaches the UI, so "I placed an order and it is not in my list" becomes a product problem, and you need a mitigation chosen up front.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Convert one read endpoint from loading aggregates to projecting directly to a DTO, and compare the SQL.</li><li>Add a denormalised summary table maintained in the same transaction and measure the read improvement.</li><li>Write down what your UI would do if a projection lagged by five seconds.</li></ul></div></section>
+<section id="event-sourcing"><h2 id="event-sourcing">Event sourcing: streams, projections and snapshots</h2><p>Event sourcing stores the <em>events</em> as the source of truth rather than current state. The aggregate is rebuilt by replaying its stream; current state is a cache you can throw away and recompute. You get a complete audit log for free, the ability to answer questions nobody asked when the schema was written, and temporal queries — "what did this look like last Tuesday" becomes a replay.</p><p>The costs are real and interviewers want to hear them. <strong>Schema evolution</strong>: events are immutable and live forever, so a v1 event from 2019 must still deserialise and be upcast. <strong>Querying</strong>: you cannot query a stream, so every read needs a projection, and projections lag. <strong>Rebuild time</strong>: a long stream is slow to load, hence snapshots. <strong>Deletion</strong>: GDPR against an immutable log needs crypto-shredding or a rewrite.</p><p>It is the right answer for a genuinely audit-driven domain — finance, compliance, anything where "how did we get here" is a product requirement — and badly oversold everywhere else.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The aggregate is a fold over its events
+public class Order
+{
+    private readonly List&lt;IDomainEvent&gt; _uncommitted = [];
+
+    public OrderId Id { get; private set; }
+    public OrderStatus Status { get; private set; }
+    public int Version { get; private set; } = -1;        // for optimistic concurrency
+
+    // 1. REHYDRATE: replay the stream
+    public static Order FromHistory(IEnumerable&lt;IDomainEvent&gt; history)
+    {
+        var order = new Order();
+        foreach (var e in history) order.Apply(e, isNew: false);
+        return order;
+    }
+
+    // 2. DECIDE: a command validates against current state and emits events
+    public void Pay(Money amount)
+    {
+        if (Status != OrderStatus.Pending) throw new DomainException(&quot;already paid&quot;);
+        if (amount != Total) throw new DomainException(&quot;amount mismatch&quot;);
+
+        Apply(new OrderPaid(Id, amount, DateTime.UtcNow), isNew: true);
+    }
+
+    // 3. APPLY: mutate state. NO validation here - replay must never throw.
+    private void Apply(IDomainEvent e, bool isNew)
+    {
+        switch (e)
+        {
+            case OrderPlaced p: Id = p.OrderId; Status = OrderStatus.Pending; break;
+            case OrderPaid:     Status = OrderStatus.Paid; break;
+            case OrderShipped:  Status = OrderStatus.Shipped; break;
+            default: break;              // an unknown old event must NOT crash replay
+        }
+        Version++;
+        if (isNew) _uncommitted.Add(e);
+    }
+
+    public IReadOnlyList&lt;IDomainEvent&gt; Uncommitted =&gt; _uncommitted;
+}
+
+// The store: append with an expected version - that IS the concurrency control
+public interface IEventStore
+{
+    Task&lt;IReadOnlyList&lt;IDomainEvent&gt;&gt; Read(string stream, int fromVersion, CancellationToken ct);
+    Task Append(string stream, int expectedVersion,
+                IEnumerable&lt;IDomainEvent&gt; events, CancellationToken ct);
+    //   expectedVersion mismatch -&gt; WrongExpectedVersionException -&gt; reload and retry
+}
+
+// SCHEMA EVOLUTION: upcast old events on read. This never goes away.
+public static IDomainEvent Upcast(StoredEvent stored) =&gt; stored switch
+{
+    { Type: &quot;OrderPaid&quot;, Version: 1 } =&gt;
+        // v1 had no currency; everything before 2023 was USD
+        new OrderPaid(stored.StreamId,
+                      new Money(stored.Get&lt;decimal&gt;(&quot;amount&quot;), &quot;USD&quot;),
+                      stored.OccurredAt),
+    { Type: &quot;OrderPaid&quot;, Version: 2 } =&gt; stored.Deserialize&lt;OrderPaid&gt;(),
+    _ =&gt; throw new UnknownEventException(stored.Type, stored.Version),
+};
+
+// SNAPSHOTS: replaying 40,000 events per load is not viable
+public async Task&lt;Order&gt; Load(OrderId id, CancellationToken ct)
+{
+    var snapshot = await _snapshots.GetLatest(id, ct);
+    var from  = snapshot?.Version + 1 ?? 0;
+    var since = await _store.Read($&quot;order-{id}&quot;, from, ct);
+
+    var order = snapshot is null
+        ? Order.FromHistory(since)
+        : Order.FromSnapshot(snapshot, since);
+
+    if (order.Version - (snapshot?.Version ?? 0) &gt; 100)
+        await _snapshots.Save(order.ToSnapshot(), ct);     // every ~100 events
+
+    return order;
+}
+
+// PROJECTIONS: the only way to query. They lag, and they are rebuildable.
+public class OrderListProjection(AppDbContext db)
+{
+    public async Task Project(IDomainEvent e, CancellationToken ct)
+    {
+        switch (e)
+        {
+            case OrderPlaced p:
+                db.OrderList.Add(new OrderRow { Id = p.OrderId.Value, Status = &quot;pending&quot; });
+                break;
+            case OrderPaid paid:
+                var row = await db.OrderList.FindAsync([paid.OrderId.Value], ct);
+                if (row is not null) row.Status = &quot;paid&quot;;
+                break;
+        }
+        await db.SaveChangesAsync(ct);
+    }
+}
+// Being able to DELETE the projection and rebuild it from the stream is the
+// property that makes this worth the trouble. If you cannot, you are carrying
+// the costs without the benefit.
+
+// Libraries you would actually use: Marten (on PostgreSQL), EventStoreDB.</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass
+from typing import Iterable
+
+# The aggregate as a fold over events
+class Order:
+    def __init__(self) -&gt; None:
+        self._uncommitted: list = []
+        self.id: OrderId | None = None
+        self.status = &quot;none&quot;
+        self.version = -1
+
+    @classmethod
+    def from_history(cls, history: Iterable) -&gt; &quot;Order&quot;:
+        order = cls()
+        for e in history:
+            order._apply(e, is_new=False)
+        return order
+
+    # DECIDE: validate, then emit
+    def pay(self, amount: Money) -&gt; None:
+        if self.status != &quot;pending&quot;:
+            raise DomainError(&quot;already paid&quot;)
+        self._apply(OrderPaid(self.id, amount), is_new=True)
+
+    # APPLY: mutate only. Replay must never raise.
+    def _apply(self, e, is_new: bool) -&gt; None:
+        match e:
+            case OrderPlaced():  self.id, self.status = e.order_id, &quot;pending&quot;
+            case OrderPaid():    self.status = &quot;paid&quot;
+            case OrderShipped(): self.status = &quot;shipped&quot;
+            case _:              pass          # unknown old event: ignore, do not crash
+        self.version += 1
+        if is_new:
+            self._uncommitted.append(e)
+
+# Upcasting - the permanent tax of event sourcing
+UPCASTERS = {
+    (&quot;OrderPaid&quot;, 1): lambda d: OrderPaid(d[&quot;order_id&quot;],
+                                          Money(Decimal(d[&quot;amount&quot;]), &quot;USD&quot;)),
+    (&quot;OrderPaid&quot;, 2): lambda d: OrderPaid(d[&quot;order_id&quot;],
+                                          Money(Decimal(d[&quot;amount&quot;]), d[&quot;currency&quot;])),
+}
+
+def upcast(stored: dict):
+    key = (stored[&quot;type&quot;], stored[&quot;version&quot;])
+    try:
+        return UPCASTERS[key](stored[&quot;payload&quot;])
+    except KeyError:
+        raise UnknownEvent(key) from None
+
+# Append with an expected version = optimistic concurrency
+async def append(conn, stream: str, expected_version: int, events: list) -&gt; None:
+    result = await conn.execute(
+        &quot;&quot;&quot;
+        INSERT INTO events (stream, version, type, payload)
+        SELECT :stream, :expected + row_number() OVER (), :type, :payload
+        WHERE (SELECT COALESCE(MAX(version), -1) FROM events WHERE stream = :stream)
+              = :expected
+        &quot;&quot;&quot;, ...)
+    if result.rowcount == 0:
+        raise WrongExpectedVersion(stream, expected_version)
+
+# Projections: rebuildable, which is the whole point
+async def rebuild_projection(store, projection) -&gt; None:
+    await projection.reset()
+    async for event in store.read_all():
+        await projection.project(event)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Event sourcing is where overconfident answers get caught, so lead with the costs. Name the four: upcasting old events forever, no ad-hoc querying without a projection, snapshotting for long streams, and the GDPR problem with an immutable log. Then give the condition under which it pays — a domain where the history <em>is</em> the product, like ledgers, trading or compliance — and say that CQRS does not require it, which is the conflation most people make. The implementation detail worth knowing: <code>Apply</code> must never validate, because replaying history through validation that has since tightened will fail on data that was legal when it was written.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement a small event-sourced aggregate and rebuild it from its stream.</li><li>Add a v2 event with a new field and write the upcaster for the v1 events already stored.</li><li>Delete a projection and rebuild it from scratch; time how long a 100k-event stream takes.</li></ul></div></section>
+<section id="vertical-slice"><h2 id="vertical-slice">Vertical slice architecture, and the case against layers</h2><p>The honest counter-argument, and knowing it is a stronger signal than defending Clean Architecture. Layered solutions optimise for swapping a layer — and teams almost never swap a layer. What they do constantly is change one feature, which in a layered solution means editing a file in each of four projects for a change that is conceptually one thing.</p><p><strong>Vertical slice architecture</strong> organises by feature instead: everything <code>PlaceOrder</code> needs lives in one folder — the request, the handler, the validator, the SQL, the response. Slices are allowed to differ: a complex one uses a rich aggregate, a CRUD one talks to the database directly, and neither is forced to pretend to be the other. Coupling within a slice is fine; coupling <em>between</em> slices is what you police.</p><p>The real answer in an interview is that the two compose. Use slices as the top-level organisation, and reach for a domain model inside the slices that have genuine business rules.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># LAYERED: one feature, four projects, four files to open
+src/
+  Shop.Domain/Orders/Order.cs
+  Shop.Application/Orders/Commands/PlaceOrderCommand.cs
+  Shop.Application/Orders/Commands/PlaceOrderHandler.cs
+  Shop.Application/Orders/Commands/PlaceOrderValidator.cs
+  Shop.Infrastructure/Persistence/OrderRepository.cs
+  Shop.Api/Controllers/OrdersController.cs
+
+# VERTICAL SLICES: one feature, one folder
+src/Shop.Api/
+  Features/
+    Orders/
+      PlaceOrder.cs          # request + validator + handler + endpoint, one file
+      GetOrder.cs            # a plain SQL query. No aggregate, no repository.
+      ListOrders.cs
+      CancelOrder.cs
+    Invoices/
+      IssueInvoice.cs
+  Domain/                    # ONLY for slices that have real rules
+    Orders/Order.cs
+  Common/
+    Database.cs
+
+# The test that matters: to change how an order is placed, how many files do
+# you open, and do any of them affect an unrelated feature?</code></pre><pre data-lang="csharp" hidden><code>// A whole feature in one file. Everything it needs, nothing it does not.
+namespace Shop.Api.Features.Orders;
+
+public static class PlaceOrder
+{
+    public record Request(Guid CustomerId, IReadOnlyList&lt;LineDto&gt; Lines);
+    public record Response(Guid OrderId, decimal Total);
+
+    public class Validator : AbstractValidator&lt;Request&gt;
+    {
+        public Validator()
+        {
+            RuleFor(x =&gt; x.CustomerId).NotEmpty();
+            RuleFor(x =&gt; x.Lines).NotEmpty().Must(l =&gt; l.Count &lt;= 100);
+        }
+    }
+
+    public class Handler(AppDbContext db, IProductCatalogue catalogue)
+    {
+        public async Task&lt;Response&gt; Handle(Request request, CancellationToken ct)
+        {
+            var prices = await catalogue.GetPrices(request.Lines.Select(l =&gt; l.Sku), ct);
+
+            // This slice HAS real rules, so it uses the domain model
+            var order = Order.Place(
+                new CustomerId(request.CustomerId),
+                request.Lines.Select(l =&gt; new OrderLine(l.Sku, l.Quantity, prices[l.Sku])));
+
+            db.Orders.Add(order);
+            await db.SaveChangesAsync(ct);
+            return new Response(order.Id.Value, order.Total.Amount);
+        }
+    }
+
+    public static void Map(IEndpointRouteBuilder app) =&gt;
+        app.MapPost(&quot;/orders&quot;, async (Request r, Handler h, CancellationToken ct)
+                =&gt; Results.Ok(await h.Handle(r, ct)))
+           .WithName(&quot;PlaceOrder&quot;)
+           .WithTags(&quot;Orders&quot;);
+}
+
+// A different slice, deliberately simpler. No aggregate, no repository, no
+// mapping layer - because this feature has no rules to protect.
+namespace Shop.Api.Features.Orders;
+
+public static class ListOrders
+{
+    public record Response(Guid Id, string Customer, decimal Total, string Status);
+
+    public class Handler(IDbConnection conn)
+    {
+        public async Task&lt;IReadOnlyList&lt;Response&gt;&gt; Handle(Guid customerId, CancellationToken ct)
+            =&gt; (await conn.QueryAsync&lt;Response&gt;(@&quot;
+                    SELECT o.id, c.name AS customer, o.total, o.status
+                    FROM orders o JOIN customers c ON c.id = o.customer_id
+                    WHERE o.customer_id = @customerId
+                    ORDER BY o.placed_at DESC&quot;, new { customerId })).ToList();
+    }
+
+    public static void Map(IEndpointRouteBuilder app) =&gt;
+        app.MapGet(&quot;/orders&quot;, async (Guid customerId, Handler h, CancellationToken ct)
+                =&gt; Results.Ok(await h.Handle(customerId, ct)));
+}
+// Two slices, two levels of ceremony, each matched to what the feature needs.
+// A layered solution would have forced both through the same repository and DTO
+// mapping, and the second one would have gained nothing from it.
+
+// What you still police: slices must not reference each other. Enforce it.
+[Fact]
+public void Slices_do_not_reference_each_other()
+    =&gt; Types.InNamespace(&quot;Shop.Api.Features.Orders&quot;)
+        .ShouldNot().HaveDependencyOn(&quot;Shop.Api.Features.Invoices&quot;)
+        .GetResult().IsSuccessful.Should().BeTrue();</code></pre><pre data-lang="python" hidden><code># Vertical slices are the natural Python layout - a module per feature
+
+# shop/features/orders/place_order.py  - the whole feature
+from dataclasses import dataclass
+from pydantic import BaseModel, Field
+
+class Request(BaseModel):
+    customer_id: uuid.UUID
+    lines: list[&quot;LineDto&quot;] = Field(min_length=1, max_length=100)
+
+class Response(BaseModel):
+    order_id: uuid.UUID
+    total: Decimal
+
+class Handler:
+    def __init__(self, session, catalogue) -&gt; None:
+        self._session, self._catalogue = session, catalogue
+
+    async def handle(self, request: Request) -&gt; Response:
+        prices = await self._catalogue.get_prices([l.sku for l in request.lines])
+        order = Order.place(                      # this slice has real rules
+            CustomerId(request.customer_id),
+            [OrderLine(l.sku, l.quantity, prices[l.sku]) for l in request.lines])
+        self._session.add(order)
+        await self._session.commit()
+        return Response(order_id=order.id, total=order.total.amount)
+
+router = APIRouter()
+
+@router.post(&quot;/orders&quot;, response_model=Response)
+async def place_order(request: Request, handler: Handler = Depends(get_handler)):
+    return await handler.handle(request)
+
+
+# shop/features/orders/list_orders.py  - deliberately simpler
+class Response(BaseModel):
+    id: uuid.UUID
+    customer: str
+    total: Decimal
+    status: str
+
+@router.get(&quot;/orders&quot;, response_model=list[Response])
+async def list_orders(customer_id: uuid.UUID, conn = Depends(get_conn)):
+    rows = await conn.fetch_all(
+        &quot;&quot;&quot;SELECT o.id, c.name AS customer, o.total, o.status
+           FROM orders o JOIN customers c ON c.id = o.customer_id
+           WHERE o.customer_id = :cid ORDER BY o.placed_at DESC&quot;&quot;&quot;,
+        {&quot;cid&quot;: customer_id})
+    return [dict(r) for r in rows]
+
+# Police the boundary with import-linter
+#   [importlinter:contract:slices]
+#   name = Features are independent
+#   type = independence
+#   modules = shop.features.orders
+#             shop.features.invoices</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Being able to argue <em>against</em> Clean Architecture is one of the more differentiating things you can do in an architecture interview, because most candidates only defend it. The argument: layers optimise for swapping infrastructure, which teams rarely do, and penalise changing a feature, which they do daily. Then resolve it rather than picking a side — slices as the organisation, a domain model inside the slices that have real invariants, and architecture tests policing that slices do not reference each other. Finish with the rule of thumb: match the ceremony to the complexity of the feature, and do not force a CRUD endpoint through four layers to be consistent.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Restructure one feature into a single-file slice and compare how many files you open to change it.</li><li>Identify two features in a system you know where one deserves a domain model and the other does not.</li><li>Add an architecture test asserting that two feature folders do not reference each other.</li></ul></div></section>
+<section id="persistence"><h2 id="persistence">Persisting the domain without leaking it</h2><p>The practical problem: a model designed for invariants has private setters, no parameterless constructor, value objects and encapsulated collections — and EF Core wants to materialise entities from a database. Getting this to work without compromising the model is a real and frequently asked question.</p><p>EF Core can do more than people expect: it sets private setters and backing fields through reflection, it maps value objects as owned types or with converters, and it can map to a private collection field so the public surface stays <code>IReadOnlyList</code>. The configuration goes in infrastructure, so the domain still has no EF reference.</p><p>The alternative — separate persistence models with explicit mapping — gives total freedom and costs you a mapping layer to maintain. Worth having a view on which you would pick and why.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The domain model, unchanged: private setters, no public ctor, encapsulated list
+public class Order : AggregateRoot&lt;OrderId&gt;
+{
+    private readonly List&lt;OrderLine&gt; _lines = [];
+
+    public CustomerId CustomerId { get; private init; }
+    public OrderStatus Status { get; private set; }
+    public Money Total { get; private set; }
+    public IReadOnlyList&lt;OrderLine&gt; Lines =&gt; _lines.AsReadOnly();
+
+    private Order() { }                       // EF uses this; nothing else can
+}
+
+// ALL the EF knowledge lives here, in Infrastructure
+public class OrderConfiguration : IEntityTypeConfiguration&lt;Order&gt;
+{
+    public void Configure(EntityTypeBuilder&lt;Order&gt; b)
+    {
+        b.ToTable(&quot;orders&quot;);
+
+        // Strongly-typed id &lt;-&gt; column, via a value converter
+        b.HasKey(o =&gt; o.Id);
+        b.Property(o =&gt; o.Id)
+         .HasConversion(id =&gt; id.Value, value =&gt; new OrderId(value))
+         .ValueGeneratedNever();
+
+        b.Property(o =&gt; o.CustomerId)
+         .HasConversion(id =&gt; id.Value, value =&gt; new CustomerId(value));
+
+        // Enum as a string, so the database stays readable and reordering is safe
+        b.Property(o =&gt; o.Status)
+         .HasConversion&lt;string&gt;()
+         .HasMaxLength(20);
+
+        // Value object as an OWNED type: two columns, no separate table
+        b.OwnsOne(o =&gt; o.Total, m =&gt;
+        {
+            m.Property(x =&gt; x.Amount).HasColumnName(&quot;total_amount&quot;).HasPrecision(19, 4);
+            m.Property(x =&gt; x.Currency).HasColumnName(&quot;total_currency&quot;).HasMaxLength(3);
+        });
+
+        // Map to the BACKING FIELD, so the public IReadOnlyList stays read-only
+        b.Metadata.FindNavigation(nameof(Order.Lines))!
+         .SetPropertyAccessMode(PropertyAccessMode.Field);
+
+        b.OwnsMany(o =&gt; o.Lines, l =&gt;
+        {
+            l.ToTable(&quot;order_lines&quot;);
+            l.WithOwner().HasForeignKey(&quot;order_id&quot;);
+            l.Property&lt;int&gt;(&quot;id&quot;);
+            l.HasKey(&quot;id&quot;);
+            l.OwnsOne(x =&gt; x.UnitPrice);
+        });
+
+        // Concurrency token on the ROOT
+        b.Property&lt;byte[]&gt;(&quot;Version&quot;).IsRowVersion();
+    }
+}
+
+// Global convention so you write the id converter once, not per type
+protected override void ConfigureConventions(ModelConfigurationBuilder builder)
+{
+    builder.Properties&lt;OrderId&gt;().HaveConversion&lt;OrderIdConverter&gt;();
+    builder.Properties&lt;decimal&gt;().HavePrecision(19, 4);
+}
+
+// THE ALTERNATIVE: separate persistence models and explicit mapping.
+// Total freedom in the domain, a mapping layer to maintain, and the repository
+// is where the translation lives.
+public class OrderRecord                       // shaped for the database
+{
+    public Guid Id { get; set; }
+    public Guid CustomerId { get; set; }
+    public string Status { get; set; } = &quot;&quot;;
+    public decimal TotalAmount { get; set; }
+    public string TotalCurrency { get; set; } = &quot;&quot;;
+    public List&lt;OrderLineRecord&gt; Lines { get; set; } = [];
+}
+
+public class OrderRepository(AppDbContext db) : IOrderRepository
+{
+    public async Task&lt;Order?&gt; Get(OrderId id, CancellationToken ct)
+    {
+        var record = await db.OrderRecords.Include(r =&gt; r.Lines)
+            .SingleOrDefaultAsync(r =&gt; r.Id == id.Value, ct);
+        return record is null ? null : OrderMapper.ToDomain(record);
+    }
+}
+
+// Which to pick: EF-mapped domain for most teams, because the mapping layer is
+// real ongoing work and EF can express almost everything the model needs.
+// Separate models when the domain shape and the schema genuinely diverge - a
+// legacy database you do not control is the usual reason.
+
+// What NOT to do, whichever you pick:
+//   - public setters &quot;because EF needs them&quot; (it does not)
+//   - [Table]/[Column] attributes on domain types (that is an EF reference)
+//   - IQueryable on a repository interface (the abstraction is then fictional)
+//   - lazy loading on an aggregate (silent N+1 inside your domain logic)</code></pre><pre data-lang="python" hidden><code># SQLAlchemy&#x27;s imperative (classical) mapping keeps the domain clean - arguably
+# a better fit for DDD than the declarative style, because the domain class has
+# no ORM base class and no ORM imports.
+
+# shop/domain/orders.py  - pure Python, no SQLAlchemy anywhere
+class Order:
+    def __init__(self, id: OrderId, customer_id: CustomerId) -&gt; None:
+        self._id = id
+        self._customer_id = customer_id
+        self._status = &quot;pending&quot;
+        self._lines: list[OrderLine] = []
+
+    @property
+    def lines(self) -&gt; tuple[OrderLine, ...]:
+        return tuple(self._lines)              # read-only surface preserved
+
+
+# shop/infrastructure/mapping.py  - ALL the ORM knowledge, in one place
+from sqlalchemy import Table, Column, String, Numeric, ForeignKey, MetaData
+from sqlalchemy.orm import registry, relationship, composite
+
+metadata = MetaData()
+mapper_registry = registry()
+
+orders = Table(
+    &quot;orders&quot;, metadata,
+    Column(&quot;id&quot;, UUID, primary_key=True),
+    Column(&quot;customer_id&quot;, UUID, nullable=False),
+    Column(&quot;status&quot;, String(20), nullable=False),
+    Column(&quot;total_amount&quot;, Numeric(19, 4)),
+    Column(&quot;total_currency&quot;, String(3)),
+    Column(&quot;version&quot;, Integer, nullable=False),
+)
+
+order_lines = Table(
+    &quot;order_lines&quot;, metadata,
+    Column(&quot;id&quot;, Integer, primary_key=True),
+    Column(&quot;order_id&quot;, UUID, ForeignKey(&quot;orders.id&quot;), nullable=False),
+    Column(&quot;sku&quot;, String(40), nullable=False),
+    Column(&quot;quantity&quot;, Integer, nullable=False),
+)
+
+def start_mappers() -&gt; None:
+    mapper_registry.map_imperatively(
+        OrderLine, order_lines,
+        properties={&quot;_sku&quot;: order_lines.c.sku, &quot;_quantity&quot;: order_lines.c.quantity},
+    )
+    mapper_registry.map_imperatively(
+        Order, orders,
+        properties={
+            &quot;_id&quot;:          orders.c.id,
+            &quot;_customer_id&quot;: orders.c.customer_id,
+            &quot;_status&quot;:      orders.c.status,
+            # value object across two columns - the OwnsOne equivalent
+            &quot;_total&quot;: composite(Money, orders.c.total_amount, orders.c.total_currency),
+            # maps to the private list, public `lines` stays a read-only tuple
+            &quot;_lines&quot;: relationship(OrderLine, cascade=&quot;all, delete-orphan&quot;),
+        },
+        version_id_col=orders.c.version,       # optimistic concurrency on the root
+    )
+
+# Called once at startup, from the composition root
+start_mappers()</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A good practical question because it catches people who have only read about DDD. Be concrete: EF Core sets private setters and backing fields by reflection, value objects map as owned types or value converters, strongly-typed ids map with a converter you can register as a convention, and <em>all</em> of that configuration lives in infrastructure so the domain project keeps zero EF references. Then name the two anti-patterns you would refuse: public setters "because EF needs them", and exposing <code>IQueryable</code> from a repository, which makes the abstraction decorative.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Map an entity with private setters, a value object and an encapsulated collection — without changing the domain class.</li><li>Register a value converter for a strongly-typed id as a global convention and delete the per-entity configuration.</li><li>Try mapping the same model with separate persistence records and decide which you would maintain.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/dotnet/architecture/microservices/microservice-ddd-cqrs-patterns/" target="_blank" rel="noopener">Microsoft: DDD-oriented microservices</a> — the reference eShop treatment</li><li><a href="https://martinfowler.com/bliki/DomainDrivenDesign.html" target="_blank" rel="noopener">Fowler on DDD</a> — the short version of the blue book</li><li><a href="https://martinfowler.com/bliki/CQRS.html" target="_blank" rel="noopener">Fowler on CQRS</a> — including when not to</li><li><a href="https://github.com/ardalis/CleanArchitecture" target="_blank" rel="noopener">Ardalis Clean Architecture template</a> — the layout most .NET teams start from</li><li><a href="https://www.jimmybogard.com/vertical-slice-architecture/" target="_blank" rel="noopener">Vertical Slice Architecture</a> — the counter-argument, from the author of MediatR</li><li><a href="https://learn.microsoft.com/azure/architecture/patterns/event-sourcing" target="_blank" rel="noopener">Event sourcing</a> — and its real operational costs</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

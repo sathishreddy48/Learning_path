@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Modern C#: 8 to 13 — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="modern-csharp">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › C# &amp; .NET › Topic 2 of 36</div>
+  <h1>Modern C#: 8 → 13</h1>
+  <p class="lede"><a href="core-concepts.html">Core Concepts</a> teaches the language that has been stable for a decade. This page is everything that arrived after it — the features an interviewer uses to work out whether you have written C# recently or are remembering C# 5. Each one comes with the problem it was introduced to solve, because "what is a record?" is a weak answer and "records exist because value equality and immutability were boilerplate" is a strong one.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#nullable">Nullable reference types and the annotation context</a></li><li><a href="#records">Records, with-expressions and value equality</a></li><li><a href="#patterns">Pattern matching: switch expressions, property, positional and list patterns</a></li><li><a href="#ranges">Ranges, indices and slicing</a></li><li><a href="#init-required">init, required and object initialisation</a></li><li><a href="#primary-ctor">Primary constructors and collection expressions</a></li><li><a href="#interface-members">Default interface members and static abstract members</a></li><li><a href="#terse">Target-typed new, file-scoped namespaces, global usings, top-level statements</a></li><li><a href="#async-streams">IAsyncEnumerable and await foreach</a></li><li><a href="#version-map">What landed in which version</a></li></ol>
+  </div>
+
+<section id="nullable"><h2 id="nullable">Nullable reference types and the annotation context</h2><p>The single biggest change in modern C#, and the one most likely to come up. Before C# 8 every reference type was implicitly nullable and <code>NullReferenceException</code> was a runtime surprise. With <code>&lt;Nullable&gt;enable&lt;/Nullable&gt;</code> in the csproj, <code>string</code> means "never null" and <code>string?</code> means "may be null", and the compiler does flow analysis to warn you when you break your own declaration.</p><p>The critical point for an interview: <strong>this is compile-time only</strong>. Nothing is emitted to enforce it, the annotations are metadata, and a caller from an unannotated assembly — or any JSON deserialiser — can still hand you a null in a non-nullable parameter. That is why public entry points still validate.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>#nullable enable
+
+public class Order
+{
+    public string Id { get; init; } = &quot;&quot;;        // non-nullable: must be initialised
+    public string? CouponCode { get; init; }     // genuinely optional
+}
+
+static int CouponLength(Order o)
+{
+    // return o.CouponCode.Length;   // CS8602: dereference of a possibly null reference
+    return o.CouponCode?.Length ?? 0;            // flow analysis is satisfied
+}
+
+static void Use(Order o)
+{
+    if (o.CouponCode is not null)
+    {
+        Console.WriteLine(o.CouponCode.Length);  // narrowed: no warning here
+    }
+}
+
+// The operators that come with it
+string? maybe = Find();
+string definitely = maybe!;                       // null-forgiving: &quot;trust me&quot;
+ArgumentNullException.ThrowIfNull(maybe);         // and now the compiler agrees
+
+// Attributes tell callers what a method does to nullability
+static bool TryParse(string? text, [NotNullWhen(true)] out Order? order) { /* ... */ }
+
+// Compile-time only: this still throws at runtime
+var fromJson = JsonSerializer.Deserialize&lt;Order&gt;(&quot;&quot;&quot;{&quot;id&quot;:null}&quot;&quot;&quot;);</code></pre><pre data-lang="python" hidden><code>from __future__ import annotations
+
+# Python&#x27;s equivalent is also advisory - checked by mypy/pyright, not the runtime
+class Order:
+    def __init__(self, id: str, coupon_code: str | None = None) -&gt; None:
+        self.id = id
+        self.coupon_code = coupon_code
+
+def coupon_length(o: Order) -&gt; int:
+    # return len(o.coupon_code)        # error: Optional[str] has no len
+    return len(o.coupon_code) if o.coupon_code is not None else 0
+
+def use(o: Order) -&gt; None:
+    if o.coupon_code is not None:
+        print(len(o.coupon_code))      # narrowed by the type checker
+
+from typing import TypeGuard, cast
+definitely = cast(str, maybe)          # the ! of the Python world
+
+# Same caveat: annotations are erased at runtime
+import json
+order = Order(**json.loads(&#x27;{&quot;id&quot;: null}&#x27;))   # no complaint until something uses it</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Expect "is <code>string?</code> enforced at runtime?" — no, and saying so cleanly is the whole question. Follow-ups: what <code>!</code> actually does (suppresses a warning, generates no code), why a non-nullable property still needs a default or a constructor, and why deserialisers and reflection can violate every annotation on the type.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Turn <code>&lt;Nullable&gt;enable&lt;/Nullable&gt;</code> on in a small project and fix the warnings without using <code>!</code> anywhere.</li><li>Write a <code>TryGet</code> method annotated with <code>[NotNullWhen(true)]</code> and confirm the caller stops warning after the <code>if</code>.</li><li>Explain to yourself why <code>List&lt;string&gt;</code> and <code>List&lt;string?&gt;</code> are the same type at runtime.</li></ul></div></section>
+<section id="records"><h2 id="records">Records, with-expressions and value equality</h2><p>A <code>record</code> is a class (or <code>record struct</code>) for which the compiler generates value equality, <code>GetHashCode</code>, <code>ToString</code>, a deconstructor and a copy constructor. It exists because writing those five members by hand for a DTO was forty lines of boilerplate that nobody kept in sync.</p><p>The two things to know: records are <strong>shallow</strong> — a record holding a <code>List&lt;T&gt;</code> compares the list by reference, so two records with equal-looking lists are not equal — and <code>with</code> is a shallow copy, not a deep clone.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Positional record: parameters become init-only properties
+public record Money(decimal Amount, string Currency);
+
+var a = new Money(10m, &quot;USD&quot;);
+var b = new Money(10m, &quot;USD&quot;);
+Console.WriteLine(a == b);           // True - value equality, generated
+Console.WriteLine(a);                // Money { Amount = 10, Currency = USD }
+
+var discounted = a with { Amount = 9m };     // non-destructive mutation
+var (amount, ccy) = a;                       // generated Deconstruct
+
+// record struct when you want it on the stack; readonly record struct to pin it
+public readonly record struct Point(int X, int Y);
+
+// A record can have a body, validation and computed members
+public record Order(string Id, IReadOnlyList&lt;string&gt; Lines)
+{
+    public int LineCount =&gt; Lines.Count;
+    public string Id { get; init; } = Id is { Length: &gt; 0 }
+        ? Id : throw new ArgumentException(&quot;Id is required&quot;);
+}
+
+// The trap: equality is shallow
+var x = new Order(&quot;1&quot;, new[] { &quot;a&quot; });
+var y = new Order(&quot;1&quot;, new[] { &quot;a&quot; });
+Console.WriteLine(x == y);           // False - different array instances
+
+// Inheritance works, and the compiler includes the runtime type in equality
+public record Base(int Id);
+public record Derived(int Id, string Name) : Base(Id);</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass, replace, field
+from decimal import Decimal
+
+@dataclass(frozen=True)              # frozen =&gt; immutable + hashable
+class Money:
+    amount: Decimal
+    currency: str
+
+a = Money(Decimal(&quot;10&quot;), &quot;USD&quot;)
+b = Money(Decimal(&quot;10&quot;), &quot;USD&quot;)
+print(a == b)                        # True - generated __eq__
+print(a)                             # Money(amount=Decimal(&#x27;10&#x27;), currency=&#x27;USD&#x27;)
+
+discounted = replace(a, amount=Decimal(&quot;9&quot;))   # the `with` of Python
+amount, ccy = a.amount, a.currency             # no generated deconstruct
+
+# Same shallow-equality trap, with a twist: list fields break hashing outright
+@dataclass(frozen=True)
+class Order:
+    id: str
+    lines: tuple[str, ...] = ()      # tuple, so equality and hashing work
+
+x = Order(&quot;1&quot;, (&quot;a&quot;,))
+y = Order(&quot;1&quot;, (&quot;a&quot;,))
+print(x == y)                        # True - tuples compare by value
+
+# NamedTuple is the lighter-weight option
+from typing import NamedTuple
+class Point(NamedTuple):
+    x: int
+    y: int</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The two questions that separate answers: "how does a record differ from a class?" (generated equality/hash/ToString/Deconstruct/copy-ctor, and <code>init</code> setters — not immutability, which you still have to arrange) and "are records deeply immutable?" (no — a record holding a mutable collection is mutable through it, and equality compares that collection by reference).</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a record holding a <code>List&lt;int&gt;</code> and prove two instances with identical contents are not equal. Then fix it.</li><li>Implement the same type as a class and count the lines the compiler saved you.</li><li>Work out what <code>record Derived : Base</code> does to <code>Equals</code> when compared against a <code>Base</code> with the same <code>Id</code>.</li></ul></div></section>
+<section id="patterns"><h2 id="patterns">Pattern matching: switch expressions, property, positional and list patterns</h2><p>Pattern matching grew from "is this a type?" in C# 7 into a small sub-language. The payoff is that branching on the <em>shape</em> of data becomes an expression that returns a value, and the compiler tells you when you have missed a case.</p><p><code>switch</code> expressions are exhaustive-checked: a non-exhaustive one warns and throws <code>SwitchExpressionException</code> at runtime, which is usually what you want over a silent default.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// switch expression: returns a value, arms are `pattern =&gt; result`
+static decimal Fee(Payment p) =&gt; p switch
+{
+    // property patterns, with nesting and relational operators
+    { Method: &quot;card&quot;, Amount: &gt; 1000m }        =&gt; p.Amount * 0.02m,
+    { Method: &quot;card&quot; }                         =&gt; p.Amount * 0.03m,
+    { Method: &quot;transfer&quot;, Currency: &quot;USD&quot; }    =&gt; 0m,
+
+    // type pattern + designation, with a `when` guard
+    Refund r when r.Amount &gt; 0                 =&gt; -r.Amount * 0.01m,
+
+    // combinators: and / or / not
+    { Amount: &lt;= 0 } or null                   =&gt; throw new ArgumentException(nameof(p)),
+    _                                          =&gt; p.Amount * 0.05m,
+};
+
+// Positional (deconstruction) patterns
+static string Quadrant(Point pt) =&gt; pt switch
+{
+    (0, 0)                    =&gt; &quot;origin&quot;,
+    ( &gt; 0, &gt; 0)               =&gt; &quot;I&quot;,
+    ( &lt; 0, &gt; 0)               =&gt; &quot;II&quot;,
+    var (x, y) when x == y    =&gt; &quot;diagonal&quot;,
+    _                         =&gt; &quot;other&quot;,
+};
+
+// List patterns (C# 11): match a sequence by shape
+static string Describe(int[] xs) =&gt; xs switch
+{
+    []                  =&gt; &quot;empty&quot;,
+    [var only]          =&gt; $&quot;one: {only}&quot;,
+    [var first, .., var last] =&gt; $&quot;{first}..{last}&quot;,
+};
+
+// is-patterns outside switch
+if (obj is string { Length: &gt; 0 } s) Console.WriteLine(s.ToUpper());
+if (value is not null and not &quot;&quot;) { }</code></pre><pre data-lang="python" hidden><code># match/case (3.10+) is the closest equivalent - also shape-based
+from dataclasses import dataclass
+
+def fee(p) -&gt; float:
+    match p:
+        # mapping / class patterns with attribute capture and guards
+        case Payment(method=&quot;card&quot;, amount=amount) if amount &gt; 1000:
+            return amount * 0.02
+        case Payment(method=&quot;card&quot;, amount=amount):
+            return amount * 0.03
+        case Payment(method=&quot;transfer&quot;, currency=&quot;USD&quot;):
+            return 0.0
+        case Refund(amount=amount) if amount &gt; 0:
+            return -amount * 0.01
+        case Payment(amount=amount) if amount &lt;= 0:
+            raise ValueError(&quot;amount&quot;)
+        case _:
+            return p.amount * 0.05
+
+def quadrant(pt) -&gt; str:
+    match pt:
+        case (0, 0):            return &quot;origin&quot;
+        case (x, y) if x &gt; 0 and y &gt; 0: return &quot;I&quot;
+        case (x, y) if x &lt; 0 and y &gt; 0: return &quot;II&quot;
+        case (x, y) if x == y:  return &quot;diagonal&quot;
+        case _:                 return &quot;other&quot;
+
+# Sequence patterns, including the star pattern
+def describe(xs: list[int]) -&gt; str:
+    match xs:
+        case []:                 return &quot;empty&quot;
+        case [only]:             return f&quot;one: {only}&quot;
+        case [first, *_, last]:  return f&quot;{first}..{last}&quot;
+
+# No exhaustiveness checking: a match with no arm falls through silently</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A good signal is knowing <code>switch</code> expressions are checked for exhaustiveness and throw rather than returning a default. Be ready to rewrite a nested <code>if/else</code> chain as a switch expression on the spot — it is a common "tidy this up" exercise — and to say why <code>when</code> guards are not considered by the exhaustiveness analysis.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Convert a three-level nested <code>if</code> over a type hierarchy into one <code>switch</code> expression.</li><li>Use a list pattern to classify an array as empty / single / palindromic.</li><li>Find out what the compiler does with a <code>switch</code> expression over an <code>enum</code> that is missing one member.</li></ul></div></section>
+<section id="ranges"><h2 id="ranges">Ranges, indices and slicing</h2><p><code>Index</code> and <code>Range</code> give <code>a[^1]</code> for "last" and <code>a[2..5]</code> for a slice. They are compiler sugar over <code>Length</code> arithmetic plus either a <code>Slice</code> method or an indexer, so any type exposing <code>Length</code>/<code>Count</code> and <code>Slice</code> supports them.</p><p>The performance point: slicing an <strong>array</strong> with <code>a[2..5]</code> <em>copies</em>; slicing a <code>Span&lt;T&gt;</code> or <code>ReadOnlySpan&lt;char&gt;</code> does not. That difference is the whole reason <code>AsSpan()</code> exists in hot paths.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>int[] a = [10, 20, 30, 40, 50];
+
+int last      = a[^1];           // 50   - ^1 means Length - 1
+int[] middle  = a[1..4];         // [20,30,40]  - end is exclusive
+int[] head    = a[..2];          // [10,20]
+int[] tail    = a[3..];          // [40,50]
+int[] copy    = a[..];           // whole-array copy
+
+// Index and Range are real types you can pass around
+Index secondFromEnd = ^2;
+Range body = 1..^1;
+int[] inner = a[body];           // [20,30,40]
+
+// Strings: Substring with nicer syntax
+string s = &quot;2026-10-07&quot;;
+string year = s[..4];            // &quot;2026&quot;
+string day  = s[^2..];           // &quot;07&quot;
+
+// The allocation difference that matters
+string[] parts = s.Split(&#x27;-&#x27;);              // allocates an array + 3 strings
+ReadOnlySpan&lt;char&gt; yearSpan = s.AsSpan(0, 4);   // allocates nothing
+int y = int.Parse(s.AsSpan(..4));               // parse straight from the span
+
+// Any type with Length/Count + Slice gets range support for free
+public class Buffer
+{
+    public int Length =&gt; _data.Length;
+    public Buffer Slice(int start, int length) =&gt; new(_data[start..(start + length)]);
+}</code></pre><pre data-lang="python" hidden><code>a = [10, 20, 30, 40, 50]
+
+last   = a[-1]        # 50   - negative indices are the ^1 equivalent
+middle = a[1:4]       # [20, 30, 40]  - stop is exclusive, same as C#
+head   = a[:2]        # [10, 20]
+tail   = a[3:]        # [40, 50]
+copy   = a[:]         # shallow copy
+
+# slice() is the Range equivalent and can be stored
+body = slice(1, -1)
+inner = a[body]       # [20, 30, 40]
+
+s = &quot;2026-10-07&quot;
+year = s[:4]          # &quot;2026&quot;
+day  = s[-2:]         # &quot;07&quot;
+
+# Python slices always copy for list/str. memoryview is the Span analogue
+raw = b&quot;2026-10-07&quot;
+mv = memoryview(raw)[0:4]      # no copy
+year_bytes = bytes(mv)         # copy only when you ask for one
+
+# Supporting slicing on your own type
+class Buffer:
+    def __init__(self, data): self._data = data
+    def __len__(self): return len(self._data)
+    def __getitem__(self, key): return Buffer(self._data[key])   # key may be a slice</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The question behind the question is allocation: "does <code>array[1..4]</code> allocate?" Yes — it is a copy. "Does <code>span[1..4]</code>?" No. Knowing that <code>^0</code> is <code>Length</code> (so <code>a[^0]</code> throws) is a nice detail.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Parse a fixed-width record (date, code, amount) using only ranges and no <code>Substring</code>.</li><li>Benchmark <code>Split</code> against <code>AsSpan</code> + ranges on a million short strings.</li><li>Add <code>Length</code> and <code>Slice</code> to a custom type and use range syntax on it.</li></ul></div></section>
+<section id="init-required"><h2 id="init-required">init, required and object initialisation</h2><p>Three features that together let you build immutable-after-construction types without a constructor per permutation. <code>init</code> accessors are settable only during object initialisation; <code>required</code> makes the compiler insist a member is set by any caller; <code>readonly</code> fields remain the strongest guarantee.</p><p><code>required</code> solved a real problem with <code>init</code>: an init-only property could still be forgotten, leaving a non-nullable <code>string</code> as null. <code>required</code> is a compile-time check, and <code>[SetsRequiredMembers]</code> is how a constructor opts out of it.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class Customer
+{
+    public required string Name { get; init; }   // caller MUST set it
+    public required string Email { get; init; }
+    public string? Phone { get; init; }          // optional
+    public DateOnly Created { get; init; } = DateOnly.FromDateTime(DateTime.UtcNow);
+}
+
+var c = new Customer { Name = &quot;Ada&quot;, Email = &quot;ada@example.com&quot; };
+// var bad = new Customer { Name = &quot;Ada&quot; };   // CS9035: Email must be set
+// c.Name = &quot;Grace&quot;;                          // CS8852: init-only
+
+// A constructor that sets them all opts out of the requirement
+public class Order
+{
+    public required string Id { get; init; }
+
+    public Order() { }
+
+    [SetsRequiredMembers]
+    public Order(string id) =&gt; Id = id;        // callers of this ctor need no initialiser
+}
+
+// init vs readonly vs set - pick deliberately
+public class Three
+{
+    private readonly int _hardest;             // only a constructor, ever
+    public int Firm { get; init; }             // constructor or object initialiser
+    public int Soft { get; set; }              // anyone, any time
+    public Three(int x) =&gt; _hardest = x;
+}
+
+// Structs: readonly struct makes every field readonly and every method readonly
+public readonly struct Temp(double Celsius)
+{
+    public double Fahrenheit =&gt; Celsius * 9 / 5 + 32;
+}</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass, field
+from datetime import date
+
+# A frozen dataclass is the init-only equivalent: set at construction, then sealed
+@dataclass(frozen=True)
+class Customer:
+    name: str                                  # no default =&gt; required
+    email: str                                 # no default =&gt; required
+    phone: str | None = None
+    created: date = field(default_factory=date.today)
+
+c = Customer(name=&quot;Ada&quot;, email=&quot;ada@example.com&quot;)
+# Customer(name=&quot;Ada&quot;)                         # TypeError: missing &#x27;email&#x27;
+# c.name = &quot;Grace&quot;                             # FrozenInstanceError
+
+# kw_only forces callers to name every argument, like C#&#x27;s object initialiser
+@dataclass(frozen=True, kw_only=True)
+class Order:
+    id: str
+
+Order(id=&quot;A-1&quot;)
+
+# Without frozen=True, &quot;required&quot; and &quot;settable&quot; are the only two states:
+# Python has no per-property init-only accessor. Properties get you close:
+class Three:
+    def __init__(self, x: int) -&gt; None:
+        self._hardest = x                      # by convention, not enforced
+    @property
+    def hardest(self) -&gt; int:
+        return self._hardest                   # no setter =&gt; read-only</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"What is the difference between <code>init</code> and <code>readonly</code>?" — <code>init</code> also allows an object initialiser, which means a caller outside the constructor can set it, which means you cannot rely on it for an invariant that must hold. Then: "how do you guarantee a property is set?" → <code>required</code>, or a constructor parameter, and know that <code>required</code> is compile-time only so reflection and deserialisation bypass it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Model a type with two mandatory and two optional members three ways: constructor, <code>init</code>, <code>required</code>. Argue for one.</li><li>Find out what <code>System.Text.Json</code> does with a <code>required</code> property missing from the payload.</li><li>Add <code>[SetsRequiredMembers]</code> to a constructor and watch the call-site error disappear.</li></ul></div></section>
+<section id="primary-ctor"><h2 id="primary-ctor">Primary constructors and collection expressions</h2><p>C# 12 extended primary constructors from records to all classes and structs, and added <code>[...]</code> as a target-typed literal for any collection type.</p><p>The gotcha interviewers like: a primary-constructor parameter on a <strong>class</strong> is a captured variable, not a property. It is mutable inside the body, it does not show up in <code>ToString</code>, and if you capture it in a lambda you have captured a field the compiler generated for you. On a <strong>record</strong>, the same syntax creates a public init-only property. Same spelling, different semantics.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Class primary constructor: parameters are captured, NOT properties
+public class OrderService(IRepository repo, ILogger&lt;OrderService&gt; log)
+{
+    public async Task Handle(string id)
+    {
+        log.LogInformation(&quot;handling {Id}&quot;, id);   // used directly, no field needed
+        var order = await repo.Get(id);
+    }
+    // repo and log are private captured state; nothing is exposed
+}
+
+// On a record the same syntax creates public init-only properties
+public record Money(decimal Amount, string Currency);   // Amount is public
+
+// Capturing deliberately into a readonly field when you want the guarantee
+public class Cache(IClock clock)
+{
+    private readonly IClock _clock = clock;    // explicit, immutable
+}
+
+// Collection expressions: one syntax, target-typed
+int[]            arr  = [1, 2, 3];
+List&lt;int&gt;        list = [1, 2, 3];
+HashSet&lt;int&gt;     set  = [1, 2, 3];
+Span&lt;int&gt;        span = [1, 2, 3];              // no heap allocation
+ImmutableArray&lt;int&gt; imm = [1, 2, 3];
+int[][]          grid = [[1, 2], [3, 4]];
+
+// The spread element
+int[] head = [1, 2];
+int[] all  = [0, ..head, 3];                    // [0, 1, 2, 3]
+
+// Empty, and in an argument position
+Process([]);
+static void Process(IEnumerable&lt;int&gt; xs) { }
+
+// A collection type opts in with [CollectionBuilder] or an Add method + IEnumerable</code></pre><pre data-lang="python" hidden><code># Python&#x27;s __init__ is already the primary constructor; the closest thing to
+# C#&#x27;s captured parameters is a closure or a dataclass
+from dataclasses import dataclass
+
+@dataclass
+class OrderService:
+    repo: &quot;Repository&quot;
+    log: &quot;Logger&quot;
+
+    async def handle(self, id: str) -&gt; None:
+        self.log.info(&quot;handling %s&quot;, id)
+        order = await self.repo.get(id)
+
+# Collection literals have always been target-specific rather than target-typed
+arr  = [1, 2, 3]            # list
+tup  = (1, 2, 3)            # tuple
+st   = {1, 2, 3}            # set
+frz  = frozenset([1, 2, 3])
+grid = [[1, 2], [3, 4]]
+
+# Unpacking is the spread element
+head = [1, 2]
+all_ = [0, *head, 3]        # [0, 1, 2, 3]
+merged = {**a, **b}         # dict merge (or a | b in 3.9+)
+
+# Empty literals need no target type
+process([])</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Have the class-vs-record distinction ready: on a class, primary-constructor parameters are captured variables (private, mutable, invisible in <code>ToString</code>); on a record they become public init-only properties. Also worth saying: a primary constructor is excellent for DI-heavy service classes and poor where you need validation, because there is no body to validate in until you add one.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Rewrite a service class with four injected dependencies using a primary constructor and count the lines removed.</li><li>Capture a primary-constructor parameter in a lambda, then mutate it, and explain what the compiler generated.</li><li>Assign the same <code>[1, 2, 3]</code> to five different collection types and check which ones allocate.</li></ul></div></section>
+<section id="interface-members"><h2 id="interface-members">Default interface members and static abstract members</h2><p>C# 8 allowed interfaces to carry implementations; C# 11 allowed them to declare <code>static abstract</code> members, which is what makes generic math possible. Both exist to let a library add to an interface without breaking every implementer.</p><p>Default interface members are <em>not</em> multiple inheritance of state — an interface still cannot hold instance fields. And they are resolved against the interface, not the class: calling one requires a reference typed as the interface.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// A default implementation lets you add a member without breaking implementers
+public interface ILogger
+{
+    void Log(LogLevel level, string message);
+
+    // new member, existing implementers keep compiling
+    void LogError(string message) =&gt; Log(LogLevel.Error, message);
+}
+
+public class ConsoleLogger : ILogger
+{
+    public void Log(LogLevel level, string message) =&gt; Console.WriteLine($&quot;{level}: {message}&quot;);
+}
+
+var logger = new ConsoleLogger();
+// logger.LogError(&quot;boom&quot;);                  // does NOT compile - not a class member
+((ILogger)logger).LogError(&quot;boom&quot;);          // resolved through the interface
+
+// static abstract: the member is on the TYPE, so generic code can call it
+public interface IParsable2&lt;T&gt; where T : IParsable2&lt;T&gt;
+{
+    static abstract T Parse(string s);
+}
+
+public readonly record struct Sku(string Value) : IParsable2&lt;Sku&gt;
+{
+    public static Sku Parse(string s) =&gt; new(s);
+}
+
+static T[] ParseAll&lt;T&gt;(string[] input) where T : IParsable2&lt;T&gt;
+    =&gt; input.Select(T.Parse).ToArray();       // calling a static through a type parameter
+
+// This is how generic math works in the BCL
+static T Sum&lt;T&gt;(IEnumerable&lt;T&gt; xs) where T : INumber&lt;T&gt;
+{
+    T total = T.Zero;                          // static property on the type parameter
+    foreach (var x in xs) total += x;          // operator from the interface
+    return total;
+}
+Console.WriteLine(Sum(new[] { 1, 2, 3 }));     // 6
+Console.WriteLine(Sum(new[] { 1.5, 2.5 }));    // 4</code></pre><pre data-lang="python" hidden><code>from abc import ABC, abstractmethod
+from typing import Protocol, Self, TypeVar
+
+# Python ABCs have always allowed concrete methods alongside abstract ones,
+# and they ARE callable on the instance - no interface cast needed
+class Logger(ABC):
+    @abstractmethod
+    def log(self, level: str, message: str) -&gt; None: ...
+
+    def log_error(self, message: str) -&gt; None:      # the &quot;default member&quot;
+        self.log(&quot;error&quot;, message)
+
+class ConsoleLogger(Logger):
+    def log(self, level: str, message: str) -&gt; None:
+        print(f&quot;{level}: {message}&quot;)
+
+ConsoleLogger().log_error(&quot;boom&quot;)                   # just works
+
+# The static-abstract equivalent: a Protocol with a classmethod
+class Parsable(Protocol):
+    @classmethod
+    def parse(cls, s: str) -&gt; Self: ...
+
+T = TypeVar(&quot;T&quot;, bound=Parsable)
+
+def parse_all(cls: type[T], values: list[str]) -&gt; list[T]:
+    return [cls.parse(v) for v in values]           # the type is passed explicitly
+
+# Generic math: Python leans on duck typing and operator protocols instead
+from typing import Iterable
+def total(xs: Iterable[float]) -&gt; float:
+    return sum(xs)                                   # works for anything with __add__</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Two reliable questions. "Why would an interface have an implementation?" — versioning: adding a member to a shipped interface is otherwise a breaking change. "Why can't I call it on the class?" — default members are interface members; the class does not inherit them into its own surface. If generic math comes up, <code>INumber&lt;T&gt;</code> plus <code>static abstract</code> is the answer for "how do you write one <code>Sum</code> for int and double without boxing".</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Add a member with a default implementation to an interface with three implementers and confirm nothing breaks.</li><li>Write a <code>Sum&lt;T&gt;() where T : INumber&lt;T&gt;</code> and call it with <code>int</code>, <code>double</code> and <code>decimal</code>.</li><li>Work out what happens when a class implements two interfaces that both default-implement the same signature.</li></ul></div></section>
+<section id="terse"><h2 id="terse">Target-typed new, file-scoped namespaces, global usings, top-level statements</h2><p>A cluster of small features that changed what idiomatic C# looks like. None are deep, all are visible: a modern file has no namespace braces, no <code>using System;</code> and a <code>Program.cs</code> with no class in it. Knowing why each exists is enough.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Program.cs - top-level statements. The compiler generates Program.Main for you.
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSingleton&lt;IClock, SystemClock&gt;();
+var app = builder.Build();
+app.MapGet(&quot;/health&quot;, () =&gt; Results.Ok());
+app.Run();
+// `args` is in scope; so is an implicit async context and a top-level `return 0;`
+
+
+// Order.cs - file-scoped namespace: one less level of indentation for the file
+namespace Shop.Domain;
+
+public class Order
+{
+    // target-typed new: the type is already on the left, do not repeat it
+    private readonly Dictionary&lt;string, List&lt;OrderLine&gt;&gt; _lines = new();
+    private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
+
+    public Order Clone() =&gt; new() { Id = Id };     // even in a return position
+}
+
+// GlobalUsings.cs - or &lt;ImplicitUsings&gt;enable&lt;/ImplicitUsings&gt; in the csproj
+global using System.Text.Json;
+global using Shop.Domain;
+global using Repo = Shop.Data.OrderRepository;     // aliases work too
+
+// file-local types: visible only inside this one file
+file class Helper { }</code></pre><pre data-lang="python" hidden><code># Python has had all of these since forever, which is why they read as normal
+
+# &quot;Top-level statements&quot;: a module IS a script. The __main__ guard is the only
+# ceremony, and only when the file is also importable.
+import asyncio
+from app import create_app
+
+app = create_app()
+
+if __name__ == &quot;__main__&quot;:
+    asyncio.run(app.serve())
+
+# &quot;File-scoped namespace&quot;: the module path is the namespace. No braces, ever.
+# shop/domain/order.py  -&gt;  shop.domain.order
+
+class Order:
+    def __init__(self) -&gt; None:
+        self._lines: dict[str, list[&quot;OrderLine&quot;]] = {}    # type on the left, inferred right
+
+# &quot;Global usings&quot;: there is no such thing - imports are per module by design.
+# The closest equivalent is re-exporting from a package __init__.py:
+#   shop/__init__.py:  from .domain.order import Order
+from shop import Order
+
+# &quot;file-local types&quot;: a leading underscore, by convention only
+class _Helper:
+    pass</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>These show up as "what version of C# is this codebase on?" signals rather than as questions. The one real question is about top-level statements: the compiler still generates a <code>Program</code> class with a <code>Main</code>, which matters when a test project or <code>WebApplicationFactory&lt;Program&gt;</code> needs to reference it — and is why you sometimes see a <code>public partial class Program { }</code> at the bottom of the file.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Enable <code>ImplicitUsings</code> on an older project and delete every using it makes redundant.</li><li>Convert a <code>Program.cs</code> with an explicit <code>Main</code> to top-level statements and get an integration test referencing <code>Program</code> to compile.</li><li>Use a <code>file</code>-scoped class for a helper and confirm another file cannot see it.</li></ul></div></section>
+<section id="async-streams"><h2 id="async-streams">IAsyncEnumerable and await foreach</h2><p>Before C# 8 an async method could return one value (<code>Task&lt;T&gt;</code>) or a sequence produced all at once (<code>Task&lt;List&lt;T&gt;&gt;</code>). <code>IAsyncEnumerable&lt;T&gt;</code> is the missing case: a sequence where <em>each</em> element is awaited. It is what you want for a paged API, a database cursor or a message stream — anything you should not buffer entirely.</p><p>Two details that are nearly always the follow-up question: cancellation needs <code>[EnumeratorCancellation]</code> to flow from <code>WithCancellation</code> into the iterator, and <code>ConfigureAwait(false)</code> on an async stream is spelled <code>.ConfigureAwait(false)</code> on the enumerable, not inside it.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Producing: async iterator - `async` + `IAsyncEnumerable&lt;T&gt;` + `yield return`
+public async IAsyncEnumerable&lt;Order&gt; GetAllAsync(
+    [EnumeratorCancellation] CancellationToken ct = default)
+{
+    string? cursor = null;
+    do
+    {
+        var page = await _api.GetPageAsync(cursor, ct);   // one await per page
+        foreach (var order in page.Items)
+            yield return order;                            // one element at a time
+        cursor = page.NextCursor;
+    }
+    while (cursor is not null);
+}
+
+// Consuming
+await foreach (var order in GetAllAsync(ct))
+{
+    Process(order);
+}
+
+// With cancellation and no captured context
+await foreach (var order in GetAllAsync()
+    .WithCancellation(ct)
+    .ConfigureAwait(false))
+{
+}
+
+// System.Linq.Async / EF Core give you the operators
+var recent = await _db.Orders.AsAsyncEnumerable()
+    .Where(o =&gt; o.Total &gt; 100)
+    .Take(10)
+    .ToListAsync(ct);
+
+// Minimal API: returning one streams the response instead of buffering it
+app.MapGet(&quot;/orders&quot;, (CancellationToken ct) =&gt; GetAllAsync(ct));
+
+// IAsyncDisposable is the partner feature
+await using var conn = new SqlConnection(cs);</code></pre><pre data-lang="python" hidden><code># async generators: `async def` + `yield`. Python had these first (3.6).
+from typing import AsyncIterator
+
+async def get_all() -&gt; AsyncIterator[&quot;Order&quot;]:
+    cursor = None
+    while True:
+        page = await api.get_page(cursor)      # one await per page
+        for order in page.items:
+            yield order                        # one element at a time
+        cursor = page.next_cursor
+        if cursor is None:
+            break
+
+# Consuming
+async for order in get_all():
+    process(order)
+
+# Cancellation is structural rather than a token you thread through
+import asyncio
+async with asyncio.timeout(30):
+    async for order in get_all():
+        process(order)
+
+# Comprehensions work over async iterators
+recent = [o async for o in get_all() if o.total &gt; 100][:10]
+
+# The IAsyncDisposable equivalent
+async with Connection(cs) as conn:
+    ...
+
+# aclose() matters: an abandoned async generator needs explicit cleanup
+agen = get_all()
+try:
+    ...
+finally:
+    await agen.aclose()</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Expect "when would you return <code>IAsyncEnumerable&lt;T&gt;</code> instead of <code>Task&lt;List&lt;T&gt;&gt;</code>?" — when the sequence is large, paged or unbounded, and you want the first element before the last one exists. The sharp follow-up is cancellation: without <code>[EnumeratorCancellation]</code>, the token passed to <code>WithCancellation</code> never reaches your iterator body and the loop keeps paging after cancellation.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Turn a paged HTTP client into an <code>IAsyncEnumerable&lt;T&gt;</code> and consume it with <code>await foreach</code>.</li><li>Omit <code>[EnumeratorCancellation]</code>, then cancel mid-stream, and observe that the iterator keeps going.</li><li>Compare peak memory streaming 100k rows with <code>IAsyncEnumerable</code> versus <code>ToListAsync</code>.</li></ul></div></section>
+<section id="version-map"><h2 id="version-map">What landed in which version</h2><p>You will not be quizzed on version numbers, but being able to say "that is C# 11, so .NET 7 or later" tells an interviewer you have followed the language rather than absorbed it. C# versions are tied to the SDK: <code>net8.0</code> defaults to C# 12, <code>net9.0</code> to C# 13, and <code>&lt;LangVersion&gt;</code> overrides it at your own risk.</p><div class="table-wrap"><table><thead><tr><th>Version</th><th>Runtime</th><th>The ones worth naming</th></tr></thead><tbody><tr><td>C# 8</td><td>.NET Core 3.1</td><td>Nullable reference types, async streams, default interface members, ranges, <code>using</code> declarations, switch expressions</td></tr><tr><td>C# 9</td><td>.NET 5</td><td>Records, init-only setters, top-level statements, target-typed <code>new</code>, pattern combinators</td></tr><tr><td>C# 10</td><td>.NET 6</td><td>File-scoped namespaces, global usings, <code>record struct</code>, extended property patterns</td></tr><tr><td>C# 11</td><td>.NET 7</td><td>Raw string literals, <code>required</code> members, list patterns, static abstract interface members (generic math), UTF-8 literals</td></tr><tr><td>C# 12</td><td>.NET 8</td><td>Primary constructors on classes, collection expressions, alias any type, inline arrays</td></tr><tr><td>C# 13</td><td>.NET 9</td><td><code>params</code> collections, <code>field</code> keyword, <code>ref struct</code> in interfaces, <code>Lock</code> type</td></tr></tbody></table></div><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Raw string literals (C# 11) - no escaping, and the closing quotes set the indent
+string json = &quot;&quot;&quot;
+    {
+      &quot;name&quot;: &quot;Ada&quot;,
+      &quot;path&quot;: &quot;C:\Users\Ada&quot;
+    }
+    &quot;&quot;&quot;;
+
+// Interpolation inside a raw literal: the brace count tells you how many are literal
+string query = $$&quot;&quot;&quot;
+    { &quot;filter&quot;: { &quot;id&quot;: &quot;{{id}}&quot; } }
+    &quot;&quot;&quot;;
+
+// UTF-8 string literals (C# 11): a ReadOnlySpan&lt;byte&gt;, no encoding at runtime
+ReadOnlySpan&lt;byte&gt; ok = &quot;OK&quot;u8;
+
+// params collections (C# 13): params is no longer array-only
+static int Sum(params ReadOnlySpan&lt;int&gt; xs) { int t = 0; foreach (var x in xs) t += x; return t; }
+Sum(1, 2, 3);                      // no array allocated
+
+// The field keyword (C# 13): a property body without naming the backing field
+public string Name
+{
+    get;
+    set =&gt; field = value.Trim();
+}
+
+// The Lock type (C# 13): lock(obj) on a System.Threading.Lock uses the new fast path
+private readonly Lock _gate = new();
+void Add() { lock (_gate) { /* ... */ } }</code></pre><pre data-lang="python" hidden><code># Python&#x27;s equivalents, for the same table
+
+# Raw / multi-line strings - no closing-quote indent trick, use textwrap.dedent
+import textwrap
+json_text = textwrap.dedent(&quot;&quot;&quot;\
+    {
+      &quot;name&quot;: &quot;Ada&quot;,
+      &quot;path&quot;: &quot;C:\\Users\\Ada&quot;
+    }
+&quot;&quot;&quot;)
+raw = r&quot;C:\Users\Ada&quot;            # r-prefix is the real raw literal
+
+# f-strings are the interpolation equivalent (3.6+), nestable since 3.12
+query = f&#x27;{{ &quot;filter&quot;: {{ &quot;id&quot;: &quot;{id}&quot; }} }}&#x27;
+
+# Bytes literals have always existed
+ok = b&quot;OK&quot;
+
+# *args is params, and has never been array-only
+def total(*xs: int) -&gt; int:
+    return sum(xs)
+total(1, 2, 3)
+
+# property with a setter that normalises - the `field` keyword equivalent
+class Person:
+    @property
+    def name(self) -&gt; str:
+        return self._name
+    @name.setter
+    def name(self, value: str) -&gt; None:
+        self._name = value.strip()
+
+# Locks
+import threading
+_gate = threading.Lock()
+def add() -&gt; None:
+    with _gate:
+        ...</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Nobody needs the table memorised. What is worth having ready: one feature you have actually adopted and the problem it removed, and one you have deliberately <em>not</em> adopted and why. "We turned nullable on in new projects only, because retrofitting it across a large solution generated 4,000 warnings and tempted everyone into <code>!</code>" is a better answer than a feature list.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Check the <code>LangVersion</code> and TFM of a project you work on and name the newest feature available to it.</li><li>Rewrite an escaped JSON string constant as a raw string literal.</li><li>Pick a feature from C# 12/13 you have never used and write ten lines with it.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/dotnet/csharp/whats-new/csharp-version-history" target="_blank" rel="noopener">C# version history</a> — the canonical per-version list</li><li><a href="https://learn.microsoft.com/dotnet/csharp/nullable-references" target="_blank" rel="noopener">Nullable reference types</a> — the annotation and warning contexts in full</li><li><a href="https://learn.microsoft.com/dotnet/csharp/language-reference/operators/patterns" target="_blank" rel="noopener">Patterns reference</a> — every pattern form with grammar</li><li><a href="https://learn.microsoft.com/dotnet/csharp/language-reference/builtin-types/record" target="_blank" rel="noopener">Records</a> — generated members, inheritance, deconstruction</li><li><a href="https://devblogs.microsoft.com/dotnet/category/csharp/" target="_blank" rel="noopener">.NET Blog — C#</a> — the release posts, which read better than the docs</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

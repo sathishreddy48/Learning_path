@@ -162,11 +162,19 @@
     if (foot) foot.innerHTML = footHtml();
   });
 
-  /* ---- prev / next pager on topic pages ---------------------------------- */
+  /* ---- breadcrumb + prev / next pager on topic pages --------------------- */
   if (currentTopic && main) {
     var idx = -1;
     C.topics.forEach(function (t, i) { if (t.id === currentTopic) idx = i; });
     if (idx >= 0) {
+      /* The breadcrumb is rendered from CURRICULUM rather than typed into each
+         page, so adding a topic never leaves 22 pages claiming "of 23". */
+      var crumb = main.querySelector('.breadcrumb');
+      if (crumb) {
+        crumb.innerHTML = '<a href="' + root + 'index.html">Dashboard</a> \u203a ' +
+          esc(C.topics[idx].groupLabel || '') + ' \u203a Topic ' + (idx + 1) + ' of ' + C.topics.length;
+      }
+
       var prev = C.topics[idx - 1], next = C.topics[idx + 1];
       var pager = document.createElement('div');
       pager.className = 'pager';

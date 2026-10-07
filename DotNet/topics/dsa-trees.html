@@ -1,0 +1,1395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trees, Tries &amp; Heaps — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="dsa-trees">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › DSA › Topic 22 of 36</div>
+  <h1>Trees, Tries &amp; Heaps</h1>
+  <p class="lede">Trees are where recursion stops being a technique and becomes the natural shape of the code. Almost every problem here is one of four skeletons — traverse, aggregate upward, search downward, or process level by level — and recognising which one you need is most of the work.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#traversals">Traversals: recursive and iterative</a></li><li><a href="#bfs-levels">Level-order BFS, depth and views</a></li><li><a href="#bst">BSTs: search, insert, validate and k-th smallest</a></li><li><a href="#lca-serialise">Lowest common ancestor and serialisation</a></li><li><a href="#tries">Tries: prefix search and word problems</a></li><li><a href="#heap">Heaps and PriorityQueue</a></li><li><a href="#heap-patterns">Top-k, merge-k and the two-heap median</a></li><li><a href="#sorted-collections">What .NET gives you: SortedSet, SortedDictionary and SortedList</a></li></ol>
+  </div>
+
+<section id="traversals"><h2 id="traversals">Traversals: recursive and iterative</h2><p>Four orders, and you should be able to write each one both ways. <strong>Pre-order</strong> (node, left, right) copies or serialises a tree. <strong>In-order</strong> (left, node, right) visits a BST in sorted order — which is why so many BST problems reduce to "do an in-order walk". <strong>Post-order</strong> (left, right, node) is for anything where a node needs its children's results first — heights, sums, deletion. <strong>Level-order</strong> is BFS.</p><p>The recursive versions are four lines each. The iterative ones are what interviewers ask for, and post-order is the awkward one: either push a visited flag with each node, or do a reversed pre-order and reverse the output.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class TreeNode(int val)
+{
+    public int Val = val;
+    public TreeNode? Left, Right;
+}
+
+// ---------- RECURSIVE: say these, then write the iterative ones ----------
+static void PreOrder(TreeNode? n, List&lt;int&gt; acc)
+{
+    if (n is null) return;
+    acc.Add(n.Val); PreOrder(n.Left, acc); PreOrder(n.Right, acc);
+}
+static void InOrder(TreeNode? n, List&lt;int&gt; acc)
+{
+    if (n is null) return;
+    InOrder(n.Left, acc); acc.Add(n.Val); InOrder(n.Right, acc);
+}
+static void PostOrder(TreeNode? n, List&lt;int&gt; acc)
+{
+    if (n is null) return;
+    PostOrder(n.Left, acc); PostOrder(n.Right, acc); acc.Add(n.Val);
+}
+// All O(n) time, O(h) space on the call stack.
+
+// ---------- ITERATIVE ----------
+
+// PRE-ORDER: push right BEFORE left, so left pops first
+static List&lt;int&gt; PreOrderIter(TreeNode? root)
+{
+    var result = new List&lt;int&gt;();
+    if (root is null) return result;
+
+    var stack = new Stack&lt;TreeNode&gt;();
+    stack.Push(root);
+    while (stack.Count &gt; 0)
+    {
+        var n = stack.Pop();
+        result.Add(n.Val);
+        if (n.Right is not null) stack.Push(n.Right);     // right first
+        if (n.Left  is not null) stack.Push(n.Left);
+    }
+    return result;
+}
+
+// IN-ORDER: walk the left spine, then pop and go right. This is also the
+// BST-iterator skeleton, so it is worth knowing cold.
+static List&lt;int&gt; InOrderIter(TreeNode? root)
+{
+    var result = new List&lt;int&gt;();
+    var stack = new Stack&lt;TreeNode&gt;();
+    var node = root;
+
+    while (node is not null || stack.Count &gt; 0)
+    {
+        while (node is not null) { stack.Push(node); node = node.Left; }
+        node = stack.Pop();
+        result.Add(node.Val);
+        node = node.Right;
+    }
+    return result;
+}
+
+// POST-ORDER, trick version: pre-order with the children swapped, then reverse
+static List&lt;int&gt; PostOrderIter(TreeNode? root)
+{
+    var result = new List&lt;int&gt;();
+    if (root is null) return result;
+
+    var stack = new Stack&lt;TreeNode&gt;();
+    stack.Push(root);
+    while (stack.Count &gt; 0)
+    {
+        var n = stack.Pop();
+        result.Add(n.Val);
+        if (n.Left  is not null) stack.Push(n.Left);      // LEFT first this time
+        if (n.Right is not null) stack.Push(n.Right);
+    }
+    result.Reverse();                                     // node-right-left reversed
+    return result;                                        //   == left-right-node
+}
+
+// POST-ORDER, honest version: a visited flag, for when you must process in
+// order without buffering (e.g. freeing nodes)
+static List&lt;int&gt; PostOrderFlag(TreeNode? root)
+{
+    var result = new List&lt;int&gt;();
+    var stack = new Stack&lt;(TreeNode Node, bool Visited)&gt;();
+    if (root is not null) stack.Push((root, false));
+
+    while (stack.Count &gt; 0)
+    {
+        var (node, visited) = stack.Pop();
+        if (visited) { result.Add(node.Val); continue; }
+
+        stack.Push((node, true));                          // re-push, now marked
+        if (node.Right is not null) stack.Push((node.Right, false));
+        if (node.Left  is not null) stack.Push((node.Left,  false));
+    }
+    return result;
+}
+
+// MORRIS TRAVERSAL - O(1) space, by temporarily rewiring the tree. Know that it
+// exists and what it costs (it mutates during the walk) rather than memorising it.
+
+// ---------- THE POST-ORDER SKELETON, which is most tree problems ----------
+// &quot;compute something for a node from its children&#x27;s results&quot;
+static int Height(TreeNode? n)
+    =&gt; n is null ? 0 : 1 + Math.Max(Height(n.Left), Height(n.Right));
+
+static int CountNodes(TreeNode? n)
+    =&gt; n is null ? 0 : 1 + CountNodes(n.Left) + CountNodes(n.Right);
+
+// DIAMETER - the pattern where the RETURN value and the ANSWER differ
+static int Diameter(TreeNode? root)
+{
+    int best = 0;
+    int Depth(TreeNode? n)
+    {
+        if (n is null) return 0;
+        int l = Depth(n.Left), r = Depth(n.Right);
+        best = Math.Max(best, l + r);        // the answer: a path THROUGH this node
+        return 1 + Math.Max(l, r);           // the return: depth, for the parent
+    }
+    Depth(root);
+    return best;
+}
+// Returning one thing while accumulating another is the single most reusable
+// tree idiom - &quot;max path sum&quot;, &quot;longest univalue path&quot;, &quot;balanced check&quot; are
+// all this shape.</code></pre><pre data-lang="python" hidden><code>class TreeNode:
+    __slots__ = (&quot;val&quot;, &quot;left&quot;, &quot;right&quot;)
+    def __init__(self, val=0, left=None, right=None):
+        self.val, self.left, self.right = val, left, right
+
+# RECURSIVE - generators make these read nicely and stay lazy
+def pre_order(n):
+    if n:
+        yield n.val
+        yield from pre_order(n.left)
+        yield from pre_order(n.right)
+
+def in_order(n):
+    if n:
+        yield from in_order(n.left)
+        yield n.val
+        yield from in_order(n.right)
+
+def post_order(n):
+    if n:
+        yield from post_order(n.left)
+        yield from post_order(n.right)
+        yield n.val
+
+# ITERATIVE
+def pre_order_iter(root) -&gt; list[int]:
+    result, stack = [], [root] if root else []
+    while stack:
+        n = stack.pop()
+        result.append(n.val)
+        if n.right: stack.append(n.right)      # right first
+        if n.left:  stack.append(n.left)
+    return result
+
+def in_order_iter(root) -&gt; list[int]:
+    result, stack, node = [], [], root
+    while node or stack:
+        while node:
+            stack.append(node)
+            node = node.left
+        node = stack.pop()
+        result.append(node.val)
+        node = node.right
+    return result
+
+def post_order_iter(root) -&gt; list[int]:
+    result, stack = [], [root] if root else []
+    while stack:
+        n = stack.pop()
+        result.append(n.val)
+        if n.left:  stack.append(n.left)       # left first
+        if n.right: stack.append(n.right)
+    return result[::-1]
+
+def post_order_flag(root) -&gt; list[int]:
+    result, stack = [], [(root, False)] if root else []
+    while stack:
+        node, visited = stack.pop()
+        if visited:
+            result.append(node.val)
+            continue
+        stack.append((node, True))
+        if node.right: stack.append((node.right, False))
+        if node.left:  stack.append((node.left,  False))
+    return result
+
+# THE POST-ORDER SKELETON
+def height(n) -&gt; int:
+    return 0 if n is None else 1 + max(height(n.left), height(n.right))
+
+def diameter(root) -&gt; int:
+    best = 0
+    def depth(n) -&gt; int:
+        nonlocal best                          # `nonlocal`, or you rebind a local
+        if n is None:
+            return 0
+        l, r = depth(n.left), depth(n.right)
+        best = max(best, l + r)                # the answer
+        return 1 + max(l, r)                   # the return value
+    depth(root)
+    return best
+
+# Depth limit: a degenerate tree of 10^5 nodes blows the 1000-frame default.
+# Say you would go iterative, or raise the limit deliberately.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Be able to produce the iterative in-order without hesitating — it is the most-asked of the three and the basis of the BST-iterator question. For post-order, the reversed-pre-order trick is the fast answer and the visited-flag version is the honest one; say which you are writing and why. The genuinely reusable idea is the diameter shape: a recursion that <em>returns</em> one value to its parent while <em>accumulating</em> a different answer in an enclosing variable. Once you see it, max-path-sum and balanced-tree checking stop being separate problems.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write all four traversals iteratively, including post-order both ways.</li><li>Solve "diameter of a binary tree" and "maximum path sum" with the same return-vs-accumulate shape.</li><li>Convert a recursive traversal to iterative and confirm it handles a 100,000-node degenerate tree.</li></ul></div></section>
+<section id="bfs-levels"><h2 id="bfs-levels">Level-order BFS, depth and views</h2><p>When a problem mentions <em>levels</em>, <em>depth</em>, <em>nearest</em> or <em>minimum number of steps</em>, it wants BFS. The implementation detail that makes level problems easy is to <strong>record the queue size at the start of each level and consume exactly that many nodes</strong> — that one line separates the levels without any extra bookkeeping.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// LEVEL ORDER - the snapshot-the-count idiom
+static IList&lt;IList&lt;int&gt;&gt; LevelOrder(TreeNode? root)
+{
+    var result = new List&lt;IList&lt;int&gt;&gt;();
+    if (root is null) return result;
+
+    var queue = new Queue&lt;TreeNode&gt;();
+    queue.Enqueue(root);
+
+    while (queue.Count &gt; 0)
+    {
+        int size = queue.Count;                  // &lt;- everything currently queued
+        var level = new List&lt;int&gt;(size);         //    is exactly this level
+
+        for (int i = 0; i &lt; size; i++)
+        {
+            var node = queue.Dequeue();
+            level.Add(node.Val);
+            if (node.Left  is not null) queue.Enqueue(node.Left);
+            if (node.Right is not null) queue.Enqueue(node.Right);
+        }
+        result.Add(level);
+    }
+    return result;
+}
+
+// MINIMUM DEPTH - BFS beats DFS here, because you can STOP at the first leaf
+static int MinDepth(TreeNode? root)
+{
+    if (root is null) return 0;
+    var queue = new Queue&lt;(TreeNode Node, int Depth)&gt;();
+    queue.Enqueue((root, 1));
+
+    while (queue.Count &gt; 0)
+    {
+        var (node, depth) = queue.Dequeue();
+        if (node.Left is null &amp;&amp; node.Right is null) return depth;   // first leaf
+        if (node.Left  is not null) queue.Enqueue((node.Left,  depth + 1));
+        if (node.Right is not null) queue.Enqueue((node.Right, depth + 1));
+    }
+    return 0;
+}
+// DFS would visit the whole tree. On a tree with one deep branch and one
+// shallow leaf, that is the difference between O(n) and O(1). Worth saying.
+
+// RIGHT SIDE VIEW - the last node of each level
+static IList&lt;int&gt; RightSideView(TreeNode? root)
+{
+    var result = new List&lt;int&gt;();
+    if (root is null) return result;
+
+    var queue = new Queue&lt;TreeNode&gt;();
+    queue.Enqueue(root);
+    while (queue.Count &gt; 0)
+    {
+        int size = queue.Count;
+        for (int i = 0; i &lt; size; i++)
+        {
+            var node = queue.Dequeue();
+            if (i == size - 1) result.Add(node.Val);     // the last one on this level
+            if (node.Left  is not null) queue.Enqueue(node.Left);
+            if (node.Right is not null) queue.Enqueue(node.Right);
+        }
+    }
+    return result;
+}
+
+// ZIGZAG - the same loop, reversing alternate levels
+static IList&lt;IList&lt;int&gt;&gt; Zigzag(TreeNode? root)
+{
+    var result = new List&lt;IList&lt;int&gt;&gt;();
+    if (root is null) return result;
+
+    var queue = new Queue&lt;TreeNode&gt;();
+    queue.Enqueue(root);
+    bool leftToRight = true;
+
+    while (queue.Count &gt; 0)
+    {
+        int size = queue.Count;
+        var level = new int[size];
+        for (int i = 0; i &lt; size; i++)
+        {
+            var node = queue.Dequeue();
+            level[leftToRight ? i : size - 1 - i] = node.Val;   // write backwards
+            if (node.Left  is not null) queue.Enqueue(node.Left);
+            if (node.Right is not null) queue.Enqueue(node.Right);
+        }
+        result.Add(level);
+        leftToRight = !leftToRight;
+    }
+    return result;
+}
+
+// VERTICAL ORDER - the column is (parent column -1 / +1); sort at the end
+static IList&lt;IList&lt;int&gt;&gt; VerticalOrder(TreeNode? root)
+{
+    var columns = new SortedDictionary&lt;int, List&lt;(int Row, int Val)&gt;&gt;();
+    var queue = new Queue&lt;(TreeNode Node, int Row, int Col)&gt;();
+    if (root is not null) queue.Enqueue((root, 0, 0));
+
+    while (queue.Count &gt; 0)
+    {
+        var (node, row, col) = queue.Dequeue();
+        if (!columns.TryGetValue(col, out var bucket)) columns[col] = bucket = [];
+        bucket.Add((row, node.Val));
+        if (node.Left  is not null) queue.Enqueue((node.Left,  row + 1, col - 1));
+        if (node.Right is not null) queue.Enqueue((node.Right, row + 1, col + 1));
+    }
+    return columns.Values
+        .Select(b =&gt; (IList&lt;int&gt;)b.OrderBy(x =&gt; x.Row).ThenBy(x =&gt; x.Val)
+                                  .Select(x =&gt; x.Val).ToList())
+        .ToList();
+}
+
+// CONNECT NEXT RIGHT POINTERS in O(1) space: use the level you have already
+// linked as the queue for the next one, instead of an actual queue.</code></pre><pre data-lang="python" hidden><code>from collections import deque, defaultdict
+
+def level_order(root) -&gt; list[list[int]]:
+    result = []
+    if not root:
+        return result
+    queue = deque([root])
+    while queue:
+        level = []
+        for _ in range(len(queue)):            # snapshot the count
+            node = queue.popleft()
+            level.append(node.val)
+            if node.left:  queue.append(node.left)
+            if node.right: queue.append(node.right)
+        result.append(level)
+    return result
+
+def min_depth(root) -&gt; int:
+    if not root:
+        return 0
+    queue = deque([(root, 1)])
+    while queue:
+        node, depth = queue.popleft()
+        if not node.left and not node.right:
+            return depth                       # the FIRST leaf, so stop here
+        if node.left:  queue.append((node.left,  depth + 1))
+        if node.right: queue.append((node.right, depth + 1))
+    return 0
+
+def right_side_view(root) -&gt; list[int]:
+    result = []
+    if not root:
+        return result
+    queue = deque([root])
+    while queue:
+        size = len(queue)
+        for i in range(size):
+            node = queue.popleft()
+            if i == size - 1:
+                result.append(node.val)
+            if node.left:  queue.append(node.left)
+            if node.right: queue.append(node.right)
+    return result
+
+def zigzag(root) -&gt; list[list[int]]:
+    result = []
+    if not root:
+        return result
+    queue = deque([root])
+    left_to_right = True
+    while queue:
+        level = deque()
+        for _ in range(len(queue)):
+            node = queue.popleft()
+            if left_to_right: level.append(node.val)
+            else:             level.appendleft(node.val)      # deque, so O(1)
+            if node.left:  queue.append(node.left)
+            if node.right: queue.append(node.right)
+        result.append(list(level))
+        left_to_right = not left_to_right
+    return result
+
+def vertical_order(root) -&gt; list[list[int]]:
+    columns: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    queue = deque([(root, 0, 0)]) if root else deque()
+    while queue:
+        node, row, col = queue.popleft()
+        columns[col].append((row, node.val))
+        if node.left:  queue.append((node.left,  row + 1, col - 1))
+        if node.right: queue.append((node.right, row + 1, col + 1))
+    return [[v for _, v in sorted(columns[c])] for c in sorted(columns)]</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Say "snapshot the queue size at the top of each level" before you write the loop — it is the one idiom that makes every level-order variant trivial, and it reads as having done this before. The other point worth volunteering: minimum depth is a BFS problem, not a DFS one, because BFS can return at the first leaf while DFS must explore everything. On a tree with one very deep branch that is a real difference, not a theoretical one.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write level-order and then derive right-side view and zigzag from it without restarting.</li><li>Solve minimum depth with both BFS and DFS and construct the input where BFS wins.</li><li>Solve vertical order and decide how ties within a cell should be broken.</li></ul></div></section>
+<section id="bst"><h2 id="bst">BSTs: search, insert, validate and k-th smallest</h2><p>The BST property is <em>global</em>, not local: every node in the left subtree is less than the node, and every node in the right is greater — not just the immediate children. Validating by comparing a node with its children is the classic wrong answer, and it is wrong for a tree like <code>[5, 1, 6, null, null, 3, 7]</code> where 3 sits in the right subtree of 5.</p><p>The correct validation passes a <strong>bounded range</strong> down the recursion. The other reliable fact: an in-order traversal of a BST is sorted, which turns k-th smallest, "is it a BST", and "recover a swapped pair" into one walk.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// SEARCH / INSERT / the shape all BST operations share: O(h)
+static TreeNode? Search(TreeNode? n, int target)
+{
+    while (n is not null &amp;&amp; n.Val != target) n = target &lt; n.Val ? n.Left : n.Right;
+    return n;
+}
+
+static TreeNode Insert(TreeNode? n, int val)
+{
+    if (n is null) return new TreeNode(val);
+    if (val &lt; n.Val) n.Left  = Insert(n.Left,  val);
+    else             n.Right = Insert(n.Right, val);
+    return n;
+}
+
+// DELETE - three cases, and the third is the one to get right
+static TreeNode? Delete(TreeNode? n, int key)
+{
+    if (n is null) return null;
+
+    if      (key &lt; n.Val) n.Left  = Delete(n.Left,  key);
+    else if (key &gt; n.Val) n.Right = Delete(n.Right, key);
+    else
+    {
+        if (n.Left  is null) return n.Right;        // 0 or 1 child
+        if (n.Right is null) return n.Left;
+
+        // two children: replace with the in-order SUCCESSOR (leftmost of the
+        // right subtree), then delete that successor from the right subtree
+        var successor = n.Right;
+        while (successor.Left is not null) successor = successor.Left;
+        n.Val = successor.Val;
+        n.Right = Delete(n.Right, successor.Val);
+    }
+    return n;
+}
+
+// VALIDATE - bounds, not neighbours. THIS is the question.
+static bool IsValidBst(TreeNode? n, long min = long.MinValue, long max = long.MaxValue)
+{
+    if (n is null) return true;
+    if (n.Val &lt;= min || n.Val &gt;= max) return false;
+    return IsValidBst(n.Left, min, n.Val) &amp;&amp; IsValidBst(n.Right, n.Val, max);
+}
+// `long` for the bounds, because a node holding int.MinValue breaks an int version.
+// The WRONG answer, which looks right:
+//   return n.Left.Val &lt; n.Val &amp;&amp; n.Right.Val &gt; n.Val &amp;&amp; recurse...
+//   -&gt; accepts [5,1,6,null,null,3,7], because 3 &lt; 6 locally but 3 &lt; 5 globally.
+
+// Or validate by checking the in-order walk is strictly increasing
+static bool IsValidBstInOrder(TreeNode? root)
+{
+    TreeNode? prev = null;
+    var stack = new Stack&lt;TreeNode&gt;();
+    var node = root;
+    while (node is not null || stack.Count &gt; 0)
+    {
+        while (node is not null) { stack.Push(node); node = node.Left; }
+        node = stack.Pop();
+        if (prev is not null &amp;&amp; node.Val &lt;= prev.Val) return false;
+        prev = node;
+        node = node.Right;
+    }
+    return true;
+}
+
+// K-TH SMALLEST - stop the in-order walk at k. O(h + k), not O(n).
+static int KthSmallest(TreeNode? root, int k)
+{
+    var stack = new Stack&lt;TreeNode&gt;();
+    var node = root;
+    while (node is not null || stack.Count &gt; 0)
+    {
+        while (node is not null) { stack.Push(node); node = node.Left; }
+        node = stack.Pop();
+        if (--k == 0) return node.Val;
+        node = node.Right;
+    }
+    throw new ArgumentException(&quot;k is larger than the tree&quot;);
+}
+// The follow-up: &quot;what if kth-smallest is called often and the tree is modified?&quot;
+// -&gt; store a subtree size on each node, and the query becomes O(h).
+
+// SORTED ARRAY -&gt; BALANCED BST: the middle is the root, recurse on each half
+static TreeNode? FromSorted(int[] a, int lo, int hi)
+{
+    if (lo &gt; hi) return null;
+    int mid = lo + (hi - lo) / 2;
+    return new TreeNode(a[mid]) { Left  = FromSorted(a, lo, mid - 1),
+                                  Right = FromSorted(a, mid + 1, hi) };
+}
+
+// IN-ORDER SUCCESSOR, without a parent pointer: the last node where you went left
+static TreeNode? Successor(TreeNode? root, TreeNode target)
+{
+    TreeNode? best = null;
+    var node = root;
+    while (node is not null)
+    {
+        if (target.Val &lt; node.Val) { best = node; node = node.Left; }
+        else                        node = node.Right;
+    }
+    return best;
+}
+
+// BALANCE: everything above is O(h), and h is O(n) on sorted insertions.
+// AVL and red-black trees keep h at O(log n) by rotating. You will almost never
+// be asked to implement one - but know that SortedDictionary and SortedSet are
+// red-black trees, which is why they are O(log n) and Dictionary is O(1).</code></pre><pre data-lang="python" hidden><code>def search(n, target):
+    while n and n.val != target:
+        n = n.left if target &lt; n.val else n.right
+    return n
+
+def insert(n, val):
+    if n is None:
+        return TreeNode(val)
+    if val &lt; n.val: n.left  = insert(n.left,  val)
+    else:           n.right = insert(n.right, val)
+    return n
+
+def delete(n, key):
+    if n is None:
+        return None
+    if key &lt; n.val:
+        n.left = delete(n.left, key)
+    elif key &gt; n.val:
+        n.right = delete(n.right, key)
+    else:
+        if n.left is None:  return n.right
+        if n.right is None: return n.left
+        successor = n.right                       # leftmost of the right subtree
+        while successor.left:
+            successor = successor.left
+        n.val = successor.val
+        n.right = delete(n.right, successor.val)
+    return n
+
+def is_valid_bst(n, low=float(&quot;-inf&quot;), high=float(&quot;inf&quot;)) -&gt; bool:
+    if n is None:
+        return True
+    if not (low &lt; n.val &lt; high):
+        return False
+    return is_valid_bst(n.left, low, n.val) and is_valid_bst(n.right, n.val, high)
+# float(&quot;inf&quot;) avoids C#&#x27;s int.MinValue problem entirely
+
+def is_valid_bst_in_order(root) -&gt; bool:
+    prev = None
+    stack, node = [], root
+    while node or stack:
+        while node:
+            stack.append(node)
+            node = node.left
+        node = stack.pop()
+        if prev is not None and node.val &lt;= prev:
+            return False
+        prev = node.val
+        node = node.right
+    return True
+
+def kth_smallest(root, k: int) -&gt; int:
+    stack, node = [], root
+    while node or stack:
+        while node:
+            stack.append(node)
+            node = node.left
+        node = stack.pop()
+        k -= 1
+        if k == 0:
+            return node.val
+        node = node.right
+    raise ValueError(&quot;k exceeds the tree size&quot;)
+
+# Or, with the generator from the traversals section - lazy, so it stops early
+from itertools import islice
+def kth_smallest_gen(root, k: int) -&gt; int:
+    return next(islice(in_order(root), k - 1, k))
+
+def from_sorted(a: list[int], lo: int = 0, hi: int | None = None):
+    if hi is None:
+        hi = len(a) - 1
+    if lo &gt; hi:
+        return None
+    mid = (lo + hi) // 2
+    return TreeNode(a[mid], from_sorted(a, lo, mid - 1), from_sorted(a, mid + 1, hi))
+
+def successor(root, target):
+    best, node = None, root
+    while node:
+        if target.val &lt; node.val:
+            best, node = node, node.left          # remember where we went left
+        else:
+            node = node.right
+    return best
+
+# Python has no balanced tree in the stdlib - name sortedcontainers.SortedDict
+# if you need O(log n) ordered operations.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"Validate a BST" is asked constantly and the local comparison is the trap it is designed to catch — have the counterexample ready (<code>[5,1,6,null,null,3,7]</code>) rather than just asserting that bounds are needed. Mention the <code>int.MinValue</code> edge case in the bounded version, because it is the second trap. For k-th smallest, note the walk can stop at k for O(h + k), and have the follow-up answer ready: if the query is frequent and the tree mutates, store subtree sizes on the nodes.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Validate a BST with bounds and construct the tree that defeats the local comparison.</li><li>Find the k-th smallest, then extend the node to carry a subtree size and make it O(h).</li><li>Delete a node with two children and confirm the tree is still a valid BST.</li></ul></div></section>
+<section id="lca-serialise"><h2 id="lca-serialise">Lowest common ancestor and serialisation</h2><p>Two staples. <strong>LCA</strong> in a plain binary tree is the cleanest small recursion in the whole set: return the node if you find either target, recurse both sides, and the node where both sides come back non-null is the answer. In a <em>BST</em> it is even simpler — walk down while both targets are on the same side, and the first node that splits them is the LCA.</p><p><strong>Serialise/deserialise</strong> tests whether you understand what information a traversal preserves. Pre-order <em>with null markers</em> determines a tree uniquely; pre-order alone does not, and in-order alone never does.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// LCA in a general binary tree. Assumes both nodes exist in the tree.
+static TreeNode? Lca(TreeNode? root, TreeNode p, TreeNode q)
+{
+    if (root is null || root == p || root == q) return root;
+
+    var left  = Lca(root.Left,  p, q);
+    var right = Lca(root.Right, p, q);
+
+    if (left is not null &amp;&amp; right is not null) return root;   // they split here
+    return left ?? right;                                     // both are below one side
+}
+// O(n) time, O(h) space. If the nodes might NOT be present, you need to count
+// matches rather than return early - say so, because it changes the code.
+
+// LCA in a BST - no recursion needed, O(h)
+static TreeNode? LcaBst(TreeNode? node, TreeNode p, TreeNode q)
+{
+    while (node is not null)
+    {
+        if      (p.Val &lt; node.Val &amp;&amp; q.Val &lt; node.Val) node = node.Left;
+        else if (p.Val &gt; node.Val &amp;&amp; q.Val &gt; node.Val) node = node.Right;
+        else return node;                      // they diverge here, or one IS node
+    }
+    return null;
+}
+
+// WITH PARENT POINTERS: walk up from both, the same two-pointer trick as
+// &quot;intersection of two linked lists&quot;
+static TreeNode? LcaWithParents(TreeNode a, TreeNode b)
+{
+    TreeNode? p = a, q = b;
+    while (p != q)
+    {
+        p = p?.Parent ?? b;                    // switch to the other list on null
+        q = q?.Parent ?? a;
+    }
+    return p;
+}
+
+// ---------- SERIALISE / DESERIALISE ----------
+
+// Pre-order WITH null markers. Pre-order alone does not determine a tree;
+// pre-order + null markers does, which is the insight being tested.
+public class Codec
+{
+    public string Serialize(TreeNode? root)
+    {
+        var sb = new StringBuilder();
+        void Write(TreeNode? n)
+        {
+            if (n is null) { sb.Append(&quot;#,&quot;); return; }
+            sb.Append(n.Val).Append(&#x27;,&#x27;);
+            Write(n.Left);
+            Write(n.Right);
+        }
+        Write(root);
+        return sb.ToString();
+    }
+
+    public TreeNode? Deserialize(string data)
+    {
+        var tokens = data.Split(&#x27;,&#x27;, StringSplitOptions.RemoveEmptyEntries);
+        int i = 0;
+
+        TreeNode? Read()
+        {
+            var token = tokens[i++];
+            if (token == &quot;#&quot;) return null;
+            return new TreeNode(int.Parse(token))
+            {
+                Left  = Read(),                  // ORDER MATTERS: the children are
+                Right = Read(),                  // consumed left-then-right
+            };
+        }
+        return Read();
+    }
+}
+// Careful in C#: object-initialiser assignments run in source order, so
+// Left = Read() before Right = Read() is correct here - but if you wrote
+// `new TreeNode(v) { Right = Read(), Left = Read() }` it would silently
+// deserialise mirrored. Being aware of evaluation order is the subtle bit.
+
+// LEVEL-ORDER serialisation is the LeetCode input format, and worth knowing
+// because you will be handed strings in it: &quot;[1,2,3,null,null,4,5]&quot;
+
+// BUILD FROM TWO TRAVERSALS - pre-order + in-order determines a tree uniquely
+// (assuming distinct values); post-order + in-order also does; pre + post does NOT.
+static TreeNode? BuildTree(int[] preorder, int[] inorder)
+{
+    var indexOf = new Dictionary&lt;int, int&gt;();
+    for (int i = 0; i &lt; inorder.Length; i++) indexOf[inorder[i]] = i;   // O(1) lookup
+
+    int p = 0;
+    TreeNode? Build(int lo, int hi)
+    {
+        if (lo &gt; hi) return null;
+        int rootVal = preorder[p++];             // pre-order gives the root
+        int mid = indexOf[rootVal];              // in-order splits the subtrees
+        return new TreeNode(rootVal)
+        {
+            Left  = Build(lo, mid - 1),
+            Right = Build(mid + 1, hi),
+        };
+    }
+    return Build(0, inorder.Length - 1);
+}
+// The dictionary is what makes it O(n) rather than O(n^2) - scanning the
+// in-order array for the root each time is the naive version.</code></pre><pre data-lang="python" hidden><code>def lca(root, p, q):
+    if root is None or root is p or root is q:
+        return root
+    left, right = lca(root.left, p, q), lca(root.right, p, q)
+    if left and right:
+        return root
+    return left or right
+
+def lca_bst(node, p, q):
+    while node:
+        if   p.val &lt; node.val and q.val &lt; node.val: node = node.left
+        elif p.val &gt; node.val and q.val &gt; node.val: node = node.right
+        else: return node
+    return None
+
+def lca_with_parents(a, b):
+    p, q = a, b
+    while p is not q:
+        p = p.parent if p else b
+        q = q.parent if q else a
+    return p
+
+class Codec:
+    def serialize(self, root) -&gt; str:
+        parts: list[str] = []
+        def write(n) -&gt; None:
+            if n is None:
+                parts.append(&quot;#&quot;)
+                return
+            parts.append(str(n.val))
+            write(n.left)
+            write(n.right)
+        write(root)
+        return &quot;,&quot;.join(parts)
+
+    def deserialize(self, data: str):
+        tokens = iter(data.split(&quot;,&quot;))
+        def read():
+            token = next(tokens)
+            if token == &quot;#&quot;:
+                return None
+            node = TreeNode(int(token))
+            node.left = read()          # explicit statements: the order is obvious
+            node.right = read()
+            return node
+        return read()
+# Using an iterator rather than an index is the idiomatic Python version, and
+# it sidesteps the evaluation-order subtlety the C# object initialiser has.
+
+def build_tree(preorder: list[int], inorder: list[int]):
+    index_of = {v: i for i, v in enumerate(inorder)}     # O(1) lookup
+    pre = iter(preorder)
+
+    def build(lo: int, hi: int):
+        if lo &gt; hi:
+            return None
+        root_val = next(pre)
+        mid = index_of[root_val]
+        node = TreeNode(root_val)
+        node.left  = build(lo, mid - 1)
+        node.right = build(mid + 1, hi)
+        return node
+
+    return build(0, len(inorder) - 1)
+
+# Which traversal pairs determine a tree (with distinct values)?
+#   pre + in    YES
+#   post + in   YES
+#   pre + post  NO  - ambiguous for nodes with a single child
+#   pre alone with null markers   YES - which is why serialise works</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>For LCA, write the general-tree version and then say what changes if the nodes might not be in the tree (you can no longer return early; you must count matches). For serialisation, the point being tested is <em>which traversal preserves structure</em>: pre-order with null markers does, pre-order alone does not, and pre-order plus post-order is ambiguous for single-child nodes. Stating that classification is a better answer than just producing working code.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write LCA for a general binary tree and for a BST, and note the complexity difference.</li><li>Serialise and deserialise a tree with null markers, then round-trip a single-child chain.</li><li>Build a tree from pre-order and in-order in O(n) using an index map.</li></ul></div></section>
+<section id="tries"><h2 id="tries">Tries: prefix search and word problems</h2><p>A trie stores strings by sharing prefixes: each node is a character, each path is a prefix, and a flag marks where a complete word ends. Lookup and insert are O(k) in the length of the word, <strong>independent of how many words are stored</strong> — which is the property a hash map cannot match, because a hash map can only answer exact-match questions.</p><p>Reach for it when you see "prefix", "autocomplete", "dictionary of words", or a grid word-search with many target words. The last one is the real payoff: searching a board for 10,000 words one at a time is hopeless, but one DFS guided by a trie prunes the moment the current path is not a prefix of anything.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class Trie
+{
+    private sealed class Node
+    {
+        // an array of 26 is faster than a Dictionary for lowercase ASCII, and
+        // much heavier for a large alphabet - say which you chose and why
+        public readonly Node?[] Children = new Node?[26];
+        public bool IsWord;
+    }
+
+    private readonly Node _root = new();
+
+    public void Insert(string word)
+    {
+        var node = _root;
+        foreach (var c in word)
+        {
+            int i = c - &#x27;a&#x27;;
+            node = node.Children[i] ??= new Node();
+        }
+        node.IsWord = true;
+    }
+
+    public bool Search(string word)  =&gt; Find(word) is { IsWord: true };
+    public bool StartsWith(string p) =&gt; Find(p) is not null;
+
+    private Node? Find(string prefix)
+    {
+        var node = _root;
+        foreach (var c in prefix)
+        {
+            node = node.Children[c - &#x27;a&#x27;];
+            if (node is null) return null;
+        }
+        return node;
+    }
+
+    // AUTOCOMPLETE: walk to the prefix, then collect everything below it
+    public List&lt;string&gt; WithPrefix(string prefix, int limit = 10)
+    {
+        var results = new List&lt;string&gt;();
+        var start = Find(prefix);
+        if (start is null) return results;
+
+        var sb = new StringBuilder(prefix);
+        void Collect(Node node)
+        {
+            if (results.Count == limit) return;
+            if (node.IsWord) results.Add(sb.ToString());
+            for (int i = 0; i &lt; 26; i++)
+            {
+                if (node.Children[i] is not { } child) continue;
+                sb.Append((char)(&#x27;a&#x27; + i));
+                Collect(child);
+                sb.Length--;                     // backtrack
+            }
+        }
+        Collect(start);
+        return results;
+    }
+}
+// Insert and search: O(k). Space: O(total characters), shared across prefixes.
+
+// WILDCARD SEARCH - &#x27;.&#x27; matches any character, so branch on every child
+public bool SearchWildcard(string word)
+{
+    bool Match(Node node, int i)
+    {
+        if (i == word.Length) return node.IsWord;
+        if (word[i] != &#x27;.&#x27;) return node.Children[word[i] - &#x27;a&#x27;] is { } c &amp;&amp; Match(c, i + 1);
+
+        foreach (var child in node.Children)     // &#x27;.&#x27; - try them all
+            if (child is not null &amp;&amp; Match(child, i + 1)) return true;
+        return false;
+    }
+    return Match(_root, 0);
+}
+
+// WORD SEARCH II - the payoff. One DFS over the board, pruned by the trie.
+// Searching 10,000 words one at a time is hopeless; this is one pass.
+static IList&lt;string&gt; FindWords(char[][] board, string[] words)
+{
+    var trie = new TrieNode();
+    foreach (var w in words) trie.Insert(w);        // build once
+
+    var found = new HashSet&lt;string&gt;();
+    int rows = board.Length, cols = board[0].Length;
+
+    void Dfs(int r, int c, TrieNode node)
+    {
+        if (r &lt; 0 || r &gt;= rows || c &lt; 0 || c &gt;= cols) return;
+
+        char ch = board[r][c];
+        if (ch == &#x27;#&#x27; || node.Children[ch - &#x27;a&#x27;] is not { } next) return;
+        //                ^ the prune: this path is not a prefix of ANY word
+
+        if (next.Word is not null)
+        {
+            found.Add(next.Word);
+            next.Word = null;                       // de-duplicate without a set scan
+        }
+
+        board[r][c] = &#x27;#&#x27;;                          // mark visited, in place
+        Dfs(r + 1, c, next); Dfs(r - 1, c, next);
+        Dfs(r, c + 1, next); Dfs(r, c - 1, next);
+        board[r][c] = ch;                           // restore
+    }
+
+    for (int r = 0; r &lt; rows; r++)
+        for (int c = 0; c &lt; cols; c++) Dfs(r, c, trie);
+
+    return found.ToList();
+}
+// Storing the whole WORD on the terminal node (rather than a bool) avoids
+// rebuilding the string during the DFS - a small but real optimisation.
+
+// OTHER USES worth naming: longest common prefix of a set, IP routing tables
+// (longest prefix match), the &quot;replace words with their root&quot; problem, and
+// a binary trie over bits for &quot;maximum XOR of two numbers&quot;.</code></pre><pre data-lang="python" hidden><code>class TrieNode:
+    __slots__ = (&quot;children&quot;, &quot;is_word&quot;)
+    def __init__(self) -&gt; None:
+        self.children: dict[str, &quot;TrieNode&quot;] = {}    # dict: any alphabet, sparse
+        self.is_word = False
+
+class Trie:
+    def __init__(self) -&gt; None:
+        self.root = TrieNode()
+
+    def insert(self, word: str) -&gt; None:
+        node = self.root
+        for c in word:
+            node = node.children.setdefault(c, TrieNode())
+        node.is_word = True
+
+    def _find(self, prefix: str) -&gt; TrieNode | None:
+        node = self.root
+        for c in prefix:
+            node = node.children.get(c)
+            if node is None:
+                return None
+        return node
+
+    def search(self, word: str) -&gt; bool:
+        node = self._find(word)
+        return node is not None and node.is_word
+
+    def starts_with(self, prefix: str) -&gt; bool:
+        return self._find(prefix) is not None
+
+    def with_prefix(self, prefix: str, limit: int = 10) -&gt; list[str]:
+        results: list[str] = []
+        start = self._find(prefix)
+        if start is None:
+            return results
+
+        def collect(node: TrieNode, path: list[str]) -&gt; None:
+            if len(results) == limit:
+                return
+            if node.is_word:
+                results.append(prefix + &quot;&quot;.join(path))
+            for c, child in node.children.items():
+                path.append(c)
+                collect(child, path)
+                path.pop()                            # backtrack
+
+        collect(start, [])
+        return results
+
+# A nested defaultdict is the &quot;trie in three lines&quot; version - fine to mention,
+# but write the class if you are asked to implement a trie
+from collections import defaultdict
+def make_trie():
+    return defaultdict(make_trie)
+
+trie = make_trie()
+node = trie
+for c in &quot;cat&quot;:
+    node = node[c]
+node[&quot;$&quot;] = True                                      # the terminal marker
+
+# WORD SEARCH II
+def find_words(board: list[list[str]], words: list[str]) -&gt; list[str]:
+    root: dict = {}
+    for w in words:                                   # build the trie
+        node = root
+        for c in w:
+            node = node.setdefault(c, {})
+        node[&quot;$&quot;] = w                                 # store the whole word
+
+    rows, cols = len(board), len(board[0])
+    found: set[str] = set()
+
+    def dfs(r: int, c: int, node: dict) -&gt; None:
+        ch = board[r][c]
+        nxt = node.get(ch)
+        if nxt is None:                               # the prune
+            return
+        word = nxt.get(&quot;$&quot;)
+        if word:
+            found.add(word)
+            del nxt[&quot;$&quot;]                              # do not find it twice
+
+        board[r][c] = &quot;#&quot;
+        for dr, dc in ((1,0), (-1,0), (0,1), (0,-1)):
+            nr, nc = r + dr, c + dc
+            if 0 &lt;= nr &lt; rows and 0 &lt;= nc &lt; cols and board[nr][nc] != &quot;#&quot;:
+                dfs(nr, nc, nxt)
+        board[r][c] = ch
+
+    for r in range(rows):
+        for c in range(cols):
+            dfs(r, c, root)
+    return list(found)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The question behind "implement a trie" is why it beats a hash set, and the answer is prefix queries: O(k) regardless of how many words are stored, where a hash set can only answer exact match. Mention the array-versus-dictionary choice for children and tie it to the alphabet size. "Word search II" is the problem that justifies the structure — one DFS pruned by the trie, instead of one search per word — and storing the complete word on the terminal node rather than a boolean is the detail that shows you have written it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement a trie with insert, search, startsWith and prefix autocomplete.</li><li>Add wildcard matching where <code>.</code> matches any character.</li><li>Solve "word search II" and measure it against searching each word separately.</li></ul></div></section>
+<section id="heap"><h2 id="heap">Heaps and PriorityQueue</h2><p>A heap gives O(log n) insert and O(1) peek of the min/max — perfect for “top k”, “k-th largest”, merging k sorted lists, and scheduling. .NET 6 added <code>PriorityQueue&lt;TElement, TPriority&gt;</code> (min-heap; negate for max). Python's <code>heapq</code> is a min-heap over lists.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// K-th largest: keep a min-heap of size k
+static int KthLargest(int[] nums, int k)
+{
+    var pq = new PriorityQueue&lt;int, int&gt;();
+    foreach (var n in nums) { pq.Enqueue(n, n); if (pq.Count &gt; k) pq.Dequeue(); }
+    return pq.Peek();
+}
+
+// Max-heap: negate the priority (or pass a custom comparer)
+var maxHeap = new PriorityQueue&lt;string, int&gt;(Comparer&lt;int&gt;.Create((a, b) =&gt; b.CompareTo(a)));
+
+// Merge k sorted lists
+static ListNode? MergeK(ListNode?[] lists)
+{
+    var pq = new PriorityQueue&lt;ListNode, int&gt;();
+    foreach (var l in lists) if (l is not null) pq.Enqueue(l, l.Val);
+    var dummy = new ListNode(0); var tail = dummy;
+    while (pq.TryDequeue(out var node, out _))
+    {
+        tail.Next = node; tail = node;
+        if (node.Next is not null) pq.Enqueue(node.Next, node.Next.Val);
+    }
+    return dummy.Next;
+}
+
+// Running median: max-heap for the low half, min-heap for the high half
+public class MedianFinder
+{
+    private readonly PriorityQueue&lt;int, int&gt; _low = new(Comparer&lt;int&gt;.Create((a, b) =&gt; b.CompareTo(a)));
+    private readonly PriorityQueue&lt;int, int&gt; _high = new();
+    public void Add(int x)
+    {
+        _low.Enqueue(x, x);
+        _high.Enqueue(_low.Peek(), _low.Dequeue());
+        if (_high.Count &gt; _low.Count) _low.Enqueue(_high.Peek(), _high.Dequeue());
+    }
+    public double Median =&gt; _low.Count &gt; _high.Count ? _low.Peek() : (_low.Peek() + _high.Peek()) / 2.0;
+}</code></pre><pre data-lang="python" hidden><code>import heapq
+
+def kth_largest(nums: list[int], k: int) -&gt; int:
+    heap = []
+    for n in nums:
+        heapq.heappush(heap, n)
+        if len(heap) &gt; k: heapq.heappop(heap)
+    return heap[0]
+# or: heapq.nlargest(k, nums)[-1]
+
+# Max-heap: push negatives
+max_heap = []; heapq.heappush(max_heap, -value)
+
+def merge_k(lists):
+    heap = [(l.val, i, l) for i, l in enumerate(lists) if l]   # i breaks ties (nodes aren&#x27;t comparable)
+    heapq.heapify(heap)
+    dummy = tail = ListNode(0)
+    while heap:
+        _, i, node = heapq.heappop(heap)
+        tail.next = tail = node
+        if node.next: heapq.heappush(heap, (node.next.val, i, node.next))
+    return dummy.next
+
+class MedianFinder:
+    def __init__(self): self.low, self.high = [], []      # low is a max-heap (negated)
+    def add(self, x):
+        heapq.heappush(self.low, -x)
+        heapq.heappush(self.high, -heapq.heappop(self.low))
+        if len(self.high) &gt; len(self.low):
+            heapq.heappush(self.low, -heapq.heappop(self.high))
+    @property
+    def median(self):
+        return -self.low[0] if len(self.low) &gt; len(self.high) else (-self.low[0] + self.high[0]) / 2</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Know the three things a heap is for: the k largest or smallest (a bounded heap of size k gives O(n log k), beating a full sort), a running median (two heaps facing each other), and the frontier in Dijkstra or A*. The .NET specifics worth saying: <code>PriorityQueue</code> is a <strong>min</strong>-heap, it is <strong>not stable</strong> for equal priorities, and <code>EnqueueDequeue</code> is cheaper than an enqueue followed by a dequeue. In Python, <code>heapq</code> is also a min-heap, so you negate for a max-heap and add a counter to break ties on unorderable payloads.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Top k frequent words (heap with custom tie-break).</li><li>Task scheduler with cooldown.</li><li>Meeting rooms II (min-heap of end times).</li></ul></div></section>
+<section id="heap-patterns"><h2 id="heap-patterns">Top-k, merge-k and the two-heap median</h2><p>Three heap patterns cover most of what gets asked. <strong>Bounded heap for top-k</strong>: keep a min-heap of size k and evict the smallest, giving O(n log k) and constant memory in k — the right answer for a stream. <strong>Merge k sorted sequences</strong>: a heap holding one element from each source, which is O(N log k). <strong>Two heaps for a running median</strong>: a max-heap of the lower half and a min-heap of the upper half, kept within one element of each other, so the median is always at the tops.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// 1. TOP-K with a BOUNDED heap - O(n log k), and it works on a stream
+static int[] TopK(int[] nums, int k)
+{
+    var heap = new PriorityQueue&lt;int, int&gt;();        // min-heap: the smallest is on top
+    foreach (var n in nums)
+    {
+        heap.Enqueue(n, n);
+        if (heap.Count &gt; k) heap.Dequeue();          // evict the smallest
+    }
+    return heap.UnorderedItems.Select(x =&gt; x.Element).ToArray();
+}
+// Counter-intuitive but correct: to find the k LARGEST you use a MIN-heap, so
+// that the easiest element to discard is the smallest of your current best k.
+// Being able to explain that inversion is the point of the question.
+
+// EnqueueDequeue avoids growing to k+1 and shrinking back
+foreach (var n in nums)
+{
+    if (heap.Count &lt; k) heap.Enqueue(n, n);
+    else if (n &gt; heap.Peek()) heap.EnqueueDequeue(n, n);
+}
+
+// K CLOSEST POINTS TO THE ORIGIN - the same shape, with a computed priority
+static int[][] KClosest(int[][] points, int k)
+{
+    var heap = new PriorityQueue&lt;int[], int&gt;();
+    foreach (var p in points)
+    {
+        int d = p[0] * p[0] + p[1] * p[1];           // no sqrt: it is monotonic
+        heap.Enqueue(p, -d);                          // negate for a max-heap
+        if (heap.Count &gt; k) heap.Dequeue();           // evict the FURTHEST
+    }
+    return heap.UnorderedItems.Select(x =&gt; x.Element).ToArray();
+}
+
+// 2. MERGE K SORTED LISTS - O(N log k)
+static int[] MergeK(int[][] lists)
+{
+    var heap = new PriorityQueue&lt;(int Value, int List, int Index), int&gt;();
+    for (int i = 0; i &lt; lists.Length; i++)
+        if (lists[i].Length &gt; 0) heap.Enqueue((lists[i][0], i, 0), lists[i][0]);
+
+    var result = new List&lt;int&gt;();
+    while (heap.TryDequeue(out var item, out _))
+    {
+        result.Add(item.Value);
+        int next = item.Index + 1;
+        if (next &lt; lists[item.List].Length)
+            heap.Enqueue((lists[item.List][next], item.List, next),
+                         lists[item.List][next]);
+    }
+    return result.ToArray();
+}
+// The heap never holds more than k elements, which is the whole point: you are
+// merging a terabyte of sorted files with k in memory, not N.
+
+// SMALLEST RANGE COVERING ELEMENTS FROM K LISTS is the same loop, tracking the
+// max as you go - a good &quot;I know this family&quot; extension to mention.
+
+// 3. TWO HEAPS - a running median in O(log n) per insert, O(1) per query
+public class MedianFinder
+{
+    private readonly PriorityQueue&lt;int, int&gt; _low = new();    // MAX-heap (negated)
+    private readonly PriorityQueue&lt;int, int&gt; _high = new();   // min-heap
+
+    public void Add(int num)
+    {
+        _low.Enqueue(num, -num);                       // always insert into low
+        _high.Enqueue(_low.Dequeue(), _low.Peek());    // move its largest to high
+
+        if (_high.Count &gt; _low.Count)                  // rebalance: low may hold
+        {                                              // one extra, high never
+            var x = _high.Dequeue();
+            _low.Enqueue(x, -x);
+        }
+    }
+
+    public double Median() =&gt; _low.Count &gt; _high.Count
+        ? _low.Peek()
+        : (_low.Peek() + _high.Peek()) / 2.0;
+}
+// The invariant: every element in _low &lt;= every element in _high, and
+// |_low| - |_high| is 0 or 1. Push-then-pop-then-rebalance maintains it without
+// any comparisons, which is why this formulation is the one to memorise.
+
+// SLIDING WINDOW MEDIAN is the hard follow-up: you need to REMOVE an arbitrary
+// element, which a binary heap cannot do in O(log n). The answers are lazy
+// deletion (mark it, skip it when it surfaces) or a balanced BST / SortedSet.
+
+// 4. TASK SCHEDULING / CPU INTERVALS - a heap of what is currently runnable,
+// plus a queue of what becomes runnable later. &quot;Task scheduler&quot;, &quot;meeting
+// rooms II&quot;, &quot;single-threaded CPU&quot; are all this shape.</code></pre><pre data-lang="python" hidden><code>import heapq
+from collections import Counter
+
+# 1. TOP-K with a bounded heap
+def top_k(nums: list[int], k: int) -&gt; list[int]:
+    heap: list[int] = []
+    for n in nums:
+        heapq.heappush(heap, n)
+        if len(heap) &gt; k:
+            heapq.heappop(heap)              # evict the smallest
+    return heap
+
+# heappushpop is the EnqueueDequeue equivalent and avoids the grow/shrink
+def top_k_fast(nums: list[int], k: int) -&gt; list[int]:
+    heap = nums[:k]
+    heapq.heapify(heap)                      # O(k)
+    for n in nums[k:]:
+        if n &gt; heap[0]:
+            heapq.heappushpop(heap, n)
+    return heap
+
+# The stdlib one-liners, worth naming before hand-rolling
+heapq.nlargest(k, nums)
+heapq.nsmallest(k, points, key=lambda p: p[0]**2 + p[1]**2)
+
+def k_closest(points: list[list[int]], k: int) -&gt; list[list[int]]:
+    heap: list[tuple[int, list[int]]] = []
+    for p in points:
+        d = p[0]**2 + p[1]**2                # no sqrt needed: monotonic
+        heapq.heappush(heap, (-d, p))        # negate for a max-heap
+        if len(heap) &gt; k:
+            heapq.heappop(heap)              # evict the furthest
+    return [p for _, p in heap]
+
+# 2. MERGE K SORTED - the stdlib does it, lazily
+list(heapq.merge(*lists))                    # O(N log k), returns an iterator
+
+def merge_k(lists: list[list[int]]) -&gt; list[int]:
+    heap = [(lst[0], i, 0) for i, lst in enumerate(lists) if lst]
+    heapq.heapify(heap)
+    result = []
+    while heap:
+        value, li, idx = heapq.heappop(heap)
+        result.append(value)
+        if idx + 1 &lt; len(lists[li]):
+            heapq.heappush(heap, (lists[li][idx + 1], li, idx + 1))
+    return result
+# The list index in the tuple is both a tiebreaker and the bookkeeping you need
+
+# 3. TWO HEAPS
+class MedianFinder:
+    def __init__(self) -&gt; None:
+        self.low: list[int] = []             # max-heap, values negated
+        self.high: list[int] = []            # min-heap
+
+    def add(self, num: int) -&gt; None:
+        heapq.heappush(self.low, -num)
+        heapq.heappush(self.high, -heapq.heappop(self.low))   # largest of low -&gt; high
+        if len(self.high) &gt; len(self.low):                    # rebalance
+            heapq.heappush(self.low, -heapq.heappop(self.high))
+
+    def median(self) -&gt; float:
+        if len(self.low) &gt; len(self.high):
+            return float(-self.low[0])
+        return (-self.low[0] + self.high[0]) / 2
+
+# 4. TASK SCHEDULER - a max-heap of remaining counts plus a cooldown queue
+from collections import deque
+def least_interval(tasks: list[str], n: int) -&gt; int:
+    heap = [-c for c in Counter(tasks).values()]
+    heapq.heapify(heap)
+    cooldown: deque[tuple[int, int]] = deque()      # (available_at, remaining)
+    time = 0
+    while heap or cooldown:
+        time += 1
+        if cooldown and cooldown[0][0] == time:
+            heapq.heappush(heap, cooldown.popleft()[1])
+        if heap:
+            remaining = heapq.heappop(heap) + 1
+            if remaining:
+                cooldown.append((time + n + 1, remaining))
+    return time</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The question worth rehearsing an answer to is the inversion: to find the k <em>largest</em> you keep a <em>min</em>-heap, because the thing you want to discard cheaply is the smallest of your current best k. Candidates who have only memorised the code get this backwards under pressure. For the running median, state the invariant before the code — every element of the low half ≤ every element of the high half, sizes differing by at most one — and have the hard follow-up ready: a sliding-window median needs arbitrary removal, which a binary heap cannot do, so you use lazy deletion or a balanced tree.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement top-k with a bounded heap and explain why it is a min-heap.</li><li>Build a running median with two heaps and test it on an even and an odd count.</li><li>Merge k sorted lists with a heap and confirm the heap never exceeds k entries.</li></ul></div></section>
+<section id="sorted-collections"><h2 id="sorted-collections">What .NET gives you: SortedSet, SortedDictionary and SortedList</h2><p>Worth a minute of preparation, because the common complaint that "C# has no TreeMap" is wrong and knowing the three options is a cheap signal. <code>SortedDictionary</code> and <code>SortedSet</code> are red-black trees: O(log n) insert, delete and lookup, and they maintain order. <code>SortedList</code> is an array pair: O(log n) lookup but O(n) insert, and much less memory — it is for build-once-then-read-many.</p><p>The one everybody forgets is <code>SortedSet.GetViewBetween</code>, which gives a live range view in O(log n) and is exactly what range queries and "nearest neighbour" problems want. Python, by contrast, genuinely has no balanced tree in the standard library — <code>bisect</code> on a list gives O(log n) search but O(n) insert, and <code>sortedcontainers</code> is the standard third-party answer.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// SortedSet&lt;T&gt; - a red-black tree. Ordered, unique, O(log n).
+var set = new SortedSet&lt;int&gt;([5, 1, 3]);
+set.Min; set.Max;                               // O(log n)
+set.Add(4); set.Remove(1);                      // O(log n)
+
+// The underused one: a LIVE view over a range, O(log n) to create
+var inRange = set.GetViewBetween(2, 4);         // {3, 4}
+inRange.Count;                                   // the count in that range
+// Mutating the view mutates the set. Useful, and occasionally surprising.
+
+// &quot;The nearest value to x&quot; - what a Dictionary cannot answer at all
+var atLeast = set.GetViewBetween(x, int.MaxValue).Min;     // ceiling
+var atMost  = set.GetViewBetween(int.MinValue, x).Max;     // floor
+
+// With a comparer, which turns it into a sorted multiset over objects
+var byDeadline = new SortedSet&lt;Task&gt;(
+    Comparer&lt;Task&gt;.Create((a, b) =&gt;
+        a.Deadline != b.Deadline ? a.Deadline.CompareTo(b.Deadline)
+                                 : a.Id.CompareTo(b.Id)));   // tiebreak, or it
+                                                             // deduplicates!
+// A SortedSet DROPS elements its comparer calls equal. Always include a unique
+// tiebreaker when you are using it as a sorted multiset - this is a real bug.
+
+// SortedDictionary&lt;K,V&gt; - a red-black tree keyed by K
+var sd = new SortedDictionary&lt;int, string&gt;();
+sd[5] = &quot;five&quot;;                                 // O(log n) insert
+foreach (var (k, v) in sd) { }                  // in key order
+
+// SortedList&lt;K,V&gt; - two parallel ARRAYS. Different trade-off entirely.
+var sl = new SortedList&lt;int, string&gt;();
+sl[5] = &quot;five&quot;;                                 // O(n) insert - it shifts
+var v = sl[5];                                  // O(log n) lookup
+var byIndex = sl.Values[0];                     // O(1) BY INDEX - the unique feature
+//   Use when: you build it once and then read a lot, or you need indexed access.
+//   Memory: much lower than SortedDictionary (no node objects).
+
+// THE CHOICE, in one table
+//   need                                   use
+//   ------------------------------------   -------------------------
+//   O(1) lookup, no order                  Dictionary / HashSet
+//   ordered iteration, frequent writes     SortedDictionary / SortedSet
+//   ordered, built once, read often        SortedList
+//   only the min or max                    PriorityQueue
+//   indexed access AND order               SortedList
+//   range queries                          SortedSet.GetViewBetween
+
+// WHAT IS MISSING: there is no built-in skip list, no order-statistic tree
+// (so no &quot;the k-th element&quot; in O(log n)), and SortedSet has no indexer.
+// For &quot;k-th smallest with updates&quot; you augment a BST with subtree sizes or use
+// a Fenwick tree - worth naming if the problem demands it.
+
+// FENWICK (binary indexed) TREE - prefix sums with updates, in ~15 lines.
+// Worth having if &quot;range sum with point updates&quot; comes up.
+public class Fenwick(int n)
+{
+    private readonly int[] _tree = new int[n + 1];
+
+    public void Add(int i, int delta)                      // O(log n)
+    {
+        for (i++; i &lt; _tree.Length; i += i &amp; -i) _tree[i] += delta;
+    }
+    public int PrefixSum(int i)                            // O(log n)
+    {
+        int sum = 0;
+        for (i++; i &gt; 0; i -= i &amp; -i) sum += _tree[i];
+        return sum;
+    }
+    public int RangeSum(int l, int r) =&gt; PrefixSum(r) - PrefixSum(l - 1);
+}</code></pre><pre data-lang="python" hidden><code>import bisect
+
+# Python has NO balanced tree in the standard library. Say this plainly - it is
+# the correct answer, not a gap in your knowledge.
+
+# bisect on a list: O(log n) search, O(n) insert
+sorted_list: list[int] = []
+bisect.insort(sorted_list, x)                  # O(n) - the shift dominates
+i = bisect.bisect_left(sorted_list, x)         # O(log n)
+
+# Ceiling and floor
+def ceiling(a: list[int], x: int):
+    i = bisect.bisect_left(a, x)
+    return a[i] if i &lt; len(a) else None
+
+def floor(a: list[int], x: int):
+    i = bisect.bisect_right(a, x)
+    return a[i - 1] if i else None
+
+# Count in a range
+count = bisect.bisect_right(a, hi) - bisect.bisect_left(a, lo)
+
+# sortedcontainers - the standard third-party answer, pure Python and fast
+# (it uses a list of lists rather than a tree, which is cache-friendlier)
+from sortedcontainers import SortedList, SortedDict, SortedSet
+
+sl = SortedList([5, 1, 3])
+sl.add(4)                      # O(log n) amortised
+sl[0]                          # O(log n) INDEXED access - a tree cannot do this
+sl.bisect_left(3)
+sl.irange(2, 4)                # the GetViewBetween equivalent
+del sl[0]
+
+sd = SortedDict()              # SortedDictionary
+ss = SortedSet()               # SortedSet
+# Many interview platforms have it installed; ask, and have the bisect fallback.
+
+# heapq when you only ever need the extreme
+import heapq
+heapq.heappush(heap, x); heapq.heappop(heap)
+
+# Fenwick tree, same ~15 lines
+class Fenwick:
+    def __init__(self, n: int) -&gt; None:
+        self.tree = [0] * (n + 1)
+
+    def add(self, i: int, delta: int) -&gt; None:
+        i += 1
+        while i &lt; len(self.tree):
+            self.tree[i] += delta
+            i += i &amp; -i
+
+    def prefix_sum(self, i: int) -&gt; int:
+        i += 1
+        total = 0
+        while i &gt; 0:
+            total += self.tree[i]
+            i -= i &amp; -i
+        return total
+
+    def range_sum(self, l: int, r: int) -&gt; int:
+        return self.prefix_sum(r) - (self.prefix_sum(l - 1) if l else 0)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Mostly a knowledge check, with one real trap: a <code>SortedSet</code> silently <em>drops</em> elements its comparer considers equal, so using it as a sorted multiset without a unique tiebreaker loses data. Knowing <code>GetViewBetween</code> exists is a small differentiator for range queries. In Python, say plainly that there is no balanced tree in the stdlib, give <code>bisect</code> with its O(n) insert, and name <code>sortedcontainers</code> as the standard answer — that reads as accurate rather than evasive.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Use <code>GetViewBetween</code> to answer "how many values fall between a and b" in O(log n).</li><li>Put objects in a <code>SortedSet</code> with a non-unique comparer and watch elements disappear.</li><li>Implement a Fenwick tree and use it for range sums with point updates.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://leetcode.com/tag/tree/" target="_blank" rel="noopener">LeetCode: tree</a> — the tag, by frequency</li><li><a href="https://leetcode.com/tag/trie/" target="_blank" rel="noopener">LeetCode: trie</a> — the smaller, very learnable set</li><li><a href="https://learn.microsoft.com/dotnet/api/system.collections.generic.priorityqueue-2" target="_blank" rel="noopener">PriorityQueue&lt;TElement,TPriority&gt;</a> — .NET 6+</li><li><a href="https://docs.python.org/3/library/heapq.html" target="_blank" rel="noopener">heapq</a> — a min-heap over a plain list</li><li><a href="https://visualgo.net/en/bst" target="_blank" rel="noopener">VisuAlgo: BST</a> — watch the rotations, if balancing comes up</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

@@ -1,0 +1,830 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>.NET Platform, Hosting &amp; Configuration — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="dotnet-platform">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › C# &amp; .NET › Topic 4 of 36</div>
+  <h1>.NET Platform, Hosting &amp; Configuration</h1>
+  <p class="lede">Everything between your code and the process it runs in. This is the most reliably probed area with the least written about it: an interviewer who wants to know whether you have actually operated a .NET service asks how configuration precedence works, what <code>IOptionsMonitor</code> is for, where a <code>BackgroundService</code> exception goes, and what Native AOT costs you. Basic service lifetimes live on the <a href="web-api.html#di">Web API</a> page — this one covers what that page does not.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#runtimes">.NET Framework, .NET Core and .NET 5–10</a></li><li><a href="#sdk-tfm">SDKs, runtimes, TFMs and global.json</a></li><li><a href="#host">The generic host, IHostedService and BackgroundService</a></li><li><a href="#configuration">Configuration providers and precedence</a></li><li><a href="#options">The options pattern: IOptions, IOptionsSnapshot, IOptionsMonitor and validation</a></li><li><a href="#logging">ILogger, log levels, scopes and structured logging</a></li><li><a href="#di-advanced">DI beyond lifetimes: captive dependencies, keyed services, factories</a></li><li><a href="#jit-aot">JIT, tiered compilation, ReadyToRun and Native AOT</a></li><li><a href="#trimming">Trimming, single-file and container-ready publishing</a></li><li><a href="#cli">The dotnet CLI and what to reach for when</a></li></ol>
+  </div>
+
+<section id="runtimes"><h2 id="runtimes">.NET Framework, .NET Core and .NET 5–10</h2><p>One of the most common opening questions, and one people answer badly by reciting history. The useful framing is three lineages: <strong>.NET Framework</strong> (4.8.1, Windows-only, in support indefinitely but closed to new features), <strong>.NET Core</strong> (1.0–3.1, the cross-platform rewrite), and <strong>.NET</strong> 5 onwards (the unified continuation — there is no ".NET Core 5"). Even-numbered releases are LTS with 3 years of support; odd-numbered are STS with 18 months.</p><p>What actually matters in an interview is the migration conversation: what does not come across. ASP.NET Web Forms has no path. WCF server-side is community-only (CoreWCF). <code>AppDomain</code>, .NET Remoting and binary serialisation are gone. <code>System.Drawing.Common</code> is Windows-only. Everything else is largely a retarget plus a csproj rewrite.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="xml">XML</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># What do I have installed?
+dotnet --info                       # SDKs, runtimes, RID, and the resolved SDK
+dotnet --list-sdks
+dotnet --list-runtimes
+
+# The modern csproj - compare this to a .NET Framework one (hundreds of lines,
+# every file listed explicitly, packages.config, no implicit globbing)
+cat Shop.Api.csproj
+
+# Migration tooling
+dotnet tool install -g upgrade-assistant
+upgrade-assistant upgrade Shop.sln
+
+# Find the API calls that will not survive the move
+dotnet tool install -g dotnet-apiport</code></pre><pre data-lang="xml" hidden><code>&lt;!-- Modern SDK-style project: no file list, implicit globbing, PackageReference --&gt;
+&lt;Project Sdk=&quot;Microsoft.NET.Sdk.Web&quot;&gt;
+
+  &lt;PropertyGroup&gt;
+    &lt;TargetFramework&gt;net8.0&lt;/TargetFramework&gt;
+    &lt;Nullable&gt;enable&lt;/Nullable&gt;
+    &lt;ImplicitUsings&gt;enable&lt;/ImplicitUsings&gt;
+    &lt;TreatWarningsAsErrors&gt;true&lt;/TreatWarningsAsErrors&gt;
+    &lt;InvariantGlobalization&gt;true&lt;/InvariantGlobalization&gt;
+  &lt;/PropertyGroup&gt;
+
+  &lt;ItemGroup&gt;
+    &lt;PackageReference Include=&quot;Serilog.AspNetCore&quot; Version=&quot;8.0.1&quot; /&gt;
+  &lt;/ItemGroup&gt;
+
+&lt;/Project&gt;
+
+&lt;!-- Multi-targeting: one library, two runtimes, conditional code --&gt;
+&lt;PropertyGroup&gt;
+  &lt;TargetFrameworks&gt;net8.0;netstandard2.0&lt;/TargetFrameworks&gt;
+&lt;/PropertyGroup&gt;
+&lt;!-- then in code: #if NET8_0_OR_GREATER ... #endif --&gt;</code></pre><pre data-lang="python" hidden><code># The Python parallel is the 2→3 split, and it is a useful analogy to reach for
+# in an interview: a breaking runtime change with a decade-long tail.
+#
+#   .NET Framework 4.8  ~  Python 2.7   (supported, frozen, do not start here)
+#   .NET 8 / 9          ~  Python 3.12+ (where the work happens)
+#
+# Checking what you are on
+import sys, platform
+print(sys.version)                   # dotnet --info
+print(platform.python_implementation())   # CPython / PyPy  ~  CoreCLR / Mono
+
+# Targeting several runtimes from one package: python_requires + env markers
+# pyproject.toml:
+#   requires-python = &quot;&gt;=3.9&quot;
+#   dependencies = [&quot;tomli; python_version &lt; &#x27;3.11&#x27;&quot;]
+
+# The #if NET8_0_OR_GREATER equivalent
+if sys.version_info &gt;= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"We are on .NET Framework 4.8 — how would you approach moving to .NET 8?" Answer with a plan, not a feature list: inventory with upgrade-assistant / API Port, retarget leaf libraries to <code>netstandard2.0</code> first so both worlds can consume them, move the web layer last, and name the things that have no path (Web Forms, WCF hosting, <code>AppDomain</code>, binary serialisation) rather than discovering them mid-project.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Run <code>dotnet --info</code> and explain every line of the output.</li><li>Multi-target a small library at <code>net8.0</code> and <code>netstandard2.0</code> and use <code>#if</code> to light up a newer API.</li><li>Name the current LTS release and its end-of-support date without looking.</li></ul></div></section>
+<section id="sdk-tfm"><h2 id="sdk-tfm">SDKs, runtimes, TFMs and global.json</h2><p>Three separate things people conflate: the <strong>SDK</strong> builds (one install can build many targets), the <strong>runtime</strong> executes, and the <strong>target framework moniker</strong> in the csproj says which API surface you compile against. <code>global.json</code> pins the SDK for a repo so a developer with a newer SDK does not silently change build behaviour.</p><p>The deployment distinction matters as much: <strong>framework-dependent</strong> output needs a runtime on the box and is small; <strong>self-contained</strong> ships the runtime and is ~70 MB but needs nothing installed.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="xml">XML</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># Pin the SDK for everyone who clones the repo
+dotnet new globaljson --sdk-version 8.0.400 --roll-forward latestFeature
+cat global.json
+# { &quot;sdk&quot;: { &quot;version&quot;: &quot;8.0.400&quot;, &quot;rollForward&quot;: &quot;latestFeature&quot; } }
+
+# Framework-dependent (default): small, needs the runtime installed
+dotnet publish -c Release -o out
+#   -&gt; out/Shop.Api.dll + Shop.Api (apphost), ~2 MB
+
+# Self-contained: ships the runtime, runs anywhere for that RID
+dotnet publish -c Release -r linux-x64 --self-contained true -o out
+#   -&gt; ~70 MB
+
+# Single file, trimmed
+dotnet publish -c Release -r linux-x64 --self-contained true \
+  -p:PublishSingleFile=true -p:PublishTrimmed=true
+
+# Which runtimes can host this app? Roll-forward policy decides.
+DOTNET_ROLL_FORWARD=LatestMajor dotnet Shop.Api.dll</code></pre><pre data-lang="xml" hidden><code>&lt;!-- The TFM is the API surface you compile against --&gt;
+&lt;TargetFramework&gt;net8.0&lt;/TargetFramework&gt;          &lt;!-- cross-platform --&gt;
+&lt;TargetFramework&gt;net8.0-windows&lt;/TargetFramework&gt;  &lt;!-- + Windows-only APIs --&gt;
+&lt;TargetFramework&gt;netstandard2.0&lt;/TargetFramework&gt;  &lt;!-- the shared subset, for libraries --&gt;
+
+&lt;!-- Central Package Management: one version list for the whole solution.
+     Directory.Packages.props at the repo root --&gt;
+&lt;Project&gt;
+  &lt;PropertyGroup&gt;
+    &lt;ManagePackageVersionsCentrally&gt;true&lt;/ManagePackageVersionsCentrally&gt;
+  &lt;/PropertyGroup&gt;
+  &lt;ItemGroup&gt;
+    &lt;PackageVersion Include=&quot;Serilog.AspNetCore&quot; Version=&quot;8.0.1&quot; /&gt;
+  &lt;/ItemGroup&gt;
+&lt;/Project&gt;
+&lt;!-- projects then write &lt;PackageReference Include=&quot;Serilog.AspNetCore&quot; /&gt; with no version --&gt;
+
+&lt;!-- Directory.Build.props: properties every project in the tree inherits --&gt;
+&lt;Project&gt;
+  &lt;PropertyGroup&gt;
+    &lt;LangVersion&gt;latest&lt;/LangVersion&gt;
+    &lt;Nullable&gt;enable&lt;/Nullable&gt;
+    &lt;EnforceCodeStyleInBuild&gt;true&lt;/EnforceCodeStyleInBuild&gt;
+  &lt;/PropertyGroup&gt;
+&lt;/Project&gt;</code></pre><pre data-lang="python" hidden><code># The same three-way split, different names
+#
+#   SDK      ~  the build backend (setuptools / hatchling / poetry-core)
+#   runtime  ~  the interpreter (python3.12)
+#   TFM      ~  requires-python + the APIs you actually call
+#
+# Pinning the toolchain for everyone - global.json&#x27;s job
+# .python-version (pyenv), or:
+#   [project] requires-python = &quot;&gt;=3.11,&lt;3.13&quot;
+#   [build-system] requires = [&quot;hatchling==1.21.1&quot;]
+
+# &quot;Framework-dependent&quot;: a wheel. Small, needs an interpreter.
+#   python -m build            -&gt;  dist/shop-1.0-py3-none-any.whl  (~20 KB)
+
+# &quot;Self-contained&quot;: bundle the interpreter
+#   pyinstaller --onefile app.py        -&gt;  ~15 MB
+#   shiv / pex                         -&gt;  zipapp with deps baked in
+
+# Lock files are the Directory.Packages.props equivalent - one resolved
+# version set for the whole project
+#   uv lock   /   poetry lock   /   pip-compile</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A clean three-sentence separation of SDK / runtime / TFM is worth more than any detail here. Then expect the deployment question: framework-dependent vs self-contained, and what you would ship in a container (framework-dependent on an <code>aspnet</code> base image is the usual answer — the base layer is cached and shared, so self-contained mostly buys you a bigger image).</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Add a <code>global.json</code> and prove that a newer SDK on the machine is no longer used.</li><li>Publish the same app both ways and compare output size and start-up time.</li><li>Set up <code>Directory.Packages.props</code> for a two-project solution and remove every inline version.</li></ul></div></section>
+<section id="host"><h2 id="host">The generic host, IHostedService and BackgroundService</h2><p>Every modern .NET app — web, worker, console — is a <em>host</em>: a container holding DI, configuration, logging and a set of <code>IHostedService</code> implementations, with one well-defined startup and shutdown sequence. Understanding that sequence is what the question is really about.</p><p>On <code>StartAsync</code>, hosted services start <strong>in registration order, sequentially</strong>, and the host does not begin serving until each returns. On shutdown they stop in <strong>reverse</strong> order, each given <code>ShutdownTimeout</code> (30s default) before being abandoned. The classic bug: doing long work directly in <code>StartAsync</code>, which blocks startup; and in <code>BackgroundService</code>, an unhandled exception in <code>ExecuteAsync</code> tears down the entire host from .NET 6 onwards (it was silently swallowed before).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// A worker: the whole app is a host with one hosted service
+var builder = Host.CreateApplicationBuilder(args);
+builder.Services.AddHostedService&lt;OutboxPublisher&gt;();
+builder.Services.AddSingleton&lt;IClock, SystemClock&gt;();
+await builder.Build().RunAsync();
+
+// BackgroundService is IHostedService with the loop boilerplate written for you
+public class OutboxPublisher(IServiceScopeFactory scopes, ILogger&lt;OutboxPublisher&gt; log)
+    : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // Return quickly or yield: ExecuteAsync is awaited by StartAsync until the
+        // first await that actually yields, so synchronous work here blocks startup.
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+
+        while (await timer.WaitForNextTickAsync(stoppingToken))
+        {
+            try
+            {
+                // A singleton cannot inject a scoped DbContext - create a scope per tick
+                using var scope = scopes.CreateScope();
+                var db = scope.ServiceProvider.GetRequiredService&lt;AppDbContext&gt;();
+                await Publish(db, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;                                   // normal shutdown, not an error
+            }
+            catch (Exception ex)
+            {
+                // Swallow deliberately: an escape from ExecuteAsync kills the host
+                log.LogError(ex, &quot;outbox tick failed&quot;);
+            }
+        }
+    }
+
+    public override async Task StopAsync(CancellationToken ct)
+    {
+        log.LogInformation(&quot;draining&quot;);                  // runs before the token is cancelled
+        await base.StopAsync(ct);
+    }
+}
+
+// Opt into the old forgiving behaviour explicitly, if you must
+builder.Services.Configure&lt;HostOptions&gt;(o =&gt;
+{
+    o.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore;
+    o.ShutdownTimeout = TimeSpan.FromSeconds(60);
+});
+
+// Graceful shutdown hooks
+app.Lifetime.ApplicationStopping.Register(() =&gt; log.LogInformation(&quot;stopping&quot;));</code></pre><pre data-lang="python" hidden><code># Python has no host abstraction; asyncio.TaskGroup + lifespan hooks are the
+# closest equivalent, and you assemble the pieces yourself.
+import asyncio, contextlib, logging
+
+log = logging.getLogger(__name__)
+
+async def outbox_publisher(stopping: asyncio.Event, session_factory) -&gt; None:
+    while not stopping.is_set():
+        try:
+            async with session_factory() as db:        # a &quot;scope&quot; per tick
+                await publish(db)
+        except asyncio.CancelledError:
+            break                                      # normal shutdown
+        except Exception:
+            log.exception(&quot;outbox tick failed&quot;)         # never let it escape
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stopping.wait(), timeout=5)
+
+# Startup / shutdown ordering is explicit, in the order you write it
+async def main() -&gt; None:
+    stopping = asyncio.Event()
+    async with asyncio.TaskGroup() as tg:              # 3.11+
+        tg.create_task(outbox_publisher(stopping, session_factory))
+        tg.create_task(serve_http())
+        await shutdown_signal()
+        stopping.set()
+    # TaskGroup cancels and awaits every child here - the reverse-order stop
+
+# FastAPI/Starlette give you the lifespan hook, the nearest thing to IHostedService
+from contextlib import asynccontextmanager
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(worker())               # startup
+    yield
+    task.cancel()                                       # shutdown
+    with contextlib.suppress(asyncio.CancelledError):
+        await task</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Three questions come up almost every time. "What happens if <code>ExecuteAsync</code> throws?" — from .NET 6 the host stops; name <code>BackgroundServiceExceptionBehavior</code>. "Why can't I inject a <code>DbContext</code> into a <code>BackgroundService</code>?" — the service is a singleton and the context is scoped; use <code>IServiceScopeFactory</code> per unit of work. "How do you make shutdown graceful?" — honour <code>stoppingToken</code>, keep work under <code>ShutdownTimeout</code>, and do draining in <code>StopAsync</code>.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a <code>BackgroundService</code> with a <code>PeriodicTimer</code> that exits cleanly on Ctrl-C with no exception logged.</li><li>Inject a scoped service into one, see it fail, then fix it with a scope factory.</li><li>Throw from <code>ExecuteAsync</code> and watch the host exit; then configure it not to.</li></ul></div></section>
+<section id="configuration"><h2 id="configuration">Configuration providers and precedence</h2><p>Configuration is a layered key-value store, not a file. Providers are added in order and <strong>later ones win</strong>; the result is flattened to colon-delimited keys (<code>Logging:LogLevel:Default</code>). Knowing the default order for <code>CreateApplicationBuilder</code> by heart is a reasonable thing to be asked.</p><p>The order is: <code>appsettings.json</code> → <code>appsettings.{Environment}.json</code> → user secrets (Development only) → environment variables → command-line arguments. The double-underscore convention exists because most shells cannot put a colon in a variable name: <code>Logging__LogLevel__Default</code> maps to <code>Logging:LogLevel:Default</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>var builder = WebApplication.CreateBuilder(args);
+
+// The defaults are already added, in this order (last wins):
+//   1. appsettings.json
+//   2. appsettings.{Environment}.json
+//   3. user secrets               (Development only)
+//   4. environment variables
+//   5. command-line args
+
+// Adding your own - order of the AddX calls is the precedence
+builder.Configuration
+    .AddJsonFile(&quot;shared.json&quot;, optional: true, reloadOnChange: true)
+    .AddAzureKeyVault(new Uri(vaultUri), new DefaultAzureCredential())
+    .AddEnvironmentVariables(prefix: &quot;SHOP_&quot;);       // SHOP_Db__Timeout -&gt; Db:Timeout
+
+// Reading: flattened colon-delimited keys, whatever the provider
+string? cs      = builder.Configuration[&quot;ConnectionStrings:Default&quot;];
+string? cs2     = builder.Configuration.GetConnectionString(&quot;Default&quot;);   // same thing
+int timeout     = builder.Configuration.GetValue&lt;int&gt;(&quot;Db:Timeout&quot;, 30);  // with default
+var section     = builder.Configuration.GetSection(&quot;Db&quot;);
+var endpoints   = builder.Configuration.GetSection(&quot;Endpoints&quot;).Get&lt;string[]&gt;();
+
+// Required, fail fast at startup rather than null at 3am
+string required = builder.Configuration.GetValue&lt;string&gt;(&quot;Db:Host&quot;)
+    ?? throw new InvalidOperationException(&quot;Db:Host is not configured&quot;);
+
+// Arrays and dictionaries flatten by index
+//   { &quot;Endpoints&quot;: [&quot;a&quot;, &quot;b&quot;] }  -&gt;  Endpoints:0 = a, Endpoints:1 = b
+//   env var: Endpoints__0=a
+
+// Environment, and how it is chosen (ASPNETCORE_ENVIRONMENT / DOTNET_ENVIRONMENT)
+if (builder.Environment.IsDevelopment()) { }
+if (builder.Environment.IsEnvironment(&quot;Staging&quot;)) { }
+
+// Dumping the resolved configuration is the fastest way to debug precedence
+foreach (var (k, v) in builder.Configuration.AsEnumerable().OrderBy(p =&gt; p.Key))
+    Console.WriteLine($&quot;{k} = {v}&quot;);</code></pre><pre data-lang="bash" hidden><code># Environment variables: __ (double underscore) becomes the : separator,
+# because most shells will not allow a colon in a name
+export Logging__LogLevel__Default=Debug
+export ConnectionStrings__Default=&quot;Server=db;Database=shop&quot;
+export Endpoints__0=https://a.example.com
+export Endpoints__1=https://b.example.com
+
+# Command line wins over everything
+dotnet run --Db:Timeout=60 --environment Staging
+
+# Which environment am I in?
+export ASPNETCORE_ENVIRONMENT=Staging        # web
+export DOTNET_ENVIRONMENT=Staging            # worker / generic host
+
+# User secrets: Development only, stored OUTSIDE the repo
+#   ~/.microsoft/usersecrets/&lt;UserSecretsId&gt;/secrets.json
+dotnet user-secrets init
+dotnet user-secrets set &quot;ConnectionStrings:Default&quot; &quot;Server=localhost;Database=shop&quot;
+dotnet user-secrets list
+
+# In a container, the same keys arrive as env vars - nothing app-side changes
+docker run -e ConnectionStrings__Default=&quot;Server=db&quot; shop-api</code></pre><pre data-lang="python" hidden><code>import os, json, tomllib
+from pathlib import Path
+
+# Python has no layered configuration abstraction in the stdlib; the usual
+# pattern is explicit layers merged in precedence order - exactly what the
+# .NET provider list does for you.
+def load_config() -&gt; dict:
+    cfg: dict = {}
+    for layer in (&quot;settings.json&quot;, f&quot;settings.{os.getenv(&#x27;ENVIRONMENT&#x27;, &#x27;dev&#x27;)}.json&quot;):
+        p = Path(layer)
+        if p.exists():
+            cfg = deep_merge(cfg, json.loads(p.read_text()))
+    # env vars last, so they win
+    for key, value in os.environ.items():
+        if key.startswith(&quot;SHOP_&quot;):
+            set_path(cfg, key[5:].lower().split(&quot;__&quot;), value)
+    return cfg
+
+# pydantic-settings is the closest thing to the options pattern + providers
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class DbSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix=&quot;SHOP_DB__&quot;, env_nested_delimiter=&quot;__&quot;)
+    host: str                                  # required: fails at startup if absent
+    timeout: int = Field(default=30, ge=1, le=300)
+
+settings = DbSettings()                        # raises ValidationError, not None at 3am</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"Where does configuration come from, and what wins?" Recite the five default layers in order. The two follow-ups: why environment variables use <code>__</code> (shells and colons), and how you would get a secret in without putting it in <code>appsettings.json</code> (user secrets locally, Key Vault or the platform's own secret store in production — and note that user secrets are Development-only and unencrypted, just outside the repo).</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Set the same key in <code>appsettings.json</code>, an environment variable and a command-line argument, and confirm which wins.</li><li>Bind a <code>string[]</code> from an environment variable using the index convention.</li><li>Dump the whole resolved configuration at startup and find a key you did not know was set.</li></ul></div></section>
+<section id="options"><h2 id="options">The options pattern: IOptions, IOptionsSnapshot, IOptionsMonitor and validation</h2><p>Injecting <code>IConfiguration</code> everywhere means every consumer does its own string lookups and type conversions, and nothing fails until the code path runs. The options pattern binds a section to a typed class once, validates it, and injects that.</p><p>The three interfaces differ only in lifetime and reload behaviour, and this is the question: <code>IOptions&lt;T&gt;</code> is a singleton bound once at startup and <strong>never</strong> reloads; <code>IOptionsSnapshot&lt;T&gt;</code> is scoped and consistent for the duration of a request; <code>IOptionsMonitor&lt;T&gt;</code> is a singleton that exposes <code>CurrentValue</code> and an <code>OnChange</code> callback, and is the only one usable from a singleton that must see updates.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// 1. The typed class, with validation attributes
+public class DbOptions
+{
+    public const string Section = &quot;Db&quot;;
+
+    [Required] public string Host { get; init; } = &quot;&quot;;
+    [Range(1, 300)] public int TimeoutSeconds { get; init; } = 30;
+    public bool EnableRetry { get; init; } = true;
+}
+
+// 2. Bind + validate, and fail at STARTUP rather than on first use
+builder.Services
+    .AddOptions&lt;DbOptions&gt;()
+    .Bind(builder.Configuration.GetSection(DbOptions.Section))
+    .ValidateDataAnnotations()
+    .Validate(o =&gt; !o.Host.Contains(&quot;localhost&quot;) || builder.Environment.IsDevelopment(),
+              &quot;localhost is not allowed outside Development&quot;)
+    .ValidateOnStart();                      // &lt;- without this, errors wait for the first inject
+
+// 3. Consume. Pick the interface by what you need:
+public class Repo(IOptions&lt;DbOptions&gt; options)            // singleton, never reloads
+{
+    private readonly DbOptions _o = options.Value;        //   bound once at startup
+}
+
+public class Handler(IOptionsSnapshot&lt;DbOptions&gt; options) // scoped, stable per request
+{
+    public void Do() { var o = options.Value; }
+}
+
+public class Publisher(IOptionsMonitor&lt;DbOptions&gt; options) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        using var _ = options.OnChange(o =&gt; log.LogInformation(&quot;timeout now {T}&quot;, o.TimeoutSeconds));
+        while (!ct.IsCancellationRequested)
+        {
+            var current = options.CurrentValue;            // re-read every tick
+            await Task.Delay(current.TimeoutSeconds * 1000, ct);
+        }
+    }
+}
+
+// Named options: several instances of the same shape
+builder.Services.Configure&lt;DbOptions&gt;(&quot;primary&quot;, builder.Configuration.GetSection(&quot;Db:Primary&quot;));
+builder.Services.Configure&lt;DbOptions&gt;(&quot;replica&quot;, builder.Configuration.GetSection(&quot;Db:Replica&quot;));
+var primary = monitor.Get(&quot;primary&quot;);
+
+// Post-configuration runs after all binding - good for derived values
+builder.Services.PostConfigure&lt;DbOptions&gt;(o =&gt; { /* normalise */ });
+
+// A source-generated, DI-free alternative for simple cases
+var db = builder.Configuration.GetSection(&quot;Db&quot;).Get&lt;DbOptions&gt;()!;</code></pre><pre data-lang="python" hidden><code>from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# pydantic-settings is the direct analogue: bind a section, validate, inject
+class DbOptions(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix=&quot;DB_&quot;, frozen=True)
+
+    host: str                                     # [Required]
+    timeout_seconds: int = Field(default=30, ge=1, le=300)   # [Range(1,300)]
+    enable_retry: bool = True
+
+    @field_validator(&quot;host&quot;)
+    @classmethod
+    def not_localhost_in_prod(cls, v: str) -&gt; str:
+        import os
+        if &quot;localhost&quot; in v and os.getenv(&quot;ENVIRONMENT&quot;) != &quot;dev&quot;:
+            raise ValueError(&quot;localhost is not allowed outside dev&quot;)
+        return v
+
+# ValidateOnStart equivalent: construct it at import/startup, not lazily
+db_options = DbOptions()                          # raises now, not at 3am
+
+# The IOptions / IOptionsSnapshot / IOptionsMonitor distinction has no direct
+# equivalent because there is no built-in reload. You build it:
+class OptionsMonitor:
+    def __init__(self, factory):
+        self._factory, self._current = factory, factory()
+        self._callbacks: list = []
+
+    @property
+    def current_value(self):                      # IOptionsMonitor.CurrentValue
+        return self._current
+
+    def reload(self) -&gt; None:                     # hook to SIGHUP or a file watcher
+        self._current = self._factory()
+        for cb in self._callbacks:
+            cb(self._current)
+
+    def on_change(self, cb) -&gt; None:
+        self._callbacks.append(cb)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>This is a favourite because the answer is short and most people get it half right. Be exact: <code>IOptions</code> — singleton, bound once, no reload. <code>IOptionsSnapshot</code> — scoped, recomputed per scope, stable within a request. <code>IOptionsMonitor</code> — singleton, <code>CurrentValue</code> re-reads, has <code>OnChange</code>, the only option for a singleton or hosted service. Then volunteer <code>ValidateOnStart()</code>: the difference between a pod that fails to start and one that serves 500s.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Bind a section with a deliberately invalid value and prove <code>ValidateOnStart</code> turns it into a startup failure.</li><li>Inject <code>IOptions</code> into a singleton, change <code>appsettings.json</code>, and confirm nothing updates. Switch to <code>IOptionsMonitor</code>.</li><li>Register two named options from two sections and resolve both with <code>Get(name)</code>.</li></ul></div></section>
+<section id="logging"><h2 id="logging">ILogger, log levels, scopes and structured logging</h2><p><code>ILogger&lt;T&gt;</code> is an abstraction over providers (console, file, Application Insights, Serilog, OpenTelemetry). Two things distinguish someone who has operated a service: using the <strong>message template</strong> rather than string interpolation, and knowing what a <strong>scope</strong> is for.</p><p><code>log.LogInformation("Order {OrderId} failed", id)</code> sends a template plus a named value, so a log backend can index and query on <code>OrderId</code>. <code>log.LogInformation($"Order {id} failed")</code> sends one opaque string and throws the structure away — and formats it even when the level is disabled.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class OrderService(ILogger&lt;OrderService&gt; log)      // T sets the category
+{
+    public async Task Handle(Order order)
+    {
+        // Structured: template + named values. NOT string interpolation.
+        log.LogInformation(&quot;Processing order {OrderId} for {Customer}&quot;, order.Id, order.Customer);
+        // log.LogInformation($&quot;Processing order {order.Id}&quot;);   // &lt;- loses all structure
+
+        // A scope attaches properties to every log inside it, including from
+        // code that knows nothing about them
+        using (log.BeginScope(&quot;Order {OrderId}&quot;, order.Id))
+        {
+            await _repo.Save(order);                   // its logs carry OrderId too
+        }
+
+        // Exceptions go in the first parameter, never into the message
+        try { await Charge(order); }
+        catch (Exception ex)
+        {
+            log.LogError(ex, &quot;Charge failed for {OrderId}&quot;, order.Id);
+        }
+
+        // Guard genuinely expensive work
+        if (log.IsEnabled(LogLevel.Debug))
+            log.LogDebug(&quot;Payload {Payload}&quot;, Expensive(order));
+
+        // Source-generated logging: no boxing, no allocation, compile-time checked
+        LogOrderReceived(log, order.Id);
+    }
+
+    [LoggerMessage(Level = LogLevel.Information, Message = &quot;Order {orderId} received&quot;)]
+    static partial void LogOrderReceived(ILogger logger, string orderId);
+}
+
+// Levels, and what each is for in practice
+//   Trace       - firehose, never on in production
+//   Debug       - developer detail, on when diagnosing
+//   Information - business events: an order was placed
+//   Warning     - degraded but handled: a retry fired
+//   Error       - this request failed
+//   Critical    - the process or a dependency is down
+
+// Configuration is per category, most specific prefix wins
+// appsettings.json:
+// &quot;Logging&quot;: { &quot;LogLevel&quot;: {
+//     &quot;Default&quot;: &quot;Information&quot;,
+//     &quot;Microsoft.AspNetCore&quot;: &quot;Warning&quot;,
+//     &quot;Microsoft.EntityFrameworkCore.Database.Command&quot;: &quot;Information&quot; } }</code></pre><pre data-lang="python" hidden><code>import logging, logging.config
+
+log = logging.getLogger(__name__)              # module name == the C# category
+
+# Structured logging: %-style args are the message-template equivalent.
+# Pass the values, do not format them in.
+log.info(&quot;Processing order %s for %s&quot;, order.id, order.customer)
+# log.info(f&quot;Processing order {order.id}&quot;)     # &lt;- same mistake, same cost
+
+# Scopes: `extra` per call, or a contextvar-backed filter for ambient properties
+log.info(&quot;Processing order&quot;, extra={&quot;order_id&quot;: order.id})
+
+import contextvars
+_order_id = contextvars.ContextVar(&quot;order_id&quot;, default=None)
+
+class ContextFilter(logging.Filter):           # the BeginScope equivalent
+    def filter(self, record):
+        record.order_id = _order_id.get()
+        return True
+
+# Exceptions: exc_info / .exception(), never str(ex) in the message
+try:
+    charge(order)
+except Exception:
+    log.exception(&quot;Charge failed for %s&quot;, order.id)   # includes the traceback
+
+# Guard expensive work
+if log.isEnabledFor(logging.DEBUG):
+    log.debug(&quot;Payload %s&quot;, expensive(order))
+
+# Per-logger levels, same most-specific-prefix rule
+logging.config.dictConfig({
+    &quot;version&quot;: 1,
+    &quot;loggers&quot;: {
+        &quot;&quot;:            {&quot;level&quot;: &quot;INFO&quot;,    &quot;handlers&quot;: [&quot;console&quot;]},
+        &quot;urllib3&quot;:     {&quot;level&quot;: &quot;WARNING&quot;},
+        &quot;sqlalchemy.engine&quot;: {&quot;level&quot;: &quot;INFO&quot;},
+    },
+})
+
+# structlog is what you reach for when you want real structured output
+import structlog
+structlog.get_logger().info(&quot;order_processed&quot;, order_id=order.id, total=order.total)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The reliable one is "what is wrong with <code>LogInformation($\"...{id}...\")</code>?" — it destroys the structured properties your log backend would have indexed, and it pays the formatting cost even when the level is off. Follow-ups: what a scope buys you (correlation across code that does not take the id as a parameter), and why <code>[LoggerMessage]</code> exists (source-generated, allocation-free, checked at compile time).</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Log the same event interpolated and templated, then query both in your log backend and compare.</li><li>Wrap a request in <code>BeginScope</code> and confirm a nested service's logs carry the id.</li><li>Convert a hot-path log call to a <code>[LoggerMessage]</code> partial method.</li></ul></div></section>
+<section id="di-advanced"><h2 id="di-advanced">DI beyond lifetimes: captive dependencies, keyed services, factories</h2><p><a href="web-api.html#di">Web API</a> covers singleton / scoped / transient. This is the next layer: what goes wrong and how you work around the container's limits.</p><p>The <strong>captive dependency</strong> is the bug worth being able to name on the spot: a singleton that depends on a scoped service captures the first scope's instance and holds it forever — a <code>DbContext</code> that lives for the lifetime of the process, is not thread-safe, and accumulates tracked entities. The built-in container catches this at build time when scope validation is on (it is by default in Development only).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The captive dependency - a singleton capturing something scoped
+builder.Services.AddSingleton&lt;CacheWarmer&gt;();        // singleton
+builder.Services.AddScoped&lt;AppDbContext&gt;();          // scoped
+// CacheWarmer(AppDbContext db)  -&gt;  InvalidOperationException at Build() when
+// ValidateScopes is on. Silently broken in production when it is not.
+
+builder.Host.UseDefaultServiceProvider((ctx, o) =&gt;
+{
+    o.ValidateScopes = true;                          // ALWAYS, not just Development
+    o.ValidateOnBuild = true;                         // fail at startup, not first request
+});
+
+// The fix: resolve a scope per unit of work
+public class CacheWarmer(IServiceScopeFactory scopes)
+{
+    public async Task Warm()
+    {
+        using var scope = scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService&lt;AppDbContext&gt;();
+        // ...
+    }
+}
+
+// Keyed services (.NET 8): several implementations of one interface
+builder.Services.AddKeyedSingleton&lt;INotifier, EmailNotifier&gt;(&quot;email&quot;);
+builder.Services.AddKeyedSingleton&lt;INotifier, SmsNotifier&gt;(&quot;sms&quot;);
+
+public class Alerts([FromKeyedServices(&quot;email&quot;)] INotifier notifier) { }
+var sms = provider.GetRequiredKeyedService&lt;INotifier&gt;(&quot;sms&quot;);
+
+// Before keyed services, and still useful: inject them all and pick
+builder.Services.AddSingleton&lt;INotifier, EmailNotifier&gt;();
+builder.Services.AddSingleton&lt;INotifier, SmsNotifier&gt;();
+public class Alerts(IEnumerable&lt;INotifier&gt; all)       // every registration, in order
+{
+    public INotifier Pick(string kind) =&gt; all.First(n =&gt; n.Kind == kind);
+}
+
+// A factory when construction needs runtime data the container cannot know
+builder.Services.AddSingleton&lt;Func&lt;string, IConnection&gt;&gt;(sp =&gt;
+    name =&gt; new Connection(sp.GetRequiredService&lt;IOptionsMonitor&lt;DbOptions&gt;&gt;().Get(name)));
+
+// TryAdd: register only if nobody else has - how libraries avoid clobbering you
+services.TryAddSingleton&lt;IClock, SystemClock&gt;();
+services.TryAddEnumerable(ServiceDescriptor.Singleton&lt;IValidator, OrderValidator&gt;());
+
+// Decoration: wrap an existing registration (Scrutor, or by hand)
+services.AddSingleton&lt;IRepo, SqlRepo&gt;();
+services.Decorate&lt;IRepo, CachingRepo&gt;();              // CachingRepo(IRepo inner)
+
+// Disposal: the container disposes what it created, in reverse order, per scope.
+// It does NOT dispose instances you hand it:
+services.AddSingleton(new HttpClient());              // never disposed - your problem</code></pre><pre data-lang="python" hidden><code># Python DI is usually explicit wiring or a small container library.
+# The captive-dependency bug exists in exactly the same shape: a module-level
+# (singleton) object holding a per-request session.
+
+# The bug
+_engine = create_engine(url)
+_session = Session(_engine)          # module level == singleton
+
+class CacheWarmer:
+    def __init__(self) -&gt; None:
+        self.db = _session           # captured forever: not thread-safe, never reset
+
+# The fix: a factory, scoped per unit of work
+from contextlib import contextmanager
+
+session_factory = sessionmaker(_engine)
+
+class CacheWarmer:
+    def __init__(self, factory=session_factory) -&gt; None:
+        self._factory = factory
+
+    def warm(self) -&gt; None:
+        with self._factory() as db:          # a scope per call
+            ...
+
+# &quot;Keyed services&quot;: a registry dict is the idiomatic answer
+NOTIFIERS = {&quot;email&quot;: EmailNotifier, &quot;sms&quot;: SmsNotifier}
+
+class Alerts:
+    def __init__(self, kind: str = &quot;email&quot;) -&gt; None:
+        self.notifier = NOTIFIERS[kind]()
+
+# FastAPI&#x27;s Depends is the closest framework equivalent, with real scoping
+from fastapi import Depends
+
+def get_db():
+    with session_factory() as db:
+        yield db                     # teardown after the response, like a DI scope
+
+@app.get(&quot;/orders&quot;)
+def list_orders(db=Depends(get_db)):
+    ...
+
+# dependency-injector / punq give you container registration if you want it
+from dependency_injector import containers, providers
+class Container(containers.DeclarativeContainer):
+    db = providers.Factory(Session, _engine)          # transient
+    clock = providers.Singleton(SystemClock)          # singleton</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"What is a captive dependency?" is close to a standard question. Give the definition, the concrete example (singleton holding a <code>DbContext</code>), the symptom (stale data, thread-safety errors, growing memory) and the guard (<code>ValidateScopes</code> / <code>ValidateOnBuild</code>, which you should turn on in every environment rather than Development only). Keyed services are a good "what is new in .NET 8" answer.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Create a captive dependency deliberately, see the Development-time error, then set <code>ValidateScopes = false</code> and watch it break at runtime instead.</li><li>Register three implementations of one interface and resolve a specific one both with keys and with <code>IEnumerable&lt;T&gt;</code>.</li><li>Register an instance you constructed yourself and verify the container never disposes it.</li></ul></div></section>
+<section id="jit-aot"><h2 id="jit-aot">JIT, tiered compilation, ReadyToRun and Native AOT</h2><p>IL is compiled to machine code at run time by the JIT. <strong>Tiered compilation</strong> means it is compiled twice: tier 0 quickly and unoptimised so start-up is fast, then tier 1 fully optimised once a method proves hot (30 calls, or loop-driven via OSR). This is why a .NET service is slow for its first few seconds and why a benchmark without warm-up is meaningless.</p><p><strong>ReadyToRun</strong> pre-compiles to native code at publish time but keeps the JIT for re-optimisation — better start-up, bigger binary. <strong>Native AOT</strong> compiles entirely ahead of time: millisecond start-up, tiny memory, no JIT at all — and therefore no runtime code generation, which rules out reflection-heavy serialisation, <code>Expression.Compile</code>, most dynamic proxies and much of EF Core.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># See the tiers at work
+export DOTNET_TieredCompilation=0        # disable: slower start, best steady-state
+export DOTNET_TieredPGO=1                # profile-guided re-optimisation (default on)
+export DOTNET_ReadyToRun=0               # ignore precompiled code, JIT everything
+
+# ReadyToRun: precompile at publish, keep the JIT
+dotnet publish -c Release -r linux-x64 -p:PublishReadyToRun=true
+
+# Native AOT: no JIT, no IL, a native executable
+dotnet publish -c Release -r linux-x64 -p:PublishAot=true
+#   start-up  ~5 ms   vs ~70 ms JIT
+#   memory    ~12 MB  vs ~45 MB
+#   size      ~12 MB single native binary
+#   build     slow, and must be on the target platform/arch
+
+# The AOT warnings are the useful part - they tell you what will break
+dotnet publish -p:PublishAot=true 2&gt;&amp;1 | grep -E &quot;IL2|IL3&quot;
+#   IL2026: reflection on a trimmed member
+#   IL3050: RequiresDynamicCode - Expression.Compile, MakeGenericType
+
+# Measure, do not guess
+dotnet-counters monitor -n Shop.Api --counters System.Runtime
+dotnet tool install -g BenchmarkDotNet.Tool</code></pre><pre data-lang="csharp" hidden><code>// Analyse before committing to AOT - these turn the problems into build errors
+// csproj:
+//   &lt;PublishAot&gt;true&lt;/PublishAot&gt;
+//   &lt;IsAotCompatible&gt;true&lt;/IsAotCompatible&gt;        (libraries)
+//   &lt;EnableTrimAnalyzer&gt;true&lt;/EnableTrimAnalyzer&gt;
+
+// What AOT forbids, and the AOT-safe replacement:
+
+// 1. Reflection-based JSON -&gt; source-generated contracts
+[JsonSerializable(typeof(Order))]
+internal partial class AppJsonContext : JsonSerializerContext { }
+
+var json = JsonSerializer.Serialize(order, AppJsonContext.Default.Order);
+
+// 2. Expression.Compile / MakeGenericType -&gt; not available, no workaround
+//    [RequiresDynamicCode] marks the APIs that will throw
+
+// 3. Annotate what you do keep, so the trimmer does not remove it
+[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties)]
+static void Bind&lt;T&gt;() { }
+
+// Minimal APIs are AOT-friendly; MVC controllers are not
+var builder = WebApplication.CreateSlimBuilder(args);     // the AOT-shaped builder
+builder.Services.ConfigureHttpJsonOptions(o =&gt;
+    o.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default));
+
+// Benchmarking honestly: BenchmarkDotNet warms up to tier 1 for you
+[MemoryDiagnoser]
+public class Bench
+{
+    [Benchmark] public int Sum() =&gt; Enumerable.Range(0, 1000).Sum();
+}</code></pre><pre data-lang="python" hidden><code># CPython has no JIT in the .NET sense - it interprets bytecode. The analogues:
+#
+#   IL            ~  .pyc bytecode
+#   JIT tier 0/1  ~  (none in CPython &lt;3.13; 3.13+ has an experimental JIT)
+#   Native AOT    ~  Cython / mypyc / Nuitka, or PyPy&#x27;s tracing JIT
+
+import dis, sys
+dis.dis(lambda x: x + 1)          # the IL-viewer equivalent
+
+# Bytecode caching is the ReadyToRun analogue - precompile at &quot;publish&quot;
+#   python -m compileall -q .      -&gt;  __pycache__/*.pyc
+
+# &quot;AOT&quot;: compile to a native extension, and lose the same dynamic features
+#   cythonize -i hot_path.py       # no runtime code gen in the compiled module
+#   mypyc module.py                # needs full annotations, ~2-4x faster
+#   nuitka --onefile app.py        # single native binary, slow build
+
+# PyPy is the closest thing to tiered JIT: warm-up then steady-state speed,
+# so the same benchmarking caveat applies
+import timeit
+timeit.timeit(&quot;sum(range(1000))&quot;, number=100000)   # repeat; discard the first run
+
+# Measuring
+#   python -X importtime app.py    # start-up cost attribution
+#   py-spy top -p &lt;pid&gt;            # the dotnet-counters equivalent</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"Why is the first request slow?" is the way in: tier 0 code, cold caches, and lazy initialisation. Then "what is Native AOT and when would you not use it?" — great for CLI tools, serverless and sidecars where start-up and memory dominate; wrong for anything depending on runtime code generation (reflection-based serialisation, <code>Expression.Compile</code>, dynamic proxies, EF Core) and for MVC. Mentioning that <code>PublishReadyToRun</code> is the low-risk middle ground is a good sign.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Publish the same minimal API normally, with ReadyToRun, and with AOT; compare start-up, RSS and size.</li><li>Turn on the AOT analyzers in an existing project and read the IL2026/IL3050 warnings.</li><li>Benchmark a method with and without warm-up and explain the difference by tier.</li></ul></div></section>
+<section id="trimming"><h2 id="trimming">Trimming, single-file and container-ready publishing</h2><p>Trimming removes IL the static analyser cannot see being used. It works well until reflection is involved, at which point the member is gone and you get a <code>MissingMethodException</code> in production rather than a build error — which is why the trim analyzer warnings matter more than the size saving.</p><p>For containers, the thing worth knowing is that <strong>framework-dependent publish onto an <code>aspnet</code> base image is usually right</strong>: the runtime layer is shared and cached across all your images, so a self-contained publish often makes the total registry and pull cost worse, not better.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="xml">XML</button><button role="tab" aria-selected="false" data-lang="dockerfile">Dockerfile</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="xml"><code>&lt;PropertyGroup&gt;
+  &lt;!-- Trimming --&gt;
+  &lt;PublishTrimmed&gt;true&lt;/PublishTrimmed&gt;
+  &lt;TrimMode&gt;full&lt;/TrimMode&gt;              &lt;!-- &#x27;partial&#x27; trims only opted-in assemblies --&gt;
+  &lt;EnableTrimAnalyzer&gt;true&lt;/EnableTrimAnalyzer&gt;   &lt;!-- the point: warnings, not size --&gt;
+  &lt;SuppressTrimAnalysisWarnings&gt;false&lt;/SuppressTrimAnalysisWarnings&gt;
+
+  &lt;!-- Single file --&gt;
+  &lt;PublishSingleFile&gt;true&lt;/PublishSingleFile&gt;
+  &lt;IncludeNativeLibrariesForSelfExtract&gt;true&lt;/IncludeNativeLibrariesForSelfExtract&gt;
+
+  &lt;!-- Size wins that are not trimming --&gt;
+  &lt;InvariantGlobalization&gt;true&lt;/InvariantGlobalization&gt;   &lt;!-- drops ICU, ~28 MB --&gt;
+  &lt;UseSystemResourceKeys&gt;true&lt;/UseSystemResourceKeys&gt;     &lt;!-- drops localised messages --&gt;
+  &lt;EventSourceSupport&gt;false&lt;/EventSourceSupport&gt;
+&lt;/PropertyGroup&gt;
+
+&lt;!-- Protect types used only through reflection --&gt;
+&lt;ItemGroup&gt;
+  &lt;TrimmerRootAssembly Include=&quot;Shop.Plugins&quot; /&gt;
+&lt;/ItemGroup&gt;
+&lt;!-- or ILLink.Descriptors.xml, embedded as an EmbeddedResource:
+&lt;linker&gt;
+  &lt;assembly fullname=&quot;Shop.Plugins&quot;&gt;
+    &lt;type fullname=&quot;Shop.Plugins.*&quot; preserve=&quot;all&quot; /&gt;
+  &lt;/assembly&gt;
+&lt;/linker&gt; --&gt;</code></pre><pre data-lang="dockerfile" hidden><code># Multi-stage, framework-dependent: the runtime layer is shared across images
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+
+# Restore as its own layer so code changes do not re-download packages
+COPY *.sln Directory.Packages.props Directory.Build.props ./
+COPY src/Shop.Api/*.csproj src/Shop.Api/
+RUN dotnet restore src/Shop.Api/Shop.Api.csproj
+
+COPY . .
+RUN dotnet publish src/Shop.Api/Shop.Api.csproj -c Release -o /app --no-restore
+
+# chiseled: no shell, no package manager, non-root by default
+FROM mcr.microsoft.com/dotnet/aspnet:8.0-jammy-chiseled AS final
+WORKDIR /app
+COPY --from=build /app .
+
+USER $APP_UID
+ENV ASPNETCORE_URLS=http://+:8080 \
+    DOTNET_gcServer=1
+EXPOSE 8080
+ENTRYPOINT [&quot;./Shop.Api&quot;]
+
+# Alternative for AOT: build native, then run on a base with no runtime at all
+# FROM mcr.microsoft.com/dotnet/runtime-deps:8.0-jammy-chiseled</code></pre><pre data-lang="python" hidden><code># The same two trade-offs, same answers
+
+# &quot;Trimming&quot;: Python has no IL trimmer. Size comes from excluding packages
+# and the same reflection problem appears with dynamic imports.
+#   pyinstaller --onefile --exclude-module tkinter app.py
+#   pyinstaller --hidden-import=shop.plugins.email      # the TrimmerRootAssembly
+#                                                        equivalent: importlib
+#                                                        loads it, the analyser
+#                                                        cannot see it
+
+# Dockerfile: the same layer-caching discipline, the same shared-base argument
+#
+#   FROM python:3.12-slim AS build
+#   WORKDIR /src
+#   COPY requirements.txt .                  # restore layer first
+#   RUN pip install --no-cache-dir -r requirements.txt --target /deps
+#   COPY . .
+#
+#   FROM python:3.12-slim
+#   COPY --from=build /deps /usr/local/lib/python3.12/site-packages
+#   COPY --from=build /src /app
+#   USER 1000
+#   ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+#   CMD [&quot;python&quot;, &quot;-m&quot;, &quot;shop.api&quot;]
+#
+# distroless / chiseled applies identically:
+#   FROM gcr.io/distroless/python3-debian12</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The trimming question is really about reflection: "what breaks when you trim?" — anything resolved by name at run time, and the failure is a runtime <code>MissingMethod</code>/<code>MissingType</code> rather than a build error, so you run the analyzer and treat its warnings as errors. On containers, the strong answer is that framework-dependent on a shared <code>aspnet</code> base beats self-contained for a fleet of services, plus chiseled/distroless, non-root, and a restore layer separate from the source layer.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Trim an app that uses reflection-based JSON, watch it fail at run time, then fix it with a source-generated context.</li><li>Set <code>InvariantGlobalization</code> and measure the image size change — then work out what you gave up.</li><li>Rewrite a single-stage Dockerfile as multi-stage with a separate restore layer and compare rebuild times after a one-line code change.</li></ul></div></section>
+<section id="cli"><h2 id="cli">The dotnet CLI and what to reach for when</h2><p>Worth being fluent in, because it comes up as "how would you find out?" rather than as a question of its own. The diagnostic tools in particular — <code>dotnet-counters</code>, <code>dotnet-dump</code>, <code>dotnet-trace</code> — are the credible answer to "the service is using 4 GB in production, what do you do?"</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># Project and solution
+dotnet new list                             # every template
+dotnet new webapi -n Shop.Api --use-minimal-apis
+dotnet sln add src/Shop.Api/Shop.Api.csproj
+dotnet add package Serilog.AspNetCore --version 8.0.1
+dotnet list package --outdated --include-transitive
+dotnet list package --vulnerable             # the one to put in CI
+
+# Build / run / test
+dotnet restore --locked-mode                 # CI: fail if the lock file would change
+dotnet build -c Release --no-restore /warnaserror
+dotnet test --no-build --logger trx --collect:&quot;XPlat Code Coverage&quot;
+dotnet test --filter &quot;Category!=Integration&quot;
+dotnet watch run                             # hot reload
+dotnet run --project src/Shop.Api -- --Db:Timeout=60
+
+# Format and analyse
+dotnet format --verify-no-changes            # CI gate on style
+dotnet build -warnaserror
+
+# Diagnostics - install once, use in anger later
+dotnet tool install -g dotnet-counters
+dotnet tool install -g dotnet-dump
+dotnet tool install -g dotnet-trace
+
+dotnet-counters monitor -n Shop.Api --counters System.Runtime,Microsoft.AspNetCore.Hosting
+dotnet-dump collect -n Shop.Api              # then: dotnet-dump analyze core_xxx
+dotnet-trace collect -n Shop.Api --profile cpu-sampling
+dotnet-stack report -n Shop.Api              # managed stacks of every thread
+
+# Inside a container, with no tools installed
+kubectl exec -it shop-api-0 -- dotnet-counters monitor -p 1
+# (or add the tools to the image / use an ephemeral debug container)
+
+# Local tool manifest - pin tool versions per repo, like global.json for tools
+dotnet new tool-manifest
+dotnet tool install dotnet-ef
+dotnet tool restore</code></pre><pre data-lang="python" hidden><code># The same workflow, different verbs
+#   dotnet new            -&gt;  cookiecutter / copier / uv init
+#   dotnet restore        -&gt;  pip install -r / uv sync / poetry install
+#   dotnet build          -&gt;  (none) python -m build for a wheel
+#   dotnet run            -&gt;  python -m shop.api
+#   dotnet test           -&gt;  pytest
+#   dotnet watch          -&gt;  uvicorn --reload / watchfiles
+#   dotnet format         -&gt;  ruff format / black
+#   dotnet list package --vulnerable  -&gt;  pip-audit
+
+# Project and deps
+uv init shop-api &amp;&amp; cd shop-api
+uv add &quot;fastapi==0.110.0&quot;
+uv lock &amp;&amp; uv sync --frozen        # dotnet restore --locked-mode
+
+# Test and gate
+pytest --cov=shop --cov-report=xml -m &quot;not integration&quot;
+ruff check --no-fix .              # dotnet format --verify-no-changes
+mypy shop
+pip-audit
+
+# Diagnostics in production - the dotnet-counters/dump/trace equivalents
+py-spy top    --pid 1              # live CPU by function, no restart needed
+py-spy dump   --pid 1              # every thread&#x27;s stack  (dotnet-stack)
+memray attach  1                   # live allocation tracking (dotnet-dump + heap)
+python -X importtime -m shop.api   # start-up attribution</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Rather than CLI trivia, expect an operational scenario: "memory keeps climbing in production — walk me through it." Say <code>dotnet-counters</code> first to see whether it is managed heap, Gen2, or handles; then <code>dotnet-dump collect</code> and analyse the heap offline rather than attaching a debugger to production; then name the usual culprits (static collections, event handlers never unsubscribed, <code>HttpClient</code> misuse, a captive <code>DbContext</code>). See <a href="performance.html#profiling">Performance</a> for the analysis itself.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Install the three diagnostic tools and run each against a local app until the output means something.</li><li>Add <code>dotnet list package --vulnerable</code> to a pipeline and make it fail the build.</li><li>Create a tool manifest so a fresh clone gets the right <code>dotnet-ef</code> with <code>dotnet tool restore</code>.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/dotnet/core/extensions/generic-host" target="_blank" rel="noopener">Generic host</a> — lifetime, startup, shutdown</li><li><a href="https://learn.microsoft.com/dotnet/core/extensions/configuration" target="_blank" rel="noopener">Configuration in .NET</a> — providers and precedence</li><li><a href="https://learn.microsoft.com/dotnet/core/extensions/options" target="_blank" rel="noopener">The options pattern</a> — IOptions, named options, validation</li><li><a href="https://learn.microsoft.com/dotnet/core/deploying/native-aot/" target="_blank" rel="noopener">Native AOT deployment</a> — what it supports and what it breaks</li><li><a href="https://learn.microsoft.com/dotnet/core/porting/" target="_blank" rel="noopener">Porting from .NET Framework</a> — the upgrade-assistant path</li><li><a href="https://versionsof.net/" target="_blank" rel="noopener">versionsof.net</a> — support dates for every release at a glance</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

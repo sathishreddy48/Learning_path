@@ -1,0 +1,838 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>APIs Beyond REST: gRPC, SignalR, GraphQL — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="communication">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › C# &amp; .NET › Topic 6 of 36</div>
+  <h1>APIs Beyond REST: gRPC, SignalR, GraphQL</h1>
+  <p class="lede"><a href="web-api.html">Web API</a> covers REST over HTTP, which is the right default and the wrong answer about a third of the time. This page is the other protocols and the decision between them — because the question is rarely "how does gRPC work" and almost always "why would you use gRPC here instead of REST", which is a design answer with latency, payload size, client reach and tooling in it.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#choosing">Choosing between REST, gRPC, GraphQL and messaging</a></li><li><a href="#grpc-basics">gRPC in .NET: proto, codegen and the four call types</a></li><li><a href="#grpc-production">Deadlines, interceptors, errors and gRPC-Web</a></li><li><a href="#signalr">SignalR: hubs, groups and scale-out</a></li><li><a href="#websockets-sse">Raw WebSockets and server-sent events</a></li><li><a href="#graphql">GraphQL with HotChocolate: schema, resolvers and DataLoader</a></li><li><a href="#streaming">Streaming responses and backpressure</a></li><li><a href="#contracts">Contracts and versioning across protocols</a></li></ol>
+  </div>
+
+<section id="choosing"><h2 id="choosing">Choosing between REST, gRPC, GraphQL and messaging</h2><p>Lead with this, because every other question on the page is downstream of it. The four options differ along axes that are easy to name: who the client is, whether the call is request/response or a stream, whether the caller or the server decides the shape of the payload, and whether the caller needs an answer at all.</p><div class="table-wrap"><table><thead><tr><th></th><th>REST / JSON</th><th>gRPC</th><th>GraphQL</th><th>Messaging</th></tr></thead><tbody><tr><td>Best for</td><td>Public APIs, browsers, anything third-party</td><td>Service-to-service on your own network</td><td>Many clients, each wanting a different slice</td><td>Work that can happen later</td></tr><tr><td>Contract</td><td>OpenAPI (optional, often stale)</td><td>.proto, compiled, enforced</td><td>Schema, introspectable</td><td>Message schema, your problem</td></tr><tr><td>Payload</td><td>JSON text</td><td>Protobuf binary, ~30–50% smaller</td><td>JSON, client-shaped</td><td>Anything</td></tr><tr><td>Streaming</td><td>SSE or chunked</td><td>Native, bidirectional</td><td>Subscriptions</td><td>Inherent</td></tr><tr><td>Browser</td><td>Native</td><td>Needs gRPC-Web + proxy</td><td>Native</td><td>No</td></tr><tr><td>Coupling</td><td>Loose, temporal</td><td>Tight, temporal</td><td>Loose, temporal</td><td>Loose, none</td></tr></tbody></table></div><p>The honest default: REST at the edge, gRPC between your own services when the call volume justifies it, messaging whenever the caller does not need the answer now, GraphQL when you have several client teams with genuinely different data needs and you are prepared to own the N+1 and query-cost problems it brings.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// One service, exposed three ways - the same domain call behind each
+
+// 1. REST: the edge. Public, cacheable, debuggable with curl.
+app.MapGet(&quot;/orders/{id}&quot;, async (string id, IOrderService svc, CancellationToken ct)
+    =&gt; await svc.Get(id, ct) is { } o ? Results.Ok(o) : Results.NotFound());
+
+// 2. gRPC: internal, typed, binary. Generated client, no hand-written DTOs.
+public class OrderGrpcService(IOrderService svc) : Orders.OrdersBase
+{
+    public override async Task&lt;OrderReply&gt; Get(OrderRequest req, ServerCallContext ctx)
+    {
+        var o = await svc.Get(req.Id, ctx.CancellationToken)
+            ?? throw new RpcException(new Status(StatusCode.NotFound, &quot;no such order&quot;));
+        return new OrderReply { Id = o.Id, Total = (double)o.Total };
+    }
+}
+
+// 3. Messaging: the caller does not wait, and does not care if we are up.
+await _bus.Publish(new OrderPlaced(order.Id, order.Total), ct);
+
+// The decision in one question: does the caller need the answer to continue?
+//   no            -&gt; messaging
+//   yes, browser  -&gt; REST (or GraphQL if the shape varies per client)
+//   yes, internal -&gt; gRPC if the call is hot, REST if it is not</code></pre><pre data-lang="python" hidden><code># The same three shapes
+
+# 1. REST - FastAPI
+@app.get(&quot;/orders/{order_id}&quot;)
+async def get_order(order_id: str, svc: OrderService = Depends(get_svc)):
+    order = await svc.get(order_id)
+    if order is None:
+        raise HTTPException(404)
+    return order
+
+# 2. gRPC - grpcio, generated from the same .proto
+class OrderServicer(orders_pb2_grpc.OrdersServicer):
+    async def Get(self, request, context):
+        order = await svc.get(request.id)
+        if order is None:
+            await context.abort(grpc.StatusCode.NOT_FOUND, &quot;no such order&quot;)
+        return orders_pb2.OrderReply(id=order.id, total=float(order.total))
+
+# 3. Messaging - the caller does not wait
+await bus.publish(OrderPlaced(order.id, order.total))
+
+# Note: the .proto file is shared between the C# and Python services verbatim.
+# That cross-language contract is a large part of why gRPC gets picked.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Expect "when would you choose gRPC over REST?" and treat it as a trade-off question, not a feature list. Strong answer: internal service-to-service where the call is hot and both ends are yours, because you get a compiled contract, a smaller payload and HTTP/2 multiplexing; weak answer anywhere a browser, a third party or a human with curl is the client. Be ready for the counter-question — "what do you lose?" — human-readable payloads, trivial caching, and the ability for anyone to call it without the proto.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take an existing REST endpoint and write down what would change if it were gRPC: contract, payload size, client, error handling.</li><li>Find a call in a system you know that should be a message rather than a synchronous request.</li><li>Argue the case against GraphQL for a single-client API.</li></ul></div></section>
+<section id="grpc-basics"><h2 id="grpc-basics">gRPC in .NET: proto, codegen and the four call types</h2><p>The <code>.proto</code> file is the contract, and it is compiled — both the server base class and the client are generated at build time, so a field rename is a compile error on both sides rather than a null at runtime. That is the main thing gRPC is buying you.</p><p>Four call shapes: <strong>unary</strong> (one in, one out), <strong>server streaming</strong> (one in, many out), <strong>client streaming</strong> (many in, one out), <strong>bidirectional</strong> (both, independently). Interviewers like asking which to use for a given scenario.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="proto">Proto</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="proto"><code>syntax = &quot;proto3&quot;;
+
+option csharp_namespace = &quot;Shop.Grpc&quot;;
+package shop.orders.v1;                    // version in the package, not the path
+
+import &quot;google/protobuf/timestamp.proto&quot;;
+
+service Orders {
+  rpc Get        (OrderRequest)        returns (OrderReply);              // unary
+  rpc Watch      (OrderRequest)        returns (stream OrderEvent);       // server streaming
+  rpc Import     (stream OrderRequest) returns (ImportSummary);           // client streaming
+  rpc Sync       (stream OrderEvent)   returns (stream OrderEvent);       // bidirectional
+}
+
+message OrderRequest {
+  string id = 1;                           // the FIELD NUMBER is the wire identity
+}
+
+message OrderReply {
+  string id = 1;
+  double total = 2;
+  google.protobuf.Timestamp placed_at = 3;
+  repeated OrderLine lines = 4;            // repeated == a list
+  optional string coupon = 5;              // explicit presence: can tell unset from &quot;&quot;
+}
+
+message OrderLine {
+  string sku = 1;
+  int32 quantity = 2;
+}
+
+// Compatibility rules, which is what gets asked:
+//   SAFE:   add a new field with a NEW number; rename a field (names are not on the wire)
+//   BREAKS: change a field&#x27;s number; change its type; reuse a deleted number
+//   deleting: mark it so nobody reuses it
+//   reserved 6, 7;
+//   reserved &quot;legacy_code&quot;;</code></pre><pre data-lang="csharp" hidden><code>// csproj: codegen happens at build
+//   &lt;ItemGroup&gt;
+//     &lt;Protobuf Include=&quot;Protos/orders.proto&quot; GrpcServices=&quot;Both&quot; /&gt;
+//   &lt;/ItemGroup&gt;
+
+// --- Server ---
+public class OrderGrpcService(IOrderService svc) : Orders.OrdersBase
+{
+    // unary
+    public override async Task&lt;OrderReply&gt; Get(OrderRequest req, ServerCallContext ctx)
+        =&gt; Map(await svc.Get(req.Id, ctx.CancellationToken));
+
+    // server streaming: push events as they happen, one connection
+    public override async Task Watch(OrderRequest req,
+        IServerStreamWriter&lt;OrderEvent&gt; stream, ServerCallContext ctx)
+    {
+        await foreach (var e in svc.WatchAsync(req.Id, ctx.CancellationToken))
+            await stream.WriteAsync(e, ctx.CancellationToken);
+    }
+
+    // client streaming: a bulk upload that returns one summary
+    public override async Task&lt;ImportSummary&gt; Import(
+        IAsyncStreamReader&lt;OrderRequest&gt; stream, ServerCallContext ctx)
+    {
+        int count = 0;
+        await foreach (var req in stream.ReadAllAsync(ctx.CancellationToken))
+        {
+            await svc.Import(req.Id, ctx.CancellationToken);
+            count++;
+        }
+        return new ImportSummary { Imported = count };
+    }
+}
+
+builder.Services.AddGrpc(o =&gt; o.EnableDetailedErrors = builder.Environment.IsDevelopment());
+app.MapGrpcService&lt;OrderGrpcService&gt;();
+
+// --- Client ---
+// Register through the factory: it manages the channel, which is the expensive part.
+// A channel is a connection pool - create ONE per endpoint and reuse it.
+builder.Services.AddGrpcClient&lt;Orders.OrdersClient&gt;(o =&gt;
+{
+    o.Address = new Uri(&quot;https://orders.internal:5001&quot;);
+})
+.ConfigureChannel(c =&gt; c.HttpHandler = new SocketsHttpHandler
+{
+    PooledConnectionIdleTimeout = Timeout.InfiniteTimeSpan,
+    KeepAlivePingDelay = TimeSpan.FromSeconds(60),     // keep HTTP/2 alive through LBs
+    EnableMultipleHttp2Connections = true,             // past the 100-stream limit
+});
+
+// Calling
+var reply = await client.GetAsync(new OrderRequest { Id = id },
+    deadline: DateTime.UtcNow.AddSeconds(5), cancellationToken: ct);
+
+using var call = client.Watch(new OrderRequest { Id = id });
+await foreach (var evt in call.ResponseStream.ReadAllAsync(ct))
+    Handle(evt);</code></pre><pre data-lang="python" hidden><code># Same .proto, different codegen:
+#   python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. orders.proto
+
+import grpc
+from grpc import aio
+import orders_pb2, orders_pb2_grpc
+
+# --- Server ---
+class OrderServicer(orders_pb2_grpc.OrdersServicer):
+    async def Get(self, request, context):                      # unary
+        order = await svc.get(request.id)
+        return orders_pb2.OrderReply(id=order.id, total=float(order.total))
+
+    async def Watch(self, request, context):                    # server streaming
+        async for event in svc.watch(request.id):
+            yield orders_pb2.OrderEvent(id=event.id, kind=event.kind)
+
+    async def Import(self, request_iterator, context):          # client streaming
+        count = 0
+        async for req in request_iterator:
+            await svc.import_(req.id)
+            count += 1
+        return orders_pb2.ImportSummary(imported=count)
+
+async def serve():
+    server = aio.server()
+    orders_pb2_grpc.add_OrdersServicer_to_server(OrderServicer(), server)
+    server.add_insecure_port(&quot;[::]:5001&quot;)
+    await server.start()
+    await server.wait_for_termination()
+
+# --- Client --- one channel, reused; the same rule as .NET
+channel = aio.insecure_channel(&quot;orders.internal:5001&quot;, options=[
+    (&quot;grpc.keepalive_time_ms&quot;, 60000),
+    (&quot;grpc.max_receive_message_length&quot;, 8 * 1024 * 1024),
+])
+client = orders_pb2_grpc.OrdersStub(channel)
+
+reply = await client.Get(orders_pb2.OrderRequest(id=order_id), timeout=5.0)
+
+async for event in client.Watch(orders_pb2.OrderRequest(id=order_id)):
+    handle(event)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Two questions recur. "What are the four call types and when would you use each?" — have a scenario per type (unary: a lookup; server streaming: a live feed; client streaming: a bulk upload; bidirectional: a chat or a long-running negotiation). And "what can you change in a .proto without breaking clients?" — add fields with new numbers and rename freely, because names are not on the wire and field numbers are; never change or reuse a number, and <code>reserved</code> is how you stop someone doing it by accident.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a four-RPC proto and implement all four shapes against one service.</li><li>Change a field number in a running system and watch what the client decodes.</li><li>Create a client per request instead of reusing the channel, and measure what it costs.</li></ul></div></section>
+<section id="grpc-production"><h2 id="grpc-production">Deadlines, interceptors, errors and gRPC-Web</h2><p>The operational half. <strong>Deadlines are the single most important gRPC practice</strong> and the one most often skipped: without one a call waits forever, and the deadline propagates — a downstream service sees how long it has left and can give up rather than doing work nobody will read.</p><p>Errors are status codes, not exceptions: the server throws <code>RpcException</code> with a <code>StatusCode</code>, the client catches <code>RpcException</code> and reads <code>.StatusCode</code>. Mapping those to domain failures sensibly (and never leaking stack traces via <code>EnableDetailedErrors</code> in production) is the part people get wrong.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// --- Deadlines: always set one. It propagates to downstream calls. ---
+var reply = await client.GetAsync(req, deadline: DateTime.UtcNow.AddSeconds(5));
+
+// Server side: how much time is left, and did the caller give up?
+public override async Task&lt;OrderReply&gt; Get(OrderRequest req, ServerCallContext ctx)
+{
+    if (ctx.Deadline &lt; DateTime.UtcNow.AddMilliseconds(100))
+        throw new RpcException(new Status(StatusCode.DeadlineExceeded, &quot;not enough time&quot;));
+
+    // ctx.CancellationToken fires when the deadline passes or the client disconnects
+    return await _svc.Get(req.Id, ctx.CancellationToken);
+}
+
+// --- Errors: status codes, with trailers for detail ---
+throw new RpcException(new Status(StatusCode.NotFound, &quot;order not found&quot;),
+    new Metadata { { &quot;order-id&quot;, req.Id } });
+
+try { await client.GetAsync(req); }
+catch (RpcException ex) when (ex.StatusCode == StatusCode.NotFound)   { /* 404 */ }
+catch (RpcException ex) when (ex.StatusCode == StatusCode.Unavailable) { /* retry */ }
+catch (RpcException ex) when (ex.StatusCode == StatusCode.DeadlineExceeded) { /* give up */ }
+
+// --- Interceptors: the middleware pipeline equivalent, both ends ---
+public class LoggingInterceptor(ILogger&lt;LoggingInterceptor&gt; log) : Interceptor
+{
+    public override async Task&lt;TResponse&gt; UnaryServerHandler&lt;TRequest, TResponse&gt;(
+        TRequest request, ServerCallContext ctx,
+        UnaryServerMethod&lt;TRequest, TResponse&gt; next)
+    {
+        using var scope = log.BeginScope(&quot;{Method}&quot;, ctx.Method);
+        try { return await next(request, ctx); }
+        catch (Exception ex) when (ex is not RpcException)
+        {
+            log.LogError(ex, &quot;unhandled&quot;);
+            throw new RpcException(new Status(StatusCode.Internal, &quot;internal error&quot;));
+        }
+    }
+}
+builder.Services.AddGrpc(o =&gt; o.Interceptors.Add&lt;LoggingInterceptor&gt;());
+
+// --- Retries: a policy on the channel, not hand-rolled ---
+var channel = GrpcChannel.ForAddress(uri, new GrpcChannelOptions
+{
+    ServiceConfig = new ServiceConfig
+    {
+        MethodConfigs = { new MethodConfig
+        {
+            Names = { MethodName.Default },
+            RetryPolicy = new RetryPolicy
+            {
+                MaxAttempts = 3,
+                InitialBackoff = TimeSpan.FromMilliseconds(200),
+                BackoffMultiplier = 2,
+                RetryableStatusCodes = { StatusCode.Unavailable },   // idempotent only
+            },
+        }},
+    },
+});
+
+// --- Browsers: gRPC-Web, because browsers cannot speak raw HTTP/2 framing ---
+app.UseGrpcWeb(new GrpcWebOptions { DefaultEnabled = true });
+app.MapGrpcService&lt;OrderGrpcService&gt;().EnableGrpcWeb().RequireCors(&quot;web&quot;);
+
+// --- Or expose the same service as REST with JSON transcoding ---
+// annotate the rpc in the proto with google.api.http, then:
+builder.Services.AddGrpc().AddJsonTranscoding();
+//   rpc Get(OrderRequest) returns (OrderReply) {
+//     option (google.api.http) = { get: &quot;/v1/orders/{id}&quot; };
+//   }</code></pre><pre data-lang="python" hidden><code>import grpc
+from grpc import aio
+
+# --- Deadlines: the `timeout` argument, propagated the same way ---
+reply = await client.Get(request, timeout=5.0)
+
+# Server side
+async def Get(self, request, context):
+    remaining = context.time_remaining()          # ctx.Deadline
+    if remaining is not None and remaining &lt; 0.1:
+        await context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, &quot;not enough time&quot;)
+    return await svc.get(request.id)
+
+# --- Errors: abort() with a status code, trailing metadata for detail ---
+await context.abort(grpc.StatusCode.NOT_FOUND, &quot;order not found&quot;)
+
+try:
+    await client.Get(request, timeout=5.0)
+except grpc.aio.AioRpcError as e:
+    if e.code() == grpc.StatusCode.NOT_FOUND:        pass
+    elif e.code() == grpc.StatusCode.UNAVAILABLE:    pass      # retry
+    elif e.code() == grpc.StatusCode.DEADLINE_EXCEEDED: pass   # give up
+
+# --- Interceptors ---
+class LoggingInterceptor(aio.ServerInterceptor):
+    async def intercept_service(self, continuation, handler_call_details):
+        log.info(&quot;rpc %s&quot;, handler_call_details.method)
+        return await continuation(handler_call_details)
+
+server = aio.server(interceptors=[LoggingInterceptor()])
+
+# --- Retries: the same service config, as JSON on the channel ---
+import json
+service_config = json.dumps({
+    &quot;methodConfig&quot;: [{
+        &quot;name&quot;: [{}],
+        &quot;retryPolicy&quot;: {
+            &quot;maxAttempts&quot;: 3,
+            &quot;initialBackoff&quot;: &quot;0.2s&quot;,
+            &quot;backoffMultiplier&quot;: 2,
+            &quot;retryableStatusCodes&quot;: [&quot;UNAVAILABLE&quot;],
+        },
+    }],
+})
+channel = aio.insecure_channel(target, options=[(&quot;grpc.service_config&quot;, service_config)])
+
+# --- Browsers: the same gRPC-Web proxy requirement (Envoy, or grpcwebproxy) ---</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"How do you stop a gRPC call hanging forever?" — a deadline, set by the caller, propagated automatically to everything downstream; and <code>ServerCallContext.CancellationToken</code> so the server stops working when the caller has gone. Then expect the browser question: a browser cannot do raw HTTP/2 framing, so you need gRPC-Web plus a proxy, or JSON transcoding, or a REST edge in front — knowing there are three answers beats knowing one.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Call a deliberately slow service with and without a deadline and watch the difference in thread/connection usage.</li><li>Add a server interceptor that converts every unhandled exception into <code>StatusCode.Internal</code> without leaking the message.</li><li>Configure a retry policy and confirm it does not retry a non-idempotent method.</li></ul></div></section>
+<section id="signalr"><h2 id="signalr">SignalR: hubs, groups and scale-out</h2><p>SignalR is a push abstraction: the server calls methods <em>on the client</em>. It negotiates the best available transport — WebSockets, then server-sent events, then long polling — so you write one API and it degrades.</p><p>The question that separates answers is <strong>scale-out</strong>. A hub keeps connection state in the process. With two instances behind a load balancer, a message sent from instance A never reaches a client connected to instance B, and a client whose transport falls back to long polling may hit a different instance on every poll. Fixes: a backplane (Redis or Azure SignalR Service) so instances forward to each other, plus sticky sessions for the fallback transports.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class OrderHub(IOrderService svc) : Hub&lt;IOrderClient&gt;   // strongly-typed client
+{
+    public override async Task OnConnectedAsync()
+    {
+        // Context.UserIdentifier comes from authentication - groups per tenant/user
+        await Groups.AddToGroupAsync(Context.ConnectionId, $&quot;tenant:{TenantId}&quot;);
+        await base.OnConnectedAsync();
+    }
+
+    public override async Task OnDisconnectedAsync(Exception? ex)
+    {
+        // Group membership is cleaned up automatically; your own state is not
+        await base.OnDisconnectedAsync(ex);
+    }
+
+    // Client -&gt; server
+    public async Task Watch(string orderId)
+        =&gt; await Groups.AddToGroupAsync(Context.ConnectionId, $&quot;order:{orderId}&quot;);
+
+    // Server -&gt; client, typed
+    public async Task Broadcast(string message)
+        =&gt; await Clients.All.OrderUpdated(message);
+}
+
+public interface IOrderClient          // the methods the CLIENT must implement
+{
+    Task OrderUpdated(string message);
+    Task PriceChanged(string sku, decimal price);
+}
+
+// Pushing from anywhere else in the app - inject the hub context, not the hub
+public class OrderService(IHubContext&lt;OrderHub, IOrderClient&gt; hub)
+{
+    public async Task Complete(Order o)
+    {
+        await hub.Clients.Group($&quot;order:{o.Id}&quot;).OrderUpdated(&quot;completed&quot;);
+        await hub.Clients.User(o.CustomerId).OrderUpdated(&quot;your order shipped&quot;);
+    }
+}
+
+// Targeting
+// Clients.All / .Caller / .Others
+// Clients.Group(&quot;name&quot;) / .Groups([...]) / .GroupExcept(&quot;name&quot;, connectionIds)
+// Clients.User(userId) / .Users([...])        - every connection of that user
+// Clients.Client(connectionId)
+
+// --- Scale-out: the part that matters ---
+// Option 1: Redis backplane - every instance forwards to every other
+builder.Services.AddSignalR().AddStackExchangeRedis(redisConnectionString);
+
+// Option 2: Azure SignalR Service - connections terminate outside your app
+builder.Services.AddSignalR().AddAzureSignalR(connectionString);
+
+// Without either, with &gt;1 instance, messages reach only the clients on the
+// instance that sent them. Sticky sessions are still needed for SSE/long polling:
+//   session affinity on the ingress, or ARRAffinity on App Service.
+
+builder.Services.AddSignalR(o =&gt;
+{
+    o.KeepAliveInterval = TimeSpan.FromSeconds(15);
+    o.ClientTimeoutInterval = TimeSpan.FromSeconds(30);    // must be &gt;= 2x KeepAlive
+    o.MaximumReceiveMessageSize = 64 * 1024;
+    o.EnableDetailedErrors = builder.Environment.IsDevelopment();
+});
+
+app.MapHub&lt;OrderHub&gt;(&quot;/hubs/orders&quot;).RequireAuthorization();</code></pre><pre data-lang="python" hidden><code># Python has no SignalR; the equivalents are raw WebSockets plus a pub/sub
+# backplane you assemble yourself - which makes the scale-out problem explicit.
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import redis.asyncio as redis, json, asyncio
+
+app = FastAPI()
+r = redis.from_url(&quot;redis://localhost&quot;)
+
+class ConnectionManager:                 # this is the Hub&#x27;s connection registry
+    def __init__(self) -&gt; None:
+        self.groups: dict[str, set[WebSocket]] = {}
+
+    async def join(self, group: str, ws: WebSocket) -&gt; None:
+        self.groups.setdefault(group, set()).add(ws)
+
+    async def leave(self, group: str, ws: WebSocket) -&gt; None:
+        self.groups.get(group, set()).discard(ws)
+
+    async def send_local(self, group: str, message: dict) -&gt; None:
+        dead = []
+        for ws in self.groups.get(group, set()):
+            try: await ws.send_json(message)
+            except Exception: dead.append(ws)
+        for ws in dead: await self.leave(group, ws)
+
+manager = ConnectionManager()
+
+# The backplane: publish to Redis, every instance relays to its own sockets
+async def publish(group: str, message: dict) -&gt; None:
+    await r.publish(&quot;hub&quot;, json.dumps({&quot;group&quot;: group, &quot;message&quot;: message}))
+
+async def backplane_listener() -&gt; None:
+    pubsub = r.pubsub()
+    await pubsub.subscribe(&quot;hub&quot;)
+    async for raw in pubsub.listen():
+        if raw[&quot;type&quot;] == &quot;message&quot;:
+            payload = json.loads(raw[&quot;data&quot;])
+            await manager.send_local(payload[&quot;group&quot;], payload[&quot;message&quot;])
+
+@app.websocket(&quot;/hubs/orders&quot;)
+async def orders(ws: WebSocket):
+    await ws.accept()
+    await manager.join(f&quot;tenant:{tenant_id(ws)}&quot;, ws)
+    try:
+        while True:
+            msg = await ws.receive_json()
+            if msg[&quot;type&quot;] == &quot;watch&quot;:
+                await manager.join(f&quot;order:{msg[&#x27;orderId&#x27;]}&quot;, ws)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        for g in list(manager.groups): await manager.leave(g, ws)
+
+# Note what SignalR gave you for free: transport negotiation and fallback,
+# automatic reconnect with state, typed client methods, user-level targeting.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Almost guaranteed: "you scale SignalR to three instances and some clients stop getting messages — why?" Connection state is per-process; you need a backplane (Redis or Azure SignalR) so instances relay to each other, and sticky sessions for the non-WebSocket transports. Good extras: <code>IHubContext</code> is how you push from outside a hub, group membership dies with the connection so it must be re-established on reconnect, and <code>Clients.User</code> targets every connection a user has, not one.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Run two instances behind a load balancer with no backplane and reproduce the missing-message bug.</li><li>Add the Redis backplane and confirm it is fixed.</li><li>Push a message from a <code>BackgroundService</code> using <code>IHubContext</code> rather than from inside a hub method.</li></ul></div></section>
+<section id="websockets-sse"><h2 id="websockets-sse">Raw WebSockets and server-sent events</h2><p>Sometimes SignalR is more than you need. <strong>Server-sent events</strong> are one-directional server→client over plain HTTP: no handshake, automatic reconnection built into the browser, works through every proxy, and costs you one line of content type. If the client never needs to send anything, SSE is usually the right answer and people reach for WebSockets out of habit.</p><p><strong>Raw WebSockets</strong> are right when you need bidirectional binary framing and you do not want SignalR's protocol or client library — a non-browser client, or a protocol you do not control.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// --- Server-sent events: one-directional, plain HTTP, free reconnection ---
+app.MapGet(&quot;/orders/{id}/events&quot;, async (string id, HttpContext ctx,
+    IOrderService svc, CancellationToken ct) =&gt;
+{
+    ctx.Response.Headers.ContentType = &quot;text/event-stream&quot;;
+    ctx.Response.Headers.CacheControl = &quot;no-cache&quot;;
+    ctx.Response.Headers[&quot;X-Accel-Buffering&quot;] = &quot;no&quot;;     // stop nginx buffering it
+
+    await foreach (var e in svc.WatchAsync(id, ct))
+    {
+        // the wire format is this simple: &quot;data: &lt;payload&gt;\n\n&quot;
+        await ctx.Response.WriteAsync($&quot;id: {e.Sequence}\n&quot;);   // enables Last-Event-ID
+        await ctx.Response.WriteAsync($&quot;event: {e.Kind}\n&quot;);
+        await ctx.Response.WriteAsync($&quot;data: {JsonSerializer.Serialize(e)}\n\n&quot;);
+        await ctx.Response.Body.FlushAsync(ct);                  // flush or nothing ships
+    }
+});
+// Browser:  const es = new EventSource(&quot;/orders/1/events&quot;);
+//           es.onmessage = e =&gt; console.log(JSON.parse(e.data));
+//           reconnection and Last-Event-ID resume are automatic
+
+// --- Raw WebSockets ---
+app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
+
+app.Map(&quot;/ws&quot;, async (HttpContext ctx) =&gt;
+{
+    if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = 400; return; }
+
+    using var socket = await ctx.WebSockets.AcceptWebSocketAsync();
+    var buffer = new byte[4 * 1024];
+
+    while (socket.State == WebSocketState.Open)
+    {
+        var result = await socket.ReceiveAsync(buffer, ctx.RequestAborted);
+        if (result.MessageType == WebSocketMessageType.Close)
+        {
+            await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, default);
+            break;
+        }
+        // echo
+        await socket.SendAsync(buffer.AsMemory(0, result.Count),
+            result.MessageType, result.EndOfMessage, ctx.RequestAborted);
+    }
+});
+
+// You now own: framing for messages larger than the buffer, reconnection,
+// heartbeats, backpressure, and per-connection state. That list is the argument
+// for SignalR.</code></pre><pre data-lang="python" hidden><code># --- Server-sent events ---
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+import json, asyncio
+
+@app.get(&quot;/orders/{order_id}/events&quot;)
+async def events(order_id: str):
+    async def gen():
+        async for e in svc.watch(order_id):
+            yield f&quot;id: {e.sequence}\n&quot;
+            yield f&quot;event: {e.kind}\n&quot;
+            yield f&quot;data: {json.dumps(e.as_dict())}\n\n&quot;
+    return StreamingResponse(gen(), media_type=&quot;text/event-stream&quot;,
+                             headers={&quot;Cache-Control&quot;: &quot;no-cache&quot;,
+                                      &quot;X-Accel-Buffering&quot;: &quot;no&quot;})
+
+# --- Raw WebSockets ---
+from fastapi import WebSocket, WebSocketDisconnect
+
+@app.websocket(&quot;/ws&quot;)
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            data = await ws.receive_bytes()
+            await ws.send_bytes(data)              # echo
+    except WebSocketDisconnect:
+        pass
+
+# Heartbeats are yours to implement, same as .NET
+async def heartbeat(ws: WebSocket) -&gt; None:
+    while True:
+        await asyncio.sleep(30)
+        await ws.send_json({&quot;type&quot;: &quot;ping&quot;})</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The useful question to be able to answer unprompted: "why not just use WebSockets for everything?" SSE is simpler, survives proxies that mangle upgrades, reconnects and resumes by itself via <code>Last-Event-ID</code>, and is one-directional — which is all a notification feed, a progress bar or a live dashboard needs. Reach for WebSockets when the client must send too, and for SignalR when you want transport fallback, reconnection and targeting handed to you.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Build a progress endpoint with SSE and watch the browser reconnect by itself when you restart the server.</li><li>Forget <code>FlushAsync</code> and work out why nothing arrives until the stream closes.</li><li>List what you would have to write yourself to replace SignalR with raw WebSockets.</li></ul></div></section>
+<section id="graphql"><h2 id="graphql">GraphQL with HotChocolate: schema, resolvers and DataLoader</h2><p>GraphQL inverts who decides the response shape: the client asks for exactly the fields it wants, from a single endpoint, against a typed and introspectable schema. That solves over-fetching and under-fetching for a product with several client teams.</p><p>It also brings two problems you must be able to name, because they are the interview: <strong>N+1</strong> (a field resolver that runs once per parent row, so 50 orders means 51 queries — solved with DataLoader, which batches and caches per request) and <strong>query cost</strong> (a client can request a deeply nested graph that costs you a tablescan, so you need depth limits, complexity analysis and persisted queries).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="graphql">GraphQL</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Schema-first via code: types are inferred from your C#
+public class Query
+{
+    [UseProjection, UseFiltering, UseSorting]
+    public IQueryable&lt;Order&gt; GetOrders(AppDbContext db) =&gt; db.Orders;
+
+    public async Task&lt;Order?&gt; GetOrder(string id, IOrderService svc, CancellationToken ct)
+        =&gt; await svc.Get(id, ct);
+}
+
+public class Mutation
+{
+    public async Task&lt;Order&gt; PlaceOrder(PlaceOrderInput input, IOrderService svc)
+        =&gt; await svc.Place(input);
+}
+
+public class Subscription
+{
+    [Subscribe, Topic]
+    public OrderEvent OnOrderUpdated([EventMessage] OrderEvent e) =&gt; e;
+}
+
+// --- The N+1 problem and its fix ---
+
+// BAD: this resolver runs once per order in the result set
+[ExtendObjectType&lt;Order&gt;]
+public class OrderResolvers
+{
+    public async Task&lt;Customer&gt; GetCustomer([Parent] Order order, AppDbContext db)
+        =&gt; await db.Customers.FindAsync(order.CustomerId);      // 1 query PER ORDER
+}
+
+// GOOD: a DataLoader batches every key requested in one tick into one query,
+// and caches within the request
+public class CustomerByIdDataLoader(IBatchScheduler scheduler, IDbContextFactory&lt;AppDbContext&gt; f,
+    DataLoaderOptions options) : BatchDataLoader&lt;string, Customer&gt;(scheduler, options)
+{
+    protected override async Task&lt;IReadOnlyDictionary&lt;string, Customer&gt;&gt; LoadBatchAsync(
+        IReadOnlyList&lt;string&gt; keys, CancellationToken ct)
+    {
+        await using var db = await f.CreateDbContextAsync(ct);
+        return await db.Customers.Where(c =&gt; keys.Contains(c.Id))
+                                 .ToDictionaryAsync(c =&gt; c.Id, ct);   // ONE query
+    }
+}
+
+[ExtendObjectType&lt;Order&gt;]
+public class OrderResolvers2
+{
+    public Task&lt;Customer&gt; GetCustomer([Parent] Order order, CustomerByIdDataLoader loader,
+        CancellationToken ct) =&gt; loader.LoadAsync(order.CustomerId, ct);
+}
+
+// --- Guard rails: without these a single query can take the service down ---
+builder.Services
+    .AddGraphQLServer()
+    .AddQueryType&lt;Query&gt;()
+    .AddMutationType&lt;Mutation&gt;()
+    .AddSubscriptionType&lt;Subscription&gt;()
+    .AddProjections().AddFiltering().AddSorting()
+    .AddDataLoader&lt;CustomerByIdDataLoader&gt;()
+    .ModifyRequestOptions(o =&gt; o.IncludeExceptionDetails = builder.Environment.IsDevelopment())
+    .AddMaxExecutionDepthRule(8)                      // no unbounded nesting
+    .ModifyCostOptions(o =&gt;
+    {
+        o.MaxFieldCost = 1_000;
+        o.EnforceCostLimits = true;
+    })
+    .UsePersistedOperationPipeline();                 // production: only allow-listed queries
+
+app.MapGraphQL();</code></pre><pre data-lang="graphql" hidden><code># The client decides the shape - one request, exactly these fields
+query OrdersWithCustomers {
+  orders(where: { total: { gt: 100 } }, order: { placedAt: DESC }, first: 20) {
+    nodes {
+      id
+      total
+      customer {          # &lt;- the field that causes N+1 without a DataLoader
+        name
+        email
+      }
+      lines {
+        sku
+        quantity
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+
+mutation {
+  placeOrder(input: { sku: &quot;ABC&quot;, quantity: 2 }) {
+    id
+    total
+  }
+}
+
+subscription {
+  onOrderUpdated { id kind }
+}
+
+# The attack the depth limit exists for:
+# query { order { customer { orders { customer { orders { ... } } } } } }</code></pre><pre data-lang="python" hidden><code>import strawberry
+from strawberry.dataloader import DataLoader
+from typing import Annotated
+
+# Same model: types, resolvers, and the same N+1 trap
+
+async def load_customers(keys: list[str]) -&gt; list[&quot;Customer&quot;]:
+    rows = await db.fetch_all(
+        &quot;SELECT * FROM customers WHERE id = ANY($1)&quot;, keys)    # ONE query
+    by_id = {r[&quot;id&quot;]: Customer(**r) for r in rows}
+    return [by_id.get(k) for k in keys]                        # order must match keys
+
+@strawberry.type
+class Order:
+    id: str
+    total: float
+
+    @strawberry.field
+    async def customer(self, info) -&gt; &quot;Customer&quot;:
+        # the loader lives on the request context, so caching is per request
+        return await info.context[&quot;customer_loader&quot;].load(self.customer_id)
+
+@strawberry.type
+class Query:
+    @strawberry.field
+    async def orders(self, first: int = 20) -&gt; list[Order]:
+        return await svc.list_orders(limit=first)
+
+# Per-request context: a NEW DataLoader each request, never a global one
+async def get_context():
+    return {&quot;customer_loader&quot;: DataLoader(load_fn=load_customers)}
+
+schema = strawberry.Schema(query=Query)
+
+# Guard rails
+from strawberry.extensions import QueryDepthLimiter, MaxTokensLimiter
+schema = strawberry.Schema(
+    query=Query,
+    extensions=[QueryDepthLimiter(max_depth=8), MaxTokensLimiter(max_token_count=1000)],
+)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"What is the N+1 problem in GraphQL and how do you fix it?" is close to guaranteed. Explain the shape (a nested field resolver runs once per parent, so a list of 50 becomes 51 queries), name DataLoader, and say the two properties that make it work: it batches all keys requested in one execution tick into a single call, and it caches <strong>per request</strong> — a DataLoader registered as a singleton is a correctness bug, because one user sees another's cached data. Then be ready for "how do you stop a client taking your service down?": depth limits, complexity scoring, pagination, and persisted queries in production.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Build a two-level GraphQL query, log the SQL, and count the queries. Add a DataLoader and count again.</li><li>Register a DataLoader as a singleton and work out exactly how it leaks data between users.</li><li>Write a query that would be expensive and confirm your depth and cost limits reject it.</li></ul></div></section>
+<section id="streaming"><h2 id="streaming">Streaming responses and backpressure</h2><p>The common thread under all of this: do not buffer what you can stream. Returning <code>IAsyncEnumerable&lt;T&gt;</code> from a minimal API streams the JSON array as it is produced, so memory stays flat whether the result is 100 rows or 10 million and the client sees the first byte almost immediately.</p><p>The thing to be able to discuss is <strong>backpressure</strong>: if the producer is faster than the consumer, something must slow down or memory grows. gRPC gets it from HTTP/2 flow control, <code>Channel&lt;T&gt;</code> gets it from a bounded capacity, and plain HTTP gets it from the TCP window once you stop buffering.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Streaming JSON: the response starts before the query finishes
+app.MapGet(&quot;/orders/export&quot;, (AppDbContext db, CancellationToken ct) =&gt;
+    db.Orders.AsNoTracking().AsAsyncEnumerable());     // serialised as it is read
+
+// NOT this: materialises everything, then serialises. Peak memory = the whole set.
+app.MapGet(&quot;/orders/bad&quot;, async (AppDbContext db, CancellationToken ct) =&gt;
+    await db.Orders.ToListAsync(ct));
+
+// NDJSON for very large exports - one object per line, trivially resumable
+app.MapGet(&quot;/orders/ndjson&quot;, async (HttpContext ctx, AppDbContext db, CancellationToken ct) =&gt;
+{
+    ctx.Response.ContentType = &quot;application/x-ndjson&quot;;
+    await foreach (var o in db.Orders.AsNoTracking().AsAsyncEnumerable().WithCancellation(ct))
+    {
+        await JsonSerializer.SerializeAsync(ctx.Response.Body, o, cancellationToken: ct);
+        await ctx.Response.Body.WriteAsync(&quot;\n&quot;u8.ToArray(), ct);
+    }
+});
+
+// Backpressure with a bounded channel: the producer BLOCKS when the consumer lags
+var channel = Channel.CreateBounded&lt;Order&gt;(new BoundedChannelOptions(capacity: 1_000)
+{
+    FullMode = BoundedChannelFullMode.Wait,        // not DropOldest: do not lose work
+    SingleReader = true,
+});
+
+// producer - WriteAsync waits once 1,000 are queued
+_ = Task.Run(async () =&gt;
+{
+    await foreach (var o in Source(ct)) await channel.Writer.WriteAsync(o, ct);
+    channel.Writer.Complete();
+});
+
+// consumer
+await foreach (var o in channel.Reader.ReadAllAsync(ct)) await Handle(o, ct);
+
+// Unbounded is where OOM comes from
+var bad = Channel.CreateUnbounded&lt;Order&gt;();        // no backpressure, ever
+
+// Large file downloads: stream, do not read into a byte[]
+app.MapGet(&quot;/files/{name}&quot;, (string name) =&gt;
+    Results.Stream(File.OpenRead(Path.Combine(dir, name)), &quot;application/octet-stream&quot;,
+        enableRangeProcessing: true));             // ranges = resumable downloads</code></pre><pre data-lang="python" hidden><code># Streaming JSON
+from fastapi.responses import StreamingResponse
+import json
+
+@app.get(&quot;/orders/ndjson&quot;)
+async def export():
+    async def gen():
+        async for order in db.stream(&quot;SELECT * FROM orders&quot;):   # server-side cursor
+            yield json.dumps(dict(order)) + &quot;\n&quot;
+    return StreamingResponse(gen(), media_type=&quot;application/x-ndjson&quot;)
+
+# NOT this - materialises everything first
+@app.get(&quot;/orders/bad&quot;)
+async def bad():
+    return await db.fetch_all(&quot;SELECT * FROM orders&quot;)
+
+# Backpressure: a bounded queue. put() blocks when full - that IS the mechanism.
+import asyncio
+queue: asyncio.Queue[Order] = asyncio.Queue(maxsize=1000)
+
+async def producer():
+    async for order in source():
+        await queue.put(order)        # blocks once 1000 are queued
+    await queue.put(None)             # sentinel
+
+async def consumer():
+    while (order := await queue.get()) is not None:
+        await handle(order)
+
+# asyncio.Queue() with no maxsize is the unbounded channel: no backpressure, OOM
+unbounded: asyncio.Queue = asyncio.Queue()
+
+# File downloads
+from fastapi.responses import FileResponse
+@app.get(&quot;/files/{name}&quot;)
+async def download(name: str):
+    return FileResponse(path / name)   # sendfile, no buffering</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A good scenario question: "an export endpoint OOMs on large accounts — fix it." Stream rather than materialise (<code>IAsyncEnumerable</code>, <code>AsNoTracking</code>, NDJSON or chunked), and say why it works: peak memory becomes one row rather than the result set. The follow-up is backpressure — name bounded channels and what <code>FullMode</code> you would pick, and why an unbounded channel just moves the OOM rather than fixing it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Return <code>ToListAsync</code> and <code>AsAsyncEnumerable</code> from the same endpoint over 100k rows and watch RSS for each.</li><li>Build a bounded channel pipeline and make the producer visibly wait by slowing the consumer.</li><li>Switch a bounded channel to unbounded and reproduce the memory growth.</li></ul></div></section>
+<section id="contracts"><h2 id="contracts">Contracts and versioning across protocols</h2><p>Every protocol on this page has the same underlying problem — you need to change the shape without breaking the clients you cannot redeploy — and four different answers. Being able to compare them is a strong architecture signal.</p><div class="table-wrap"><table><thead><tr><th></th><th>How you version</th><th>Breaking change looks like</th></tr></thead><tbody><tr><td>REST</td><td>URL segment (<code>/v2/</code>), header, or media type</td><td>Removing a field, tightening validation, changing a status code</td></tr><tr><td>gRPC</td><td>Package name (<code>shop.orders.v2</code>); add fields freely</td><td>Changing or reusing a field number, changing a type</td></tr><tr><td>GraphQL</td><td>No versions — add fields, <code>@deprecated</code> the old ones</td><td>Removing a field someone still selects</td></tr><tr><td>Messaging</td><td>Event type/version in the envelope; consumers ignore unknowns</td><td>Changing the meaning of a field, which nothing detects</td></tr></tbody></table></div><p>The underlying rule is the same in all four: <strong>additive changes are safe, removals and redefinitions are not</strong>, and you need telemetry on usage before you can remove anything.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// --- REST: explicit versions, and deprecate with a header ---
+builder.Services.AddApiVersioning(o =&gt;
+{
+    o.DefaultApiVersion = new ApiVersion(1, 0);
+    o.ReportApiVersions = true;                     // api-supported-versions response header
+    o.ApiVersionReader = ApiVersionReader.Combine(
+        new UrlSegmentApiVersionReader(),
+        new HeaderApiVersionReader(&quot;api-version&quot;));
+});
+
+var v1 = app.NewVersionedApi(&quot;orders&quot;).MapGroup(&quot;/v{version:apiVersion}/orders&quot;)
+            .HasApiVersion(1.0).HasDeprecatedApiVersion(0.9);
+
+// --- gRPC: version in the proto package; adding a field is not breaking ---
+//   package shop.orders.v1;   -&gt;   package shop.orders.v2;
+//   run both services side by side until v1 traffic is zero
+//   reserved 5, 6;            // never let anyone reuse a retired field number
+
+// --- GraphQL: no versions. Add, deprecate, measure, then remove. ---
+public class Order
+{
+    [GraphQLDeprecated(&quot;Use totalMoney, which carries the currency.&quot;)]
+    public decimal Total { get; init; }
+    public Money TotalMoney { get; init; } = default!;
+}
+// Field-level usage telemetry is what tells you when removal is safe.
+
+// --- Messaging: version the envelope, tolerate unknown fields ---
+public record OrderPlacedV2(string OrderId, decimal Total, string Currency)
+{
+    public const string Type = &quot;order.placed.v2&quot;;
+}
+
+// Consumers upcast old events rather than the producer emitting both forever
+public static OrderPlacedV2 Upcast(OrderPlacedV1 old)
+    =&gt; new(old.OrderId, old.Total, Currency: &quot;USD&quot;);
+
+// And deserialise permissively so a new producer field does not break old consumers
+var options = new JsonSerializerOptions
+{
+    UnmappedMemberHandling = JsonUnmappedMemberHandling.Skip,   // the default; keep it
+};
+
+// The thing that makes any of this safe: know who is calling what
+// - log the api-version / proto package / GraphQL field per request
+// - alert when a deprecated path is still in use within N days of removal</code></pre><pre data-lang="python" hidden><code># --- REST ---
+from fastapi import APIRouter, FastAPI, Response
+
+v1 = APIRouter(prefix=&quot;/v1/orders&quot;)
+v2 = APIRouter(prefix=&quot;/v2/orders&quot;)
+
+@v1.get(&quot;/{order_id}&quot;, deprecated=True)
+async def get_v1(order_id: str, response: Response):
+    response.headers[&quot;Deprecation&quot;] = &quot;true&quot;
+    response.headers[&quot;Sunset&quot;] = &quot;Wed, 01 Apr 2026 00:00:00 GMT&quot;
+    return await svc.get(order_id)
+
+# --- gRPC: the same proto rules, language-independent ---
+#   package shop.orders.v2;
+#   reserved 5, 6;
+
+# --- GraphQL: deprecate, do not version ---
+import strawberry
+
+@strawberry.type
+class Order:
+    total: float = strawberry.field(deprecation_reason=&quot;Use totalMoney&quot;)
+    total_money: &quot;Money&quot;
+
+# --- Messaging: version in the envelope, tolerate unknowns ---
+from pydantic import BaseModel, ConfigDict
+
+class OrderPlacedV2(BaseModel):
+    model_config = ConfigDict(extra=&quot;ignore&quot;)   # ignore fields we do not know about
+    type: str = &quot;order.placed.v2&quot;
+    order_id: str
+    total: float
+    currency: str
+
+def upcast(old: dict) -&gt; OrderPlacedV2:
+    return OrderPlacedV2(order_id=old[&quot;order_id&quot;], total=old[&quot;total&quot;], currency=&quot;USD&quot;)
+
+# Same prerequisite for removal: per-field / per-version usage telemetry</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A strong architecture answer compares the four rather than describing one. The punchline worth landing: GraphQL has no versioning because the client already told you which fields it wants, so you can deprecate per field and measure usage — which is also why GraphQL removals need field-level telemetry that REST removals do not. And for messaging, note that the dangerous change is not adding or removing a field but <em>redefining</em> one, because no schema check catches a field that still deserialises and now means something else.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Add a field to a proto message and prove an old client still works; then change a field number and watch it decode garbage.</li><li>Deprecate a GraphQL field and find out whether your server can tell you who still selects it.</li><li>Write the deprecation policy you would want: how long, what headers, what telemetry gates the removal.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/aspnet/core/grpc/" target="_blank" rel="noopener">gRPC on ASP.NET Core</a> — the whole stack, including gRPC-Web and JSON transcoding</li><li><a href="https://learn.microsoft.com/aspnet/core/signalr/introduction" target="_blank" rel="noopener">SignalR</a> — hubs, transports and scale-out</li><li><a href="https://protobuf.dev/programming-guides/proto3/" target="_blank" rel="noopener">Protocol Buffers language guide</a> — proto3, and the compatibility rules</li><li><a href="https://chillicream.com/docs/hotchocolate" target="_blank" rel="noopener">HotChocolate</a> — the GraphQL server everyone uses in .NET</li><li><a href="https://grpc.io/docs/guides/performance/" target="_blank" rel="noopener">gRPC performance best practices</a> — channel reuse, keepalive, streaming</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

@@ -1,0 +1,1085 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stacks, Queues, Deques &amp; Linked Lists — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="dsa-linear">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › DSA › Topic 20 of 36</div>
+  <h1>Stacks, Queues, Deques &amp; Linked Lists</h1>
+  <p class="lede">The structures where the <em>order</em> you remove things is the algorithm. Two ideas carry most of these problems: a stack remembers what is still unresolved, and a dummy head removes every special case from linked-list surgery.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#stack-queue">Stack and queue patterns</a></li><li><a href="#monotonic">The monotonic stack</a></li><li><a href="#deque">Deques and the sliding-window maximum</a></li><li><a href="#linked-list">Linked lists</a></li><li><a href="#list-surgery">Dummy heads, in-place partitioning and k-way merge</a></li><li><a href="#stack-designs">Min-stack, queue from stacks and other designs</a></li><li><a href="#iterators">Iterators and yield return</a></li></ol>
+  </div>
+
+<section id="stack-queue"><h2 id="stack-queue">Stack and queue patterns</h2><p>Stack: matching/nesting, undo, monotonic stacks for “next greater element”. Queue: BFS, sliding window with deque, rate limiters. Canonical: valid parentheses, daily temperatures, min-stack.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Valid parentheses
+static bool IsValid(string s)
+{
+    var pairs = new Dictionary&lt;char, char&gt; { [&#x27;)&#x27;] = &#x27;(&#x27;, [&#x27;]&#x27;] = &#x27;[&#x27;, [&#x27;}&#x27;] = &#x27;{&#x27; };
+    var st = new Stack&lt;char&gt;();
+    foreach (var c in s)
+    {
+        if (pairs.ContainsValue(c)) st.Push(c);
+        else if (pairs.TryGetValue(c, out var open) &amp;&amp; (st.Count == 0 || st.Pop() != open)) return false;
+    }
+    return st.Count == 0;
+}
+
+// Monotonic stack: days until a warmer temperature
+static int[] DailyTemperatures(int[] t)
+{
+    var res = new int[t.Length]; var st = new Stack&lt;int&gt;();   // indices, decreasing temps
+    for (int i = 0; i &lt; t.Length; i++)
+    {
+        while (st.Count &gt; 0 &amp;&amp; t[st.Peek()] &lt; t[i]) { var j = st.Pop(); res[j] = i - j; }
+        st.Push(i);
+    }
+    return res;
+}
+
+// Min-stack: O(1) min via a parallel stack
+public class MinStack
+{
+    private readonly Stack&lt;int&gt; _s = new(), _min = new();
+    public void Push(int x) { _s.Push(x); _min.Push(_min.Count == 0 ? x : Math.Min(x, _min.Peek())); }
+    public int Pop() { _min.Pop(); return _s.Pop(); }
+    public int Min =&gt; _min.Peek();
+}
+
+// Queue via two stacks (amortised O(1))
+public class QueueViaStacks&lt;T&gt;
+{
+    private readonly Stack&lt;T&gt; _in = new(), _out = new();
+    public void Enqueue(T x) =&gt; _in.Push(x);
+    public T Dequeue() { if (_out.Count == 0) while (_in.Count &gt; 0) _out.Push(_in.Pop()); return _out.Pop(); }
+}</code></pre><pre data-lang="python" hidden><code>def is_valid(s: str) -&gt; bool:
+    pairs = {&quot;)&quot;: &quot;(&quot;, &quot;]&quot;: &quot;[&quot;, &quot;}&quot;: &quot;{&quot;}
+    st = []
+    for c in s:
+        if c in pairs.values(): st.append(c)
+        elif c in pairs and (not st or st.pop() != pairs[c]): return False
+    return not st
+
+def daily_temperatures(t: list[int]) -&gt; list[int]:
+    res = [0] * len(t); st = []            # indices with decreasing temps
+    for i, temp in enumerate(t):
+        while st and t[st[-1]] &lt; temp:
+            j = st.pop(); res[j] = i - j
+        st.append(i)
+    return res
+
+class MinStack:
+    def __init__(self): self._s, self._min = [], []
+    def push(self, x):
+        self._s.append(x); self._min.append(x if not self._min else min(x, self._min[-1]))
+    def pop(self): self._min.pop(); return self._s.pop()
+    @property
+    def min(self): return self._min[-1]
+
+class QueueViaStacks:
+    def __init__(self): self._in, self._out = [], []
+    def enqueue(self, x): self._in.append(x)
+    def dequeue(self):
+        if not self._out:
+            while self._in: self._out.append(self._in.pop())
+        return self._out.pop()
+
+# collections.deque is the real queue: append / popleft are O(1)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The tell for a stack is "matching", "most recent", "undo" or "nesting" — anything where the thing you need next is the thing you saw last. For a queue it is "level by level" or "in the order they arrived". The implementation detail worth saying in C#: use <code>Queue&lt;T&gt;</code> rather than a <code>List&lt;T&gt;</code> with <code>RemoveAt(0)</code>, because that is O(n) per dequeue and quietly makes BFS quadratic; in Python the same mistake is <code>list.pop(0)</code> instead of <code>deque.popleft()</code>.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Evaluate reverse Polish notation.</li><li>Largest rectangle in histogram (monotonic stack).</li><li>Design a circular queue with a fixed array.</li></ul></div></section>
+<section id="monotonic"><h2 id="monotonic">The monotonic stack</h2><p>A stack kept in sorted order — strictly increasing or decreasing — by popping anything that would violate the order before pushing. It answers "for each element, what is the nearest larger/smaller element to its left or right" in O(n) total, where the obvious nested loop is O(n²).</p><p>The complexity argument is the question you will be asked: it looks nested because of the inner <code>while</code>, but <strong>each element is pushed once and popped once</strong>, so the total work across the whole run is O(n).</p><p>The recognition cue is any problem phrased as "next greater", "previous smaller", "how many days until", "largest rectangle", or "span".</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// NEXT GREATER ELEMENT - the base template. Store INDICES, not values:
+// you almost always end up needing the distance.
+static int[] NextGreater(int[] nums)
+{
+    var result = new int[nums.Length];
+    Array.Fill(result, -1);
+    var stack = new Stack&lt;int&gt;();                 // indices, values DECREASING
+
+    for (int i = 0; i &lt; nums.Length; i++)
+    {
+        // everything smaller than nums[i] has found its answer: it is nums[i]
+        while (stack.Count &gt; 0 &amp;&amp; nums[stack.Peek()] &lt; nums[i])
+            result[stack.Pop()] = nums[i];
+        stack.Push(i);
+    }
+    return result;                                // anything left has no greater element
+}
+// Each index is pushed once and popped at most once -&gt; O(n), not O(n^2).
+
+// DAILY TEMPERATURES - identical, but record the distance instead of the value
+static int[] DailyTemperatures(int[] t)
+{
+    var result = new int[t.Length];
+    var stack = new Stack&lt;int&gt;();
+    for (int i = 0; i &lt; t.Length; i++)
+    {
+        while (stack.Count &gt; 0 &amp;&amp; t[stack.Peek()] &lt; t[i])
+        {
+            int j = stack.Pop();
+            result[j] = i - j;                    // this is why you store indices
+        }
+        stack.Push(i);
+    }
+    return result;
+}
+
+// LARGEST RECTANGLE IN A HISTOGRAM - the hardest common use, and the one worth
+// drilling. An INCREASING stack: when a bar is shorter than the top, the bar on
+// top can no longer extend right, so finalise its rectangle.
+static int LargestRectangle(int[] heights)
+{
+    var stack = new Stack&lt;int&gt;();                 // indices, heights INCREASING
+    int best = 0;
+
+    for (int i = 0; i &lt;= heights.Length; i++)
+    {
+        int h = i == heights.Length ? 0 : heights[i];   // sentinel flushes the stack
+
+        while (stack.Count &gt; 0 &amp;&amp; heights[stack.Peek()] &gt; h)
+        {
+            int height = heights[stack.Pop()];
+            // the left boundary is the new top; if the stack is empty it extends to 0
+            int left = stack.Count == 0 ? -1 : stack.Peek();
+            int width = i - left - 1;
+            best = Math.Max(best, height * width);
+        }
+        stack.Push(i);
+    }
+    return best;
+}
+// The sentinel 0 at the end is what avoids a second drain loop. Say so.
+
+// TRAPPING RAIN WATER - a decreasing stack, filling horizontally
+static int Trap(int[] height)
+{
+    var stack = new Stack&lt;int&gt;();
+    int water = 0;
+
+    for (int i = 0; i &lt; height.Length; i++)
+    {
+        while (stack.Count &gt; 0 &amp;&amp; height[stack.Peek()] &lt; height[i])
+        {
+            int bottom = stack.Pop();
+            if (stack.Count == 0) break;                   // no left wall
+            int left = stack.Peek();
+            int width = i - left - 1;
+            int depth = Math.Min(height[left], height[i]) - height[bottom];
+            water += width * depth;
+        }
+        stack.Push(i);
+    }
+    return water;
+}
+// The two-pointer solution is O(1) space and usually preferred - offer both.
+
+// REMOVE K DIGITS to make the smallest number - greedy with a monotonic stack
+static string RemoveKDigits(string num, int k)
+{
+    var stack = new Stack&lt;char&gt;();
+    foreach (var d in num)
+    {
+        while (k &gt; 0 &amp;&amp; stack.Count &gt; 0 &amp;&amp; stack.Peek() &gt; d) { stack.Pop(); k--; }
+        stack.Push(d);
+    }
+    while (k-- &gt; 0 &amp;&amp; stack.Count &gt; 0) stack.Pop();        // still over budget
+
+    var s = new string(stack.Reverse().ToArray()).TrimStart(&#x27;0&#x27;);
+    return s.Length == 0 ? &quot;0&quot; : s;
+}
+
+// WHICH DIRECTION? Decide from the question:
+//   next GREATER  -&gt; pop while the top is SMALLER   (decreasing stack)
+//   next SMALLER  -&gt; pop while the top is LARGER    (increasing stack)
+//   previous X    -&gt; same, but read the answer at PUSH time instead of at pop</code></pre><pre data-lang="python" hidden><code>def next_greater(nums: list[int]) -&gt; list[int]:
+    result = [-1] * len(nums)
+    stack: list[int] = []                 # indices, values decreasing
+    for i, n in enumerate(nums):
+        while stack and nums[stack[-1]] &lt; n:
+            result[stack.pop()] = n
+        stack.append(i)
+    return result
+
+def daily_temperatures(t: list[int]) -&gt; list[int]:
+    result = [0] * len(t)
+    stack: list[int] = []
+    for i, temp in enumerate(t):
+        while stack and t[stack[-1]] &lt; temp:
+            j = stack.pop()
+            result[j] = i - j
+        stack.append(i)
+    return result
+
+def largest_rectangle(heights: list[int]) -&gt; int:
+    stack: list[int] = []                 # indices, heights increasing
+    best = 0
+    for i, h in enumerate(heights + [0]):           # the 0 sentinel flushes it
+        while stack and heights[stack[-1]] &gt; h:
+            height = heights[stack.pop()]
+            left = stack[-1] if stack else -1
+            best = max(best, height * (i - left - 1))
+        stack.append(i)
+    return best
+# Careful: `heights + [0]` makes a copy, so heights[stack[-1]] still indexes the
+# original - which is what you want here, but worth noticing.
+
+def trap(height: list[int]) -&gt; int:
+    stack: list[int] = []
+    water = 0
+    for i, h in enumerate(height):
+        while stack and height[stack[-1]] &lt; h:
+            bottom = stack.pop()
+            if not stack:
+                break
+            left = stack[-1]
+            width = i - left - 1
+            depth = min(height[left], h) - height[bottom]
+            water += width * depth
+        stack.append(i)
+    return water
+
+def remove_k_digits(num: str, k: int) -&gt; str:
+    stack: list[str] = []
+    for d in num:
+        while k and stack and stack[-1] &gt; d:
+            stack.pop()
+            k -= 1
+        stack.append(d)
+    return &quot;&quot;.join(stack[:len(stack) - k]).lstrip(&quot;0&quot;) or &quot;0&quot;
+
+# Direction cheat sheet
+#   next greater   -&gt; while stack and arr[stack[-1]] &lt;  arr[i]   (decreasing)
+#   next smaller   -&gt; while stack and arr[stack[-1]] &gt;  arr[i]   (increasing)
+#   with equality, decide whether ties should pop - ask</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The complexity question is guaranteed: "that has a loop inside a loop, isn't it O(n²)?" Answer with the amortised argument — each index is pushed once and popped at most once, so the total is O(n) regardless of how the pops distribute. Beyond that, the useful preparation is the direction rule (for next-greater you pop while the top is smaller) and storing indices rather than values, because half these problems want a distance. Largest-rectangle-in-histogram is the hardest common instance and worth being able to write without hesitating.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write next-greater and daily-temperatures from the same template.</li><li>Solve largest rectangle in a histogram, including why the sentinel is there.</li><li>Solve trapping rain water with both a monotonic stack and two pointers, and compare the space.</li></ul></div></section>
+<section id="deque"><h2 id="deque">Deques and the sliding-window maximum</h2><p>A deque adds O(1) removal from the <em>front</em> to a stack's O(1) back. That single capability solves the sliding-window maximum, which is otherwise O(n·k).</p><p>The structure is a <strong>monotonic deque</strong>: hold indices whose values are decreasing, pop from the back anything smaller than the incoming value (it can never be the maximum again while the newcomer is in the window), and pop from the front anything that has fallen out of the window. The front is always the maximum of the current window.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// SLIDING WINDOW MAXIMUM - O(n), with a monotonic deque
+static int[] MaxSlidingWindow(int[] nums, int k)
+{
+    var deque = new LinkedList&lt;int&gt;();            // indices, values DECREASING
+    var result = new int[nums.Length - k + 1];
+
+    for (int i = 0; i &lt; nums.Length; i++)
+    {
+        // 1. drop indices that have left the window, from the FRONT
+        if (deque.Count &gt; 0 &amp;&amp; deque.First!.Value &lt;= i - k) deque.RemoveFirst();
+
+        // 2. drop values smaller than the newcomer, from the BACK - while the
+        //    newcomer is in the window, none of them can ever be the maximum
+        while (deque.Count &gt; 0 &amp;&amp; nums[deque.Last!.Value] &lt;= nums[i])
+            deque.RemoveLast();
+
+        deque.AddLast(i);
+
+        // 3. the front is the maximum of the current window
+        if (i &gt;= k - 1) result[i - k + 1] = nums[deque.First!.Value];
+    }
+    return result;
+}
+// Each index is added once and removed once -&gt; O(n). Space O(k).
+// The alternative, a max-heap with lazy deletion, is O(n log k) - offer both.
+
+// C# has no Deque&lt;T&gt;. The options, in order of how they read:
+//   LinkedList&lt;T&gt;              - O(1) both ends, allocates a node per item
+//   Queue&lt;T&gt; + Stack&lt;T&gt;        - awkward
+//   a circular buffer on an array of size k - fastest, most code
+// Saying &quot;there is no Deque&lt;T&gt; in the BCL, so I would use LinkedList&lt;T&gt; or an
+// array-backed ring buffer&quot; is itself a small signal.
+
+// A ring buffer when the window size is fixed and performance matters
+static int[] MaxSlidingWindowRing(int[] nums, int k)
+{
+    var dq = new int[nums.Length];                // indices
+    int head = 0, tail = 0;                       // [head, tail)
+    var result = new int[nums.Length - k + 1];
+
+    for (int i = 0; i &lt; nums.Length; i++)
+    {
+        if (tail &gt; head &amp;&amp; dq[head] &lt;= i - k) head++;
+        while (tail &gt; head &amp;&amp; nums[dq[tail - 1]] &lt;= nums[i]) tail--;
+        dq[tail++] = i;
+        if (i &gt;= k - 1) result[i - k + 1] = nums[dq[head]];
+    }
+    return result;
+}
+
+// SLIDING WINDOW MINIMUM: the same code with the comparison flipped.
+// Both at once (e.g. &quot;longest subarray where max - min &lt;= limit&quot;): two deques.
+static int LongestSubarrayWithinLimit(int[] nums, int limit)
+{
+    var maxQ = new LinkedList&lt;int&gt;();             // decreasing
+    var minQ = new LinkedList&lt;int&gt;();             // increasing
+    int left = 0, best = 0;
+
+    for (int right = 0; right &lt; nums.Length; right++)
+    {
+        while (maxQ.Count &gt; 0 &amp;&amp; nums[maxQ.Last!.Value] &lt;= nums[right]) maxQ.RemoveLast();
+        while (minQ.Count &gt; 0 &amp;&amp; nums[minQ.Last!.Value] &gt;= nums[right]) minQ.RemoveLast();
+        maxQ.AddLast(right);
+        minQ.AddLast(right);
+
+        while (nums[maxQ.First!.Value] - nums[minQ.First!.Value] &gt; limit)
+        {
+            if (maxQ.First.Value == left) maxQ.RemoveFirst();
+            if (minQ.First.Value == left) minQ.RemoveFirst();
+            left++;
+        }
+        best = Math.Max(best, right - left + 1);
+    }
+    return best;
+}
+
+// A deque is also the natural queue for 0-1 BFS: push a zero-weight edge to the
+// FRONT and a weight-one edge to the back, and you get Dijkstra&#x27;s answer without
+// a heap. See the Graphs page.</code></pre><pre data-lang="python" hidden><code>from collections import deque
+
+def max_sliding_window(nums: list[int], k: int) -&gt; list[int]:
+    dq: deque[int] = deque()              # indices, values decreasing
+    result: list[int] = []
+
+    for i, n in enumerate(nums):
+        if dq and dq[0] &lt;= i - k:         # left the window
+            dq.popleft()
+        while dq and nums[dq[-1]] &lt;= n:   # can never be the max again
+            dq.pop()
+        dq.append(i)
+        if i &gt;= k - 1:
+            result.append(nums[dq[0]])
+    return result
+
+def longest_subarray_within_limit(nums: list[int], limit: int) -&gt; int:
+    max_q: deque[int] = deque()           # decreasing
+    min_q: deque[int] = deque()           # increasing
+    left = best = 0
+
+    for right, n in enumerate(nums):
+        while max_q and nums[max_q[-1]] &lt;= n: max_q.pop()
+        while min_q and nums[min_q[-1]] &gt;= n: min_q.pop()
+        max_q.append(right)
+        min_q.append(right)
+
+        while nums[max_q[0]] - nums[min_q[0]] &gt; limit:
+            if max_q[0] == left: max_q.popleft()
+            if min_q[0] == left: min_q.popleft()
+            left += 1
+        best = max(best, right - left + 1)
+    return best
+
+# deque(maxlen=k) is a free fixed-size window - appending past the limit drops
+# from the other end automatically. Useful for &quot;last k items&quot; problems.
+window = deque(maxlen=3)
+for x in [1, 2, 3, 4]:
+    window.append(x)
+print(window)                             # deque([2, 3, 4], maxlen=3)
+
+# deque is also the BFS queue, and the 0-1 BFS structure
+q = deque([start])
+q.append(x)        # weight 1: back
+q.appendleft(y)    # weight 0: front
+q.rotate(1)        # O(k) for k positions - occasionally the whole answer
+                   # to a &quot;circular&quot; problem</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Sliding-window maximum is the canonical deque question. The invariant is what you need to articulate: the deque holds indices in decreasing value order, so the front is always the window's maximum, and anything smaller than an incoming element can be discarded because it can never be the maximum again while that element remains. Offer the heap alternative at O(n log k) and say why the deque is better. If you are in C#, mention there is no <code>Deque&lt;T&gt;</code> in the BCL and name your substitute.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write sliding-window maximum and state the invariant before the code.</li><li>Solve it again with a max-heap and lazy deletion, and compare complexities.</li><li>Solve "longest subarray where max − min ≤ limit" with two deques.</li></ul></div></section>
+<section id="linked-list"><h2 id="linked-list">Linked lists</h2><p>Pointer manipulation under pressure: reverse, detect cycle (Floyd), find middle, merge sorted lists, remove nth from end. Use a dummy head to avoid edge cases. .NET has <code>LinkedList&lt;T&gt;</code> for real code; interviews want the hand-rolled node.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class ListNode(int val, ListNode? next = null) { public int Val = val; public ListNode? Next = next; }
+
+// Reverse iteratively
+static ListNode? Reverse(ListNode? head)
+{
+    ListNode? prev = null;
+    while (head is not null) { var next = head.Next; head.Next = prev; prev = head; head = next; }
+    return prev;
+}
+
+// Cycle detection (fast/slow)
+static bool HasCycle(ListNode? head)
+{
+    var slow = head; var fast = head;
+    while (fast?.Next is not null) { slow = slow!.Next; fast = fast.Next.Next; if (slow == fast) return true; }
+    return false;
+}
+
+// Middle node
+static ListNode? Middle(ListNode? head)
+{
+    var slow = head; var fast = head;
+    while (fast?.Next is not null) { slow = slow!.Next; fast = fast.Next.Next; }
+    return slow;
+}
+
+// Merge two sorted lists with a dummy head
+static ListNode? Merge(ListNode? a, ListNode? b)
+{
+    var dummy = new ListNode(0); var tail = dummy;
+    while (a is not null &amp;&amp; b is not null)
+    {
+        if (a.Val &lt;= b.Val) { tail.Next = a; a = a.Next; } else { tail.Next = b; b = b.Next; }
+        tail = tail.Next;
+    }
+    tail.Next = a ?? b;
+    return dummy.Next;
+}
+
+// Remove nth from end: two pointers n apart
+static ListNode? RemoveNthFromEnd(ListNode? head, int n)
+{
+    var dummy = new ListNode(0, head); ListNode? fast = dummy, slow = dummy;
+    for (int i = 0; i &lt;= n; i++) fast = fast!.Next;
+    while (fast is not null) { fast = fast.Next; slow = slow!.Next; }
+    slow!.Next = slow.Next!.Next;
+    return dummy.Next;
+}</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class ListNode:
+    val: int
+    next: Optional[&quot;ListNode&quot;] = None
+
+def reverse(head):
+    prev = None
+    while head:
+        head.next, prev, head = prev, head, head.next
+    return prev
+
+def has_cycle(head) -&gt; bool:
+    slow = fast = head
+    while fast and fast.next:
+        slow, fast = slow.next, fast.next.next
+        if slow is fast: return True
+    return False
+
+def middle(head):
+    slow = fast = head
+    while fast and fast.next:
+        slow, fast = slow.next, fast.next.next
+    return slow
+
+def merge(a, b):
+    dummy = tail = ListNode(0)
+    while a and b:
+        if a.val &lt;= b.val: tail.next, a = a, a.next
+        else: tail.next, b = b, b.next
+        tail = tail.next
+    tail.next = a or b
+    return dummy.next
+
+def remove_nth_from_end(head, n):
+    dummy = ListNode(0, head); fast = slow = dummy
+    for _ in range(n + 1): fast = fast.next
+    while fast: fast, slow = fast.next, slow.next
+    slow.next = slow.next.next
+    return dummy.next</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Linked-list problems are tests of pointer discipline, not insight. The two habits that prevent most bugs: use a <strong>dummy head</strong> so inserting or deleting at position 0 needs no special case, and draw the pointers before you reassign them. When reversing, save <code>next</code> before you overwrite it — that one line is the most common error in the whole category.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Reorder list (L0→Ln→L1→Ln-1…): middle + reverse + merge.</li><li>Add two numbers represented as lists.</li><li>LRU cache with a doubly linked list + dictionary.</li></ul></div></section>
+<section id="list-surgery"><h2 id="list-surgery">Dummy heads, in-place partitioning and k-way merge</h2><p>The techniques that make harder list problems routine. A <strong>dummy head</strong> gives every node a predecessor, so insertion and deletion are uniform and "delete the first node" stops being a special case. <strong>Two dummy heads</strong> let you split a list into two by relinking rather than allocating — which is how partition, odd/even and "reverse in groups of k" are all done in O(1) space.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// DUMMY HEAD - the single most useful habit in this category
+static ListNode? RemoveElements(ListNode? head, int val)
+{
+    var dummy = new ListNode(0) { Next = head };   // now EVERY node has a prev
+    var prev = dummy;
+
+    while (prev.Next is not null)
+    {
+        if (prev.Next.Val == val) prev.Next = prev.Next.Next;   // no special case
+        else prev = prev.Next;
+    }
+    return dummy.Next;                             // the head may have changed
+}
+
+// TWO DUMMIES - partition around x, keeping relative order, O(1) space
+static ListNode? Partition(ListNode? head, int x)
+{
+    ListNode lessHead = new(0), moreHead = new(0);
+    ListNode less = lessHead, more = moreHead;
+
+    for (var node = head; node is not null; node = node.Next)
+    {
+        if (node.Val &lt; x) { less.Next = node; less = node; }
+        else              { more.Next = node; more = node; }
+    }
+    more.Next = null;                              // TERMINATE, or you make a cycle
+    less.Next = moreHead.Next;
+    return lessHead.Next;
+}
+// Forgetting `more.Next = null` creates an infinite list. It is the classic bug.
+
+// ODD / EVEN positions - same shape
+static ListNode? OddEvenList(ListNode? head)
+{
+    if (head?.Next is null) return head;
+    ListNode odd = head, even = head.Next, evenHead = even;
+
+    while (even?.Next is not null)
+    {
+        odd.Next = even.Next;  odd = odd.Next;
+        even.Next = odd.Next;  even = even.Next!;
+    }
+    odd.Next = evenHead;
+    return head;
+}
+
+// REVERSE IN GROUPS OF K - the hardest common one, and pure bookkeeping
+static ListNode? ReverseKGroup(ListNode? head, int k)
+{
+    var dummy = new ListNode(0) { Next = head };
+    var groupPrev = dummy;
+
+    while (true)
+    {
+        // 1. find the kth node from groupPrev; if there is none, we are done
+        var kth = groupPrev;
+        for (int i = 0; i &lt; k &amp;&amp; kth is not null; i++) kth = kth.Next;
+        if (kth is null) break;
+
+        var groupNext = kth.Next;
+
+        // 2. reverse the group, stopping at groupNext
+        ListNode? prev = groupNext, curr = groupPrev.Next;
+        while (curr != groupNext)
+        {
+            var next = curr!.Next;                 // SAVE IT FIRST
+            curr.Next = prev;
+            prev = curr;
+            curr = next;
+        }
+
+        // 3. relink: groupPrev now points at the new head, and the old head
+        //    (which is now the tail) becomes the next groupPrev
+        var newGroupPrev = groupPrev.Next;
+        groupPrev.Next = kth;
+        groupPrev = newGroupPrev!;
+    }
+    return dummy.Next;
+}
+
+// MERGE TWO SORTED LISTS - a dummy head, again
+static ListNode? MergeTwo(ListNode? a, ListNode? b)
+{
+    var dummy = new ListNode(0);
+    var tail = dummy;
+    while (a is not null &amp;&amp; b is not null)
+    {
+        if (a.Val &lt;= b.Val) { tail.Next = a; a = a.Next; }
+        else                { tail.Next = b; b = b.Next; }
+        tail = tail.Next;
+    }
+    tail.Next = a ?? b;                            // attach whatever is left
+    return dummy.Next;
+}
+
+// MERGE K SORTED LISTS - two answers, both worth knowing
+// (a) a min-heap of the current head of each list: O(N log k)
+static ListNode? MergeKHeap(ListNode?[] lists)
+{
+    var heap = new PriorityQueue&lt;ListNode, int&gt;();
+    foreach (var l in lists) if (l is not null) heap.Enqueue(l, l.Val);
+
+    var dummy = new ListNode(0);
+    var tail = dummy;
+    while (heap.TryDequeue(out var node, out _))
+    {
+        tail.Next = node; tail = node;
+        if (node.Next is not null) heap.Enqueue(node.Next, node.Next.Val);
+    }
+    return dummy.Next;
+}
+// (b) pairwise merge, halving the list count each round: also O(N log k),
+//     and O(1) extra space. Usually the better answer.
+static ListNode? MergeKPairwise(ListNode?[] lists)
+{
+    if (lists.Length == 0) return null;
+    var current = lists.ToList();
+    while (current.Count &gt; 1)
+    {
+        var next = new List&lt;ListNode?&gt;();
+        for (int i = 0; i &lt; current.Count; i += 2)
+            next.Add(MergeTwo(current[i], i + 1 &lt; current.Count ? current[i + 1] : null));
+        current = next;
+    }
+    return current[0];
+}</code></pre><pre data-lang="python" hidden><code>class ListNode:
+    __slots__ = (&quot;val&quot;, &quot;next&quot;)
+    def __init__(self, val=0, next=None):
+        self.val, self.next = val, next
+
+def remove_elements(head, val: int):
+    dummy = ListNode(0, head)
+    prev = dummy
+    while prev.next:
+        if prev.next.val == val:
+            prev.next = prev.next.next
+        else:
+            prev = prev.next
+    return dummy.next
+
+def partition(head, x: int):
+    less_head, more_head = ListNode(), ListNode()
+    less, more = less_head, more_head
+    node = head
+    while node:
+        if node.val &lt; x:
+            less.next = node; less = node
+        else:
+            more.next = node; more = node
+        node = node.next
+    more.next = None                  # TERMINATE or you build a cycle
+    less.next = more_head.next
+    return less_head.next
+
+def odd_even_list(head):
+    if not head or not head.next:
+        return head
+    odd, even = head, head.next
+    even_head = even
+    while even and even.next:
+        odd.next = even.next;  odd = odd.next
+        even.next = odd.next;  even = even.next
+    odd.next = even_head
+    return head
+
+def reverse_k_group(head, k: int):
+    dummy = ListNode(0, head)
+    group_prev = dummy
+
+    while True:
+        kth = group_prev
+        for _ in range(k):
+            kth = kth.next
+            if not kth:
+                return dummy.next
+        group_next = kth.next
+
+        prev, curr = group_next, group_prev.next
+        while curr is not group_next:
+            curr.next, prev, curr = prev, curr, curr.next   # save-before-overwrite,
+                                                            # done by tuple unpacking
+        group_prev.next, group_prev = kth, group_prev.next
+
+def merge_two(a, b):
+    dummy = tail = ListNode()
+    while a and b:
+        if a.val &lt;= b.val: tail.next, a = a, a.next
+        else:              tail.next, b = b, b.next
+        tail = tail.next
+    tail.next = a or b
+    return dummy.next
+
+import heapq
+
+def merge_k_heap(lists):
+    heap = [(l.val, i, l) for i, l in enumerate(lists) if l]
+    heapq.heapify(heap)               # the index breaks ties: ListNode is unorderable
+    dummy = tail = ListNode()
+    while heap:
+        _, i, node = heapq.heappop(heap)
+        tail.next = node; tail = node
+        if node.next:
+            heapq.heappush(heap, (node.next.val, i, node.next))
+    return dummy.next
+
+def merge_k_pairwise(lists):
+    if not lists:
+        return None
+    while len(lists) &gt; 1:
+        lists = [merge_two(lists[i], lists[i + 1] if i + 1 &lt; len(lists) else None)
+                 for i in range(0, len(lists), 2)]
+    return lists[0]</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Say "I will use a dummy head" before you write anything — it signals that you know where the special cases are and removes them before they become bugs. The two errors interviewers watch for: forgetting to terminate the second list in a partition (which builds a cycle) and overwriting <code>next</code> before saving it in a reversal. For merge-k, give both solutions and note that pairwise merging matches the heap's O(N log k) with O(1) extra space. In Python, remember a heap of nodes needs a tiebreaker because <code>ListNode</code> is not orderable.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Reverse a linked list in groups of k, iteratively, in O(1) space.</li><li>Partition a list around a value and verify you terminated the second half.</li><li>Merge k sorted lists both ways and compare the space.</li></ul></div></section>
+<section id="stack-designs"><h2 id="stack-designs">Min-stack, queue from stacks and other designs</h2><p>"Design a structure that…" is a distinct question type, and the standard ones recur. The shared insight is <strong>store more per element</strong> or <strong>amortise across operations</strong>.</p><p>Min-stack keeps the running minimum alongside each value, so <code>GetMin</code> is O(1) rather than a scan. Queue-from-two-stacks moves elements between an input and an output stack only when the output is empty, which makes each element move at most twice — O(1) amortised per operation even though a single dequeue can be O(n).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// MIN STACK - O(1) push, pop, top and getMin
+public class MinStack
+{
+    // store (value, minimum at or below this point) - the simplest correct answer
+    private readonly Stack&lt;(int Value, int Min)&gt; _stack = new();
+
+    public void Push(int x)
+        =&gt; _stack.Push((x, _stack.Count == 0 ? x : Math.Min(x, _stack.Peek().Min)));
+
+    public void Pop()    =&gt; _stack.Pop();
+    public int  Top()    =&gt; _stack.Peek().Value;
+    public int  GetMin() =&gt; _stack.Peek().Min;
+}
+// O(n) extra space. The follow-up is &quot;can you do better?&quot; - yes: a second stack
+// that only pushes when a new value is &lt;= the current minimum.
+public class MinStackTwoStacks
+{
+    private readonly Stack&lt;int&gt; _main = new(), _mins = new();
+
+    public void Push(int x)
+    {
+        _main.Push(x);
+        if (_mins.Count == 0 || x &lt;= _mins.Peek()) _mins.Push(x);   // &lt;= handles
+    }                                                                // duplicates
+
+    public void Pop()
+    {
+        if (_main.Pop() == _mins.Peek()) _mins.Pop();
+    }
+    public int Top()    =&gt; _main.Peek();
+    public int GetMin() =&gt; _mins.Peek();
+}
+// The &lt;= rather than &lt; is the bug people ship: with duplicate minima, a strict
+// &lt; pops the single recorded minimum too early.
+
+// QUEUE FROM TWO STACKS - O(1) AMORTISED
+public class QueueFromStacks
+{
+    private readonly Stack&lt;int&gt; _in = new(), _out = new();
+
+    public void Push(int x) =&gt; _in.Push(x);
+
+    public int Pop()
+    {
+        Shift();
+        return _out.Pop();
+    }
+    public int Peek()
+    {
+        Shift();
+        return _out.Peek();
+    }
+    public bool Empty() =&gt; _in.Count == 0 &amp;&amp; _out.Count == 0;
+
+    private void Shift()
+    {
+        if (_out.Count &gt; 0) return;                  // ONLY when out is empty
+        while (_in.Count &gt; 0) _out.Push(_in.Pop());
+    }
+}
+// Each element is pushed and popped at most twice across its lifetime, so the
+// AMORTISED cost is O(1) even though one Pop can be O(n). That distinction is
+// the question.
+
+// STACK FROM TWO QUEUES - the mirror, and strictly worse: one operation is
+// unavoidably O(n). Make Push expensive and Pop O(1):
+public class StackFromQueues
+{
+    private Queue&lt;int&gt; _q = new(), _tmp = new();
+
+    public void Push(int x)
+    {
+        _tmp.Enqueue(x);
+        while (_q.Count &gt; 0) _tmp.Enqueue(_q.Dequeue());    // rotate the new one
+        (_q, _tmp) = (_tmp, _q);                             // to the front
+    }
+    public int Pop() =&gt; _q.Dequeue();
+    public int Top() =&gt; _q.Peek();
+}
+
+// BROWSER HISTORY / UNDO-REDO - two stacks facing each other
+public class BrowserHistory(string homepage)
+{
+    private readonly Stack&lt;string&gt; _back = new(), _forward = new();
+    private string _current = homepage;
+
+    public void Visit(string url)
+    {
+        _back.Push(_current);
+        _current = url;
+        _forward.Clear();                 // a new branch discards the forward path
+    }
+    public string Back(int steps)
+    {
+        while (steps-- &gt; 0 &amp;&amp; _back.Count &gt; 0) { _forward.Push(_current); _current = _back.Pop(); }
+        return _current;
+    }
+    public string Forward(int steps)
+    {
+        while (steps-- &gt; 0 &amp;&amp; _forward.Count &gt; 0) { _back.Push(_current); _current = _forward.Pop(); }
+        return _current;
+    }
+}
+
+// MAX FREQUENCY STACK - a map from frequency to a stack of values at that
+// frequency, plus the current maximum frequency. Same &quot;index by count&quot; idea as
+// bucketing on the Hashing page.</code></pre><pre data-lang="python" hidden><code>class MinStack:
+    def __init__(self) -&gt; None:
+        self.stack: list[tuple[int, int]] = []       # (value, min so far)
+
+    def push(self, x: int) -&gt; None:
+        self.stack.append((x, min(x, self.stack[-1][1]) if self.stack else x))
+
+    def pop(self) -&gt; None:   self.stack.pop()
+    def top(self) -&gt; int:    return self.stack[-1][0]
+    def get_min(self) -&gt; int: return self.stack[-1][1]
+
+
+class MinStackTwoStacks:
+    def __init__(self) -&gt; None:
+        self.main: list[int] = []
+        self.mins: list[int] = []
+
+    def push(self, x: int) -&gt; None:
+        self.main.append(x)
+        if not self.mins or x &lt;= self.mins[-1]:      # &lt;= , not &lt;
+            self.mins.append(x)
+
+    def pop(self) -&gt; None:
+        if self.main.pop() == self.mins[-1]:
+            self.mins.pop()
+
+    def top(self) -&gt; int:     return self.main[-1]
+    def get_min(self) -&gt; int: return self.mins[-1]
+
+
+class QueueFromStacks:
+    def __init__(self) -&gt; None:
+        self.inbox: list[int] = []
+        self.outbox: list[int] = []
+
+    def push(self, x: int) -&gt; None:
+        self.inbox.append(x)
+
+    def _shift(self) -&gt; None:
+        if not self.outbox:                          # only when empty
+            while self.inbox:
+                self.outbox.append(self.inbox.pop())
+
+    def pop(self) -&gt; int:
+        self._shift()
+        return self.outbox.pop()
+
+    def peek(self) -&gt; int:
+        self._shift()
+        return self.outbox[-1]
+
+    def empty(self) -&gt; bool:
+        return not self.inbox and not self.outbox
+
+
+class BrowserHistory:
+    def __init__(self, homepage: str) -&gt; None:
+        self.back_stack: list[str] = []
+        self.forward_stack: list[str] = []
+        self.current = homepage
+
+    def visit(self, url: str) -&gt; None:
+        self.back_stack.append(self.current)
+        self.current = url
+        self.forward_stack.clear()
+
+    def back(self, steps: int) -&gt; str:
+        while steps and self.back_stack:
+            self.forward_stack.append(self.current)
+            self.current = self.back_stack.pop()
+            steps -= 1
+        return self.current
+
+    def forward(self, steps: int) -&gt; str:
+        while steps and self.forward_stack:
+            self.back_stack.append(self.current)
+            self.current = self.forward_stack.pop()
+            steps -= 1
+        return self.current
+
+
+# MAX FREQUENCY STACK
+from collections import defaultdict
+class FreqStack:
+    def __init__(self) -&gt; None:
+        self.freq: dict[int, int] = defaultdict(int)
+        self.groups: dict[int, list[int]] = defaultdict(list)
+        self.max_freq = 0
+
+    def push(self, x: int) -&gt; None:
+        self.freq[x] += 1
+        self.max_freq = max(self.max_freq, self.freq[x])
+        self.groups[self.freq[x]].append(x)
+
+    def pop(self) -&gt; int:
+        x = self.groups[self.max_freq].pop()
+        self.freq[x] -= 1
+        if not self.groups[self.max_freq]:
+            self.max_freq -= 1
+        return x</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Design questions are scored on whether you state the invariant and the complexity per operation. For min-stack, give the simple answer first (store the running minimum with each element) and the space-optimised one when asked, and flag the <code>&lt;=</code> that handles duplicate minima. For queue-from-stacks, the whole point is <strong>amortised</strong> O(1): one dequeue can be O(n), but each element moves at most twice over its lifetime. Using the word amortised correctly, with that justification, is the thing being tested.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement min-stack both ways and work out the duplicate-minimum case.</li><li>Implement a queue from two stacks and state why it is amortised O(1) rather than O(1).</li><li>Implement a max-frequency stack using the frequency-to-stack map.</li></ul></div></section>
+<section id="iterators"><h2 id="iterators">Iterators and yield return</h2><p>Occasionally the question is "design an iterator" — flatten a nested list, peek at the next element, iterate a BST in order. C#'s <code>yield return</code> and Python's generators make the recursive version trivial, but the interviewer usually wants the <strong>explicit stack</strong> version, because that is the one with O(h) space and genuine laziness.</p><p>The distinction worth knowing: a <code>yield return</code> iterator <em>is</em> a compiler-generated state machine, so it is already lazy and already O(h) — but writing one over a recursive traversal can hide an O(n) cost if the recursion itself is eager.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// yield return: the compiler builds a state machine implementing both
+// IEnumerable&lt;T&gt; and IEnumerator&lt;T&gt;. Nothing runs until you enumerate.
+static IEnumerable&lt;int&gt; InOrder(TreeNode? node)
+{
+    if (node is null) yield break;
+    foreach (var v in InOrder(node.Left)) yield return v;
+    yield return node.Val;
+    foreach (var v in InOrder(node.Right)) yield return v;
+}
+// Lazy and short, but nested foreach over a recursive iterator is O(n*h) in the
+// worst case, because each value is re-yielded through every enclosing level.
+
+// The explicit-stack version: O(1) amortised per MoveNext, O(h) space,
+// and it is what &quot;design a BST iterator&quot; is actually asking for.
+public class BstIterator
+{
+    private readonly Stack&lt;TreeNode&gt; _stack = new();
+
+    public BstIterator(TreeNode? root) =&gt; PushLeft(root);
+
+    private void PushLeft(TreeNode? node)
+    {
+        while (node is not null) { _stack.Push(node); node = node.Left; }
+    }
+
+    public bool HasNext() =&gt; _stack.Count &gt; 0;
+
+    public int Next()
+    {
+        var node = _stack.Pop();
+        PushLeft(node.Right);              // the next smallest is down its left spine
+        return node.Val;
+    }
+}
+// Each node is pushed and popped exactly once across the whole traversal, so
+// Next() is O(1) AMORTISED even though one call can push h nodes.
+
+// PEEKING ITERATOR - buffer one element
+public class PeekingIterator(IEnumerator&lt;int&gt; inner)
+{
+    private bool _hasBuffered = inner.MoveNext();
+    private int _buffered = inner.Current;
+
+    public int Peek() =&gt; _buffered;
+    public bool HasNext() =&gt; _hasBuffered;
+
+    public int Next()
+    {
+        int value = _buffered;
+        _hasBuffered = inner.MoveNext();
+        if (_hasBuffered) _buffered = inner.Current;
+        return value;
+    }
+}
+
+// FLATTEN A NESTED LIST - the lazy, explicit-stack version
+public class NestedIterator
+{
+    private readonly Stack&lt;IEnumerator&lt;NestedInteger&gt;&gt; _stack = new();
+
+    public NestedIterator(IList&lt;NestedInteger&gt; nested)
+        =&gt; _stack.Push(nested.GetEnumerator());
+
+    public bool HasNext()
+    {
+        while (_stack.Count &gt; 0)
+        {
+            var top = _stack.Peek();
+            if (!top.MoveNext()) { _stack.Pop(); continue; }
+            if (top.Current.IsInteger()) { _pending = top.Current; return true; }
+            _stack.Push(top.Current.GetList().GetEnumerator());
+        }
+        return false;
+    }
+    private NestedInteger? _pending;
+    public int Next() =&gt; _pending!.GetInteger();
+}
+// The eager version - flatten everything in the constructor - is simpler and
+// usually accepted, but say which you chose and why: eager is O(n) up front,
+// lazy is O(1) construction and lets you stop early.
+
+// DEFERRED EXECUTION, the gotcha worth knowing: the body does not run until
+// you enumerate, so an argument check placed inside is not thrown at call time.
+static IEnumerable&lt;int&gt; Bad(int[] items)
+{
+    if (items is null) throw new ArgumentNullException(nameof(items));  // DEFERRED
+    foreach (var i in items) yield return i;
+}
+// Fix: validate eagerly in a wrapper, and yield from a private iterator method.
+static IEnumerable&lt;int&gt; Good(int[] items)
+{
+    ArgumentNullException.ThrowIfNull(items);        // runs at CALL time
+    return Iterate(items);
+    static IEnumerable&lt;int&gt; Iterate(int[] items)
+    {
+        foreach (var i in items) yield return i;
+    }
+}</code></pre><pre data-lang="python" hidden><code># Generators: the yield return equivalent, and `yield from` handles delegation
+def in_order(node):
+    if node is None:
+        return
+    yield from in_order(node.left)
+    yield node.val
+    yield from in_order(node.right)
+
+# yield from is better than a loop here: it delegates directly rather than
+# re-yielding through every level, so it avoids the O(n*h) cost.
+
+# The explicit-stack iterator
+class BSTIterator:
+    def __init__(self, root) -&gt; None:
+        self.stack: list = []
+        self._push_left(root)
+
+    def _push_left(self, node) -&gt; None:
+        while node:
+            self.stack.append(node)
+            node = node.left
+
+    def has_next(self) -&gt; bool:
+        return bool(self.stack)
+
+    def next(self) -&gt; int:
+        node = self.stack.pop()
+        self._push_left(node.right)
+        return node.val
+
+# A generator can implement the same thing with less code - and since a
+# generator IS lazy with O(h) frames, it is a legitimate answer. Say so.
+class BSTIteratorGen:
+    def __init__(self, root) -&gt; None:
+        self._gen = in_order(root)
+        self._next = next(self._gen, None)
+
+    def has_next(self) -&gt; bool: return self._next is not None
+
+    def next(self) -&gt; int:
+        value = self._next
+        self._next = next(self._gen, None)
+        return value
+
+# PEEKING ITERATOR - one-element buffer
+class PeekingIterator:
+    _SENTINEL = object()
+    def __init__(self, iterator) -&gt; None:
+        self._it = iter(iterator)
+        self._buffered = next(self._it, self._SENTINEL)
+
+    def peek(self):     return self._buffered
+    def has_next(self) -&gt; bool: return self._buffered is not self._SENTINEL
+    def next(self):
+        value = self._buffered
+        self._buffered = next(self._it, self._SENTINEL)
+        return value
+
+# FLATTEN - recursively, lazily
+def flatten(nested):
+    for item in nested:
+        if isinstance(item, list):
+            yield from flatten(item)
+        else:
+            yield item
+
+# itertools.chain.from_iterable flattens ONE level, lazily
+from itertools import chain
+list(chain.from_iterable([[1, 2], [3]]))     # [1, 2, 3]
+
+# The deferred-execution gotcha exists here too
+def bad(items):
+    if items is None:
+        raise ValueError(&quot;items&quot;)            # not raised until you iterate
+    yield from items
+
+def good(items):
+    if items is None:
+        raise ValueError(&quot;items&quot;)            # raised at CALL time
+    return _iterate(items)
+
+def _iterate(items):
+    yield from items</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"Design a BST iterator" is the common form and the expected answer is the explicit stack with <code>PushLeft</code>, plus the complexity claim: <code>Next()</code> is O(1) <em>amortised</em> and the space is O(h), not O(n), which is the whole point of doing it lazily. Mentioning that <code>yield return</code> compiles to the same kind of state machine shows you know what the sugar is. The deferred-execution gotcha — argument validation inside an iterator method does not run until enumeration — is a good extra and a real production bug.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement a BST iterator with an explicit stack and justify the amortised O(1).</li><li>Write a peeking iterator over an arbitrary <code>IEnumerator&lt;T&gt;</code>.</li><li>Write an iterator method with argument validation inside it and prove the exception is deferred.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://leetcode.com/tag/monotonic-stack/" target="_blank" rel="noopener">LeetCode: monotonic stack</a> — the pattern, by frequency</li><li><a href="https://leetcode.com/tag/linked-list/" target="_blank" rel="noopener">LeetCode: linked list</a> — the standard set</li><li><a href="https://learn.microsoft.com/dotnet/api/system.collections.generic.linkedlist-1" target="_blank" rel="noopener">LinkedList&lt;T&gt;</a> — the only BCL structure with O(1) middle removal</li><li><a href="https://docs.python.org/3/library/collections.html#collections.deque" target="_blank" rel="noopener">collections.deque</a> — O(1) at both ends</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

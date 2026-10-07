@@ -1,0 +1,1508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL &amp; Database Fundamentals — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="sql-databases">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › C# &amp; .NET › Topic 9 of 36</div>
+  <h1>SQL &amp; Database Fundamentals</h1>
+  <p class="lede"><a href="entity-framework.html">EF Core</a> is how you talk to the database; this is the database. Almost every senior .NET loop has a SQL round, and it is rarely about syntax — it is "here is a slow query, why is it slow", "what index would you add", "what isolation level is this and what can go wrong". Every sample has the SQL, the LINQ that generates it, and the Python equivalent.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#modelling">Modelling, normalisation and when to denormalise</a></li><li><a href="#joins">Joins, set operators and NULL</a></li><li><a href="#aggregates-ctes">Aggregates, GROUP BY, HAVING and CTEs</a></li><li><a href="#windows">Window functions and running totals</a></li><li><a href="#indexes">Indexes: clustered, non-clustered, covering and composite</a></li><li><a href="#plans">Reading an execution plan</a></li><li><a href="#sargable">SARGability and query anti-patterns</a></li><li><a href="#transactions">Transactions, isolation levels and the anomalies each allows</a></li><li><a href="#locking">Locking, blocking and deadlocks</a></li><li><a href="#pagination">Paging, keyset pagination and counting at scale</a></li><li><a href="#procs-views">Stored procedures, views and functions</a></li><li><a href="#sql-vs-nosql">SQL vs NoSQL: choosing the store</a></li></ol>
+  </div>
+
+<section id="modelling"><h2 id="modelling">Modelling, normalisation and when to denormalise</h2><p>Normalisation is a set of rules for removing redundancy so a fact lives in exactly one place. In practice you need 1NF–3NF and the sentence that summarises them: <em>every non-key column depends on the key, the whole key, and nothing but the key</em>. Past 3NF is academic for interview purposes.</p><p>The more interesting half is when you deliberately break it. Denormalising — a cached <code>OrderTotal</code>, a duplicated <code>CustomerName</code>, a counter column — trades write complexity and a consistency risk for read speed. The answer an interviewer wants is that it is a measured decision with a named mechanism to keep the copy correct, not something you do by default.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="sql"><code>-- 3NF: each fact once, relationships by key
+CREATE TABLE customers (
+    id          INT IDENTITY PRIMARY KEY,
+    email       NVARCHAR(256) NOT NULL UNIQUE,     -- natural key, enforced
+    name        NVARCHAR(200) NOT NULL,
+    created_at  DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
+);
+
+CREATE TABLE orders (
+    id          INT IDENTITY PRIMARY KEY,
+    customer_id INT           NOT NULL REFERENCES customers(id),
+    status      VARCHAR(20)   NOT NULL
+                  CONSTRAINT ck_orders_status CHECK (status IN (&#x27;pending&#x27;,&#x27;paid&#x27;,&#x27;shipped&#x27;)),
+    placed_at   DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+    -- total is NOT stored: it is derivable from order_lines
+);
+
+CREATE TABLE order_lines (
+    order_id    INT           NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    sku         VARCHAR(40)   NOT NULL,
+    quantity    INT           NOT NULL CHECK (quantity &gt; 0),
+    unit_price  DECIMAL(19,4) NOT NULL,            -- never FLOAT for money
+    PRIMARY KEY (order_id, sku)                    -- composite natural key
+);
+
+-- Deliberate denormalisation, with the mechanism that keeps it true
+ALTER TABLE orders ADD total DECIMAL(19,4) NULL;
+
+-- Option 1: a computed column - always correct, costs on read (or on write if persisted)
+ALTER TABLE orders ADD line_count AS (
+    SELECT COUNT(*) FROM order_lines l WHERE l.order_id = orders.id);   -- not allowed:
+-- SQL Server computed columns cannot contain subqueries. Use an indexed view instead:
+CREATE VIEW vw_order_totals WITH SCHEMABINDING AS
+SELECT order_id, SUM(quantity * unit_price) AS total, COUNT_BIG(*) AS lines
+FROM dbo.order_lines GROUP BY order_id;
+CREATE UNIQUE CLUSTERED INDEX ix_vw_order_totals ON vw_order_totals(order_id);
+-- the engine now maintains it on every write, and can use it automatically
+
+-- Option 2: maintain it in the same transaction as the write (application-side)
+-- Option 3: accept staleness and rebuild it on a schedule - say so out loud
+
+-- Soft delete and temporal data: two patterns worth recognising
+ALTER TABLE orders ADD deleted_at DATETIME2 NULL;
+CREATE INDEX ix_orders_active ON orders(customer_id)
+    WHERE deleted_at IS NULL;                      -- filtered index: only live rows</code></pre><pre data-lang="csharp" hidden><code>// The same model in EF Core - the configuration IS the schema decision
+public class OrderConfiguration : IEntityTypeConfiguration&lt;Order&gt;
+{
+    public void Configure(EntityTypeBuilder&lt;Order&gt; b)
+    {
+        b.HasKey(o =&gt; o.Id);
+
+        b.Property(o =&gt; o.Status).HasMaxLength(20).IsRequired();
+        b.ToTable(t =&gt; t.HasCheckConstraint(&quot;ck_orders_status&quot;,
+            &quot;status IN (&#x27;pending&#x27;,&#x27;paid&#x27;,&#x27;shipped&#x27;)&quot;));
+
+        // money: decimal with explicit precision, never double
+        b.Property(o =&gt; o.Total).HasPrecision(19, 4);
+
+        b.HasOne(o =&gt; o.Customer)
+         .WithMany(c =&gt; c.Orders)
+         .HasForeignKey(o =&gt; o.CustomerId)
+         .OnDelete(DeleteBehavior.Restrict);        // not Cascade by default - decide
+
+        // composite key on the dependent
+        b.OwnsMany(o =&gt; o.Lines, l =&gt; l.HasKey(&quot;OrderId&quot;, &quot;Sku&quot;));
+
+        // soft delete, applied globally so you cannot forget it
+        b.HasQueryFilter(o =&gt; o.DeletedAt == null);
+
+        // filtered index to match the query filter
+        b.HasIndex(o =&gt; o.CustomerId).HasFilter(&quot;deleted_at IS NULL&quot;);
+    }
+}
+
+// Keeping a denormalised total honest - in the same transaction as the change
+public async Task AddLine(int orderId, OrderLine line, CancellationToken ct)
+{
+    var order = await _db.Orders.Include(o =&gt; o.Lines)
+        .SingleAsync(o =&gt; o.Id == orderId, ct);
+    order.Lines.Add(line);
+    order.Total = order.Lines.Sum(l =&gt; l.Quantity * l.UnitPrice);   // recomputed, not +=
+    await _db.SaveChangesAsync(ct);                                 // one transaction
+}</code></pre><pre data-lang="python" hidden><code>from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy import ForeignKey, CheckConstraint, Index, Numeric, String, DateTime, func
+from decimal import Decimal
+import datetime as dt
+
+class Base(DeclarativeBase): pass
+
+class Customer(Base):
+    __tablename__ = &quot;customers&quot;
+    id:    Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(256), unique=True)
+    name:  Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[dt.datetime] = mapped_column(server_default=func.now())
+    orders: Mapped[list[&quot;Order&quot;]] = relationship(back_populates=&quot;customer&quot;)
+
+class Order(Base):
+    __tablename__ = &quot;orders&quot;
+    __table_args__ = (
+        CheckConstraint(&quot;status IN (&#x27;pending&#x27;,&#x27;paid&#x27;,&#x27;shipped&#x27;)&quot;, name=&quot;ck_orders_status&quot;),
+        Index(&quot;ix_orders_active&quot;, &quot;customer_id&quot;,
+              postgresql_where=text(&quot;deleted_at IS NULL&quot;)),       # filtered index
+    )
+    id:          Mapped[int] = mapped_column(primary_key=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey(&quot;customers.id&quot;))
+    status:      Mapped[str] = mapped_column(String(20))
+    # money: Numeric, never Float
+    total:       Mapped[Decimal | None] = mapped_column(Numeric(19, 4))
+    deleted_at:  Mapped[dt.datetime | None]
+    customer: Mapped[Customer] = relationship(back_populates=&quot;orders&quot;)
+    lines: Mapped[list[&quot;OrderLine&quot;]] = relationship(cascade=&quot;all, delete-orphan&quot;)
+
+class OrderLine(Base):
+    __tablename__ = &quot;order_lines&quot;
+    order_id:   Mapped[int] = mapped_column(ForeignKey(&quot;orders.id&quot;), primary_key=True)
+    sku:        Mapped[str] = mapped_column(String(40), primary_key=True)
+    quantity:   Mapped[int]
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(19, 4))</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"Walk me through normalising this" is a common whiteboard opener, and the sentence about the key is enough to carry it. The sharper question is the reverse: "when would you denormalise?" — answer with a concrete read pattern that cannot be served cheaply, name the mechanism that keeps the copy correct (same transaction, indexed view, trigger, or a scheduled rebuild with accepted staleness), and say what you would monitor to detect drift. "For performance" on its own is a weak answer.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Normalise a spreadsheet-shaped table (repeating customer name and address on every order row) to 3NF.</li><li>Add a denormalised order total three ways and compare the write cost of each.</li><li>Explain why <code>DECIMAL</code> and not <code>FLOAT</code> for money, with an example that loses a cent.</li></ul></div></section>
+<section id="joins"><h2 id="joins">Joins, set operators and NULL</h2><p>Join semantics are reliably tested, usually by asking for the difference between <code>LEFT JOIN ... WHERE b.x = 1</code> and <code>LEFT JOIN ... AND b.x = 1</code> — the first silently turns the outer join into an inner join, because a <code>WHERE</code> on the right-hand table filters out the NULL-extended rows the join just produced.</p><p>The other reliable trap is <code>NOT IN</code> with a nullable column: if the subquery returns a single NULL the whole predicate is unknown and you get zero rows. <code>NOT EXISTS</code> does not have this problem, which is why it is the safer default.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="sql"><code>-- The classic: these two are NOT the same query
+SELECT c.name, o.id
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.status = &#x27;paid&#x27;;          -- customers with NO orders are filtered OUT:
+                                  -- o.status is NULL for them, NULL = &#x27;paid&#x27; is unknown
+                                  -- this is an INNER JOIN wearing a disguise
+
+SELECT c.name, o.id
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id AND o.status = &#x27;paid&#x27;;
+                                  -- customers with no paid orders are KEPT, with NULLs
+
+-- &quot;customers with no orders at all&quot; - three ways, one of them broken
+SELECT c.* FROM customers c                       -- 1. anti-join (clear + fast)
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.id IS NULL;
+
+SELECT c.* FROM customers c                       -- 2. NOT EXISTS (clearest, NULL-safe)
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);
+
+SELECT c.* FROM customers c                       -- 3. NOT IN - BROKEN if the column
+WHERE c.id NOT IN (SELECT customer_id FROM orders);  -- is nullable: one NULL in the
+                                                  -- subquery returns zero rows, always
+
+-- Set operators: UNION dedups (and sorts to do it), UNION ALL does not
+SELECT sku FROM order_lines
+UNION ALL                          -- always prefer ALL unless you need the dedup
+SELECT sku FROM returns;
+
+SELECT sku FROM catalogue
+EXCEPT                             -- rows in the first not in the second (MINUS in Oracle)
+SELECT sku FROM order_lines;
+
+-- NULL semantics, the part people get wrong
+SELECT NULL = NULL;                -- NULL, not true
+SELECT NULL &lt;&gt; 1;                  -- NULL, not true
+WHERE col IS NULL                  -- the only way to test it
+SELECT COUNT(*), COUNT(coupon);    -- COUNT(*) counts rows, COUNT(col) skips NULLs
+SELECT AVG(score) FROM t;          -- ignores NULLs: the denominator is non-null rows
+SELECT COALESCE(coupon, &#x27;none&#x27;);   -- first non-null
+
+-- CROSS APPLY / LATERAL: a correlated subquery you can join to.
+-- &quot;the 3 most recent orders per customer&quot; without a window function:
+SELECT c.name, o.id, o.placed_at
+FROM customers c
+CROSS APPLY (SELECT TOP 3 * FROM orders o
+             WHERE o.customer_id = c.id ORDER BY o.placed_at DESC) o;</code></pre><pre data-lang="csharp" hidden><code>// EF Core: the join shape follows the navigation, and the filter position matters
+
+// LEFT JOIN ... WHERE  (collapses to an inner join - usually not what you meant)
+var wrong = await db.Customers
+    .SelectMany(c =&gt; c.Orders.DefaultIfEmpty(), (c, o) =&gt; new { c, o })
+    .Where(x =&gt; x.o!.Status == &quot;paid&quot;)
+    .ToListAsync(ct);
+
+// LEFT JOIN ... AND  (filtered join: keeps customers with no paid orders)
+var right = await db.Customers
+    .Select(c =&gt; new
+    {
+        c.Name,
+        PaidOrders = c.Orders.Where(o =&gt; o.Status == &quot;paid&quot;).Select(o =&gt; o.Id).ToList(),
+    })
+    .ToListAsync(ct);
+
+// NOT EXISTS - this is what !Any() translates to, and it is NULL-safe
+var noOrders = await db.Customers
+    .Where(c =&gt; !c.Orders.Any())
+    .ToListAsync(ct);
+
+// Careful: Contains() over a nullable column translates to NOT IN and inherits the bug
+var ids = await db.Orders.Select(o =&gt; o.CustomerId).ToListAsync(ct);
+var broken = await db.Customers.Where(c =&gt; !ids.Contains(c.Id)).ToListAsync(ct);
+
+// Explicit join when there is no navigation property
+var joined = await (from c in db.Customers
+                    join o in db.Orders on c.Id equals o.CustomerId into g
+                    from o in g.DefaultIfEmpty()               // &lt;- LEFT JOIN
+                    select new { c.Name, OrderId = (int?)o.Id })
+                   .ToListAsync(ct);
+
+// Always check what was generated
+var sql = db.Customers.Where(c =&gt; !c.Orders.Any()).ToQueryString();</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import select, func, not_, exists
+
+# LEFT JOIN ... WHERE  (collapses to inner)
+wrong = select(Customer.name, Order.id).outerjoin(Order).where(Order.status == &quot;paid&quot;)
+
+# LEFT JOIN ... AND  (filtered join)
+right = (select(Customer.name, Order.id)
+         .outerjoin(Order, (Order.customer_id == Customer.id) &amp; (Order.status == &quot;paid&quot;)))
+
+# NOT EXISTS - NULL-safe
+no_orders = select(Customer).where(
+    ~exists().where(Order.customer_id == Customer.id))
+
+# NOT IN - same trap as SQL: one NULL and you get nothing back
+broken = select(Customer).where(Customer.id.not_in(select(Order.customer_id)))
+
+# Set operators
+from sqlalchemy import union_all, except_
+all_skus = union_all(select(OrderLine.sku), select(Return.sku))
+unsold   = except_(select(Catalogue.sku), select(OrderLine.sku))
+
+# LATERAL - the CROSS APPLY equivalent
+recent = (select(Order).where(Order.customer_id == Customer.id)
+          .order_by(Order.placed_at.desc()).limit(3).lateral())
+q = select(Customer.name, recent.c.id).join(recent, true())
+
+# NULL semantics are identical, and pandas differs - worth knowing if you move between
+import pandas as pd
+pd.NA == pd.NA        # &lt;NA&gt;, like SQL
+float(&quot;nan&quot;) == float(&quot;nan&quot;)   # False
+df.count()            # like COUNT(col): skips NaN
+len(df)               # like COUNT(*)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The <code>WHERE</code>-versus-<code>AND</code> question on an outer join is asked constantly — be able to say <em>why</em> (the <code>WHERE</code> runs after the join and discards the NULL-extended rows), not just which is which. Second most common: "how do you find rows in A with no match in B?" Give <code>NOT EXISTS</code> or an anti-join and volunteer why you avoid <code>NOT IN</code> on a nullable column.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write the same "customers with no paid orders" query with an anti-join, <code>NOT EXISTS</code> and <code>NOT IN</code>; insert a NULL and see which breaks.</li><li>Predict the row count of each of <code>UNION</code> and <code>UNION ALL</code> on overlapping sets, then check.</li><li>Use <code>CROSS APPLY</code>/<code>LATERAL</code> for a top-N-per-group, then do it again with a window function.</li></ul></div></section>
+<section id="aggregates-ctes"><h2 id="aggregates-ctes">Aggregates, GROUP BY, HAVING and CTEs</h2><p>The thing to internalise is the <strong>logical order of evaluation</strong>, because it explains every error message in this area: <code>FROM</code> → <code>WHERE</code> → <code>GROUP BY</code> → <code>HAVING</code> → <code>SELECT</code> → <code>ORDER BY</code>. That is why you cannot use a <code>SELECT</code> alias in a <code>WHERE</code>, why <code>HAVING</code> filters groups and <code>WHERE</code> filters rows, and why <code>ORDER BY</code> can use an alias when nothing else can.</p><p>CTEs (<code>WITH</code>) name a subquery so a multi-step query reads top to bottom instead of inside out. Recursive CTEs walk hierarchies — org charts, category trees, bills of materials — and are the standard "how would you query a tree" answer.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="sql"><code>-- Logical order: FROM -&gt; WHERE -&gt; GROUP BY -&gt; HAVING -&gt; SELECT -&gt; ORDER BY
+SELECT   c.id,
+         c.name,
+         COUNT(*)              AS order_count,     -- an alias defined here...
+         SUM(o.total)          AS lifetime_value
+FROM     customers c
+JOIN     orders o ON o.customer_id = c.id
+WHERE    o.placed_at &gt;= &#x27;2026-01-01&#x27;               -- filters ROWS, before grouping
+GROUP BY c.id, c.name                              -- every non-aggregate SELECT column
+HAVING   COUNT(*) &gt;= 5                             -- filters GROUPS, after
+ORDER BY lifetime_value DESC;                      -- ...is usable only here
+
+-- CTEs: name the steps, read top to bottom
+WITH monthly AS (
+    SELECT customer_id,
+           DATEFROMPARTS(YEAR(placed_at), MONTH(placed_at), 1) AS month,
+           SUM(total) AS revenue
+    FROM   orders
+    GROUP BY customer_id, DATEFROMPARTS(YEAR(placed_at), MONTH(placed_at), 1)
+),
+ranked AS (
+    SELECT *, RANK() OVER (PARTITION BY month ORDER BY revenue DESC) AS rk
+    FROM   monthly
+)
+SELECT month, customer_id, revenue
+FROM   ranked
+WHERE  rk &lt;= 3                                     -- top 3 customers per month
+ORDER  BY month, rk;
+
+-- Recursive CTE: walk a hierarchy
+WITH RECURSIVE org AS (
+    SELECT id, name, manager_id, 0 AS depth, CAST(name AS NVARCHAR(MAX)) AS path
+    FROM   employees
+    WHERE  manager_id IS NULL                      -- anchor: the roots
+
+    UNION ALL
+
+    SELECT e.id, e.name, e.manager_id, org.depth + 1, org.path + &#x27; &gt; &#x27; + e.name
+    FROM   employees e
+    JOIN   org ON e.manager_id = org.id            -- recursive member
+    WHERE  org.depth &lt; 20                          -- ALWAYS bound it
+)
+SELECT depth, path FROM org ORDER BY path;
+
+-- Conditional aggregation: pivot without PIVOT
+SELECT customer_id,
+       COUNT(*)                                            AS total,
+       SUM(CASE WHEN status = &#x27;paid&#x27;    THEN 1 ELSE 0 END) AS paid,
+       SUM(CASE WHEN status = &#x27;shipped&#x27; THEN 1 ELSE 0 END) AS shipped,
+       AVG(CASE WHEN status = &#x27;paid&#x27; THEN o.total END)     AS avg_paid  -- NULL skipped
+FROM   orders o
+GROUP  BY customer_id;
+
+-- GROUPING SETS / ROLLUP: subtotals without UNION ALL
+SELECT status, YEAR(placed_at) AS yr, SUM(total)
+FROM   orders
+GROUP  BY ROLLUP (status, YEAR(placed_at));</code></pre><pre data-lang="csharp" hidden><code>// GroupBy in EF Core: translates to SQL GROUP BY when the shape allows it
+var summary = await db.Orders
+    .Where(o =&gt; o.PlacedAt &gt;= new DateTime(2026, 1, 1))     // WHERE
+    .GroupBy(o =&gt; new { o.CustomerId, o.Customer.Name })    // GROUP BY
+    .Where(g =&gt; g.Count() &gt;= 5)                             // HAVING
+    .Select(g =&gt; new
+    {
+        g.Key.CustomerId,
+        g.Key.Name,
+        OrderCount   = g.Count(),
+        LifetimeValue = g.Sum(o =&gt; o.Total),
+    })
+    .OrderByDescending(x =&gt; x.LifetimeValue)                // ORDER BY
+    .ToListAsync(ct);
+
+// The trap: selecting the group itself forces client evaluation of every row
+var bad = await db.Orders
+    .GroupBy(o =&gt; o.CustomerId)
+    .Select(g =&gt; new { g.Key, Orders = g.ToList() })        // pulls EVERYTHING back
+    .ToListAsync(ct);
+
+// Conditional aggregation translates fine
+var byStatus = await db.Orders
+    .GroupBy(o =&gt; o.CustomerId)
+    .Select(g =&gt; new
+    {
+        g.Key,
+        Total   = g.Count(),
+        Paid    = g.Count(o =&gt; o.Status == &quot;paid&quot;),
+        AvgPaid = g.Where(o =&gt; o.Status == &quot;paid&quot;).Average(o =&gt; (decimal?)o.Total),
+    })
+    .ToListAsync(ct);
+
+// Recursive queries have no LINQ equivalent - drop to raw SQL
+var tree = await db.Database
+    .SqlQuery&lt;OrgRow&gt;($@&quot;
+        WITH org AS (
+            SELECT id, name, manager_id, 0 AS depth FROM employees WHERE manager_id IS NULL
+            UNION ALL
+            SELECT e.id, e.name, e.manager_id, org.depth + 1
+            FROM employees e JOIN org ON e.manager_id = org.id WHERE org.depth &lt; 20)
+        SELECT * FROM org&quot;)
+    .ToListAsync(ct);
+
+// Always verify the translation
+Console.WriteLine(query.ToQueryString());</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import select, func, case, and_
+
+summary = (
+    select(Customer.id, Customer.name,
+           func.count().label(&quot;order_count&quot;),
+           func.sum(Order.total).label(&quot;lifetime_value&quot;))
+    .join(Order, Order.customer_id == Customer.id)
+    .where(Order.placed_at &gt;= dt.date(2026, 1, 1))     # WHERE
+    .group_by(Customer.id, Customer.name)              # GROUP BY
+    .having(func.count() &gt;= 5)                         # HAVING
+    .order_by(func.sum(Order.total).desc())            # ORDER BY
+)
+
+# CTEs
+monthly = (
+    select(Order.customer_id,
+           func.date_trunc(&quot;month&quot;, Order.placed_at).label(&quot;month&quot;),
+           func.sum(Order.total).label(&quot;revenue&quot;))
+    .group_by(Order.customer_id, func.date_trunc(&quot;month&quot;, Order.placed_at))
+    .cte(&quot;monthly&quot;)
+)
+ranked = select(
+    monthly.c.month, monthly.c.customer_id, monthly.c.revenue,
+    func.rank().over(partition_by=monthly.c.month,
+                     order_by=monthly.c.revenue.desc()).label(&quot;rk&quot;),
+).cte(&quot;ranked&quot;)
+top3 = select(ranked).where(ranked.c.rk &lt;= 3)
+
+# Recursive CTE
+roots = select(Employee.id, Employee.name, Employee.manager_id,
+               literal(0).label(&quot;depth&quot;)).where(Employee.manager_id.is_(None))
+org = roots.cte(&quot;org&quot;, recursive=True)
+org = org.union_all(
+    select(Employee.id, Employee.name, Employee.manager_id, org.c.depth + 1)
+    .join(org, Employee.manager_id == org.c.id)
+    .where(org.c.depth &lt; 20)
+)
+
+# Conditional aggregation
+by_status = select(
+    Order.customer_id,
+    func.count().label(&quot;total&quot;),
+    func.sum(case((Order.status == &quot;paid&quot;, 1), else_=0)).label(&quot;paid&quot;),
+).group_by(Order.customer_id)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"Difference between <code>WHERE</code> and <code>HAVING</code>" is the warm-up; answer it through the logical evaluation order, which also covers "why can't I use my alias here". The real question is usually "top N per group" — have both answers ready: a window function in a CTE (the modern one) and <code>CROSS APPLY</code>/correlated subquery (the portable one). For recursive CTEs, always volunteer the depth bound; an unbounded recursive CTE on cyclic data runs until the engine stops it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write "the 3 highest-value orders per customer" with a window function and with <code>CROSS APPLY</code>; compare the plans.</li><li>Use conditional aggregation to pivot order counts by status without <code>PIVOT</code>.</li><li>Write a recursive CTE over an employee hierarchy that also produces the full path string.</li></ul></div></section>
+<section id="windows"><h2 id="windows">Window functions and running totals</h2><p>Window functions compute across a set of rows related to the current row <em>without collapsing them</em> — that is the whole idea, and the one-sentence definition worth having ready. <code>GROUP BY</code> gives you one row per group; <code>OVER()</code> gives you every row plus the aggregate.</p><p>Know the three ranking functions and how they differ on ties: <code>ROW_NUMBER</code> (1,2,3,4 — arbitrary tiebreak), <code>RANK</code> (1,2,2,4 — gaps), <code>DENSE_RANK</code> (1,2,2,3 — no gaps). Deduplication is the most common real use: number the rows per key and delete everything above 1.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="sql"><code>-- The definition in one query: the aggregate without losing the rows
+SELECT id, customer_id, total,
+       SUM(total)   OVER (PARTITION BY customer_id)             AS customer_lifetime,
+       AVG(total)   OVER (PARTITION BY customer_id)             AS customer_avg,
+       total - AVG(total) OVER (PARTITION BY customer_id)       AS vs_their_average,
+       COUNT(*)     OVER ()                                      AS total_rows
+FROM   orders;
+
+-- Ranking: the difference on ties is the question
+SELECT customer_id, total,
+       ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY total DESC) AS rn,  -- 1,2,3,4
+       RANK()       OVER (PARTITION BY customer_id ORDER BY total DESC) AS rk,  -- 1,2,2,4
+       DENSE_RANK() OVER (PARTITION BY customer_id ORDER BY total DESC) AS dr,  -- 1,2,2,3
+       NTILE(4)     OVER (ORDER BY total DESC)                         AS quartile
+FROM   orders;
+
+-- Deduplication: the single most useful window-function recipe
+WITH dupes AS (
+    SELECT id, ROW_NUMBER() OVER (PARTITION BY email ORDER BY created_at) AS rn
+    FROM   customers
+)
+DELETE FROM customers WHERE id IN (SELECT id FROM dupes WHERE rn &gt; 1);
+
+-- Running total: the frame clause is what makes it &quot;running&quot;
+SELECT placed_at, total,
+       SUM(total) OVER (ORDER BY placed_at
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running,
+       -- the DEFAULT frame with ORDER BY is RANGE UNBOUNDED PRECEDING, which sums
+       -- all PEERS of the current row - different answer when timestamps tie.
+       AVG(total) OVER (ORDER BY placed_at
+                        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)         AS moving_avg_7
+FROM   orders;
+
+-- LAG / LEAD: compare a row to its neighbours without a self-join
+SELECT placed_at, total,
+       LAG(total)  OVER (PARTITION BY customer_id ORDER BY placed_at) AS previous,
+       total - LAG(total) OVER (PARTITION BY customer_id ORDER BY placed_at) AS delta,
+       LEAD(placed_at) OVER (PARTITION BY customer_id ORDER BY placed_at) AS next_order,
+       DATEDIFF(day, placed_at,
+           LEAD(placed_at) OVER (PARTITION BY customer_id ORDER BY placed_at)) AS gap_days
+FROM   orders;
+
+-- FIRST_VALUE / LAST_VALUE - LAST_VALUE needs the frame or it returns the current row
+SELECT customer_id, placed_at, total,
+       FIRST_VALUE(total) OVER (PARTITION BY customer_id ORDER BY placed_at) AS first_order,
+       LAST_VALUE(total)  OVER (PARTITION BY customer_id ORDER BY placed_at
+                                ROWS BETWEEN UNBOUNDED PRECEDING
+                                         AND UNBOUNDED FOLLOWING)           AS last_order
+FROM   orders;</code></pre><pre data-lang="csharp" hidden><code>// EF Core 8+ has no LINQ operator for window functions. Three options:
+
+// 1. Raw SQL mapped to a type - the usual answer
+public record OrderRank(int Id, int CustomerId, decimal Total, long Rank);
+
+var ranked = await db.Database.SqlQuery&lt;OrderRank&gt;($@&quot;
+    SELECT id AS Id, customer_id AS CustomerId, total AS Total,
+           ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY total DESC) AS Rank
+    FROM   orders
+    WHERE  placed_at &gt;= {from}&quot;)                 // interpolation here is PARAMETERISED
+    .ToListAsync(ct);
+
+// 2. A database view or a keyless entity mapped to it
+modelBuilder.Entity&lt;OrderRank&gt;().HasNoKey().ToView(&quot;vw_order_ranks&quot;);
+
+// 3. Dapper, when the query is the point and the mapping is incidental
+var rows = await conn.QueryAsync&lt;OrderRank&gt;(@&quot;
+    SELECT id, customer_id, total,
+           ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY total DESC) AS rank
+    FROM orders WHERE placed_at &gt;= @from&quot;, new { from });
+
+// What people write instead, and why it is worse: fetch everything, rank in memory
+var inMemory = (await db.Orders.ToListAsync(ct))     // every row over the wire
+    .GroupBy(o =&gt; o.CustomerId)
+    .SelectMany(g =&gt; g.OrderByDescending(o =&gt; o.Total)
+                      .Select((o, i) =&gt; new { o, Rank = i + 1 }));
+
+// LINQ CAN express the running total, but it becomes a correlated subquery per row
+var running = db.Orders.Select(o =&gt; new
+{
+    o.Id,
+    Running = db.Orders.Where(x =&gt; x.PlacedAt &lt;= o.PlacedAt).Sum(x =&gt; x.Total),
+});   // O(n^2) - check the plan before shipping it</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import select, func
+
+# SQLAlchemy exposes window functions directly with .over()
+ranked = select(
+    Order.id, Order.customer_id, Order.total,
+    func.sum(Order.total).over(partition_by=Order.customer_id).label(&quot;lifetime&quot;),
+    func.row_number().over(partition_by=Order.customer_id,
+                           order_by=Order.total.desc()).label(&quot;rn&quot;),
+    func.rank().over(partition_by=Order.customer_id,
+                     order_by=Order.total.desc()).label(&quot;rk&quot;),
+)
+
+# Running total: the frame is explicit, same semantics as SQL
+running = select(
+    Order.placed_at, Order.total,
+    func.sum(Order.total).over(order_by=Order.placed_at,
+                               rows=(None, 0)).label(&quot;running&quot;),      # UNBOUNDED..CURRENT
+    func.avg(Order.total).over(order_by=Order.placed_at,
+                               rows=(-6, 0)).label(&quot;moving_avg_7&quot;),
+)
+
+# LAG / LEAD
+deltas = select(
+    Order.placed_at, Order.total,
+    func.lag(Order.total).over(partition_by=Order.customer_id,
+                               order_by=Order.placed_at).label(&quot;previous&quot;),
+    func.lead(Order.placed_at).over(partition_by=Order.customer_id,
+                                    order_by=Order.placed_at).label(&quot;next_order&quot;),
+)
+
+# pandas, for the same operations on data already in memory
+df[&quot;lifetime&quot;]    = df.groupby(&quot;customer_id&quot;)[&quot;total&quot;].transform(&quot;sum&quot;)   # OVER (PARTITION BY)
+df[&quot;rn&quot;]          = df.groupby(&quot;customer_id&quot;)[&quot;total&quot;].rank(method=&quot;first&quot;, ascending=False)
+df[&quot;rk&quot;]          = df.groupby(&quot;customer_id&quot;)[&quot;total&quot;].rank(method=&quot;min&quot;,   ascending=False)
+df[&quot;running&quot;]     = df.sort_values(&quot;placed_at&quot;)[&quot;total&quot;].cumsum()
+df[&quot;moving_avg7&quot;] = df[&quot;total&quot;].rolling(7).mean()
+df[&quot;previous&quot;]    = df.groupby(&quot;customer_id&quot;)[&quot;total&quot;].shift(1)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"What is the difference between <code>ROW_NUMBER</code>, <code>RANK</code> and <code>DENSE_RANK</code>?" is the standard opener and takes one sentence. The follow-up that separates people: write a deduplication query, or a running total — and if you write a running total, know the default frame. <code>SUM(x) OVER (ORDER BY d)</code> without a <code>ROWS</code> clause uses <code>RANGE</code>, which includes every row that ties on <code>d</code>; on a timestamp column with duplicates that quietly gives a different answer than the one you intended.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Deduplicate a table on a business key, keeping the earliest row, using <code>ROW_NUMBER</code>.</li><li>Write a 7-day moving average and then change <code>ROWS</code> to <code>RANGE</code> on tied dates and explain the difference.</li><li>Use <code>LAG</code> to find customers whose order gap exceeded 90 days.</li></ul></div></section>
+<section id="indexes"><h2 id="indexes">Indexes: clustered, non-clustered, covering and composite</h2><p>An index is a sorted structure (a B-tree) over one or more columns, with a pointer back to the row. The <strong>clustered</strong> index <em>is</em> the table — the rows are physically stored in its order, so a table has exactly one. A <strong>non-clustered</strong> index is a separate structure holding the key columns plus a pointer; reading any other column means a <em>key lookup</em> back to the table, which is the single most common reason an index "is not being used".</p><p>The rule that answers most index questions is <strong>leftmost prefix</strong>: an index on <code>(a, b, c)</code> serves predicates on <code>a</code>, on <code>a, b</code> and on <code>a, b, c</code> — but not on <code>b</code> alone. Order the columns equality-first, then range, then the rest as <code>INCLUDE</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="sql"><code>-- The clustered index IS the table. Choose it deliberately:
+-- narrow, static, ever-increasing. An IDENTITY/sequence key fits; a random GUID
+-- does not (it causes page splits and fragmentation on every insert).
+CREATE TABLE orders (
+    id          INT IDENTITY,
+    customer_id INT NOT NULL,
+    status      VARCHAR(20) NOT NULL,
+    placed_at   DATETIME2 NOT NULL,
+    total       DECIMAL(19,4) NOT NULL,
+    notes       NVARCHAR(MAX) NULL,
+    CONSTRAINT pk_orders PRIMARY KEY CLUSTERED (id)
+);
+
+-- Composite index: EQUALITY columns first, then the RANGE column
+CREATE INDEX ix_orders_customer_placed ON orders (customer_id, placed_at);
+--   serves:     WHERE customer_id = 1
+--               WHERE customer_id = 1 AND placed_at &gt;= &#x27;2026-01-01&#x27;
+--               WHERE customer_id = 1 ORDER BY placed_at       (no sort needed)
+--   does NOT:   WHERE placed_at &gt;= &#x27;2026-01-01&#x27;                (leftmost prefix)
+
+-- Covering index: INCLUDE the columns you SELECT so there is no key lookup
+CREATE INDEX ix_orders_customer_placed_cov
+    ON orders (customer_id, placed_at)
+    INCLUDE (status, total);
+--   this query is now served entirely from the index:
+--   SELECT status, total FROM orders WHERE customer_id = 1 AND placed_at &gt;= &#x27;2026-01-01&#x27;;
+--   INCLUDE columns sit only in the leaf, so they cost space but not tree depth,
+--   and they cannot be used for seeking or ordering.
+
+-- Filtered index: much smaller, for a query that always carries the same predicate
+CREATE INDEX ix_orders_pending ON orders (placed_at)
+    WHERE status = &#x27;pending&#x27;;
+
+-- Unique index: a constraint AND an access path
+CREATE UNIQUE INDEX ux_customers_email ON customers (email);
+
+-- What indexes cost: every INSERT/UPDATE/DELETE maintains every index on the table.
+-- Finding the ones nobody uses (SQL Server):
+SELECT OBJECT_NAME(s.object_id) AS tbl, i.name,
+       s.user_seeks, s.user_scans, s.user_lookups, s.user_updates
+FROM   sys.dm_db_index_usage_stats s
+JOIN   sys.indexes i ON i.object_id = s.object_id AND i.index_id = s.index_id
+WHERE  s.database_id = DB_ID()
+  AND  s.user_seeks + s.user_scans + s.user_lookups = 0       -- never read
+  AND  s.user_updates &gt; 0                                      -- always maintained
+ORDER  BY s.user_updates DESC;
+
+-- Fragmentation and statistics - the two reasons a good index stops performing
+ALTER INDEX ix_orders_customer_placed ON orders REBUILD;
+UPDATE STATISTICS orders;</code></pre><pre data-lang="csharp" hidden><code>// EF Core: declare the index with the model, so it ships with the migration
+public void Configure(EntityTypeBuilder&lt;Order&gt; b)
+{
+    // composite: equality column first, range column second
+    b.HasIndex(o =&gt; new { o.CustomerId, o.PlacedAt })
+     .HasDatabaseName(&quot;ix_orders_customer_placed&quot;);
+
+    // covering
+    b.HasIndex(o =&gt; new { o.CustomerId, o.PlacedAt })
+     .IncludeProperties(o =&gt; new { o.Status, o.Total });
+
+    // filtered
+    b.HasIndex(o =&gt; o.PlacedAt)
+     .HasFilter(&quot;status = &#x27;pending&#x27;&quot;);
+
+    // unique constraint and access path in one
+    b.HasIndex(o =&gt; o.ExternalRef).IsUnique();
+
+    // clustered key choice: sequential, not a random GUID
+    b.Property(o =&gt; o.Id).UseIdentityColumn();
+    // if you must use a GUID key:
+    // b.Property(o =&gt; o.Id).HasDefaultValueSql(&quot;NEWSEQUENTIALID()&quot;);
+}
+
+// Writing queries the index can actually serve -------------------------------
+
+// SARGable: the column is bare on one side, so a seek is possible
+var ok = db.Orders.Where(o =&gt; o.PlacedAt &gt;= from &amp;&amp; o.PlacedAt &lt; to);
+
+// NOT SARGable: the column is wrapped in a function -&gt; index scan
+var bad1 = db.Orders.Where(o =&gt; o.PlacedAt.Year == 2026);
+var bad2 = db.Orders.Where(o =&gt; o.Status.ToUpper() == &quot;PAID&quot;);
+var bad3 = db.Orders.Where(o =&gt; EF.Functions.Like(o.Email, &quot;%@example.com&quot;));  // leading %
+
+// Fixes
+var fix1 = db.Orders.Where(o =&gt; o.PlacedAt &gt;= new DateTime(2026,1,1)
+                             &amp;&amp; o.PlacedAt &lt;  new DateTime(2027,1,1));
+// fix2: store it normalised, or use a case-insensitive collation
+// fix3: store a reversed/computed column and index that
+
+// Ordering that the index already satisfies costs no sort
+var sorted = db.Orders.Where(o =&gt; o.CustomerId == id).OrderBy(o =&gt; o.PlacedAt);</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import Index, text
+from sqlalchemy.orm import Mapped, mapped_column
+
+class Order(Base):
+    __tablename__ = &quot;orders&quot;
+    __table_args__ = (
+        # composite: equality first, range second
+        Index(&quot;ix_orders_customer_placed&quot;, &quot;customer_id&quot;, &quot;placed_at&quot;),
+
+        # covering (PostgreSQL INCLUDE)
+        Index(&quot;ix_orders_cov&quot;, &quot;customer_id&quot;, &quot;placed_at&quot;,
+              postgresql_include=[&quot;status&quot;, &quot;total&quot;]),
+
+        # filtered / partial
+        Index(&quot;ix_orders_pending&quot;, &quot;placed_at&quot;,
+              postgresql_where=text(&quot;status = &#x27;pending&#x27;&quot;)),
+
+        # unique
+        Index(&quot;ux_orders_external_ref&quot;, &quot;external_ref&quot;, unique=True),
+    )
+
+# SARGability is identical in any database
+from sqlalchemy import select, extract, func
+
+ok   = select(Order).where(Order.placed_at &gt;= start, Order.placed_at &lt; end)
+bad1 = select(Order).where(extract(&quot;year&quot;, Order.placed_at) == 2026)   # scan
+bad2 = select(Order).where(func.upper(Order.status) == &quot;PAID&quot;)         # scan
+bad3 = select(Order).where(Order.email.like(&quot;%@example.com&quot;))          # leading % = scan
+
+# PostgreSQL can index the expression instead - the escape hatch
+# CREATE INDEX ix_orders_year ON orders ((EXTRACT(YEAR FROM placed_at)));
+# CREATE INDEX ix_orders_email_rev ON orders (reverse(email) text_pattern_ops);
+
+# Finding unused indexes (PostgreSQL)
+# SELECT relname, indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid))
+# FROM pg_stat_user_indexes WHERE idx_scan = 0 ORDER BY pg_relation_size(indexrelid) DESC;</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"What index would you add for this query?" is the single most likely practical SQL question. Work it aloud: equality predicates first in the key, then the range or sort column, then <code>INCLUDE</code> the selected columns to make it covering — and say the leftmost-prefix rule as your justification. Then volunteer the cost: every index is maintained on every write, so the second half of the answer is which existing index this one makes redundant.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a query, look at the plan, add a composite index, and confirm a scan became a seek.</li><li>Add the <code>INCLUDE</code> columns and watch the key lookup disappear from the plan.</li><li>Find an index in a real database that is written but never read.</li></ul></div></section>
+<section id="plans"><h2 id="plans">Reading an execution plan</h2><p>"This query is slow, what do you do?" The answer is always: look at the plan. You do not need to read every operator — you need to find the expensive one and recognise about six shapes.</p><ul><li><strong>Index Seek</strong> — navigated the B-tree to the rows. Good.</li><li><strong>Index Scan / Table Scan</strong> — read everything. Fine on a small or mostly-returned table, a problem when the predicate should have been selective.</li><li><strong>Key Lookup / RID Lookup</strong> — found rows in a non-clustered index, then went back to the table for more columns. Usually fixed by <code>INCLUDE</code>.</li><li><strong>Sort</strong> — often removable by matching the index order to the <code>ORDER BY</code>.</li><li><strong>Hash Match</strong> vs <strong>Nested Loops</strong> vs <strong>Merge Join</strong> — large/unsorted, small outer, both sorted respectively.</li><li><strong>Estimated vs actual rows far apart</strong> — stale statistics or a non-SARGable predicate; this is the single most useful thing to look at, because a bad estimate causes every other bad choice.</li></ul><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="sql"><code>-- SQL Server
+SET STATISTICS IO, TIME ON;             -- logical reads is the metric that matters:
+                                        -- it is stable, unlike elapsed time
+SET SHOWPLAN_XML ON;                    -- estimated plan, no execution
+-- or in SSMS: Ctrl-M for the ACTUAL plan, which has real row counts
+
+SELECT o.id, o.total, c.name
+FROM   orders o
+JOIN   customers c ON c.id = o.customer_id
+WHERE  o.placed_at &gt;= &#x27;2026-01-01&#x27; AND o.status = &#x27;paid&#x27;;
+
+-- Table &#x27;orders&#x27;. Scan count 1, logical reads 48123   &lt;- before the index
+-- Table &#x27;orders&#x27;. Scan count 1, logical reads 31      &lt;- after
+
+-- PostgreSQL: the better tooling, and the one to quote if asked
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT ...;
+--   Seq Scan on orders  (cost=0.00..18334.00 rows=1000 width=48)
+--                       (actual time=0.015..94.321 rows=982341 loops=1)
+--     Filter: (placed_at &gt;= &#x27;2026-01-01&#x27;)
+--     Rows Removed by Filter: 17659
+--   ^ estimated 1000, actual 982341: the estimate is wrong by 1000x, and every
+--     join method chosen above this node was chosen on that wrong number.
+
+-- What to look at, in order:
+--   1. the operator with the highest actual time / most logical reads
+--   2. estimated rows vs actual rows at that operator
+--   3. scans where you expected seeks
+--   4. lookups (fix with INCLUDE), sorts (fix with index order)
+--   5. warnings: implicit conversion, spills to tempdb, missing index
+
+-- Implicit conversion kills a seek silently, and the plan warns about it:
+--   WHERE varchar_column = N&#x27;value&#x27;    -- nvarchar literal vs varchar column
+--   WHERE int_column = &#x27;123&#x27;           -- string literal vs int column
+
+-- Statistics: when the estimate is wrong and the query is fine
+UPDATE STATISTICS orders WITH FULLSCAN;
+-- PostgreSQL: ANALYZE orders;
+
+-- The query store / pg_stat_statements: find the worst queries without guessing
+SELECT TOP 20 qt.query_sql_text, rs.avg_duration, rs.count_executions
+FROM   sys.query_store_runtime_stats rs
+JOIN   sys.query_store_plan p  ON p.plan_id = rs.plan_id
+JOIN   sys.query_store_query q ON q.query_id = p.query_id
+JOIN   sys.query_store_query_text qt ON qt.query_text_id = q.query_text_id
+ORDER  BY rs.avg_duration DESC;</code></pre><pre data-lang="csharp" hidden><code>// Step 1: see the SQL EF actually generated
+var query = db.Orders
+    .Where(o =&gt; o.PlacedAt &gt;= from &amp;&amp; o.Status == &quot;paid&quot;)
+    .Select(o =&gt; new { o.Id, o.Total, o.Customer.Name });
+
+Console.WriteLine(query.ToQueryString());     // copy this into the plan tool
+
+// Step 2: log every query with its timing, so you find the slow one in situ
+builder.Services.AddDbContext&lt;AppDbContext&gt;(o =&gt; o
+    .UseSqlServer(cs)
+    .LogTo(Console.WriteLine, new[] { DbLoggerCategory.Database.Command.Name },
+           LogLevel.Information)
+    .EnableSensitiveDataLogging(builder.Environment.IsDevelopment()));
+
+// Step 3: a threshold interceptor beats reading logs
+public class SlowQueryInterceptor(ILogger&lt;SlowQueryInterceptor&gt; log) : DbCommandInterceptor
+{
+    public override ValueTask&lt;DbDataReader&gt; ReaderExecutedAsync(
+        DbCommand command, CommandExecutedEventData e, DbDataReader result,
+        CancellationToken ct = default)
+    {
+        if (e.Duration &gt; TimeSpan.FromMilliseconds(200))
+            log.LogWarning(&quot;Slow query {Ms}ms: {Sql}&quot;, e.Duration.TotalMilliseconds,
+                           command.CommandText);
+        return ValueTask.FromResult(result);
+    }
+}
+
+// Parameter sniffing: EF parameterises, which is right for plan reuse and for
+// injection safety - but one cached plan now serves every parameter value.
+// When a value is wildly unrepresentative:
+//   OPTION (RECOMPILE)         - fresh plan per execution
+//   OPTION (OPTIMIZE FOR UNKNOWN)
+// In EF, via a raw query or an interceptor appending the hint.
+
+// The .NET-side symptom worth naming: a query that is fast in SSMS and slow in
+// the app is usually either parameter sniffing or a type mismatch causing an
+// implicit conversion (nvarchar parameter against a varchar column).</code></pre><pre data-lang="python" hidden><code># PostgreSQL + SQLAlchemy
+from sqlalchemy import text
+
+# Step 1: see the SQL
+print(query.compile(engine, compile_kwargs={&quot;literal_binds&quot;: True}))
+
+# Step 2: the plan, with real numbers
+with engine.connect() as conn:
+    plan = conn.execute(text(&quot;EXPLAIN (ANALYZE, BUFFERS) &quot; + str(query))).fetchall()
+    for row in plan:
+        print(row[0])
+
+# Step 3: log slow queries from the application side
+import logging, time
+from sqlalchemy import event
+
+logging.getLogger(&quot;sqlalchemy.engine&quot;).setLevel(logging.INFO)
+
+@event.listens_for(engine, &quot;before_cursor_execute&quot;)
+def before(conn, cursor, statement, params, context, executemany):
+    context._t0 = time.perf_counter()
+
+@event.listens_for(engine, &quot;after_cursor_execute&quot;)
+def after(conn, cursor, statement, params, context, executemany):
+    ms = (time.perf_counter() - context._t0) * 1000
+    if ms &gt; 200:
+        logging.warning(&quot;Slow query %.0fms: %s&quot;, ms, statement)
+
+# Step 4: find the worst offenders across the whole database
+#   CREATE EXTENSION pg_stat_statements;
+#   SELECT query, calls, mean_exec_time, rows
+#   FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 20;
+
+# Statistics
+#   ANALYZE orders;
+#   ALTER TABLE orders ALTER COLUMN status SET STATISTICS 1000;   -- skewed column</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Have a repeatable method rather than a list of operators: get the actual SQL, get the actual plan, find the most expensive operator, compare estimated to actual rows there, then decide between an index, a rewrite and a statistics update. The detail that impresses: measure <strong>logical reads</strong>, not elapsed time, because reads are stable across a warm and cold cache. And know the "fast in SSMS, slow in the app" classic — parameter sniffing, or an implicit conversion from an <code>nvarchar</code> parameter hitting a <code>varchar</code> column.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take a slow query, capture the plan before and after adding an index, and compare logical reads.</li><li>Create a query with a 1000x row-estimate error and fix it with a statistics update.</li><li>Reproduce an implicit conversion by querying a <code>varchar</code> column with an <code>nvarchar</code> parameter and find the warning in the plan.</li></ul></div></section>
+<section id="sargable"><h2 id="sargable">SARGability and query anti-patterns</h2><p><em>SARGable</em> — Search ARGument able — means the predicate can be used to seek into an index. The rule is simple: <strong>keep the indexed column bare on one side of the comparison</strong>. The moment you wrap it in a function, cast it, or concatenate it, the engine can no longer map your predicate onto the index's sorted order and falls back to reading everything.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="sql"><code>-- NOT SARGable                          -- SARGable rewrite
+WHERE YEAR(placed_at) = 2026           -- WHERE placed_at &gt;= &#x27;2026-01-01&#x27;
+                                       --   AND placed_at &lt;  &#x27;2027-01-01&#x27;
+
+WHERE CAST(placed_at AS DATE) = @d     -- WHERE placed_at &gt;= @d
+                                       --   AND placed_at &lt;  DATEADD(day, 1, @d)
+
+WHERE UPPER(status) = &#x27;PAID&#x27;           -- store it normalised, or use a
+                                       -- case-insensitive collation on the column
+
+WHERE total * 1.2 &gt; 100                -- WHERE total &gt; 100 / 1.2
+
+WHERE email LIKE &#x27;%@example.com&#x27;       -- leading wildcard cannot seek.
+                                       -- store a reversed column + index it,
+                                       -- or use full-text search
+
+WHERE ISNULL(coupon, &#x27;&#x27;) = &#x27;&#x27;          -- WHERE coupon IS NULL OR coupon = &#x27;&#x27;
+
+WHERE varchar_col = N&#x27;x&#x27;               -- implicit conversion: match the types
+
+WHERE id + 0 = @id                     -- the oldest &quot;force a scan&quot; trick there is
+
+-- SELECT *: forces lookups, breaks covering indexes, and ships columns nobody reads
+SELECT * FROM orders WHERE customer_id = 1;          -- bad
+SELECT id, total, status FROM orders WHERE customer_id = 1;    -- good
+
+-- Functions on the column in a JOIN are just as bad
+JOIN customers c ON UPPER(c.email) = UPPER(o.email)   -- no index usable on either side
+
+-- OR across different columns often defeats a single index. UNION ALL can beat it:
+SELECT * FROM orders WHERE customer_id = 1 OR external_ref = &#x27;X&#x27;;     -- likely a scan
+SELECT * FROM orders WHERE customer_id = 1
+UNION ALL
+SELECT * FROM orders WHERE external_ref = &#x27;X&#x27; AND customer_id &lt;&gt; 1;   -- two seeks
+
+-- Expression indexes: when you genuinely cannot change the predicate
+CREATE INDEX ix_orders_year ON orders (YEAR(placed_at));              -- PostgreSQL
+ALTER TABLE orders ADD placed_year AS YEAR(placed_at) PERSISTED;      -- SQL Server
+CREATE INDEX ix_orders_year ON orders (placed_year);</code></pre><pre data-lang="csharp" hidden><code>// The same mistakes, written in LINQ - EF translates them faithfully,
+// including the non-SARGable shape
+
+// BAD: translates to YEAR(placed_at) = 2026
+var bad = db.Orders.Where(o =&gt; o.PlacedAt.Year == 2026);
+// GOOD
+var good = db.Orders.Where(o =&gt; o.PlacedAt &gt;= new DateTime(2026, 1, 1)
+                             &amp;&amp; o.PlacedAt &lt;  new DateTime(2027, 1, 1));
+
+// BAD: UPPER(status) = &#x27;PAID&#x27;
+var bad2 = db.Orders.Where(o =&gt; o.Status.ToUpper() == &quot;PAID&quot;);
+// GOOD: normalise on write, compare directly
+var good2 = db.Orders.Where(o =&gt; o.Status == &quot;paid&quot;);
+
+// BAD: leading wildcard
+var bad3 = db.Customers.Where(c =&gt; c.Email.EndsWith(&quot;@example.com&quot;));
+// GOOD, where it fits: a prefix search can seek
+var good3 = db.Customers.Where(c =&gt; c.Email.StartsWith(&quot;ada&quot;));
+
+// BAD: Select(*) by default - EF selects every mapped column unless you project
+var bad4 = await db.Orders.Where(o =&gt; o.CustomerId == id).ToListAsync(ct);
+// GOOD: project only what you need (and it becomes covering-index friendly)
+var good4 = await db.Orders.Where(o =&gt; o.CustomerId == id)
+    .Select(o =&gt; new OrderSummary(o.Id, o.Total, o.Status))
+    .ToListAsync(ct);
+
+// BAD: client evaluation of a filter - EF3+ throws rather than doing this silently,
+// but Contains over a huge list produces a giant IN(...) that cannot be cached
+var ids = Enumerable.Range(1, 10_000).ToList();
+var bad5 = db.Orders.Where(o =&gt; ids.Contains(o.Id));      // 10k parameters
+// GOOD: a temp table / TVP, or join against a real table
+
+// The string type mismatch that causes an implicit conversion in SQL Server:
+// EF sends nvarchar by default. For a varchar column, say so.
+b.Property(o =&gt; o.Status).HasColumnType(&quot;varchar(20)&quot;);   // in the configuration
+
+// Always verify
+Console.WriteLine(bad.ToQueryString());</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import select, func, extract, cast, Date
+import datetime as dt
+
+# BAD -&gt; GOOD, same rules
+bad  = select(Order).where(extract(&quot;year&quot;, Order.placed_at) == 2026)
+good = select(Order).where(Order.placed_at &gt;= dt.date(2026, 1, 1),
+                           Order.placed_at &lt;  dt.date(2027, 1, 1))
+
+bad2  = select(Order).where(func.upper(Order.status) == &quot;PAID&quot;)
+good2 = select(Order).where(Order.status == &quot;paid&quot;)
+
+bad3  = select(Customer).where(Customer.email.like(&quot;%@example.com&quot;))
+good3 = select(Customer).where(Customer.email.like(&quot;ada%&quot;))        # prefix can seek
+
+# SELECT * -&gt; project
+bad4  = select(Order).where(Order.customer_id == cid)              # every column
+good4 = select(Order.id, Order.total, Order.status).where(Order.customer_id == cid)
+
+# Huge IN lists: use a VALUES join or a temp table instead
+ids = list(range(1, 10_001))
+bad5 = select(Order).where(Order.id.in_(ids))                      # 10k params
+
+from sqlalchemy import values, column, Integer
+vals = values(column(&quot;id&quot;, Integer), name=&quot;wanted&quot;).data([(i,) for i in ids])
+good5 = select(Order).join(vals, Order.id == vals.c.id)
+
+# Expression index when the predicate cannot change (PostgreSQL)
+#   CREATE INDEX ix_orders_year ON orders ((EXTRACT(YEAR FROM placed_at)));</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Being given a slow query and asked to fix it is the standard practical exercise, and the function-on-the-column mistake is in it more often than not. Say the word SARGable, state the rule in one sentence, and show the date-range rewrite — that specific rewrite comes up constantly. Then mention the escape hatch (a computed/expression index) for when the predicate genuinely cannot change, so it does not sound like the only fix is editing the query.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Rewrite five non-SARGable predicates and confirm each turned a scan into a seek.</li><li>Add a persisted computed column plus an index for a predicate you cannot change.</li><li>Measure a <code>SELECT *</code> against a projected select on a wide table — compare logical reads, not time.</li></ul></div></section>
+<section id="transactions"><h2 id="transactions">Transactions, isolation levels and the anomalies each allows</h2><p>ACID in one line each: <strong>atomicity</strong> (all or nothing), <strong>consistency</strong> (constraints hold at the boundaries), <strong>isolation</strong> (concurrent transactions do not see each other's mess), <strong>durability</strong> (committed means committed). Isolation is the only one with a dial, and the dial is what gets asked.</p><div class="table-wrap"><table><thead><tr><th>Level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom</th><th>Cost</th></tr></thead><tbody><tr><td>Read Uncommitted</td><td>yes</td><td>yes</td><td>yes</td><td>none</td></tr><tr><td>Read Committed <em>(default)</em></td><td>no</td><td>yes</td><td>yes</td><td>short read locks</td></tr><tr><td>Repeatable Read</td><td>no</td><td>no</td><td>yes</td><td>read locks held to commit</td></tr><tr><td>Serializable</td><td>no</td><td>no</td><td>no</td><td>range locks; blocking</td></tr><tr><td>Snapshot / RCSI</td><td>no</td><td>no</td><td>no</td><td>row versions in tempdb</td></tr></tbody></table></div><p>The three anomalies, concretely: a <strong>dirty read</strong> sees uncommitted data that may be rolled back; a <strong>non-repeatable read</strong> reads the same row twice and gets different values; a <strong>phantom</strong> runs the same range query twice and gets different <em>rows</em>. <code>WITH (NOLOCK)</code> is Read Uncommitted and will also give you rows twice or skip them during a page split — it is not a free performance switch.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="sql"><code>-- Explicit transaction with error handling
+BEGIN TRY
+    BEGIN TRANSACTION;
+
+    UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+    IF @@ROWCOUNT &lt;&gt; 1 THROW 50001, &#x27;source account missing&#x27;, 1;
+
+    UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+    IF @@ROWCOUNT &lt;&gt; 1 THROW 50002, &#x27;target account missing&#x27;, 1;
+
+    COMMIT TRANSACTION;
+END TRY
+BEGIN CATCH
+    IF XACT_STATE() &lt;&gt; 0 ROLLBACK TRANSACTION;
+    THROW;
+END CATCH;
+
+-- Setting the level
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;        -- the default
+SET TRANSACTION ISOLATION LEVEL SNAPSHOT;              -- readers never block writers
+
+-- Read Committed Snapshot: usually the right setting for an OLTP database.
+-- Readers see a consistent version instead of taking shared locks, so reports
+-- stop blocking writes, at the cost of version storage in tempdb.
+ALTER DATABASE shop SET READ_COMMITTED_SNAPSHOT ON;
+
+-- The lost update, and the two ways to prevent it ----------------------------
+
+-- BROKEN: read, think, write. Two sessions both read 10, both write 9.
+SELECT quantity FROM stock WHERE sku = &#x27;ABC&#x27;;          -- 10
+UPDATE stock SET quantity = 9 WHERE sku = &#x27;ABC&#x27;;
+
+-- PESSIMISTIC: take the lock on read
+SELECT quantity FROM stock WITH (UPDLOCK, ROWLOCK) WHERE sku = &#x27;ABC&#x27;;
+UPDATE stock SET quantity = quantity - 1 WHERE sku = &#x27;ABC&#x27;;
+-- PostgreSQL: SELECT ... FOR UPDATE
+
+-- OPTIMISTIC: detect the conflict on write with a version column
+UPDATE stock SET quantity = @new, version = version + 1
+WHERE sku = &#x27;ABC&#x27; AND version = @versionIReadEarlier;
+IF @@ROWCOUNT = 0 THROW 50003, &#x27;someone else changed it&#x27;, 1;
+
+-- ATOMIC: let the database do the arithmetic. Best when it fits.
+UPDATE stock SET quantity = quantity - 1 WHERE sku = &#x27;ABC&#x27; AND quantity &gt;= 1;
+
+-- Keep transactions SHORT and never await external I/O inside one
+-- (no HTTP calls, no message sends, no user think-time between BEGIN and COMMIT).</code></pre><pre data-lang="csharp" hidden><code>// EF Core: SaveChangesAsync is already a transaction. Use an explicit one only
+// when several SaveChanges calls, or raw SQL, must be atomic together.
+await using var tx = await db.Database.BeginTransactionAsync(
+    IsolationLevel.ReadCommitted, ct);
+try
+{
+    db.Accounts.Update(from);
+    await db.SaveChangesAsync(ct);
+
+    db.Accounts.Update(to);
+    await db.SaveChangesAsync(ct);
+
+    await tx.CommitAsync(ct);
+}
+catch
+{
+    await tx.RollbackAsync(ct);          // DisposeAsync rolls back too, if not committed
+    throw;
+}
+
+// OPTIMISTIC concurrency - the EF-idiomatic answer
+public class Stock
+{
+    public string Sku { get; set; } = &quot;&quot;;
+    public int Quantity { get; set; }
+
+    [Timestamp] public byte[] RowVersion { get; set; } = [];   // SQL Server rowversion
+    // or: b.Property(s =&gt; s.Version).IsConcurrencyToken();
+}
+
+try
+{
+    stock.Quantity--;
+    await db.SaveChangesAsync(ct);       // UPDATE ... WHERE RowVersion = @original
+}
+catch (DbUpdateConcurrencyException ex)
+{
+    // Someone else won. Decide: reload and retry, merge, or surface to the user.
+    var entry = ex.Entries.Single();
+    var current = await entry.GetDatabaseValuesAsync(ct);
+    entry.OriginalValues.SetValues(current!);
+    await db.SaveChangesAsync(ct);       // retry once
+}
+
+// PESSIMISTIC, when you must serialise access
+var row = await db.Stock
+    .FromSql($&quot;SELECT * FROM stock WITH (UPDLOCK, ROWLOCK) WHERE sku = {sku}&quot;)
+    .SingleAsync(ct);
+
+// ATOMIC, no round trip, no conflict possible
+var updated = await db.Stock
+    .Where(s =&gt; s.Sku == sku &amp;&amp; s.Quantity &gt;= 1)
+    .ExecuteUpdateAsync(s =&gt; s.SetProperty(x =&gt; x.Quantity, x =&gt; x.Quantity - 1), ct);
+if (updated == 0) throw new OutOfStockException(sku);
+
+// Transactions across services are NOT distributed transactions - see
+// the outbox and saga patterns on the Microservices page.</code></pre><pre data-lang="python" hidden><code>from sqlalchemy.orm import Session
+from sqlalchemy import select, update, text
+from sqlalchemy.exc import StaleDataError
+
+# Explicit transaction
+with Session(engine) as session, session.begin():       # commits or rolls back
+    session.execute(update(Account).where(Account.id == 1)
+                    .values(balance=Account.balance - 100))
+    session.execute(update(Account).where(Account.id == 2)
+                    .values(balance=Account.balance + 100))
+
+# Isolation level, per connection or per engine
+with engine.connect().execution_options(isolation_level=&quot;SERIALIZABLE&quot;) as conn:
+    ...
+engine = create_engine(url, isolation_level=&quot;REPEATABLE READ&quot;)
+
+# OPTIMISTIC: SQLAlchemy&#x27;s built-in version counter
+class Stock(Base):
+    __tablename__ = &quot;stock&quot;
+    __mapper_args__ = {&quot;version_id_col&quot;: version}
+    sku:      Mapped[str] = mapped_column(primary_key=True)
+    quantity: Mapped[int]
+    version:  Mapped[int] = mapped_column(default=0)
+
+try:
+    stock.quantity -= 1
+    session.commit()                      # UPDATE ... WHERE version = :old
+except StaleDataError:
+    session.rollback()                    # someone else won
+
+# PESSIMISTIC
+stock = session.execute(
+    select(Stock).where(Stock.sku == sku).with_for_update()    # SELECT ... FOR UPDATE
+).scalar_one()
+
+# ATOMIC
+result = session.execute(
+    update(Stock).where(Stock.sku == sku, Stock.quantity &gt;= 1)
+    .values(quantity=Stock.quantity - 1))
+if result.rowcount == 0:
+    raise OutOfStock(sku)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Expect the anomaly table, and expect to be asked for a concrete example rather than the name — "two transactions read a balance of 100 and both write 90, so one update is lost" beats reciting "non-repeatable read". The follow-up is always optimistic versus pessimistic concurrency: optimistic (a version column, detect on write, retry) suits low contention and avoids holding locks; pessimistic (<code>UPDLOCK</code> / <code>SELECT ... FOR UPDATE</code>) suits high contention and short critical sections. Say that <code>NOLOCK</code> is Read Uncommitted and can return duplicated or missing rows, not just uncommitted ones.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Open two sessions and reproduce a dirty read, a non-repeatable read and a phantom by changing only the isolation level.</li><li>Implement the same decrement three ways (optimistic, pessimistic, atomic) and hammer each with 100 concurrent callers.</li><li>Turn on RCSI on a test database and watch a long report stop blocking writes.</li></ul></div></section>
+<section id="locking"><h2 id="locking">Locking, blocking and deadlocks</h2><p><strong>Blocking</strong> is normal: one transaction waits for another's lock. <strong>Deadlock</strong> is a cycle — A holds X and wants Y, B holds Y and wants X — and the engine resolves it by killing one of them (SQL Server error 1205, "chosen as the deadlock victim"). Your job is to make cycles rare and to retry the victim.</p><p>The three fixes, in order of how often they are the right answer: <strong>access objects in a consistent order</strong> everywhere (the cycle cannot form if everyone takes locks in the same sequence); <strong>keep transactions short</strong> and never do I/O inside one; <strong>add the index</strong> that turns a scan taking many locks into a seek taking few.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="sql"><code>-- A deadlock in two sessions ------------------------------------------------
+-- Session A                             -- Session B
+BEGIN TRAN;                              BEGIN TRAN;
+UPDATE accounts SET bal=bal-10           UPDATE accounts SET bal=bal-10
+  WHERE id=1;   -- locks row 1             WHERE id=2;   -- locks row 2
+UPDATE accounts SET bal=bal+10           UPDATE accounts SET bal=bal+10
+  WHERE id=2;   -- waits for B             WHERE id=1;   -- waits for A  =&gt; CYCLE
+-- Msg 1205: Transaction was deadlocked on lock resources and has been chosen
+--           as the deadlock victim. Rerun the transaction.
+
+-- Fix 1: consistent ordering. Always lock the lower id first - everywhere.
+DECLARE @first INT = IIF(@from &lt; @to, @from, @to),
+        @second INT = IIF(@from &lt; @to, @to, @from);
+UPDATE accounts SET bal = bal + CASE id WHEN @from THEN -10 ELSE 10 END
+WHERE  id IN (@first, @second);          -- or two statements in that order
+
+-- Fix 2: shorter transactions. Do the HTTP call BEFORE BEGIN TRAN, not inside.
+
+-- Fix 3: the index. A scan locks every row it reads; a seek locks the one it wants.
+CREATE INDEX ix_accounts_customer ON accounts (customer_id);
+
+-- Who is blocking whom, right now (SQL Server)
+SELECT r.session_id, r.blocking_session_id, r.wait_type, r.wait_time,
+       r.wait_resource, t.text
+FROM   sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+WHERE  r.blocking_session_id &lt;&gt; 0;
+
+-- PostgreSQL
+SELECT blocked.pid, blocked.query AS blocked_query,
+       blocking.pid AS blocking_pid, blocking.query AS blocking_query
+FROM   pg_stat_activity blocked
+JOIN   pg_stat_activity blocking
+       ON blocking.pid = ANY(pg_blocking_pids(blocked.pid));
+
+-- Reading past deadlocks: the system_health extended event session has them all
+SELECT xed.value(&#x27;@timestamp&#x27;,&#x27;datetime2&#x27;) AS t,
+       xed.query(&#x27;.&#x27;) AS deadlock_graph
+FROM (SELECT CAST(target_data AS XML) AS td FROM sys.dm_xe_session_targets st
+      JOIN sys.dm_xe_sessions s ON s.address = st.event_session_address
+      WHERE s.name = &#x27;system_health&#x27; AND st.target_name = &#x27;ring_buffer&#x27;) AS d
+CROSS APPLY td.nodes(&#x27;RingBufferTarget/event[@name=&quot;xml_deadlock_report&quot;]&#x27;) AS x(xed);
+
+-- Lock escalation: ~5000 row locks become a TABLE lock. Batch large writes.
+DELETE TOP (5000) FROM audit_log WHERE created_at &lt; @cutoff;   -- loop until 0 rows</code></pre><pre data-lang="csharp" hidden><code>// Deadlocks are transient: the victim should RETRY. EF Core has this built in.
+builder.Services.AddDbContext&lt;AppDbContext&gt;(o =&gt; o.UseSqlServer(cs, sql =&gt;
+    sql.EnableRetryOnFailure(
+        maxRetryCount: 3,
+        maxRetryDelay: TimeSpan.FromSeconds(5),
+        errorNumbersToAdd: [1205])));        // 1205 = deadlock victim
+
+// Note: the execution strategy will NOT retry a user-managed transaction unless
+// you wrap the whole unit of work so it can be replayed in full.
+var strategy = db.Database.CreateExecutionStrategy();
+await strategy.ExecuteAsync(async () =&gt;
+{
+    await using var tx = await db.Database.BeginTransactionAsync(ct);
+    await DoWork(ct);
+    await tx.CommitAsync(ct);
+});
+
+// Consistent ordering - the fix that actually removes the cycle
+public async Task Transfer(int fromId, int toId, decimal amount, CancellationToken ct)
+{
+    var (first, second) = fromId &lt; toId ? (fromId, toId) : (toId, fromId);
+
+    var accounts = await db.Accounts
+        .Where(a =&gt; a.Id == first || a.Id == second)
+        .OrderBy(a =&gt; a.Id)                  // deterministic lock order
+        .ToListAsync(ct);
+
+    accounts.Single(a =&gt; a.Id == fromId).Balance -= amount;
+    accounts.Single(a =&gt; a.Id == toId).Balance   += amount;
+    await db.SaveChangesAsync(ct);
+}
+
+// Keep I/O out of the transaction
+// BAD
+await using (var tx = await db.Database.BeginTransactionAsync(ct))
+{
+    var rate = await _http.GetRate(ct);      // network call holding locks
+    // ...
+}
+// GOOD
+var rate = await _http.GetRate(ct);          // first
+await using (var tx = await db.Database.BeginTransactionAsync(ct)) { /* ... */ }
+
+// Catching it explicitly when you are not using the execution strategy
+catch (SqlException ex) when (ex.Number is 1205 or -2)   // deadlock or timeout
+{
+    // back off and retry - these are transient, not bugs in the data
+}</code></pre><pre data-lang="python" hidden><code>from sqlalchemy.exc import OperationalError, DBAPIError
+import time, random
+
+# Retry with backoff - deadlocks are transient
+def with_deadlock_retry(fn, attempts: int = 3):
+    for i in range(attempts):
+        try:
+            return fn()
+        except OperationalError as e:
+            # PostgreSQL 40P01 deadlock_detected, 40001 serialization_failure
+            # MySQL 1213, SQL Server 1205
+            code = getattr(e.orig, &quot;pgcode&quot;, None)
+            if code not in (&quot;40P01&quot;, &quot;40001&quot;) or i == attempts - 1:
+                raise
+            time.sleep((2 ** i) * 0.05 + random.random() * 0.05)
+
+# Consistent ordering - the real fix
+def transfer(session, from_id: int, to_id: int, amount) -&gt; None:
+    first, second = sorted((from_id, to_id))
+    accounts = session.execute(
+        select(Account).where(Account.id.in_((first, second)))
+        .order_by(Account.id).with_for_update()      # deterministic lock order
+    ).scalars().all()
+    by_id = {a.id: a for a in accounts}
+    by_id[from_id].balance -= amount
+    by_id[to_id].balance   += amount
+
+# Keep I/O out of the transaction
+rate = await http.get_rate()                  # BEFORE
+with Session(engine) as s, s.begin():
+    ...                                        # no awaits on the network in here
+
+# Who is blocking whom (PostgreSQL)
+#   SELECT pid, pg_blocking_pids(pid), state, query FROM pg_stat_activity
+#   WHERE cardinality(pg_blocking_pids(pid)) &gt; 0;
+
+# Batch large deletes so lock escalation does not take the table
+#   DELETE FROM audit_log WHERE id IN (
+#       SELECT id FROM audit_log WHERE created_at &lt; %s LIMIT 5000);</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"You are seeing deadlocks in production — what do you do?" Separate diagnosis from fix. Diagnosis: get the deadlock graph (system_health in SQL Server, the log in PostgreSQL) and read which two resources formed the cycle. Fixes in priority order: consistent access ordering, shorter transactions with no network I/O inside them, and the index that reduces how many rows get locked. Then add retry — but say explicitly that retry is a mitigation, not the fix, because an unfixed cycle just retries forever under load.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Reproduce a deadlock with two sessions, then fix it by ordering the updates consistently.</li><li>Turn on <code>EnableRetryOnFailure</code> and verify the victim transaction succeeds on retry.</li><li>Delete a million rows in one statement, watch lock escalation take the table, then batch it.</li></ul></div></section>
+<section id="pagination"><h2 id="pagination">Paging, keyset pagination and counting at scale</h2><p><code>OFFSET 100000 LIMIT 20</code> makes the database produce and discard 100,000 rows to return 20. Page 1 is instant, page 5,000 is a timeout — and the degradation is linear in the page number, which is why it survives every load test and dies in production.</p><p><strong>Keyset (seek) pagination</strong> uses the last row you saw as the starting point: <code>WHERE (placed_at, id) &lt; (@lastDate, @lastId) ORDER BY placed_at DESC, id DESC LIMIT 20</code>. Every page costs the same, it rides the index directly, and it is stable when rows are inserted while the user pages. The trade-off is that you cannot jump to an arbitrary page number — which is exactly what infinite scroll and "load more" do not need.</p><p><code>COUNT(*)</code> over a large filtered set has the same problem. Options: do not show a total, cache it, or show an estimate from the statistics.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="sql"><code>-- OFFSET: correct, and progressively slower
+SELECT id, placed_at, total
+FROM   orders
+WHERE  customer_id = @cid
+ORDER  BY placed_at DESC, id DESC
+OFFSET @page * 20 ROWS FETCH NEXT 20 ROWS ONLY;
+--   page 1:     ~20 rows read
+--   page 5000:  ~100,020 rows read and thrown away
+--   and if a row is inserted between page views, rows shift and the user sees
+--   a duplicate or misses one
+
+-- KEYSET: constant cost, stable under concurrent inserts
+SELECT TOP 20 id, placed_at, total
+FROM   orders
+WHERE  customer_id = @cid
+  AND  (placed_at &lt; @lastPlacedAt
+        OR (placed_at = @lastPlacedAt AND id &lt; @lastId))   -- tiebreak on a unique column
+ORDER  BY placed_at DESC, id DESC;
+--   every page: ~20 rows read
+
+-- PostgreSQL says the same thing far more neatly with a row constructor
+SELECT id, placed_at, total FROM orders
+WHERE  customer_id = :cid AND (placed_at, id) &lt; (:last_placed_at, :last_id)
+ORDER  BY placed_at DESC, id DESC
+LIMIT  20;
+
+-- The index that makes keyset paging a pure range scan
+CREATE INDEX ix_orders_cid_placed_id ON orders (customer_id, placed_at DESC, id DESC);
+
+-- Counting ---------------------------------------------------------------
+SELECT COUNT(*) FROM orders WHERE customer_id = @cid;   -- scans the matching range
+
+-- 1. Do not show a total. &quot;Next&quot; is enabled if you got 21 rows for a page of 20.
+SELECT TOP 21 ...;      -- hasMore = rows.Count &gt; 20
+
+-- 2. An estimate, from the statistics - instant, approximate
+SELECT SUM(row_count) FROM sys.dm_db_partition_stats
+WHERE object_id = OBJECT_ID(&#x27;orders&#x27;) AND index_id IN (0,1);
+-- PostgreSQL: SELECT reltuples::bigint FROM pg_class WHERE relname = &#x27;orders&#x27;;
+
+-- 3. A capped count: &quot;1000+&quot; is as useful as 48,217 and much cheaper
+SELECT COUNT(*) FROM (SELECT TOP 1001 1 AS x FROM orders WHERE customer_id=@cid) t;
+
+-- 4. A maintained counter table, updated in the same transaction as the write</code></pre><pre data-lang="csharp" hidden><code>// OFFSET paging - fine for an admin screen with 50 pages, wrong for a feed
+var page = await db.Orders
+    .Where(o =&gt; o.CustomerId == cid)
+    .OrderByDescending(o =&gt; o.PlacedAt).ThenByDescending(o =&gt; o.Id)
+    .Skip(pageNumber * 20).Take(20)
+    .ToListAsync(ct);
+
+// KEYSET paging - the cursor is the last row you saw
+public record Cursor(DateTime PlacedAt, int Id);
+
+public async Task&lt;(List&lt;Order&gt; Items, string? Next)&gt; Page(
+    int cid, Cursor? after, CancellationToken ct)
+{
+    var q = db.Orders.Where(o =&gt; o.CustomerId == cid);
+
+    if (after is not null)
+        q = q.Where(o =&gt; o.PlacedAt &lt; after.PlacedAt
+                      || (o.PlacedAt == after.PlacedAt &amp;&amp; o.Id &lt; after.Id));
+
+    var rows = await q
+        .OrderByDescending(o =&gt; o.PlacedAt).ThenByDescending(o =&gt; o.Id)
+        .Take(21)                                  // one extra: is there a next page?
+        .ToListAsync(ct);
+
+    var hasMore = rows.Count &gt; 20;
+    var items   = rows.Take(20).ToList();
+    var next    = hasMore ? Encode(new Cursor(items[^1].PlacedAt, items[^1].Id)) : null;
+    return (items, next);
+}
+
+// Encode the cursor so clients treat it as opaque and you can change it later
+static string Encode(Cursor c) =&gt;
+    Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(c));
+
+// Counting: run it ONCE and cache, or skip it. Do not run it per page.
+var total = await cache.GetOrCreateAsync($&quot;count:{cid}&quot;, async e =&gt;
+{
+    e.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5);
+    return await db.Orders.CountAsync(o =&gt; o.CustomerId == cid, ct);
+});
+
+// A capped count when &quot;1000+&quot; will do
+var capped = await db.Orders.Where(o =&gt; o.CustomerId == cid)
+    .Take(1001).CountAsync(ct);</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import select, tuple_
+import base64, json
+
+# OFFSET
+page = session.execute(
+    select(Order).where(Order.customer_id == cid)
+    .order_by(Order.placed_at.desc(), Order.id.desc())
+    .offset(page_number * 20).limit(20)
+).scalars().all()
+
+# KEYSET - PostgreSQL row comparison makes this clean
+def page_after(session, cid: int, after: tuple | None, size: int = 20):
+    q = select(Order).where(Order.customer_id == cid)
+    if after is not None:
+        q = q.where(tuple_(Order.placed_at, Order.id) &lt; after)
+    rows = session.execute(
+        q.order_by(Order.placed_at.desc(), Order.id.desc()).limit(size + 1)
+    ).scalars().all()
+    has_more = len(rows) &gt; size
+    items = rows[:size]
+    nxt = encode((items[-1].placed_at, items[-1].id)) if has_more else None
+    return items, nxt
+
+def encode(cursor) -&gt; str:
+    return base64.urlsafe_b64encode(json.dumps(cursor, default=str).encode()).decode()
+
+# Counting
+total = session.scalar(select(func.count()).select_from(Order)
+                       .where(Order.customer_id == cid))        # exact, scans
+
+capped = session.scalar(                                        # &quot;1000+&quot;
+    select(func.count()).select_from(
+        select(Order.id).where(Order.customer_id == cid).limit(1001).subquery()))
+
+# Estimate (PostgreSQL)
+#   SELECT reltuples::bigint FROM pg_class WHERE relname = &#x27;orders&#x27;;</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A great question to be asked, because the naive answer is so common. Say that <code>OFFSET</code> makes the database materialise and discard everything before the page, so cost grows with the page number; describe keyset paging with the composite tiebreaker and the matching index; and name the trade-off honestly — no jumping to page N, which infinite scroll and "load more" never needed. Add the counting point unprompted: the <code>COUNT(*)</code> next to the pager is often more expensive than the page itself.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Page to row 500,000 with <code>OFFSET</code> and with keyset, and compare logical reads on each.</li><li>Implement an opaque base64 cursor and handle a client sending a stale or malformed one.</li><li>Replace an exact total with a capped "1000+" count and measure the difference.</li></ul></div></section>
+<section id="procs-views"><h2 id="procs-views">Stored procedures, views and functions</h2><p>Worth having an opinion on, because you will be asked for one. <strong>Stored procedures</strong> give you a stable interface, server-side plan reuse and permissions at the procedure rather than the table — and cost you version control, testability and deployment stories that are worse than application code. The common modern position: procedures for genuinely set-based bulk work that would otherwise pull rows to the app, application code for everything else.</p><p><strong>Views</strong> name a query; they do not store anything unless indexed/materialised. The failure mode is nesting them, where a three-level view hierarchy produces a plan nobody can read. <strong>Scalar UDFs</strong> are the real trap: before SQL Server 2019 they execute once per row and silently serialise the plan.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="sql"><code>-- A procedure worth writing: set-based work that would otherwise be a round trip per row
+CREATE OR ALTER PROCEDURE dbo.ExpireStaleCarts
+    @CutoffUtc DATETIME2,
+    @BatchSize INT = 5000
+AS
+BEGIN
+    SET NOCOUNT ON;                      -- do not send rowcount messages per statement
+    SET XACT_ABORT ON;                   -- roll back the whole thing on any error
+
+    DECLARE @rows INT = 1;
+    WHILE @rows &gt; 0                      -- batched, so locks do not escalate
+    BEGIN
+        UPDATE TOP (@BatchSize) carts
+        SET    status = &#x27;expired&#x27;, expired_at = SYSUTCDATETIME()
+        WHERE  status = &#x27;active&#x27; AND updated_at &lt; @CutoffUtc;
+
+        SET @rows = @@ROWCOUNT;
+    END
+END;
+
+-- Views: naming a query. No storage, no performance by itself.
+CREATE OR ALTER VIEW dbo.vw_active_customers AS
+SELECT c.id, c.name, c.email
+FROM   customers c
+WHERE  c.deleted_at IS NULL;
+
+-- Indexed (materialised) view: the engine stores and maintains it.
+-- Requires SCHEMABINDING, COUNT_BIG(*), deterministic expressions, no outer joins.
+CREATE OR ALTER VIEW dbo.vw_order_totals WITH SCHEMABINDING AS
+SELECT order_id, SUM(quantity * unit_price) AS total, COUNT_BIG(*) AS lines
+FROM   dbo.order_lines
+GROUP  BY order_id;
+CREATE UNIQUE CLUSTERED INDEX ix_vw_order_totals ON dbo.vw_order_totals(order_id);
+-- now every write to order_lines maintains it. Read speed bought with write cost.
+
+-- Scalar UDF: the classic performance trap
+CREATE FUNCTION dbo.fnOrderTotal(@orderId INT) RETURNS DECIMAL(19,4)
+AS BEGIN
+    RETURN (SELECT SUM(quantity*unit_price) FROM order_lines WHERE order_id=@orderId);
+END;
+SELECT id, dbo.fnOrderTotal(id) FROM orders;   -- executes PER ROW; pre-2019 also
+                                               -- forces a serial plan
+
+-- Inline table-valued function: expanded into the calling query, so it optimises
+CREATE OR ALTER FUNCTION dbo.OrderTotals(@orderId INT)
+RETURNS TABLE AS RETURN
+    SELECT SUM(quantity*unit_price) AS total FROM order_lines WHERE order_id=@orderId;
+
+SELECT o.id, t.total FROM orders o CROSS APPLY dbo.OrderTotals(o.id) t;   -- fine
+
+-- Table-valued parameter: send a set in one round trip instead of N inserts
+CREATE TYPE dbo.IdList AS TABLE (id INT PRIMARY KEY);
+CREATE OR ALTER PROCEDURE dbo.GetOrders @Ids dbo.IdList READONLY AS
+    SELECT o.* FROM orders o JOIN @Ids i ON i.id = o.id;</code></pre><pre data-lang="csharp" hidden><code>// Calling a procedure from EF Core
+await db.Database.ExecuteSqlAsync(
+    $&quot;EXEC dbo.ExpireStaleCarts @CutoffUtc = {cutoff}, @BatchSize = {5000}&quot;);
+
+// Mapping a procedure&#x27;s result set
+var rows = await db.Database
+    .SqlQuery&lt;CartSummary&gt;($&quot;EXEC dbo.GetCartSummary @CustomerId = {cid}&quot;)
+    .ToListAsync(ct);
+
+// Mapping a view as a keyless entity - read-only, no key needed
+modelBuilder.Entity&lt;ActiveCustomer&gt;().HasNoKey().ToView(&quot;vw_active_customers&quot;);
+var active = await db.ActiveCustomers.Where(c =&gt; c.Email.EndsWith(&quot;@x.com&quot;))
+                                     .ToListAsync(ct);
+
+// A table-valued parameter via Dapper - one round trip for a thousand ids
+var table = new DataTable();
+table.Columns.Add(&quot;id&quot;, typeof(int));
+foreach (var id in ids) table.Rows.Add(id);
+
+var orders = await conn.QueryAsync&lt;Order&gt;(
+    &quot;dbo.GetOrders&quot;,
+    new { Ids = table.AsTableValuedParameter(&quot;dbo.IdList&quot;) },
+    commandType: CommandType.StoredProcedure);
+
+// Mapping a user-defined function into LINQ so EF can translate it
+public static class Fn
+{
+    [DbFunction(&quot;OrderTotals&quot;, &quot;dbo&quot;)]
+    public static IQueryable&lt;OrderTotal&gt; OrderTotals(int orderId) =&gt; throw new NotSupportedException();
+}
+var withTotals = from o in db.Orders
+                 from t in Fn.OrderTotals(o.Id)       // becomes CROSS APPLY
+                 select new { o.Id, t.Total };
+
+// The practical position to be able to defend: keep logic in C# where it is
+// version-controlled, testable and reviewable; use a procedure when the
+// alternative is shipping a large result set to the app to throw most of it away.</code></pre><pre data-lang="python" hidden><code>from sqlalchemy import text
+
+# Calling a procedure
+with engine.begin() as conn:
+    conn.execute(text(&quot;CALL expire_stale_carts(:cutoff, :batch)&quot;),
+                 {&quot;cutoff&quot;: cutoff, &quot;batch&quot;: 5000})
+
+# PostgreSQL functions returning a set
+rows = session.execute(
+    text(&quot;SELECT * FROM order_totals(:order_id)&quot;), {&quot;order_id&quot;: oid}).all()
+
+# Mapping a view as a read-only model
+class ActiveCustomer(Base):
+    __tablename__ = &quot;vw_active_customers&quot;
+    __table_args__ = {&quot;info&quot;: {&quot;is_view&quot;: True}}
+    id:    Mapped[int] = mapped_column(primary_key=True)   # SQLAlchemy needs a PK
+    name:  Mapped[str]
+    email: Mapped[str]
+
+# Materialised view (PostgreSQL) - stored, and refreshed on your schedule
+#   CREATE MATERIALIZED VIEW mv_order_totals AS
+#     SELECT order_id, SUM(quantity*unit_price) AS total FROM order_lines
+#     GROUP BY order_id;
+#   CREATE UNIQUE INDEX ON mv_order_totals (order_id);
+#   REFRESH MATERIALIZED VIEW CONCURRENTLY mv_order_totals;
+#
+# Note the difference from SQL Server&#x27;s indexed view: PostgreSQL does NOT
+# maintain it automatically - you refresh it, and it is stale until you do.
+
+# Bulk send, the TVP equivalent: COPY or execute_values
+from psycopg2.extras import execute_values
+execute_values(cur, &quot;INSERT INTO staging_ids (id) VALUES %s&quot;, [(i,) for i in ids])</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"Stored procedures or application code?" is an opinion question — give one, with a boundary. The strongest version: application code by default because it is versioned, testable and reviewable alongside the feature; procedures for set-based bulk operations where the alternative is a round trip per row or shipping a large result set to throw most of it away. Technical credibility comes from the scalar-UDF trap (per-row execution, and a serial plan before SQL Server 2019) and from knowing an indexed view is maintained by the engine while a PostgreSQL materialised view is stale until you refresh it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Replace a row-by-row update loop in C# with one set-based statement and compare the time.</li><li>Write a scalar UDF and an inline TVF for the same calculation and compare plans.</li><li>Use a table-valued parameter to send 10,000 ids in one call instead of a 10,000-parameter <code>IN</code>.</li></ul></div></section>
+<section id="sql-vs-nosql"><h2 id="sql-vs-nosql">SQL vs NoSQL: choosing the store</h2><p>The question is never "which is better" — it is "what is your access pattern". Relational gives you joins, constraints, transactions across tables and an optimiser that adapts when you ask a new question. Document and key-value stores give you horizontal scale and a denormalised shape read in one hop, provided you knew the access pattern in advance.</p><p>The best answer names the default and then the exceptions: <strong>start relational</strong>, because it is the only option that does not need you to know the queries up front, and move specific workloads out when they have an access pattern that relational serves badly — a cache, a document read whole and never joined, a time series, a graph traversal, a full-text search.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="sql">SQL</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="sql"><code>-- What relational gives you that the others do not --------------------------
+
+-- 1. Joins you did not plan for. New question, no migration.
+SELECT c.region, COUNT(DISTINCT o.customer_id) AS buyers, SUM(ol.quantity * ol.unit_price)
+FROM   customers c
+JOIN   orders o       ON o.customer_id = c.id
+JOIN   order_lines ol ON ol.order_id = o.id
+JOIN   products p     ON p.sku = ol.sku
+WHERE  p.category = &#x27;books&#x27; AND o.placed_at &gt;= &#x27;2026-01-01&#x27;
+GROUP  BY c.region;
+
+-- 2. Constraints the database enforces, so bad data cannot exist
+ALTER TABLE order_lines ADD CONSTRAINT fk_lines_order
+    FOREIGN KEY (order_id) REFERENCES orders(id);
+ALTER TABLE order_lines ADD CONSTRAINT ck_lines_qty CHECK (quantity &gt; 0);
+ALTER TABLE customers    ADD CONSTRAINT uq_customers_email UNIQUE (email);
+
+-- 3. Atomic multi-row, multi-table writes
+BEGIN TRAN;
+  INSERT INTO orders ...;
+  INSERT INTO order_lines ...;
+  UPDATE stock SET quantity = quantity - 1 WHERE sku = &#x27;ABC&#x27; AND quantity &gt;= 1;
+COMMIT;
+
+-- Relational can also do the things people switch away for:
+SELECT * FROM orders WHERE JSON_VALUE(metadata, &#x27;$.channel&#x27;) = &#x27;mobile&#x27;;  -- JSON columns
+CREATE FULLTEXT INDEX ON products(description) KEY INDEX pk_products;     -- search
+-- PostgreSQL: JSONB with GIN indexes, tsvector full-text, PostGIS, TimescaleDB.
+-- &quot;We need a document store&quot; often means &quot;we have not used JSONB&quot;.</code></pre><pre data-lang="csharp" hidden><code>// The decision, written as a table you can defend ---------------------------
+//
+//  Need                                   Store                     Why
+//  ------------------------------------   -----------------------   ----------------
+//  Unknown future queries, joins,         SQL Server / PostgreSQL   the optimiser
+//  constraints, multi-table transactions                            adapts
+//
+//  Read a whole document by a known key,  Cosmos DB / MongoDB       one hop, scales
+//  partitionable, no cross-doc joins                                horizontally
+//
+//  Ephemeral, sub-millisecond, expiring   Redis                     in-memory, TTL
+//
+//  Append-only metrics over time          Timescale / ADX           compression +
+//                                                                   time partitioning
+//
+//  &quot;Friends of friends who bought X&quot;      Neo4j / Gremlin           traversal beats
+//                                                                   recursive joins
+//
+//  Ranked relevance over text             AI Search / Elastic       inverted index
+
+// In practice most systems are polyglot, and the interesting part is the seam:
+public class OrderReadService(AppDbContext db, IDistributedCache cache)
+{
+    public async Task&lt;OrderDto?&gt; Get(int id, CancellationToken ct)
+    {
+        // Redis for the hot read
+        var cached = await cache.GetStringAsync($&quot;order:{id}&quot;, ct);
+        if (cached is not null) return JsonSerializer.Deserialize&lt;OrderDto&gt;(cached);
+
+        // SQL as the system of record
+        var order = await db.Orders.AsNoTracking()
+            .Where(o =&gt; o.Id == id)
+            .Select(o =&gt; new OrderDto(o.Id, o.Total, o.Status))
+            .SingleOrDefaultAsync(ct);
+
+        if (order is not null)
+            await cache.SetStringAsync($&quot;order:{id}&quot;, JsonSerializer.Serialize(order),
+                new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow =
+                    TimeSpan.FromMinutes(5) }, ct);
+
+        return order;
+    }
+}
+// The hard part is invalidation, and the honest answer is that it is a cache
+// consistency problem, not a database choice. See Performance &gt; Caching.
+
+// Cosmos DB: the partition key IS the design decision. Get it wrong and you
+// get hot partitions and cross-partition queries that cost 100x the RU.
+var container = cosmos.GetContainer(&quot;shop&quot;, &quot;orders&quot;);
+var order = await container.ReadItemAsync&lt;OrderDto&gt;(
+    id: id, partitionKey: new PartitionKey(customerId));   // single-partition: ~1 RU
+
+var crossPartition = container.GetItemQueryIterator&lt;OrderDto&gt;(
+    &quot;SELECT * FROM c WHERE c.status = &#x27;paid&#x27;&quot;);           // fans out: expensive</code></pre><pre data-lang="python" hidden><code># The same decision, and the same polyglot seam
+
+# System of record: PostgreSQL
+order = session.execute(select(Order).where(Order.id == oid)).scalar_one_or_none()
+
+# Hot reads: Redis
+import redis.asyncio as redis, json
+r = redis.from_url(&quot;redis://localhost&quot;)
+
+async def get_order(oid: int) -&gt; dict | None:
+    cached = await r.get(f&quot;order:{oid}&quot;)
+    if cached:
+        return json.loads(cached)
+    row = session.execute(select(Order).where(Order.id == oid)).scalar_one_or_none()
+    if row:
+        await r.set(f&quot;order:{oid}&quot;, json.dumps(row.as_dict()), ex=300)
+    return row.as_dict() if row else None
+
+# Documents: MongoDB - one hop for the whole aggregate
+from motor.motor_asyncio import AsyncIOMotorClient
+mongo = AsyncIOMotorClient(uri).shop
+doc = await mongo.orders.find_one({&quot;_id&quot;: oid})
+
+# Before reaching for a document store, check whether JSONB already does it:
+#   ALTER TABLE orders ADD COLUMN metadata JSONB;
+#   CREATE INDEX ix_orders_metadata ON orders USING GIN (metadata);
+#   SELECT * FROM orders WHERE metadata @&gt; &#x27;{&quot;channel&quot;: &quot;mobile&quot;}&#x27;;
+#
+# and full-text:
+#   CREATE INDEX ix_products_fts ON products
+#     USING GIN (to_tsvector(&#x27;english&#x27;, description));
+#   SELECT * FROM products
+#   WHERE to_tsvector(&#x27;english&#x27;, description) @@ plainto_tsquery(&#x27;wireless mouse&#x27;);</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Answer with access patterns, never with "NoSQL scales better". The strongest line: relational is the only store that does not require you to know the queries in advance, so it is the default, and you move a workload out when it has a specific pattern relational serves badly. Two credibility details: in Cosmos DB the partition key is the design decision and a cross-partition query can cost orders of magnitude more RU; and a surprising amount of "we need a document store" is answered by JSONB with a GIN index. Expect CAP to come up — see <a href="../../SystemDesign/chapters/06-key-value-store.html">Key-Value Store</a> for that side of it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take a feature you have built and write down which store each of its access patterns wants.</li><li>Model the same data relationally and as a document, then write the three queries your product actually needs against both.</li><li>Store a JSON blob in a relational column with a GIN/computed index and query into it.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://use-the-index-luke.com/" target="_blank" rel="noopener">Use The Index, Luke!</a> — the best free material on index design, by a long way</li><li><a href="https://learn.microsoft.com/sql/relational-databases/performance/execution-plans" target="_blank" rel="noopener">Execution plans</a> — how to read them in SQL Server</li><li><a href="https://www.brentozar.com/archive/2018/04/how-to-think-like-the-sql-server-engine/" target="_blank" rel="noopener">How to think like the engine</a> — Brent Ozar on what the optimiser is doing</li><li><a href="https://jepsen.io/consistency" target="_blank" rel="noopener">Jepsen: consistency models</a> — what each isolation level actually guarantees</li><li><a href="https://use-the-index-luke.com/no-offset" target="_blank" rel="noopener">No Offset</a> — why OFFSET paging degrades and what to do instead</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

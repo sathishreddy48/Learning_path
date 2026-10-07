@@ -1,0 +1,1093 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Advanced C# &amp; Runtime Internals — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="advanced-csharp">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › C# &amp; .NET › Topic 14 of 36</div>
+  <h1>Advanced C# &amp; Runtime Internals</h1>
+  <p class="lede">The layer underneath the language: what the compiler generates, what the runtime does with it, and the APIs that let you inspect or build code at run time. Most of this is not daily work, which is exactly why it is asked — it separates people who have read the manual from people who have debugged something strange. <a href="performance.html">Performance</a> owns <code>Span&lt;T&gt;</code>, pooling and GC tuning; this page owns the metaprogramming.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#reflection">Reflection, Type, Activator and attributes</a></li><li><a href="#expression-trees">Expression trees and how LINQ providers use them</a></li><li><a href="#source-generators">Source generators</a></li><li><a href="#dynamic">dynamic and the DLR</a></li><li><a href="#closures">Delegates, closures and captured variables</a></li><li><a href="#unsafe-interop">unsafe, pointers, fixed and P/Invoke</a></li><li><a href="#assembly-loading">AssemblyLoadContext, plugins and unloading</a></li><li><a href="#il">Reading IL and decompiled output</a></li><li><a href="#equality">Equals, GetHashCode and the comparison contracts</a></li></ol>
+  </div>
+
+<section id="reflection"><h2 id="reflection">Reflection, Type, Activator and attributes</h2><p>Reflection reads an assembly's metadata at run time: types, members, attributes — and lets you construct and invoke without knowing the type at compile time. It powers DI containers, serialisers, ORMs and test runners.</p><p>The thing to lead with is the cost, because that is where the follow-up goes. A reflective call is roughly two orders of magnitude slower than a direct one, it defeats inlining, and it is invisible to the trimmer — which is why reflection-heavy code breaks under Native AOT. The mitigation is to do the reflection <em>once</em> and cache a compiled delegate.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Inspecting
+Type t = typeof(Order);
+Type t2 = order.GetType();                       // the RUNTIME type, not the static one
+Type t3 = Type.GetType(&quot;Shop.Domain.Order, Shop.Domain&quot;)!;   // by name
+
+var props   = t.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+var privates = t.GetFields(BindingFlags.NonPublic | BindingFlags.Instance);
+var method  = t.GetMethod(nameof(Order.Pay))!;
+bool isList = t.IsGenericType &amp;&amp; t.GetGenericTypeDefinition() == typeof(List&lt;&gt;);
+
+// Constructing and invoking
+var instance = Activator.CreateInstance&lt;Order&gt;();
+var instance2 = (Order)Activator.CreateInstance(t, args: [customerId])!;
+method.Invoke(instance, [money]);
+var value = props[0].GetValue(instance);
+props[0].SetValue(instance, newValue);           // works through a private setter
+
+// Generics at run time
+var openType   = typeof(Repository&lt;&gt;);
+var closedType = openType.MakeGenericType(typeof(Order));    // Repository&lt;Order&gt;
+var repo = Activator.CreateInstance(closedType);
+// NOTE: MakeGenericType over a value type generates code -&gt; fails under Native AOT
+
+// ATTRIBUTES: metadata you attach and then read back
+[AttributeUsage(AttributeTargets.Property, AllowMultiple = false)]
+public sealed class AuditedAttribute(string reason) : Attribute
+{
+    public string Reason { get; } = reason;
+}
+
+public class Order
+{
+    [Audited(&quot;regulatory&quot;)] public Money Total { get; set; }
+}
+
+foreach (var p in typeof(Order).GetProperties())
+    if (p.GetCustomAttribute&lt;AuditedAttribute&gt;() is { } a)
+        Console.WriteLine($&quot;{p.Name}: {a.Reason}&quot;);
+
+// THE PERFORMANCE FIX: reflect once, cache a delegate, call it forever after
+public static class FastAccessor&lt;T&gt;
+{
+    private static readonly Dictionary&lt;string, Func&lt;T, object?&gt;&gt; _getters = Build();
+
+    private static Dictionary&lt;string, Func&lt;T, object?&gt;&gt; Build() =&gt;
+        typeof(T).GetProperties()
+            .Where(p =&gt; p.CanRead)
+            .ToDictionary(p =&gt; p.Name, p =&gt;
+            {
+                // Build:  (T x) =&gt; (object)x.Prop
+                var param = Expression.Parameter(typeof(T), &quot;x&quot;);
+                var body  = Expression.Convert(Expression.Property(param, p), typeof(object));
+                return Expression.Lambda&lt;Func&lt;T, object?&gt;&gt;(body, param).Compile();
+            });
+
+    public static object? Get(T instance, string name) =&gt; _getters[name](instance);
+}
+// ~100x faster than PropertyInfo.GetValue per call. The compile happens once.
+// (And Expression.Compile is itself unavailable under Native AOT - a source
+//  generator is the AOT-safe version of this trick.)
+
+// CallerArgumentExpression: compile-time metadata, no reflection needed
+public static void Require(bool condition,
+    [CallerArgumentExpression(nameof(condition))] string? expr = null)
+{
+    if (!condition) throw new ArgumentException($&quot;failed: {expr}&quot;);
+}
+Require(order.Total &gt; Money.Zero(&quot;USD&quot;));   // message names the expression</code></pre><pre data-lang="python" hidden><code># Python reflection is just attribute access - the metadata IS the object
+import inspect, importlib
+from dataclasses import fields, dataclass
+
+t = type(order)                              # order.GetType()
+t2 = Order                                   # typeof(Order)
+mod = importlib.import_module(&quot;shop.domain.orders&quot;)
+t3 = getattr(mod, &quot;Order&quot;)                   # Type.GetType(&quot;...&quot;)
+
+members   = inspect.getmembers(Order, predicate=inspect.isfunction)
+sig       = inspect.signature(Order.pay)
+annotations = inspect.get_annotations(Order)
+props     = [f.name for f in fields(Order)]  # for a dataclass
+
+# Constructing and invoking
+instance = Order(customer_id)                # Activator.CreateInstance
+getattr(instance, &quot;pay&quot;)(money)              # MethodInfo.Invoke
+value = getattr(instance, &quot;total&quot;)
+setattr(instance, &quot;_status&quot;, &quot;paid&quot;)         # no access modifiers to defeat
+
+# Generics: erased at runtime, inspected through typing
+from typing import get_origin, get_args, List
+get_origin(list[Order])   # list
+get_args(list[Order])     # (Order,)
+
+# &quot;ATTRIBUTES&quot;: decorators, or Annotated metadata
+from typing import Annotated
+
+def audited(reason: str):
+    def decorator(fn):
+        fn._audited = reason                 # metadata on the function object
+        return fn
+    return decorator
+
+@dataclass
+class Order:
+    total: Annotated[Decimal, &quot;audited:regulatory&quot;]
+
+import typing
+hints = typing.get_type_hints(Order, include_extras=True)
+# {&#x27;total&#x27;: Annotated[Decimal, &#x27;audited:regulatory&#x27;]}
+
+# The performance point is identical: getattr in a hot loop is slow.
+# operator.attrgetter is the cached-delegate equivalent.
+from operator import attrgetter
+get_total = attrgetter(&quot;total&quot;)              # built once
+totals = [get_total(o) for o in orders]      # ~2x faster than getattr in a loop
+
+# __slots__ removes the per-instance dict and speeds attribute access
+class Point:
+    __slots__ = (&quot;x&quot;, &quot;y&quot;)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Expect "when would you use reflection, and what does it cost?" Cover both halves: it is how DI containers, serialisers and ORMs work, and it costs roughly 100x a direct call, blocks inlining, and is invisible to the trimmer so it breaks under trimming and Native AOT. Then give the mitigation — reflect once at startup and cache a compiled delegate (or use a source generator, which is the AOT-safe version). Knowing that <code>MakeGenericType</code> over value types generates code at run time, and is therefore an AOT hard stop, is a strong detail.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Benchmark <code>PropertyInfo.GetValue</code> against a cached compiled accessor over a million calls.</li><li>Write a custom attribute and a small validator that discovers it by reflection.</li><li>Publish a reflection-based serialiser with <code>PublishTrimmed</code> and find out what breaks.</li></ul></div></section>
+<section id="expression-trees"><h2 id="expression-trees">Expression trees and how LINQ providers use them</h2><p>An expression tree is code as <em>data</em>: <code>Expression&lt;Func&lt;Order, bool&gt;&gt;</code> is not a compiled method, it is an object graph describing one. That distinction is the entire answer to the most common question in this area — <strong>why does <code>IQueryable</code> take <code>Expression&lt;Func&lt;...&gt;&gt;</code> while <code>IEnumerable</code> takes <code>Func&lt;...&gt;</code>?</strong></p><p>Because EF Core cannot run your lambda; it has to <em>read</em> it and translate it into SQL. <code>IEnumerable.Where</code> gets a delegate and calls it per item in memory; <code>IQueryable.Where</code> gets a tree, walks it, and emits a <code>WHERE</code> clause. Accidentally converting one to the other — by calling <code>.AsEnumerable()</code>, or passing a <code>Func</code> — is the classic bug where filtering silently moves from the database to your process.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The same lambda, two completely different things
+Func&lt;Order, bool&gt;             compiled = o =&gt; o.Total &gt; 100;   // a METHOD
+Expression&lt;Func&lt;Order, bool&gt;&gt; tree     = o =&gt; o.Total &gt; 100;   // a TREE describing it
+
+bool result = compiled(order);            // just runs
+BinaryExpression body = (BinaryExpression)tree.Body;
+Console.WriteLine(body.NodeType);         // GreaterThan
+Console.WriteLine(body.Left);             // o.Total
+Console.WriteLine(body.Right);            // 100
+var runnable = tree.Compile();            // emit IL at run time, then run it
+
+// THIS is why IQueryable differs from IEnumerable
+IQueryable&lt;Order&gt; q = db.Orders;
+var fromDb = q.Where(o =&gt; o.Total &gt; 100);          // tree -&gt; WHERE total &gt; 100 in SQL
+
+IEnumerable&lt;Order&gt; e = db.Orders.AsEnumerable();   // &lt;- everything is now loaded
+var inMemory = e.Where(o =&gt; o.Total &gt; 100);        // delegate, filtered in YOUR process
+
+// The silent version of the same bug: a Func cannot be translated
+Func&lt;Order, bool&gt; predicate = o =&gt; o.Total &gt; 100;
+var oops = db.Orders.Where(predicate);             // binds to Enumerable.Where:
+                                                   // the whole table comes back
+// Fix: keep it an Expression all the way down
+Expression&lt;Func&lt;Order, bool&gt;&gt; good = o =&gt; o.Total &gt; 100;
+var fixedQuery = db.Orders.Where(good);            // translated
+
+// BUILDING a tree by hand - how dynamic filtering is implemented
+public static Expression&lt;Func&lt;T, bool&gt;&gt; PropertyEquals&lt;T&gt;(string property, object value)
+{
+    var param = Expression.Parameter(typeof(T), &quot;x&quot;);         // x
+    var member = Expression.PropertyOrField(param, property);  // x.Prop
+    var constant = Expression.Constant(value, member.Type);    // value
+    var body = Expression.Equal(member, constant);             // x.Prop == value
+    return Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(body, param);      // x =&gt; x.Prop == value
+}
+
+var filter = PropertyEquals&lt;Order&gt;(&quot;Status&quot;, &quot;paid&quot;);
+var paid = await db.Orders.Where(filter).ToListAsync(ct);      // real SQL
+
+// COMPOSING predicates, which is what you actually want in a search endpoint
+public static Expression&lt;Func&lt;T, bool&gt;&gt; And&lt;T&gt;(
+    Expression&lt;Func&lt;T, bool&gt;&gt; a, Expression&lt;Func&lt;T, bool&gt;&gt; b)
+{
+    var param = Expression.Parameter(typeof(T));
+    var body = Expression.AndAlso(
+        new Rebind(a.Parameters[0], param).Visit(a.Body)!,
+        new Rebind(b.Parameters[0], param).Visit(b.Body)!);
+    return Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(body, param);
+}
+
+private sealed class Rebind(ParameterExpression from, ParameterExpression to)
+    : ExpressionVisitor
+{
+    protected override Expression VisitParameter(ParameterExpression node)
+        =&gt; node == from ? to : base.VisitParameter(node);
+}
+
+// In practice: just compose with Where, which EF already ANDs for you
+IQueryable&lt;Order&gt; query = db.Orders;
+if (status is not null)  query = query.Where(o =&gt; o.Status == status);
+if (from is not null)    query = query.Where(o =&gt; o.PlacedAt &gt;= from);
+// nothing executes until ToListAsync - deferred execution is the other half of this
+
+// REWRITING a tree with a visitor - how query interceptors and multi-tenancy work
+public class TenantFilterVisitor(Guid tenantId) : ExpressionVisitor { /* ... */ }
+
+// Cost: Expression.Compile emits IL at run time. It is slow (microseconds, not
+// nanoseconds), it allocates, and it is unavailable under Native AOT.
+// Cache the compiled delegate; never compile inside a loop.</code></pre><pre data-lang="python" hidden><code># Python has no expression trees, because it does not need them: the AST is
+# available and functions carry their source. The ORM problem is solved by
+# OVERLOADING OPERATORS instead - which is arguably cleaner.
+
+from sqlalchemy import select
+
+# Order.total &gt; 100 does not evaluate to a bool - it builds a BinaryExpression
+clause = Order.total &gt; 100
+print(type(clause))        # &lt;class &#x27;sqlalchemy.sql.elements.BinaryExpression&#x27;&gt;
+print(clause)              # orders.total &gt; :total_1
+
+q = select(Order).where(Order.total &gt; 100)     # translated to SQL
+
+# The IEnumerable mistake has an exact analogue
+rows = session.execute(select(Order)).scalars().all()    # everything loaded
+filtered = [o for o in rows if o.total &gt; 100]            # filtered in Python
+
+# Building filters dynamically - the PropertyEquals equivalent
+def property_equals(model, name: str, value):
+    return getattr(model, name) == value
+
+q = select(Order).where(property_equals(Order, &quot;status&quot;, &quot;paid&quot;))
+
+# Composing
+from sqlalchemy import and_, or_
+conditions = []
+if status is not None: conditions.append(Order.status == status)
+if since  is not None: conditions.append(Order.placed_at &gt;= since)
+q = select(Order).where(and_(*conditions)) if conditions else select(Order)
+
+# Reading real source as a tree, when you do need it
+import ast, inspect, textwrap
+
+def f(o): return o.total &gt; 100
+
+tree = ast.parse(textwrap.dedent(inspect.getsource(f)))
+print(ast.dump(tree, indent=2))
+#   Compare(left=Attribute(attr=&#x27;total&#x27;), ops=[Gt()], comparators=[Constant(100)])
+
+# And compiling generated code at runtime - the Expression.Compile analogue
+code = compile(ast.parse(&quot;lambda o: o.total &gt; 100&quot;), &quot;&lt;gen&gt;&quot;, &quot;eval&quot;)
+fn = eval(code)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"Why does <code>IQueryable</code> take an <code>Expression&lt;Func&lt;T,bool&gt;&gt;</code> and <code>IEnumerable</code> take a <code>Func&lt;T,bool&gt;</code>?" is one of the best LINQ questions there is, and expression trees are the whole answer: the provider must read the code, not run it. Follow it with the practical consequence — assigning a predicate to a <code>Func</code> variable, or calling <code>AsEnumerable()</code> early, silently moves the filter from SQL into your process and loads the table. Mention that <code>Expression.Compile</code> emits IL at run time and is therefore both slow and AOT-incompatible.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write the same predicate as a <code>Func</code> and an <code>Expression</code>, pass both to <code>db.Orders.Where</code>, and compare the generated SQL.</li><li>Build <code>x => x.Status == "paid"</code> by hand with the <code>Expression</code> factory methods and run it against EF.</li><li>Write an <code>ExpressionVisitor</code> that rewrites every constant in a tree.</li></ul></div></section>
+<section id="source-generators"><h2 id="source-generators">Source generators</h2><p>A source generator is a compiler plug-in that <em>adds</em> C# during compilation. It is the modern answer to everything people used reflection or runtime emit for: the work happens at build time, so the output is ordinary code — fast, debuggable, trimmable and AOT-safe.</p><p>You already use several: <code>System.Text.Json</code>'s <code>JsonSerializerContext</code>, <code>[LoggerMessage]</code>, <code>[GeneratedRegex]</code>, <code>[LibraryImport]</code>, and the record/primary-constructor members the compiler writes for you.</p><p>Write <strong>incremental</strong> generators (<code>IIncrementalGenerator</code>), not the obsolete <code>ISourceGenerator</code> — the incremental pipeline caches, so it does not re-run on every keystroke and tank IDE responsiveness. Generators can only add code, never modify existing code, which is why everything they touch must be <code>partial</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// --- Using the ones that ship with .NET ---
+
+// JSON: reflection-free, trim-safe, ~2x faster serialisation
+[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+[JsonSerializable(typeof(Order))]
+[JsonSerializable(typeof(List&lt;Order&gt;))]
+internal partial class AppJsonContext : JsonSerializerContext { }
+
+var json = JsonSerializer.Serialize(order, AppJsonContext.Default.Order);
+
+// Logging: no boxing, no allocation when the level is off, checked at compile time
+public partial class OrderService
+{
+    [LoggerMessage(Level = LogLevel.Information, Message = &quot;Order {orderId} placed by {customer}&quot;)]
+    private partial void LogPlaced(string orderId, string customer);
+}
+
+// Regex: the pattern is compiled to C# at BUILD time, not at startup
+public partial class Validators
+{
+    [GeneratedRegex(@&quot;^[\w\.-]+@[\w\.-]+\.\w{2,}$&quot;, RegexOptions.IgnoreCase)]
+    public static partial Regex Email();
+}
+if (Validators.Email().IsMatch(input)) { }
+
+// P/Invoke: generated marshalling instead of runtime-generated stubs
+internal partial class Native
+{
+    [LibraryImport(&quot;libc&quot;, EntryPoint = &quot;getpid&quot;)]
+    internal static partial int GetPid();
+}
+
+// --- Writing one: an incremental generator ---
+[Generator]
+public class ToStringGenerator : IIncrementalGenerator
+{
+    public void Initialize(IncrementalGeneratorInitializationContext context)
+    {
+        // 1. a cheap syntactic predicate runs on EVERY keystroke - keep it trivial
+        var classes = context.SyntaxProvider.ForAttributeWithMetadataName(
+            &quot;Shop.GenerateToStringAttribute&quot;,
+            predicate: static (node, _) =&gt; node is ClassDeclarationSyntax,
+            // 2. the semantic transform runs only for matches, and is CACHED
+            transform: static (ctx, _) =&gt;
+            {
+                var symbol = (INamedTypeSymbol)ctx.TargetSymbol;
+                var props = symbol.GetMembers().OfType&lt;IPropertySymbol&gt;()
+                    .Where(p =&gt; p.DeclaredAccessibility == Accessibility.Public)
+                    .Select(p =&gt; p.Name)
+                    .ToImmutableArray();
+                // Return a VALUE-EQUATABLE model, never a Symbol or a Compilation,
+                // or caching breaks and the generator re-runs constantly.
+                return (Namespace: symbol.ContainingNamespace.ToDisplayString(),
+                        Name: symbol.Name, Props: props);
+            });
+
+        // 3. emit
+        context.RegisterSourceOutput(classes, static (spc, model) =&gt;
+        {
+            var body = string.Join(&quot; + \&quot;, \&quot; + &quot;,
+                model.Props.Select(p =&gt; $&quot;\&quot;{p}=\&quot; + {p}&quot;));
+
+            spc.AddSource($&quot;{model.Name}.ToString.g.cs&quot;, $$&quot;&quot;&quot;
+                // &lt;auto-generated/&gt;
+                #nullable enable
+                namespace {{model.Namespace}};
+
+                partial class {{model.Name}}
+                {
+                    public override string ToString() =&gt; $&quot;{{model.Name}} {{{{&quot; + {{body}} + &quot;}}}}&quot;;
+                }
+                &quot;&quot;&quot;);
+        });
+    }
+}
+
+// Used like this - note `partial`, which is what makes it possible at all
+[GenerateToString]
+public partial class Order
+{
+    public string Id { get; init; } = &quot;&quot;;
+    public decimal Total { get; init; }
+}
+
+// Seeing the output: &lt;EmitCompilerGeneratedFiles&gt;true&lt;/EmitCompilerGeneratedFiles&gt;
+//                    &lt;CompilerGeneratedFilesOutputPath&gt;obj/generated&lt;/...&gt;</code></pre><pre data-lang="python" hidden><code># Python generates code at runtime rather than build time, because it can -
+# but the trade-off is exactly the one source generators were invented to avoid.
+
+# 1. The dataclass decorator IS a code generator: it builds __init__, __repr__
+#    and __eq__ as source and execs them.
+from dataclasses import dataclass
+
+@dataclass
+class Order:
+    id: str
+    total: Decimal
+# dataclasses.py literally does:
+#     txt = f&quot;def __init__(self, {args}): ...&quot;
+#     exec(txt, globals, locals)
+
+# 2. Doing it yourself - the same technique
+def generate_to_string(cls):
+    props = [f.name for f in dataclasses.fields(cls)]
+    body = &quot; + &#x27;, &#x27; + &quot;.join(f&#x27;f&quot;{p}={{self.{p}}}&quot;&#x27; for p in props)
+    src = f&quot;def __str__(self):\n    return f&#x27;{cls.__name__} {{{{&#x27; + {body} + &#x27;}}}}&#x27;&quot;
+    ns: dict = {}
+    exec(src, {}, ns)
+    cls.__str__ = ns[&quot;__str__&quot;]
+    return cls
+
+@generate_to_string
+@dataclass
+class Order:
+    id: str
+    total: Decimal
+
+# 3. The build-time equivalents, when runtime generation costs too much:
+#      mypyc      - compile annotated Python to a C extension
+#      Cython     - .pyx compiled ahead of time
+#      pydantic 2 - the validation core is compiled Rust, not generated Python
+#
+# Note what .NET gets that Python does not: the generated code is checked by the
+# compiler, is steppable in the debugger, and is visible to the trimmer. Python&#x27;s
+# exec&#x27;d code is invisible to every static tool you own.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A good "what is new" question. Define it as a compiler plug-in that adds code at build time, then give the <em>why</em>: it replaces runtime reflection and IL emit with ordinary compiled code, which is faster, debuggable, trim-safe and AOT-compatible. Name the ones you already use (<code>JsonSerializerContext</code>, <code>[LoggerMessage]</code>, <code>[GeneratedRegex]</code>, <code>[LibraryImport]</code>) — that shows practical exposure rather than having written a toy generator. If you have written one, the detail that proves it is that the transform must return a value-equatable model, because returning a symbol or a compilation defeats the incremental cache and makes the IDE crawl.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Convert reflection-based JSON to a <code>JsonSerializerContext</code> and benchmark both.</li><li>Replace a hot-path <code>ILogger</code> call with a <code>[LoggerMessage]</code> partial method.</li><li>Turn on <code>EmitCompilerGeneratedFiles</code> and read what the compiler writes for a record.</li></ul></div></section>
+<section id="dynamic"><h2 id="dynamic">dynamic and the DLR</h2><p><code>dynamic</code> turns off compile-time binding for an expression: the compiler emits a call site that resolves the member at run time through the Dynamic Language Runtime. It is not <code>object</code> (which binds at compile time to <code>object</code>'s members) and it is not <code>var</code> (which is full static typing with inference).</p><p>Legitimate uses are narrow: COM interop, genuinely dynamic JSON where the shape is unknown, and interop with dynamic languages. Everywhere else it costs you IntelliSense, refactoring, compile-time errors and about 10–20x the call overhead — and it fails at run time with a <code>RuntimeBinderException</code> that a compiler would have caught.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The three that get confused
+var    a = GetOrder();     // STATIC. The compiler infers Order. Full checking.
+object b = GetOrder();     // STATIC, as object. b.Total does not compile.
+dynamic c = GetOrder();    // DEFERRED. c.Total compiles; it binds at run time.
+
+c.Total;                   // fine
+c.Toatl;                   // ALSO compiles. RuntimeBinderException when it runs.
+
+// ExpandoObject: add and remove members at run time
+dynamic expando = new ExpandoObject();
+expando.Name = &quot;Ada&quot;;
+expando.Greet = (Func&lt;string&gt;)(() =&gt; &quot;hello&quot;);
+((IDictionary&lt;string, object&gt;)expando).Remove(&quot;Name&quot;);
+foreach (var kv in (IDictionary&lt;string, object&gt;)expando) { }
+
+// DynamicObject: define what member access MEANS for your type
+public class CaseInsensitiveBag : DynamicObject
+{
+    private readonly Dictionary&lt;string, object?&gt; _data =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    public override bool TryGetMember(GetMemberBinder binder, out object? result)
+        =&gt; _data.TryGetValue(binder.Name, out result) || Ok(out result);
+
+    public override bool TrySetMember(SetMemberBinder binder, object? value)
+    {
+        _data[binder.Name] = value;
+        return true;
+    }
+
+    private static bool Ok(out object? r) { r = null; return true; }  // null, not throw
+}
+
+dynamic bag = new CaseInsensitiveBag();
+bag.Name = &quot;Ada&quot;;
+Console.WriteLine(bag.NAME);          // &quot;Ada&quot;
+
+// The real-world use: JSON whose shape you do not know
+dynamic payload = JsonNode.Parse(body)!;
+string channel = payload[&quot;metadata&quot;]![&quot;channel&quot;]!.GetValue&lt;string&gt;();
+
+// ...and the modern alternative, which is better in almost every case
+var node = JsonNode.Parse(body);
+var channel2 = node?[&quot;metadata&quot;]?[&quot;channel&quot;]?.GetValue&lt;string&gt;();   // null-safe, static
+
+// COM interop, where dynamic genuinely earns its place
+dynamic excel = Activator.CreateInstance(Type.GetTypeFromProgID(&quot;Excel.Application&quot;)!)!;
+excel.Visible = true;
+excel.Workbooks.Add();                // no interop assembly, no casting every call
+
+// Cost: each call site caches its binding, so a repeated call is ~10x a direct
+// call rather than ~100x - but the FIRST call pays full binder cost, and you
+// have given up every compile-time guarantee to get there.
+
+// One genuinely clever use: dynamic restores runtime dispatch on overloads
+void Handle(Circle c) { } void Handle(Square s) { } void Handle(Shape s) { }
+Shape shape = GetShape();
+Handle(shape);            // always binds to Handle(Shape) - static overload resolution
+Handle((dynamic)shape);   // binds to the RUNTIME type: double dispatch, no visitor</code></pre><pre data-lang="python" hidden><code># Python is dynamic by default, so this whole section is its baseline.
+# The interesting direction is the reverse: how to get static guarantees back.
+
+order = get_order()          # dynamic, like C#&#x27;s `dynamic`
+order.toatl                  # AttributeError at runtime - same failure mode
+
+# The `var` equivalent: annotations plus a checker
+order: Order = get_order()   # mypy/pyright now check attribute access
+
+# ExpandoObject: that is just an object, or a SimpleNamespace
+from types import SimpleNamespace
+expando = SimpleNamespace(name=&quot;Ada&quot;)
+expando.greet = lambda: &quot;hello&quot;
+del expando.name
+vars(expando)                # the IDictionary&lt;string, object&gt; view
+
+# DynamicObject: __getattr__ / __setattr__ define what member access means
+class CaseInsensitiveBag:
+    def __init__(self) -&gt; None:
+        object.__setattr__(self, &quot;_data&quot;, {})
+
+    def __getattr__(self, name: str):            # called only when normal lookup fails
+        return self._data.get(name.lower())
+
+    def __setattr__(self, name: str, value) -&gt; None:
+        self._data[name.lower()] = value
+
+bag = CaseInsensitiveBag()
+bag.Name = &quot;Ada&quot;
+print(bag.NAME)              # &quot;Ada&quot;
+
+# Unknown-shape JSON
+import json
+payload = json.loads(body)
+channel = payload.get(&quot;metadata&quot;, {}).get(&quot;channel&quot;)
+
+# Runtime dispatch on the argument type - the (dynamic) overload trick, built in
+from functools import singledispatch
+
+@singledispatch
+def handle(shape) -&gt; None: raise NotImplementedError
+
+@handle.register
+def _(shape: Circle) -&gt; None: ...
+@handle.register
+def _(shape: Square) -&gt; None: ...
+
+handle(get_shape())          # dispatches on the RUNTIME type</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The reliable question is "<code>dynamic</code> vs <code>var</code> vs <code>object</code>", and the distinction to make crisply is that <code>var</code> is static typing with inference, <code>object</code> is static typing at the base type, and only <code>dynamic</code> defers binding to run time. Then give a position: narrow legitimate uses (COM, genuinely unknown JSON shapes), and otherwise it trades every compile-time guarantee for convenience you can get from <code>JsonNode</code> or a typed model. The <code>(dynamic)</code> double-dispatch trick is a nice thing to know for a visitor-pattern discussion.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a <code>DynamicObject</code> that makes member access case-insensitive.</li><li>Replace a <code>dynamic</code> JSON traversal with <code>JsonNode</code> and null-conditional access.</li><li>Use <code>(dynamic)</code> to get double dispatch and compare it to writing a visitor.</li></ul></div></section>
+<section id="closures"><h2 id="closures">Delegates, closures and captured variables</h2><p>A lambda that references a local variable does not copy it — the compiler <strong>hoists the variable into a generated class</strong> and both the enclosing method and the lambda use the field. That is why a closure sees later changes to the variable, and why the loop-variable question has the answer it does.</p><p>The classic puzzle: in C# 5+ <code>foreach</code> declares a <em>fresh</em> variable per iteration, so capturing it in a loop works as people expect. A C-style <code>for</code> loop has <strong>one</strong> variable for the whole loop, so every lambda captures the same one and they all see the final value. Knowing that the <code>foreach</code> behaviour changed in C# 5 is the detail that marks real experience.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The puzzle, both halves
+var actions = new List&lt;Action&gt;();
+
+for (int i = 0; i &lt; 3; i++)
+    actions.Add(() =&gt; Console.Write(i));         // ONE variable i, captured 3 times
+actions.ForEach(a =&gt; a());                       // 333
+
+var actions2 = new List&lt;Action&gt;();
+foreach (var x in Enumerable.Range(0, 3))
+    actions2.Add(() =&gt; Console.Write(x));        // a NEW x per iteration (C# 5+)
+actions2.ForEach(a =&gt; a());                      // 012
+
+// The fix for the `for` loop: introduce a per-iteration variable yourself
+for (int i = 0; i &lt; 3; i++)
+{
+    int copy = i;
+    actions.Add(() =&gt; Console.Write(copy));      // 012
+}
+
+// What the compiler actually generates for the first case:
+//   private sealed class &lt;&gt;c__DisplayClass0_0 { public int i; }
+//   var cls = new &lt;&gt;c__DisplayClass0_0();
+//   for (cls.i = 0; cls.i &lt; 3; cls.i++)
+//       actions.Add(new Action(cls.&lt;M&gt;b__0));   // all three share `cls`
+
+// Closures allocate. A lambda capturing nothing is cached as a static singleton;
+// one that captures gets a display class per entry to the scope.
+list.Where(x =&gt; x &gt; 0);          // captures nothing: cached, zero allocation
+list.Where(x =&gt; x &gt; min);        // captures min: allocates a display class
+list.Where(static x =&gt; x &gt; 0);   // `static` lambda: compile ERROR if it captures
+
+// The allocation trap in a hot loop - capture via state instead
+foreach (var item in items)
+    queue.Enqueue(() =&gt; Process(item));          // one display class per item
+
+// Overloads that take state avoid the capture entirely
+Task.Run(() =&gt; Process(item));                           // captures
+ThreadPool.QueueUserWorkItem(static s =&gt; Process(s), item, preferLocal: true);  // no
+
+// Capture in async is the same mechanism and the same leak risk: a long-lived
+// delegate keeps everything it captured alive.
+public class Subscriber
+{
+    private readonly byte[] _big = new byte[10_000_000];
+
+    public void Subscribe(EventBus bus)
+        =&gt; bus.OnMessage += m =&gt; Console.WriteLine(m);
+    // This lambda captures `this` (it is an instance method&#x27;s lambda), so the
+    // whole Subscriber - including _big - lives as long as the bus does.
+    // Unsubscribing requires the same delegate instance, which a lambda makes
+    // awkward: store it in a field if you intend to detach.
+}
+
+// Delegates: multicast, and what that means for return values and exceptions
+Action chain = () =&gt; Console.Write(&quot;a&quot;);
+chain += () =&gt; Console.Write(&quot;b&quot;);
+chain();                              // &quot;ab&quot; - invoked in order
+
+Func&lt;int&gt; f = () =&gt; 1;
+f += () =&gt; 2;
+Console.WriteLine(f());               // 2 - only the LAST return value survives
+
+// An exception in one handler stops the rest. Invoke individually if that matters:
+foreach (var d in chain.GetInvocationList().Cast&lt;Action&gt;())
+    try { d(); } catch (Exception ex) { log.LogError(ex, &quot;handler failed&quot;); }</code></pre><pre data-lang="python" hidden><code># Python has the SAME late-binding behaviour, and in a form that catches more
+# people, because its `for` does not create a new scope per iteration either.
+
+actions = []
+for i in range(3):
+    actions.append(lambda: print(i, end=&quot;&quot;))
+[a() for a in actions]            # 222  - all three see the final i
+
+# The fix: bind at definition time with a default argument
+actions = []
+for i in range(3):
+    actions.append(lambda i=i: print(i, end=&quot;&quot;))
+[a() for a in actions]            # 012
+
+# or functools.partial
+from functools import partial
+actions = [partial(print, i, end=&quot;&quot;) for i in range(3)]   # 012
+
+# Note: unlike C# 5+, a Python `for` target is ONE variable for the whole loop,
+# so there is no foreach/for distinction to remember - it is always the trap.
+# Comprehensions DO have their own scope (Python 3), which is why the partial
+# version above works and `[lambda: i for i in range(3)]` still does not.
+
+# Inspecting the closure - the display-class equivalent
+def make():
+    secret = 42
+    return lambda: secret
+
+fn = make()
+print(fn.__closure__[0].cell_contents)     # 42
+print(fn.__code__.co_freevars)             # (&#x27;secret&#x27;,)
+
+# nonlocal: write to a captured variable (C# does this implicitly)
+def counter():
+    count = 0
+    def increment():
+        nonlocal count                     # without this, it rebinds a LOCAL
+        count += 1
+        return count
+    return increment
+
+# The lifetime trap is identical: a long-lived callback keeps its captures alive
+class Subscriber:
+    def __init__(self) -&gt; None:
+        self._big = bytearray(10_000_000)
+
+    def subscribe(self, bus) -&gt; None:
+        bus.on_message(lambda m: print(m))   # captures `self` through the closure
+        # weakref.WeakMethod is the mitigation when the bus outlives the subscriber</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The loop-capture question gets asked constantly. Answer it by explaining the <em>mechanism</em> — the compiler hoists the variable into a generated display class shared by every lambda — and then give the <code>for</code> versus <code>foreach</code> difference and note that <code>foreach</code> only behaves this way since C# 5. Strong follow-ups to volunteer: closures allocate (a capture-free lambda is cached, a capturing one is not, and <code>static</code> lambdas let the compiler enforce it), and a long-lived delegate keeps everything it captured alive, which is a common managed memory leak.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Reproduce the 333-versus-012 result and then look at the generated code on SharpLab.</li><li>Find a lambda in a hot path that captures, and remove the allocation with a <code>static</code> lambda plus a state parameter.</li><li>Subscribe to a long-lived event with a lambda capturing <code>this</code> and watch the object survive in a heap dump.</li></ul></div></section>
+<section id="unsafe-interop"><h2 id="unsafe-interop">unsafe, pointers, fixed and P/Invoke</h2><p><code>unsafe</code> lets you use pointers, which means you take over from the GC and the bounds checker. It is rarely the right answer any more — <code>Span&lt;T&gt;</code> gives most of the performance with none of the risk — but it remains necessary for interop and for a few genuinely hot paths.</p><p>The concept to be able to explain is <strong>pinning</strong>. The GC compacts the heap, which moves objects; a raw pointer into a managed object would dangle after a collection. <code>fixed</code> pins the object so the GC cannot move it for the duration of the block — and pinning for too long fragments the heap, which is why you pin narrowly.</p><p>For P/Invoke, use <code>[LibraryImport]</code> (source-generated marshalling, AOT-safe) over <code>[DllImport]</code> (runtime-generated stubs) in new code.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// csproj: &lt;AllowUnsafeBlocks&gt;true&lt;/AllowUnsafeBlocks&gt;
+
+// PINNING: the GC moves objects; a pointer into one must be pinned first
+unsafe static int SumUnsafe(int[] data)
+{
+    fixed (int* p = data)                  // pinned for this block only
+    {
+        int sum = 0;
+        for (int i = 0; i &lt; data.Length; i++)
+            sum += p[i];                   // no bounds check, no GC move
+        return sum;
+    }
+}
+// Pin narrowly. A long-lived pinned object fragments the heap because the GC
+// must compact around it. GCHandle.Alloc(obj, GCHandleType.Pinned) is the
+// explicit, long-lived form - and the one that causes the problem.
+
+// Span&lt;T&gt; gets you most of this with none of the risk. Prefer it.
+static int SumSafe(ReadOnlySpan&lt;int&gt; data)
+{
+    int sum = 0;
+    foreach (var x in data) sum += x;      // the JIT elides the bounds check here
+    return sum;
+}
+
+// stackalloc: a buffer on the stack, no allocation, no pinning needed
+Span&lt;byte&gt; buffer = stackalloc byte[256];  // bound the size, or you blow the stack
+if (needed &gt; 256) buffer = new byte[needed];   // the standard guard
+
+// --- P/INVOKE ---
+
+// Modern: source-generated marshalling, trim- and AOT-safe
+internal static partial class Native
+{
+    [LibraryImport(&quot;libc&quot;, EntryPoint = &quot;getpid&quot;)]
+    internal static partial int GetPid();
+
+    [LibraryImport(&quot;kernel32.dll&quot;, EntryPoint = &quot;GetTickCount64&quot;)]
+    internal static partial ulong GetTickCount64();
+
+    // String marshalling is explicit now, which is the point
+    [LibraryImport(&quot;libc&quot;, EntryPoint = &quot;getenv&quot;,
+                   StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial IntPtr GetEnv(string name);
+}
+
+// Legacy: runtime-generated stub. Still everywhere, works fine, not AOT-safe.
+[DllImport(&quot;kernel32.dll&quot;, SetLastError = true, CharSet = CharSet.Unicode)]
+static extern bool GetDiskFreeSpaceEx(string path,
+    out ulong freeBytesAvailable, out ulong totalBytes, out ulong totalFreeBytes);
+
+// Marshalling a struct: layout must match the native one EXACTLY
+[StructLayout(LayoutKind.Sequential)]
+struct NativePoint { public int X; public int Y; }
+
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+struct NativeConfig
+{
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+    public string Name;                    // a fixed-size inline char array
+    public int Timeout;
+}
+
+// Owning a native handle correctly - SafeHandle, not IntPtr
+internal sealed class FileHandle() : SafeHandleZeroOrMinusOneIsInvalid(ownsHandle: true)
+{
+    protected override bool ReleaseHandle() =&gt; Native.Close(handle);
+}
+// SafeHandle is why you should not pass raw IntPtr: it is ref-counted, it
+// participates in finalisation, and it closes the handle-recycling race that a
+// bare IntPtr leaves open.
+
+// Errors: capture immediately, before anything else can overwrite it
+if (!GetDiskFreeSpaceEx(path, out var a, out var b, out var c))
+    throw new Win32Exception(Marshal.GetLastWin32Error());
+
+// Blittable types (int, byte, pointers, structs of them) marshal for free.
+// Non-blittable (bool, char, string, arrays of them) require a conversion per
+// call - which is where interop performance goes.
+
+// Reinterpreting without copying - the modern replacement for pointer casts
+Span&lt;byte&gt; bytes = stackalloc byte[8];
+ref int first = ref MemoryMarshal.AsRef&lt;int&gt;(bytes);
+Span&lt;int&gt; ints = MemoryMarshal.Cast&lt;byte, int&gt;(bytes);</code></pre><pre data-lang="python" hidden><code># Python&#x27;s equivalent is ctypes (runtime) or a C extension / cffi (compiled)
+
+import ctypes, ctypes.util
+
+# P/Invoke equivalent
+libc = ctypes.CDLL(ctypes.util.find_library(&quot;c&quot;))
+
+libc.getpid.restype = ctypes.c_int              # ALWAYS set these; the default
+libc.getpid.argtypes = []                       # is c_int and silently wrong
+print(libc.getpid())
+
+libc.getenv.restype = ctypes.c_char_p
+libc.getenv.argtypes = [ctypes.c_char_p]
+print(libc.getenv(b&quot;HOME&quot;))
+
+# Struct marshalling - the StructLayout equivalent
+class NativePoint(ctypes.Structure):
+    _fields_ = [(&quot;x&quot;, ctypes.c_int), (&quot;y&quot;, ctypes.c_int)]
+
+class NativeConfig(ctypes.Structure):
+    _pack_ = 1                                   # LayoutKind.Sequential, Pack = 1
+    _fields_ = [(&quot;name&quot;, ctypes.c_char * 64),    # ByValTStr, SizeConst = 64
+                (&quot;timeout&quot;, ctypes.c_int)]
+
+# &quot;Pinning&quot;: CPython does not move objects, so there is nothing to pin - but
+# you must keep a reference alive or the buffer is freed under the pointer.
+buf = ctypes.create_string_buffer(256)           # keep `buf` referenced!
+libc.read(fd, buf, 256)
+
+# The Span&lt;T&gt; equivalent: memoryview - a view, no copy
+data = bytearray(1024)
+view = memoryview(data)[0:256]
+view[0] = 65                                      # writes through to `data`
+
+# Zero-copy reinterpretation - MemoryMarshal.Cast
+ints = memoryview(data).cast(&quot;i&quot;)                 # bytes viewed as int32
+
+# Errors
+ctypes.set_errno(0)
+if libc.some_call() &lt; 0:
+    raise OSError(ctypes.get_errno())
+
+# The faster options, when ctypes overhead per call matters:
+#   cffi     - compiled bindings, much lower per-call cost
+#   Cython   - write the hot loop in Cython, call C directly
+#   PyO3     - Rust extension modules</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Nobody expects daily pointer work, so the signal is knowing <em>why</em> the rules exist. Be able to explain pinning: the GC compacts the heap, a raw pointer into a managed object would dangle, so <code>fixed</code> pins it — and pinning for too long fragments the heap. Then say you would reach for <code>Span&lt;T&gt;</code> and <code>stackalloc</code> before <code>unsafe</code>, because they get most of the performance with bounds checking intact. For interop: <code>SafeHandle</code> rather than <code>IntPtr</code>, and <code>[LibraryImport]</code> rather than <code>[DllImport]</code> in new code because its marshalling is source-generated and therefore AOT-safe.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Rewrite an <code>unsafe</code> pointer loop with <code>Span&lt;T&gt;</code> and benchmark both.</li><li>P/Invoke a libc function with <code>[LibraryImport]</code> and get the struct layout right.</li><li>Wrap a native handle in a <code>SafeHandle</code> and verify it releases under a forced GC.</li></ul></div></section>
+<section id="assembly-loading"><h2 id="assembly-loading">AssemblyLoadContext, plugins and unloading</h2><p>.NET Framework had <code>AppDomain</code> for isolation and unloading. .NET Core removed it and replaced it with <code>AssemblyLoadContext</code> — which gives you isolation and <em>collectible</em> contexts, but no security boundary. That is the answer to "what replaced AppDomain", and the caveat matters: an AppDomain was a sandbox, an ALC is not.</p><p>A collectible ALC can be unloaded, which is how plugin hosts load and reload extensions without restarting. The thing that makes it hard in practice is that unloading happens only when <strong>every</strong> reference is gone — including a <code>Type</code> you cached, a delegate pointing into the assembly, or a static field somewhere holding one of its instances. A single stray reference leaks the whole context.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// A collectible context that resolves the plugin&#x27;s own dependencies
+public class PluginLoadContext : AssemblyLoadContext
+{
+    private readonly AssemblyDependencyResolver _resolver;
+
+    public PluginLoadContext(string pluginPath)
+        : base(name: Path.GetFileNameWithoutExtension(pluginPath), isCollectible: true)
+        =&gt; _resolver = new AssemblyDependencyResolver(pluginPath);
+
+    protected override Assembly? Load(AssemblyName name)
+    {
+        // Return null for shared contracts so they come from the DEFAULT context.
+        // Otherwise the plugin loads its own copy of IPlugin and the host&#x27;s
+        // `is IPlugin` check fails against a type with the same name.
+        if (name.Name == &quot;Shop.Plugins.Abstractions&quot;) return null;
+
+        var path = _resolver.ResolveAssemblyToPath(name);
+        return path is null ? null : LoadFromAssemblyPath(path);
+    }
+
+    protected override IntPtr LoadUnmanagedDll(string name)
+    {
+        var path = _resolver.ResolveUnmanagedDllToPath(name);
+        return path is null ? IntPtr.Zero : LoadUnmanagedDllFromPath(path);
+    }
+}
+
+// Loading, using, unloading. Note [MethodImpl(NoInlining)] - without it the JIT
+// may keep a local alive past its last use and the unload never completes.
+[MethodImpl(MethodImplOptions.NoInlining)]
+static WeakReference LoadAndRun(string path, out string result)
+{
+    var alc = new PluginLoadContext(path);
+    var assembly = alc.LoadFromAssemblyPath(path);
+
+    var type = assembly.GetTypes().First(t =&gt; typeof(IPlugin).IsAssignableFrom(t));
+    var plugin = (IPlugin)Activator.CreateInstance(type)!;
+    result = plugin.Run();
+
+    alc.Unload();                       // REQUESTS unload; does not force it
+    return new WeakReference(alc);      // everything above is now out of scope
+}
+
+var weak = LoadAndRun(path, out var output);
+for (int i = 0; weak.IsAlive &amp;&amp; i &lt; 10; i++)
+{
+    GC.Collect();
+    GC.WaitForPendingFinalizers();      // unload completes across several GCs
+}
+Console.WriteLine(weak.IsAlive ? &quot;LEAKED - something still holds a reference&quot;
+                               : &quot;unloaded&quot;);
+
+// What keeps a context alive, in order of how often it is the culprit:
+//   - a cached Type, MethodInfo or Assembly from the plugin
+//   - a delegate whose target lives in the plugin (an event subscription)
+//   - a static field anywhere holding a plugin instance
+//   - a running thread or a Task with a plugin frame on its stack
+//   - a generic instantiation over a plugin type (Dictionary&lt;string, PluginType&gt;)
+
+// Inspecting what is loaded
+foreach (var alc in AssemblyLoadContext.All)
+    Console.WriteLine($&quot;{alc.Name}: {alc.Assemblies.Count()} assemblies&quot;);
+
+AssemblyLoadContext.Default.Resolving += (ctx, name) =&gt;
+    ctx.LoadFromAssemblyPath(Path.Combine(probeDir, name.Name + &quot;.dll&quot;));
+
+// MetadataLoadContext: inspect an assembly WITHOUT running any of its code.
+// This is the right tool for scanning untrusted plugins before loading them.
+var resolver = new PathAssemblyResolver(Directory.GetFiles(dir, &quot;*.dll&quot;));
+using var mlc = new MetadataLoadContext(resolver);
+var inspected = mlc.LoadFromAssemblyPath(path);
+foreach (var t in inspected.GetTypes()) Console.WriteLine(t.FullName);</code></pre><pre data-lang="python" hidden><code># Python&#x27;s module system is the equivalent, and unloading is just as leaky.
+import importlib, importlib.util, sys, gc, weakref
+
+# &quot;LoadFromAssemblyPath&quot; - load a module from an explicit path
+def load_plugin(name: str, path: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module                  # the &quot;load context&quot;
+    spec.loader.exec_module(module)
+    return module
+
+plugin = load_plugin(&quot;myplugin&quot;, &quot;/plugins/myplugin.py&quot;)
+result = plugin.run()
+
+# &quot;Unload&quot;: remove from sys.modules and drop every reference
+ref = weakref.ref(plugin)
+del sys.modules[&quot;myplugin&quot;]
+del plugin
+gc.collect()
+print(&quot;unloaded&quot; if ref() is None else &quot;LEAKED&quot;)
+
+# The same culprits keep it alive:
+#   - a class object cached somewhere (type(obj) from the plugin)
+#   - a bound method registered as a callback
+#   - a module-level singleton holding an instance
+#   - a running thread executing plugin code
+#   - instances still referenced anywhere
+
+# &quot;Reload&quot; - and the same gotcha: existing instances keep the OLD class
+importlib.reload(module)       # rebinds module attributes; live objects are stale
+
+# &quot;MetadataLoadContext&quot; - inspect without executing
+import ast
+with open(path) as f:
+    tree = ast.parse(f.read())
+classes = [n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+# This is genuinely safer than Python&#x27;s import, which runs module-level code.
+
+# Isolation: Python has no ALC equivalent. For real isolation you need a
+# subprocess (multiprocessing) or a subinterpreter (PEP 554, 3.12+).</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"What replaced <code>AppDomain</code> in .NET Core?" — <code>AssemblyLoadContext</code>, and the important qualification is that it provides isolation and collectibility but <strong>not</strong> a security boundary, so untrusted code needs a process or a container, not an ALC. If plugins come up, the practical detail that shows you have done it: shared contract assemblies must resolve from the default context (return <code>null</code> from <code>Load</code>), or the host and the plugin end up with two different <code>IPlugin</code> types with the same name and every cast fails.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Load a plugin into a collectible context, unload it, and prove with a <code>WeakReference</code> that it was collected.</li><li>Deliberately cache a <code>Type</code> from the plugin and watch the unload stop working.</li><li>Use <code>MetadataLoadContext</code> to list the types in an assembly without executing its code.</li></ul></div></section>
+<section id="il"><h2 id="il">Reading IL and decompiled output</h2><p>You will not be asked to write IL. You may well be asked something whose honest answer is "I checked what the compiler generates" — what <code>async</code> lowers to, why a <code>foreach</code> over a <code>List&lt;T&gt;</code> does not allocate but one over <code>IEnumerable&lt;T&gt;</code> does, what a record's <code>Equals</code> looks like, why string concatenation in a loop is quadratic.</p><p>The tool to name is <a href="https://sharplab.io/" target="_blank" rel="noopener">SharpLab</a>: paste C#, see the IL <em>and</em> the "lowered" C# — the compiler's output translated back into readable C#, which is far more useful than the IL itself.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// What the compiler turns things into. All of this is visible on SharpLab.
+
+// 1. foreach over List&lt;T&gt; uses the STRUCT enumerator - no allocation
+foreach (var x in list) { }
+//   List&lt;int&gt;.Enumerator e = list.GetEnumerator();   // a struct
+//   try { while (e.MoveNext()) { int x = e.Current; } } finally { e.Dispose(); }
+
+// ...but through the interface it is boxed
+IEnumerable&lt;int&gt; seq = list;
+foreach (var x in seq) { }
+//   IEnumerator&lt;int&gt; e = seq.GetEnumerator();        // boxed to the interface
+//   -&gt; one allocation per loop. This is why hot paths take List&lt;T&gt;, not IEnumerable&lt;T&gt;.
+
+// 2. async lowers to a state machine struct plus a builder
+public async Task&lt;int&gt; GetAsync()
+{
+    var a = await FirstAsync();
+    return a + 1;
+}
+//   private struct &lt;GetAsync&gt;d__0 : IAsyncStateMachine
+//   { int &lt;&gt;1__state; AsyncTaskMethodBuilder&lt;int&gt; &lt;&gt;t__builder; ... }
+//   The struct is boxed onto the heap only when the method actually suspends -
+//   which is why a method that completes synchronously allocates nothing.
+
+// 3. string + in a loop is quadratic: each + allocates a NEW string
+string s = &quot;&quot;;
+for (int i = 0; i &lt; n; i++) s += i;        // n allocations, O(n^2) copying
+//   s = string.Concat(s, i.ToString());
+
+// but + on one expression is a single Concat call
+string t = a + b + c + d;                  // string.Concat(a, b, c, d) - one allocation
+
+// 4. lock lowers to Monitor with a flag, so the finally cannot run unentered
+lock (obj) { Work(); }
+//   bool taken = false;
+//   try { Monitor.Enter(obj, ref taken); Work(); }
+//   finally { if (taken) Monitor.Exit(obj); }
+
+// 5. using lowers to try/finally with a null check
+using var f = File.OpenRead(path);
+//   try { ... } finally { if (f != null) ((IDisposable)f).Dispose(); }
+
+// 6. A capturing lambda becomes a display class (see the Closures section)
+// 7. yield return becomes a state-machine class implementing IEnumerable + IEnumerator
+// 8. A record generates Equals, GetHashCode, ToString, Deconstruct, &lt;Clone&gt;$,
+//    a copy constructor, and operator ==/!=
+
+// Seeing it yourself, without SharpLab
+//   obj/Debug/net8.0/*.dll  -&gt;  ILSpy / dotPeek / `ildasm`
+//   dotnet tool install -g ilspycmd
+//   ilspycmd -il bin/Debug/net8.0/Shop.dll
+
+// Generated source files from source generators:
+//   &lt;EmitCompilerGeneratedFiles&gt;true&lt;/EmitCompilerGeneratedFiles&gt;
+
+// Emitting IL yourself - DynamicMethod. Almost always the wrong answer now;
+// expression trees are more readable and source generators are AOT-safe.
+var dm = new DynamicMethod(&quot;Add&quot;, typeof(int), [typeof(int), typeof(int)]);
+var il = dm.GetILGenerator();
+il.Emit(OpCodes.Ldarg_0);
+il.Emit(OpCodes.Ldarg_1);
+il.Emit(OpCodes.Add);
+il.Emit(OpCodes.Ret);
+var add = dm.CreateDelegate&lt;Func&lt;int, int, int&gt;&gt;();</code></pre><pre data-lang="python" hidden><code># Python&#x27;s equivalent is the `dis` module, and it is built in
+import dis, sys
+
+# 1. What a comprehension compiles to
+dis.dis(&quot;[x * 2 for x in items]&quot;)
+#   In 3.12+ this is inlined rather than creating a nested code object
+
+# 2. String concatenation in a loop - the same quadratic trap
+def bad(n):
+    s = &quot;&quot;
+    for i in range(n):
+        s += str(i)          # CPython has a refcount-1 optimisation that sometimes
+    return s                 # rescues this in place - but it is not guaranteed and
+                             # it does not apply on PyPy or to non-str
+def good(n):
+    return &quot;&quot;.join(str(i) for i in range(n))
+
+# 3. async becomes a coroutine object with a generator-like protocol
+async def get():
+    a = await first()
+    return a + 1
+
+dis.dis(get)
+#   SEND / YIELD_VALUE / RESUME - the state machine, in bytecode
+
+# 4. `with` compiles to SETUP_WITH / WITH_EXCEPT_START - the try/finally
+dis.dis(&quot;with open(p) as f: pass&quot;)
+
+# 5. Closures: LOAD_DEREF rather than LOAD_FAST tells you it is a free variable
+def outer():
+    x = 1
+    return lambda: x
+dis.dis(outer())             # LOAD_DEREF x
+
+# Inspecting a compiled module
+import py_compile, dis, marshal, importlib.util
+with open(&quot;__pycache__/module.cpython-312.pyc&quot;, &quot;rb&quot;) as f:
+    f.read(16)               # header
+    code = marshal.load(f)
+dis.dis(code)
+
+# &quot;Emitting IL&quot;: compile() from a source string or an AST
+code = compile(&quot;lambda a, b: a + b&quot;, &quot;&lt;gen&gt;&quot;, &quot;eval&quot;)
+add = eval(code)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>This rarely appears as a direct question; it appears as the <em>reason</em> your answer to another question is right. "Why does <code>foreach</code> over <code>IEnumerable&lt;T&gt;</code> allocate when over <code>List&lt;T&gt;</code> it does not?" — because <code>List&lt;T&gt;</code> exposes a struct enumerator that the compiler binds to directly, and going through the interface boxes it. Being able to say "I checked on SharpLab" is a genuinely good answer to a how-does-this-lower question, and naming the tool signals you have gone looking before.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Put an <code>async</code> method into SharpLab and find the state machine and the boxing point.</li><li>Compare the lowered output of <code>foreach</code> over <code>List&lt;T&gt;</code> and over <code>IEnumerable&lt;T&gt;</code>.</li><li>Decompile a record with ILSpy and list every member the compiler generated.</li></ul></div></section>
+<section id="equality"><h2 id="equality">Equals, GetHashCode and the comparison contracts</h2><p>Getting equality wrong is a silent correctness bug, not a crash: an object goes into a <code>Dictionary</code> or <code>HashSet</code> and can never be found again. The contract is short and is asked almost verbatim.</p><ul><li>If <code>a.Equals(b)</code> then <code>a.GetHashCode() == b.GetHashCode()</code>. <strong>Always.</strong> The reverse need not hold — a hash collision is legal.</li><li>Equality must be reflexive, symmetric, transitive and consistent over time.</li><li><strong>Never hash on mutable state.</strong> Mutate a key after inserting it and the entry lands in the wrong bucket; the object is in the dictionary and <code>ContainsKey</code> returns false.</li><li>Override <code>Equals(object)</code>, implement <code>IEquatable&lt;T&gt;</code> (avoids boxing), override <code>GetHashCode</code>, and if you define <code>==</code> define <code>!=</code> too.</li></ul><p>Records do all of this for you, which is why "use a record" is the right first answer for a value type.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The full contract, written by hand
+public sealed class Money : IEquatable&lt;Money&gt;, IComparable&lt;Money&gt;
+{
+    public decimal Amount { get; }          // IMMUTABLE - the hash stays valid
+    public string Currency { get; }
+
+    public Money(decimal amount, string currency) =&gt; (Amount, Currency) = (amount, currency);
+
+    public bool Equals(Money? other)        // IEquatable&lt;T&gt;: no boxing
+        =&gt; other is not null
+           &amp;&amp; Amount == other.Amount
+           &amp;&amp; Currency == other.Currency;
+
+    public override bool Equals(object? obj) =&gt; Equals(obj as Money);
+
+    public override int GetHashCode() =&gt; HashCode.Combine(Amount, Currency);
+    //   Use HashCode.Combine. Hand-rolled `17 * 31 + x` is fine but Combine is
+    //   randomised per process, which defeats hash-flooding attacks.
+
+    public int CompareTo(Money? other)
+        =&gt; other is null ? 1
+         : Currency != other.Currency
+             ? throw new InvalidOperationException(&quot;different currencies&quot;)
+             : Amount.CompareTo(other.Amount);
+
+    public static bool operator ==(Money? a, Money? b) =&gt; a?.Equals(b) ?? b is null;
+    public static bool operator !=(Money? a, Money? b) =&gt; !(a == b);
+    public static bool operator &lt; (Money a, Money b) =&gt; a.CompareTo(b) &lt;  0;
+    public static bool operator &gt; (Money a, Money b) =&gt; a.CompareTo(b) &gt;  0;
+}
+
+// ...or just use a record, which generates all of it correctly
+public record Money(decimal Amount, string Currency);
+
+// THE BUG: hashing on mutable state
+public class MutableKey
+{
+    public string Name { get; set; } = &quot;&quot;;
+    public override int GetHashCode() =&gt; Name.GetHashCode();
+    public override bool Equals(object? o) =&gt; o is MutableKey k &amp;&amp; k.Name == Name;
+}
+
+var set = new HashSet&lt;MutableKey&gt;();
+var key = new MutableKey { Name = &quot;a&quot; };
+set.Add(key);                      // bucketed by hash(&quot;a&quot;)
+key.Name = &quot;b&quot;;                    // the hash changed; the bucket did not
+Console.WriteLine(set.Contains(key));   // FALSE - and it is still in there
+Console.WriteLine(set.Count);           // 1
+
+// Reference vs value semantics by default
+class C { public int X; }
+struct S { public int X; }
+new C { X = 1 }.Equals(new C { X = 1 });    // false - reference equality
+new S { X = 1 }.Equals(new S { X = 1 });    // true  - but via SLOW reflection-based
+                                            // ValueType.Equals unless you override it
+// That default struct Equals boxes and reflects. Always override it on a struct
+// you will compare, or use `record struct`.
+
+// Comparer&lt;T&gt; vs EqualityComparer&lt;T&gt;: ORDERING vs IDENTITY. Different contracts.
+var byTotal = Comparer&lt;Order&gt;.Create((a, b) =&gt; a.Total.CompareTo(b.Total));
+list.Sort(byTotal);
+
+public class SkuComparer : IEqualityComparer&lt;Product&gt;
+{
+    public bool Equals(Product? a, Product? b) =&gt; a?.Sku == b?.Sku;
+    public int GetHashCode(Product p) =&gt; p.Sku.GetHashCode();
+}
+var distinct = products.Distinct(new SkuComparer());
+var dict = new Dictionary&lt;string, int&gt;(StringComparer.OrdinalIgnoreCase);
+
+// String comparison: pick the semantics explicitly
+&quot;a&quot;.Equals(&quot;A&quot;, StringComparison.OrdinalIgnoreCase);   // identity: Ordinal
+string.Compare(a, b, StringComparison.CurrentCulture); // display order: culture
+// Ordinal for ids, keys, paths and protocol tokens. Culture only for humans.
+
+// Note: string.GetHashCode() is randomised per process since .NET Core.
+// Persisting it or comparing it across processes is a real bug people ship.</code></pre><pre data-lang="python" hidden><code># Python&#x27;s contract is identical, with __eq__ and __hash__
+from dataclasses import dataclass
+from decimal import Decimal
+from functools import total_ordering
+
+@dataclass(frozen=True)          # frozen =&gt; __hash__ generated, immutable
+class Money:
+    amount: Decimal
+    currency: str
+
+    def __lt__(self, other: &quot;Money&quot;) -&gt; bool:
+        if self.currency != other.currency:
+            raise ValueError(&quot;different currencies&quot;)
+        return self.amount &lt; other.amount
+
+# By hand
+@total_ordering                  # fills in &lt;=, &gt;, &gt;= from __eq__ and __lt__
+class Money:
+    __slots__ = (&quot;_amount&quot;, &quot;_currency&quot;)
+
+    def __init__(self, amount: Decimal, currency: str) -&gt; None:
+        object.__setattr__(self, &quot;_amount&quot;, amount)
+        object.__setattr__(self, &quot;_currency&quot;, currency)
+
+    def __eq__(self, other: object) -&gt; bool:
+        if not isinstance(other, Money):
+            return NotImplemented            # let the other side try
+        return (self._amount, self._currency) == (other._amount, other._currency)
+
+    def __hash__(self) -&gt; int:
+        return hash((self._amount, self._currency))   # HashCode.Combine
+
+    def __lt__(self, other: &quot;Money&quot;) -&gt; bool:
+        return self._amount &lt; other._amount
+
+# THE RULE Python enforces for you: defining __eq__ sets __hash__ to None,
+# so the class becomes unhashable unless you define __hash__ too. C# only warns.
+class Broken:
+    def __eq__(self, other): return True
+# hash(Broken())  -&gt;  TypeError: unhashable type
+
+# THE SAME BUG: mutating a key after insertion
+class MutableKey:
+    def __init__(self, name): self.name = name
+    def __eq__(self, o): return isinstance(o, MutableKey) and o.name == self.name
+    def __hash__(self): return hash(self.name)
+
+s = {MutableKey(&quot;a&quot;)}
+k = next(iter(s))
+k.name = &quot;b&quot;
+print(k in s)        # False - still in the set, unfindable
+print(len(s))        # 1
+
+# Hash randomisation is on by default (PYTHONHASHSEED), same caveat as .NET:
+# never persist hash() or compare it across processes.
+
+# IEqualityComparer / IComparer equivalents: key functions
+products_by_sku = {p.sku: p for p in products}          # Distinct by key
+sorted(orders, key=lambda o: o.total)                   # Comparer&lt;T&gt;
+
+import functools
+sorted(items, key=functools.cmp_to_key(my_comparison))  # Comparer.Create</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"What is the contract between <code>Equals</code> and <code>GetHashCode</code>?" is a staple, and the complete answer has three parts: equal objects must have equal hashes, unequal hashes guarantee unequal objects while equal hashes guarantee nothing, and the hash must not change while the object is in a hash-based collection. Have the mutable-key bug ready as the concrete consequence — the object is in the <code>HashSet</code> and <code>Contains</code> returns false. Good extras: the default struct <code>Equals</code> uses reflection and boxes, so override it; and <code>string.GetHashCode()</code> is randomised per process, so persisting it is a bug.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Put a mutable object in a <code>HashSet</code>, mutate a hashed field, and demonstrate that it is lost.</li><li>Implement <code>IEquatable&lt;T&gt;</code> on a struct and benchmark against the default <code>ValueType.Equals</code>.</li><li>Explain why <code>Dictionary&lt;string, T&gt;</code> with <code>StringComparer.Ordinal</code> is faster than the culture-aware default.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://learn.microsoft.com/dotnet/csharp/advanced-topics/reflection-and-attributes/" target="_blank" rel="noopener">Reflection and attributes</a> — the API surface</li><li><a href="https://learn.microsoft.com/dotnet/csharp/roslyn-sdk/source-generators-overview" target="_blank" rel="noopener">Source generators</a> — incremental generators, with samples</li><li><a href="https://sharplab.io/" target="_blank" rel="noopener">SharpLab</a> — paste C#, see the IL and the lowered C# — the single most useful tool here</li><li><a href="https://learn.microsoft.com/dotnet/standard/native-interop/" target="_blank" rel="noopener">Native interoperability</a> — P/Invoke, marshalling, LibraryImport</li><li><a href="https://github.com/icsharpcode/ILSpy" target="_blank" rel="noopener">ILSpy</a> — decompile an assembly and read what the compiler actually did</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

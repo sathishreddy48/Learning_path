@@ -1,0 +1,924 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Binary Search &amp; Sorting — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="dsa-search-sort">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › DSA › Topic 21 of 36</div>
+  <h1>Binary Search &amp; Sorting</h1>
+  <p class="lede">Binary search is the most-failed easy question in interviewing — not because the idea is hard but because the boundary conditions are, and people improvise them under pressure. Learn one template, prove it to yourself once, and never improvise again. The second half of the page is sorting: what the library does, when to write your own, and the two linear-time escapes.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#binary-search">Binary search</a></li><li><a href="#bounds">Lower bound, upper bound and Array.BinarySearch</a></li><li><a href="#search-answer">Binary search on the answer</a></li><li><a href="#rotated">Rotated arrays and 2-D search</a></li><li><a href="#sorting">Sorting and comparers</a></li><li><a href="#writing-sorts">Writing quicksort and mergesort from memory</a></li><li><a href="#linear-sorts">Counting sort, bucket sort and quickselect</a></li></ol>
+  </div>
+
+<section id="binary-search"><h2 id="binary-search">Binary search</h2><p>Halve the search space each step on anything monotonic — sorted arrays, but also “smallest x such that f(x) is true” (answer-space search). Off-by-one bugs are the whole difficulty; settle on one template. .NET has <code>Array.BinarySearch</code> and Python has <code>bisect</code> for the plain case.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Template: lower bound (first index where a[i] &gt;= target)
+static int LowerBound(int[] a, int target)
+{
+    int lo = 0, hi = a.Length;              // hi is exclusive
+    while (lo &lt; hi)
+    {
+        int mid = lo + (hi - lo) / 2;         // avoids overflow
+        if (a[mid] &lt; target) lo = mid + 1; else hi = mid;
+    }
+    return lo;                              // == a.Length if none
+}
+
+// Exact search
+static int Search(int[] a, int target)
+{
+    int i = LowerBound(a, target);
+    return i &lt; a.Length &amp;&amp; a[i] == target ? i : -1;
+}
+
+// Rotated sorted array
+static int SearchRotated(int[] a, int t)
+{
+    int lo = 0, hi = a.Length - 1;
+    while (lo &lt;= hi)
+    {
+        int mid = (lo + hi) / 2;
+        if (a[mid] == t) return mid;
+        if (a[lo] &lt;= a[mid]) { if (a[lo] &lt;= t &amp;&amp; t &lt; a[mid]) hi = mid - 1; else lo = mid + 1; }
+        else                 { if (a[mid] &lt; t &amp;&amp; t &lt;= a[hi]) lo = mid + 1; else hi = mid - 1; }
+    }
+    return -1;
+}
+
+// Answer-space search: minimum eating speed to finish piles in h hours
+static int MinEatingSpeed(int[] piles, int h)
+{
+    int lo = 1, hi = piles.Max();
+    while (lo &lt; hi)
+    {
+        int k = lo + (hi - lo) / 2;
+        long hours = piles.Sum(p =&gt; (long)Math.Ceiling(p / (double)k));
+        if (hours &lt;= h) hi = k; else lo = k + 1;
+    }
+    return lo;
+}
+
+// Built-in
+int idx = Array.BinarySearch(a, target);      // negative = bitwise complement of insertion point</code></pre><pre data-lang="python" hidden><code>import bisect, math
+
+def lower_bound(a: list[int], target: int) -&gt; int:
+    lo, hi = 0, len(a)
+    while lo &lt; hi:
+        mid = (lo + hi) // 2
+        if a[mid] &lt; target: lo = mid + 1
+        else: hi = mid
+    return lo
+
+def search(a, target):
+    i = lower_bound(a, target)
+    return i if i &lt; len(a) and a[i] == target else -1
+
+def search_rotated(a, t):
+    lo, hi = 0, len(a) - 1
+    while lo &lt;= hi:
+        mid = (lo + hi) // 2
+        if a[mid] == t: return mid
+        if a[lo] &lt;= a[mid]:
+            if a[lo] &lt;= t &lt; a[mid]: hi = mid - 1
+            else: lo = mid + 1
+        else:
+            if a[mid] &lt; t &lt;= a[hi]: lo = mid + 1
+            else: hi = mid - 1
+    return -1
+
+def min_eating_speed(piles, h):
+    lo, hi = 1, max(piles)
+    while lo &lt; hi:
+        k = (lo + hi) // 2
+        if sum(math.ceil(p / k) for p in piles) &lt;= h: hi = k
+        else: lo = k + 1
+    return lo
+
+# Built-in
+i = bisect.bisect_left(a, target)     # lower bound
+j = bisect.bisect_right(a, target)    # upper bound</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The most common failure in the whole set is an off-by-one under pressure. Commit to one template — half-open <code>[lo, hi)</code> with <code>while (lo &lt; hi)</code> — and use it every time rather than reasoning afresh. Always say the invariant out loud ("the answer is always in <code>[lo, hi)</code>") and always compute the midpoint as <code>lo + (hi - lo) / 2</code>; the <code>(lo + hi) / 2</code> overflow is a real bug that sat in the JDK for two decades.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>First and last position of element in sorted array.</li><li>Find peak element.</li><li>Median of two sorted arrays (hard).</li></ul></div></section>
+<section id="bounds"><h2 id="bounds">Lower bound, upper bound and Array.BinarySearch</h2><p>Plain "find x" is the least useful form. What problems actually ask for is a <strong>boundary</strong>: the first index where a predicate becomes true, the first element ≥ x, the last element ≤ x, how many values fall in a range. Those are lower bound and upper bound, and once you have both, counting and range queries fall out.</p><p><code>lower_bound(x)</code> is the first index with <code>a[i] >= x</code>; <code>upper_bound(x)</code> is the first with <code>a[i] > x</code>. The count of values equal to x is <code>upper - lower</code>, and the insertion point that keeps the array sorted is the lower bound.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// THE TEMPLATE. Half-open [lo, hi). Memorise this shape.
+// Invariant: the answer, if it exists, is always in [lo, hi).
+static int LowerBound(int[] a, int target)
+{
+    int lo = 0, hi = a.Length;                  // hi is EXCLUSIVE - a.Length, not -1
+    while (lo &lt; hi)                             // strict &lt;, so it terminates
+    {
+        int mid = lo + (hi - lo) / 2;           // never (lo + hi) / 2: overflow
+        if (a[mid] &lt; target) lo = mid + 1;      // mid is too small: discard it
+        else                 hi = mid;          // mid might be the answer: KEEP it
+    }
+    return lo;                                  // lo == hi == the first index &gt;= target
+}
+
+static int UpperBound(int[] a, int target)
+{
+    int lo = 0, hi = a.Length;
+    while (lo &lt; hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (a[mid] &lt;= target) lo = mid + 1;     // the ONLY difference: &lt;= not &lt;
+        else                  hi = mid;
+    }
+    return lo;                                  // the first index &gt; target
+}
+// Everything else is these two:
+static bool Contains(int[] a, int x) { int i = LowerBound(a, x); return i &lt; a.Length &amp;&amp; a[i] == x; }
+static int  CountOf (int[] a, int x) =&gt; UpperBound(a, x) - LowerBound(a, x);
+static int  CountInRange(int[] a, int lo, int hi) =&gt; UpperBound(a, hi) - LowerBound(a, lo);
+static int  LastAtMost(int[] a, int x) =&gt; UpperBound(a, x) - 1;      // -1 if none
+
+// SEARCH RANGE - &quot;first and last position of element in sorted array&quot; is one call each
+static int[] SearchRange(int[] a, int target)
+{
+    int first = LowerBound(a, target);
+    if (first == a.Length || a[first] != target) return [-1, -1];
+    return [first, UpperBound(a, target) - 1];
+}
+
+// THE BCL VERSION, and its sharp edge
+int found = Array.BinarySearch(a, target);
+//   &gt;= 0  : an index of a matching element (NOT necessarily the first - with
+//           duplicates you get an arbitrary one)
+//   &lt;  0  : the bitwise complement of the insertion point
+int insertionPoint = found &lt; 0 ? ~found : found;
+// ~found is the idiom. Reading it as -found - 1 is the same thing and is what
+// people get wrong when they reimplement it.
+
+var list = new List&lt;int&gt;();
+int i = list.BinarySearch(x);
+list.Insert(i &lt; 0 ? ~i : i, x);        // insert keeping the list sorted
+
+// THE PREDICATE FORM - the generalisation worth internalising. Any monotonic
+// predicate (false, false, ..., false, true, ..., true) has a first-true index.
+static int FirstTrue(int lo, int hi, Func&lt;int, bool&gt; predicate)
+{
+    while (lo &lt; hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (predicate(mid)) hi = mid;      // mid might be the first true
+        else                lo = mid + 1;  // mid is false: discard it
+    }
+    return lo;                             // == hi, the first true (or hi if none)
+}
+// LowerBound is FirstTrue(0, n, m =&gt; a[m] &gt;= target).
+// Once you see every binary search as &quot;find the first true&quot;, the variants stop
+// needing separate memorisation - which is the real point of this section.</code></pre><pre data-lang="python" hidden><code>import bisect
+
+# Python ships both, which is why the C# ones are worth writing out and the
+# Python ones are worth KNOWING BY NAME
+i = bisect.bisect_left(a, x)        # lower bound: first index with a[i] &gt;= x
+j = bisect.bisect_right(a, x)       # upper bound: first index with a[i] &gt;  x
+bisect.insort(a, x)                 # insert keeping sorted (O(n) for the shift)
+
+# Everything else is these two
+contains      = i &lt; len(a) and a[i] == x
+count_of_x    = bisect.bisect_right(a, x) - bisect.bisect_left(a, x)
+count_in_range = bisect.bisect_right(a, hi) - bisect.bisect_left(a, lo)
+last_at_most  = bisect.bisect_right(a, x) - 1
+
+def search_range(a: list[int], target: int) -&gt; list[int]:
+    first = bisect.bisect_left(a, target)
+    if first == len(a) or a[first] != target:
+        return [-1, -1]
+    return [first, bisect.bisect_right(a, target) - 1]
+
+# 3.10+: a key function, so you can search a list of objects without unzipping
+i = bisect.bisect_left(orders, target_date, key=lambda o: o.placed_at)
+
+# Writing it by hand, which interviewers often ask for even in Python
+def lower_bound(a: list[int], target: int) -&gt; int:
+    lo, hi = 0, len(a)                    # hi exclusive
+    while lo &lt; hi:
+        mid = (lo + hi) // 2              # Python ints do not overflow - say so
+        if a[mid] &lt; target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+def upper_bound(a: list[int], target: int) -&gt; int:
+    lo, hi = 0, len(a)
+    while lo &lt; hi:
+        mid = (lo + hi) // 2
+        if a[mid] &lt;= target:              # the only change
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+# THE PREDICATE FORM
+def first_true(lo: int, hi: int, predicate) -&gt; int:
+    while lo &lt; hi:
+        mid = (lo + hi) // 2
+        if predicate(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+# lower_bound(a, x) == first_true(0, len(a), lambda m: a[m] &gt;= x)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Being asked for "the first and last position of an element in a sorted array" is really being asked whether you know lower and upper bound, and the elegant answer is one call each. The framing that impresses is the generalisation: every binary search is "find the first index where a monotonic predicate becomes true", which is why you only need one template. Know <code>Array.BinarySearch</code>'s negative return convention (<code>~result</code> is the insertion point) and that with duplicates it returns an arbitrary match, not the first.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write lower bound and upper bound from memory and verify on an array of all-equal values.</li><li>Implement "count of values in [lo, hi]" with two calls and no loop.</li><li>Use <code>Array.BinarySearch</code>'s negative result to insert into a sorted list.</li></ul></div></section>
+<section id="search-answer"><h2 id="search-answer">Binary search on the answer</h2><p>The highest-value idea on this page, and the one that converts "hard" problems into easy ones. When a problem asks you to <strong>minimise a maximum</strong> or <strong>maximise a minimum</strong>, you often cannot compute the answer directly — but you <em>can</em> cheaply check "is a candidate answer feasible?", and feasibility is monotonic: if x works, everything larger works too.</p><p>That monotonicity is exactly what binary search needs. Search the <em>answer space</em> rather than the input, with a feasibility check as the predicate: O(log(range) × cost of the check).</p><p>The tells: "minimum largest…", "maximum smallest…", "the smallest capacity such that…", "can you finish in D days?", "split into k parts minimising the largest sum".</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// KOKO EATING BANANAS - the canonical example.
+// &quot;What is the minimum eating speed k so that all piles are finished in h hours?&quot;
+// You cannot compute k directly. You CAN check a given k in O(n). And the check
+// is monotonic: if speed k works, every speed above k works.
+static int MinEatingSpeed(int[] piles, int h)
+{
+    bool CanFinish(int speed)
+    {
+        long hours = 0;
+        foreach (var p in piles) hours += (p + speed - 1) / speed;   // ceil
+        return hours &lt;= h;
+    }
+
+    int lo = 1, hi = piles.Max();            // the answer is in [1, max pile]
+    while (lo &lt; hi)                          // the same template as always
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (CanFinish(mid)) hi = mid;        // feasible: maybe we can go slower
+        else                lo = mid + 1;    // too slow
+    }
+    return lo;
+}
+// O(n log(max)) instead of O(n * max).
+
+// SPLIT ARRAY LARGEST SUM / CAPACITY TO SHIP PACKAGES IN D DAYS - identical
+static int ShipWithinDays(int[] weights, int days)
+{
+    bool Fits(int capacity)
+    {
+        int needed = 1, load = 0;
+        foreach (var w in weights)
+        {
+            if (load + w &gt; capacity) { needed++; load = 0; }
+            load += w;
+        }
+        return needed &lt;= days;
+    }
+
+    // the lower bound must be at least the largest single item, or nothing fits
+    int lo = weights.Max(), hi = weights.Sum();
+    while (lo &lt; hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (Fits(mid)) hi = mid; else lo = mid + 1;
+    }
+    return lo;
+}
+// Picking the right lo and hi is half the work. lo = the smallest conceivable
+// answer, hi = an answer that definitely works.
+
+// MINIMISE THE MAXIMUM DISTANCE / allocate books / aggressive cows - all the same.
+
+// FLOATING-POINT answers: iterate a fixed number of times instead of comparing
+static double SquareRoot(double x)
+{
+    double lo = 0, hi = Math.Max(1, x);
+    for (int i = 0; i &lt; 100; i++)            // 100 halvings: far below any epsilon
+    {
+        double mid = (lo + hi) / 2;
+        if (mid * mid &lt; x) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+// A fixed iteration count beats `while (hi - lo &gt; 1e-9)`, which can loop
+// forever on values where the gap stops shrinking in floating point.
+
+// INTEGER SQRT, with the overflow guard
+static int MySqrt(int x)
+{
+    int lo = 0, hi = x;
+    while (lo &lt; hi)
+    {
+        int mid = lo + (hi - lo + 1) / 2;    // UPPER mid, because lo = mid below
+        if ((long)mid * mid &lt;= x) lo = mid;  // (long) or mid*mid overflows
+        else                      hi = mid - 1;
+    }
+    return lo;
+}
+// Note the asymmetry: when the body does `lo = mid` you MUST round the midpoint
+// up, or lo never advances and you loop forever. That is the one place the
+// standard template changes, and it is worth stating when you write it.
+
+// THE RECOGNITION CHECKLIST
+//   1. Is the answer a number in a bounded range?
+//   2. Can I CHECK a candidate answer more easily than computing it?
+//   3. Is the check monotonic - if x works, does everything above x work?
+//   If yes to all three: binary search the answer.</code></pre><pre data-lang="python" hidden><code>import bisect
+
+def min_eating_speed(piles: list[int], h: int) -&gt; int:
+    def can_finish(speed: int) -&gt; bool:
+        return sum((p + speed - 1) // speed for p in piles) &lt;= h
+
+    lo, hi = 1, max(piles)
+    while lo &lt; hi:
+        mid = (lo + hi) // 2
+        if can_finish(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+def ship_within_days(weights: list[int], days: int) -&gt; int:
+    def fits(capacity: int) -&gt; bool:
+        needed, load = 1, 0
+        for w in weights:
+            if load + w &gt; capacity:
+                needed += 1
+                load = 0
+            load += w
+        return needed &lt;= days
+
+    lo, hi = max(weights), sum(weights)
+    while lo &lt; hi:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+# bisect with a key turns &quot;binary search the answer&quot; into one call (3.10+)
+def min_eating_speed_bisect(piles: list[int], h: int) -&gt; int:
+    def hours(speed: int) -&gt; int:
+        return sum((p + speed - 1) // speed for p in piles)
+    # hours() is DECREASING in speed, so search on -hours to get a sorted key
+    lo, hi = 1, max(piles)
+    return lo + bisect.bisect_left(range(lo, hi + 1), -h, key=lambda s: -hours(s))
+# Clever, and harder to read than the explicit loop. Write the loop in an
+# interview; mention this exists.
+
+def square_root(x: float) -&gt; float:
+    lo, hi = 0.0, max(1.0, x)
+    for _ in range(100):                 # fixed count, not an epsilon comparison
+        mid = (lo + hi) / 2
+        if mid * mid &lt; x:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+def my_sqrt(x: int) -&gt; int:
+    lo, hi = 0, x
+    while lo &lt; hi:
+        mid = (lo + hi + 1) // 2         # round UP when the body does lo = mid
+        if mid * mid &lt;= x:               # Python ints: no overflow to guard
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+# The checklist
+#   1. bounded numeric answer?
+#   2. checking a candidate is cheaper than computing the answer?
+#   3. the check is monotonic?
+#   -&gt; binary search the answer space</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Recognising this pattern is one of the clearest separators in a coding round, because the problems are usually labelled hard and the solution is twenty lines. Train the three-question checklist — bounded numeric answer, cheap feasibility check, monotonic feasibility — and say it out loud when you spot it. The implementation trap to mention before you hit it: when the loop body assigns <code>lo = mid</code>, the midpoint must round up, or <code>lo</code> never advances and it hangs.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Solve "Koko eating bananas" and "capacity to ship packages in D days" with the same template.</li><li>Solve "split array largest sum" and justify your choice of <code>lo</code> and <code>hi</code>.</li><li>Write integer square root with the upper-mid variant and find the infinite loop if you use the lower mid.</li></ul></div></section>
+<section id="rotated"><h2 id="rotated">Rotated arrays and 2-D search</h2><p>Binary search survives when the array is <em>partly</em> ordered, as long as you can decide which half is sorted. In a rotated sorted array, one half always is: compare <code>a[mid]</code> with <code>a[lo]</code> to find out which, then check whether the target lies inside that sorted half.</p><p>For a 2-D matrix the trick depends on the guarantee. If each row is sorted <em>and</em> the first element of each row exceeds the last of the previous, the whole matrix is one sorted array — index it as <code>[mid / cols][mid % cols]</code>. If rows and columns are only individually sorted, start at the <strong>top-right corner</strong> and walk: left decreases, down increases, so each step eliminates a whole row or column in O(m + n).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// SEARCH IN A ROTATED SORTED ARRAY - decide which half is sorted
+static int SearchRotated(int[] a, int target)
+{
+    int lo = 0, hi = a.Length - 1;              // inclusive here: we return an index
+    while (lo &lt;= hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (a[mid] == target) return mid;
+
+        if (a[lo] &lt;= a[mid])                    // the LEFT half is sorted
+        {
+            if (a[lo] &lt;= target &amp;&amp; target &lt; a[mid]) hi = mid - 1;   // inside it
+            else                                    lo = mid + 1;
+        }
+        else                                    // the RIGHT half is sorted
+        {
+            if (a[mid] &lt; target &amp;&amp; target &lt;= a[hi]) lo = mid + 1;
+            else                                    hi = mid - 1;
+        }
+    }
+    return -1;
+}
+// The &lt;= in `a[lo] &lt;= a[mid]` matters: with two elements, mid == lo, and a
+// strict &lt; sends you down the wrong branch.
+
+// FIND THE MINIMUM in a rotated sorted array - compare against the RIGHT end
+static int FindMin(int[] a)
+{
+    int lo = 0, hi = a.Length - 1;
+    while (lo &lt; hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (a[mid] &gt; a[hi]) lo = mid + 1;       // the minimum is to the right
+        else                hi = mid;           // mid might BE the minimum
+    }
+    return a[lo];
+}
+// Comparing with a[hi] rather than a[lo] is deliberate - with a[lo] the
+// non-rotated case needs a special case, and with a[hi] it does not.
+
+// WITH DUPLICATES, the worst case degrades to O(n) and you must say so:
+// [1,1,1,0,1] - a[lo] == a[mid] == a[hi] tells you nothing, so you shrink by one.
+static bool SearchRotatedDup(int[] a, int target)
+{
+    int lo = 0, hi = a.Length - 1;
+    while (lo &lt;= hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (a[mid] == target) return true;
+
+        if (a[lo] == a[mid] &amp;&amp; a[mid] == a[hi]) { lo++; hi--; continue; }  // O(n)
+        if (a[lo] &lt;= a[mid])
+        {
+            if (a[lo] &lt;= target &amp;&amp; target &lt; a[mid]) hi = mid - 1; else lo = mid + 1;
+        }
+        else
+        {
+            if (a[mid] &lt; target &amp;&amp; target &lt;= a[hi]) lo = mid + 1; else hi = mid - 1;
+        }
+    }
+    return false;
+}
+
+// PEAK ELEMENT - binary search with no sorted array at all, just a local rule
+static int FindPeak(int[] a)
+{
+    int lo = 0, hi = a.Length - 1;
+    while (lo &lt; hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (a[mid] &lt; a[mid + 1]) lo = mid + 1;   // ascending: a peak is to the right
+        else                     hi = mid;       // descending: mid might be it
+    }
+    return lo;
+}
+// O(log n) for a problem that looks like it needs a scan. Worth knowing.
+
+// 2-D, FULLY SORTED (row-major) - treat it as one array
+static bool SearchMatrix(int[][] m, int target)
+{
+    int rows = m.Length, cols = m[0].Length;
+    int lo = 0, hi = rows * cols - 1;
+    while (lo &lt;= hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        int value = m[mid / cols][mid % cols];       // the only interesting line
+        if (value == target) return true;
+        if (value &lt; target) lo = mid + 1; else hi = mid - 1;
+    }
+    return false;
+}
+// O(log(m*n))
+
+// 2-D, ROWS AND COLUMNS SORTED INDEPENDENTLY - start at the top right
+static bool SearchMatrixII(int[][] m, int target)
+{
+    int r = 0, c = m[0].Length - 1;                  // top-right corner
+    while (r &lt; m.Length &amp;&amp; c &gt;= 0)
+    {
+        if (m[r][c] == target) return true;
+        if (m[r][c] &gt; target) c--;                   // this whole COLUMN is too big
+        else                  r++;                   // this whole ROW is too small
+    }
+    return false;
+}
+// O(m + n). The top-right (or bottom-left) corner is the only starting point
+// where each comparison eliminates an entire row or column - from the top-left
+// both moves increase, so you learn nothing.</code></pre><pre data-lang="python" hidden><code>def search_rotated(a: list[int], target: int) -&gt; int:
+    lo, hi = 0, len(a) - 1
+    while lo &lt;= hi:
+        mid = (lo + hi) // 2
+        if a[mid] == target:
+            return mid
+        if a[lo] &lt;= a[mid]:                      # left half sorted
+            if a[lo] &lt;= target &lt; a[mid]: hi = mid - 1
+            else:                        lo = mid + 1
+        else:                                    # right half sorted
+            if a[mid] &lt; target &lt;= a[hi]: lo = mid + 1
+            else:                        hi = mid - 1
+    return -1
+
+def find_min(a: list[int]) -&gt; int:
+    lo, hi = 0, len(a) - 1
+    while lo &lt; hi:
+        mid = (lo + hi) // 2
+        if a[mid] &gt; a[hi]:
+            lo = mid + 1
+        else:
+            hi = mid
+    return a[lo]
+
+def search_rotated_dup(a: list[int], target: int) -&gt; bool:
+    lo, hi = 0, len(a) - 1
+    while lo &lt;= hi:
+        mid = (lo + hi) // 2
+        if a[mid] == target:
+            return True
+        if a[lo] == a[mid] == a[hi]:             # ambiguous -&gt; O(n) worst case
+            lo, hi = lo + 1, hi - 1
+        elif a[lo] &lt;= a[mid]:
+            if a[lo] &lt;= target &lt; a[mid]: hi = mid - 1
+            else:                        lo = mid + 1
+        else:
+            if a[mid] &lt; target &lt;= a[hi]: lo = mid + 1
+            else:                        hi = mid - 1
+    return False
+
+def find_peak(a: list[int]) -&gt; int:
+    lo, hi = 0, len(a) - 1
+    while lo &lt; hi:
+        mid = (lo + hi) // 2
+        if a[mid] &lt; a[mid + 1]:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+def search_matrix(m: list[list[int]], target: int) -&gt; bool:
+    rows, cols = len(m), len(m[0])
+    lo, hi = 0, rows * cols - 1
+    while lo &lt;= hi:
+        mid = (lo + hi) // 2
+        value = m[mid // cols][mid % cols]
+        if value == target:  return True
+        if value &lt; target:   lo = mid + 1
+        else:                hi = mid - 1
+    return False
+
+def search_matrix_ii(m: list[list[int]], target: int) -&gt; bool:
+    r, c = 0, len(m[0]) - 1                      # top-right
+    while r &lt; len(m) and c &gt;= 0:
+        if m[r][c] == target: return True
+        if m[r][c] &gt; target:  c -= 1             # eliminate the column
+        else:                 r += 1             # eliminate the row
+    return False</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>For the rotated array, state the insight before coding: at least one half is always sorted, so compare <code>a[mid]</code> with <code>a[lo]</code> to find which, then test whether the target lies inside it. For the two matrix variants, be sure which guarantee you were given — fully sorted row-major means one O(log mn) search; rows and columns sorted independently means the staircase walk from the top-right in O(m + n). Explaining why the top-right corner works, and the top-left does not, is the detail worth volunteering.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write rotated search and test it on a two-element array to catch the <code>&lt;=</code>.</li><li>Find the minimum in a rotated array and explain why comparing against <code>a[hi]</code> is simpler.</li><li>Solve both matrix variants and state the complexity of each.</li></ul></div></section>
+<section id="sorting"><h2 id="sorting">Sorting and comparers</h2><p><code>Array.Sort</code>/<code>List.Sort</code> are introsort (unstable, O(n log n)); LINQ <code>OrderBy</code> is stable. Write comparers with <code>Comparison&lt;T&gt;</code> or <code>IComparer&lt;T&gt;</code>. Know one O(n log n) algorithm well enough to write it (merge sort) and when counting/bucket sort wins.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Custom ordering
+people.Sort((a, b) =&gt; a.Age != b.Age ? a.Age.CompareTo(b.Age) : string.CompareOrdinal(a.Name, b.Name));
+var sorted = people.OrderBy(p =&gt; p.Age).ThenBy(p =&gt; p.Name).ToList();     // stable
+Array.Sort(keys, values);                                                  // parallel arrays
+people.Sort(Comparer&lt;Person&gt;.Create((a, b) =&gt; b.Score.CompareTo(a.Score))); // descending
+
+// IComparable&lt;T&gt; for a natural order
+public record Version(int Major, int Minor) : IComparable&lt;Version&gt;
+{
+    public int CompareTo(Version? o) =&gt; o is null ? 1 : Major != o.Major ? Major.CompareTo(o.Major) : Minor.CompareTo(o.Minor);
+}
+
+// Merge sort (stable, O(n log n), O(n) extra)
+static int[] MergeSort(int[] a)
+{
+    if (a.Length &lt;= 1) return a;
+    var mid = a.Length / 2;
+    var l = MergeSort(a[..mid]); var r = MergeSort(a[mid..]);
+    var res = new int[a.Length]; int i = 0, j = 0, k = 0;
+    while (i &lt; l.Length &amp;&amp; j &lt; r.Length) res[k++] = l[i] &lt;= r[j] ? l[i++] : r[j++];
+    while (i &lt; l.Length) res[k++] = l[i++];
+    while (j &lt; r.Length) res[k++] = r[j++];
+    return res;
+}
+
+// Counting sort when the range is small
+static int[] CountingSort(int[] a, int max)
+{
+    var counts = new int[max + 1];
+    foreach (var x in a) counts[x]++;
+    var res = new int[a.Length]; int k = 0;
+    for (int v = 0; v &lt;= max; v++) while (counts[v]-- &gt; 0) res[k++] = v;
+    return res;
+}
+
+// Quickselect for k-th largest: average O(n)</code></pre><pre data-lang="python" hidden><code># Custom ordering — key functions, always stable (Timsort)
+people.sort(key=lambda p: (p.age, p.name))
+people.sort(key=lambda p: p.score, reverse=True)
+from operator import attrgetter
+people.sort(key=attrgetter(&quot;age&quot;, &quot;name&quot;))
+
+# Natural order via dataclass(order=True) or functools.total_ordering
+from dataclasses import dataclass
+@dataclass(order=True)
+class Version:
+    major: int; minor: int
+
+def merge_sort(a: list[int]) -&gt; list[int]:
+    if len(a) &lt;= 1: return a
+    mid = len(a) // 2
+    l, r = merge_sort(a[:mid]), merge_sort(a[mid:])
+    res, i, j = [], 0, 0
+    while i &lt; len(l) and j &lt; len(r):
+        if l[i] &lt;= r[j]: res.append(l[i]); i += 1
+        else: res.append(r[j]); j += 1
+    return res + l[i:] + r[j:]
+
+def counting_sort(a: list[int], max_v: int) -&gt; list[int]:
+    counts = [0] * (max_v + 1)
+    for x in a: counts[x] += 1
+    return [v for v in range(max_v + 1) for _ in range(counts[v])]
+
+# k-th largest: heapq.nlargest(k, a)[-1] or quickselect</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Know what the library actually does: <code>Array.Sort</code> is introsort — quicksort with a heapsort fallback for bad pivots and insertion sort for small ranges — and is <strong>unstable</strong>; <code>OrderBy</code> and Python's <code>sorted</code> are <strong>stable</strong>. That difference is the question. Also be exact about the comparer contract: it must be consistent and transitive, and an inconsistent one makes <code>Array.Sort</code> throw rather than silently misbehave.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Sort an array of 0/1/2 in one pass.</li><li>Merge intervals.</li><li>K closest points to origin (sort vs heap).</li></ul></div></section>
+<section id="writing-sorts"><h2 id="writing-sorts">Writing quicksort and mergesort from memory</h2><p>Being asked to implement a sort is rarely about the sort — it is about whether you can write a correct recursive partition and talk about the trade-offs. Have both, and know the one-line differences: <strong>mergesort</strong> is O(n log n) always, stable, needs O(n) extra space; <strong>quicksort</strong> is O(n log n) average, O(n²) worst, unstable, sorts in place with O(log n) stack.</p><p>The follow-up is always about quicksort's worst case and how to avoid it: a random or median-of-three pivot makes adversarial input vanishingly unlikely, and falling back to heapsort at a depth limit (which is what introsort does) makes the guarantee hard.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// MERGESORT - stable, O(n log n) guaranteed, O(n) space
+static void MergeSort(int[] a) =&gt; MergeSort(a, new int[a.Length], 0, a.Length - 1);
+
+static void MergeSort(int[] a, int[] buffer, int lo, int hi)
+{
+    if (lo &gt;= hi) return;
+    int mid = lo + (hi - lo) / 2;
+    MergeSort(a, buffer, lo, mid);
+    MergeSort(a, buffer, mid + 1, hi);
+
+    // skip the merge entirely when already ordered - this is what makes it
+    // adaptive on partly-sorted input
+    if (a[mid] &lt;= a[mid + 1]) return;
+
+    Merge(a, buffer, lo, mid, hi);
+}
+
+static void Merge(int[] a, int[] buffer, int lo, int mid, int hi)
+{
+    int i = lo, j = mid + 1, k = lo;
+    while (i &lt;= mid &amp;&amp; j &lt;= hi)
+        buffer[k++] = a[i] &lt;= a[j] ? a[i++] : a[j++];    // &lt;= preserves STABILITY
+    while (i &lt;= mid) buffer[k++] = a[i++];
+    while (j &lt;= hi)  buffer[k++] = a[j++];
+    Array.Copy(buffer, lo, a, lo, hi - lo + 1);
+}
+// The `&lt;=` in the comparison is the entire reason this is stable. A `&lt;` would
+// take from the right half on ties and reorder equal elements.
+
+// QUICKSORT - in place, O(log n) stack, unstable
+static void QuickSort(int[] a, int lo, int hi)
+{
+    while (lo &lt; hi)
+    {
+        int p = Partition(a, lo, hi);
+
+        // recurse into the SMALLER side, loop on the larger: bounds the stack
+        // at O(log n) even on a bad pivot sequence
+        if (p - lo &lt; hi - p) { QuickSort(a, lo, p - 1); lo = p + 1; }
+        else                 { QuickSort(a, p + 1, hi); hi = p - 1; }
+    }
+}
+
+static int Partition(int[] a, int lo, int hi)
+{
+    // RANDOM pivot: without this, an already-sorted array is the O(n^2) case
+    int r = Random.Shared.Next(lo, hi + 1);
+    (a[r], a[hi]) = (a[hi], a[r]);
+
+    int pivot = a[hi], i = lo - 1;                // Lomuto: simpler to get right
+    for (int j = lo; j &lt; hi; j++)
+        if (a[j] &lt; pivot) { i++; (a[i], a[j]) = (a[j], a[i]); }
+
+    (a[i + 1], a[hi]) = (a[hi], a[i + 1]);
+    return i + 1;
+}
+
+// THREE-WAY PARTITION (Dutch national flag) - O(n) when there are many
+// duplicates, where Lomuto degrades to O(n^2). This is also &quot;sort colors&quot;.
+static void SortColors(int[] a)
+{
+    int low = 0, mid = 0, high = a.Length - 1;
+    while (mid &lt;= high)
+    {
+        switch (a[mid])
+        {
+            case 0: (a[low], a[mid]) = (a[mid], a[low]); low++; mid++; break;
+            case 1: mid++; break;
+            default: (a[mid], a[high]) = (a[high], a[mid]); high--; break;
+                     // note: do NOT advance mid here - the swapped-in value is unseen
+        }
+    }
+}
+
+// WHAT THE LIBRARY DOES
+//   Array.Sort        introsort: quicksort -&gt; heapsort at depth 2*log n,
+//                     insertion sort under 16 elements. UNSTABLE.
+//   List&lt;T&gt;.Sort      the same.
+//   OrderBy           a stable mergesort, and LAZY - nothing sorts until you
+//                     enumerate. It also allocates; Array.Sort does not.
+//   Array.Sort(keys, items)   sorts a parallel array alongside - occasionally
+//                             exactly what you want and nobody remembers it.
+
+// COMPLEXITY SUMMARY, worth being able to recite
+//   mergesort   O(n log n) always   stable     O(n) space
+//   quicksort   O(n log n) average  unstable   O(log n) stack, O(n^2) worst
+//   heapsort    O(n log n) always   unstable   O(1) space, poor cache behaviour
+//   insertion   O(n^2), O(n) on nearly-sorted, stable - which is why the
+//               library switches to it for small ranges</code></pre><pre data-lang="python" hidden><code>def merge_sort(a: list[int]) -&gt; list[int]:
+    if len(a) &lt;= 1:
+        return a
+    mid = len(a) // 2
+    left, right = merge_sort(a[:mid]), merge_sort(a[mid:])
+    return merge(left, right)
+
+def merge(left: list[int], right: list[int]) -&gt; list[int]:
+    result, i, j = [], 0, 0
+    while i &lt; len(left) and j &lt; len(right):
+        if left[i] &lt;= right[j]:            # &lt;= keeps it STABLE
+            result.append(left[i]); i += 1
+        else:
+            result.append(right[j]); j += 1
+    result.extend(left[i:])
+    result.extend(right[j:])
+    return result
+
+import random
+
+def quick_sort(a: list[int], lo: int = 0, hi: int | None = None) -&gt; None:
+    if hi is None:
+        hi = len(a) - 1
+    while lo &lt; hi:
+        p = partition(a, lo, hi)
+        if p - lo &lt; hi - p:                # recurse into the smaller side
+            quick_sort(a, lo, p - 1); lo = p + 1
+        else:
+            quick_sort(a, p + 1, hi); hi = p - 1
+
+def partition(a: list[int], lo: int, hi: int) -&gt; int:
+    r = random.randint(lo, hi)             # random pivot: avoids the sorted-input
+    a[r], a[hi] = a[hi], a[r]              # worst case
+    pivot, i = a[hi], lo - 1
+    for j in range(lo, hi):
+        if a[j] &lt; pivot:
+            i += 1
+            a[i], a[j] = a[j], a[i]
+    a[i + 1], a[hi] = a[hi], a[i + 1]
+    return i + 1
+
+def sort_colors(a: list[int]) -&gt; None:
+    &quot;&quot;&quot;Dutch national flag: three-way partition, one pass.&quot;&quot;&quot;
+    low = mid = 0
+    high = len(a) - 1
+    while mid &lt;= high:
+        if a[mid] == 0:
+            a[low], a[mid] = a[mid], a[low]; low += 1; mid += 1
+        elif a[mid] == 1:
+            mid += 1
+        else:
+            a[mid], a[high] = a[high], a[mid]; high -= 1   # mid does NOT advance
+
+# WHAT THE LIBRARY DOES
+#   sorted() / list.sort()  Timsort: STABLE, adaptive (O(n) on already-sorted
+#                           input), O(n log n) worst case. It detects existing
+#                           runs and merges them, which is why it beats
+#                           quicksort on real-world data.
+#   list.sort()   in place, returns None
+#   sorted()      returns a new list, works on any iterable
+
+# Sort keys, not comparators - Python removed cmp in 3.0
+items.sort(key=lambda x: (x.last, x.first))         # tuple key: multi-level
+items.sort(key=lambda x: (-x.score, x.name))        # desc then asc, in one key
+items.sort(key=lambda x: x.score, reverse=True)
+
+from functools import cmp_to_key
+items.sort(key=cmp_to_key(my_comparison))           # when a key cannot express it
+
+# Stability in action: two passes give you a multi-level sort for free
+items.sort(key=lambda x: x.first)        # secondary first
+items.sort(key=lambda x: x.last)         # then primary - ties keep first order</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>If asked to implement one, pick mergesort when correctness under pressure matters and quicksort when they want to see in-place partitioning. Either way, volunteer the three trade-offs (stability, space, worst case) and the mitigation for quicksort's O(n²) — a random pivot, or introsort's depth-limited fallback to heapsort. The detail that shows real understanding: point at the <code>&lt;=</code> in the merge and say that it is the single character that makes mergesort stable.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write mergesort and quicksort from memory and test both on sorted, reversed and all-equal input.</li><li>Implement the Dutch national flag partition and explain why <code>mid</code> does not advance on a swap with <code>high</code>.</li><li>Demonstrate stability by sorting records twice, by secondary key then primary.</li></ul></div></section>
+<section id="linear-sorts"><h2 id="linear-sorts">Counting sort, bucket sort and quickselect</h2><p>The O(n log n) bound applies to <em>comparison</em> sorts. If you can exploit structure in the data you can beat it: <strong>counting sort</strong> is O(n + k) when values are integers in a small range k, and <strong>bucket sort</strong> is O(n) when values are roughly uniform over a known interval.</p><p><strong>Quickselect</strong> is the other escape: when you need the k-th element rather than the whole order, partitioning only into the side containing k gives O(n) average (O(n²) worst) instead of O(n log n).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// COUNTING SORT - O(n + k). Valid only when values are integers in [0, k).
+static int[] CountingSort(int[] a, int maxValue)
+{
+    var counts = new int[maxValue + 1];
+    foreach (var x in a) counts[x]++;
+
+    // prefix sums turn counts into END positions, which is what makes it stable
+    for (int i = 1; i &lt; counts.Length; i++) counts[i] += counts[i - 1];
+
+    var result = new int[a.Length];
+    for (int i = a.Length - 1; i &gt;= 0; i--)        // BACKWARDS, for stability
+        result[--counts[a[i]]] = a[i];
+    return result;
+}
+// Say the constraint before you use it: &quot;this needs integer keys in a bounded
+// range, and costs O(k) space - with values up to 10^9 it is useless.&quot;
+
+// Where it legitimately applies: &quot;sort an array of ages&quot;, &quot;sort by frequency&quot;
+// (frequency is bounded by n), radix sort&#x27;s inner loop.
+
+// BUCKET SORT - O(n) when the values are roughly uniform over a known range
+static void BucketSort(double[] a)                  // values in [0, 1)
+{
+    int n = a.Length;
+    var buckets = new List&lt;double&gt;[n];
+    for (int i = 0; i &lt; n; i++) buckets[i] = [];
+
+    foreach (var x in a) buckets[(int)(x * n)].Add(x);
+    foreach (var b in buckets) b.Sort();            // each is expected to be tiny
+
+    int k = 0;
+    foreach (var b in buckets) foreach (var x in b) a[k++] = x;
+}
+// O(n) expected, O(n log n) if everything lands in one bucket.
+
+// MAXIMUM GAP is the problem bucket sort exists for: find the largest gap
+// between consecutive values in O(n). With n values spanning [min, max], the
+// gap is at least (max-min)/(n-1), so a bucket of that width holds at most one
+// relevant pair - you only need each bucket&#x27;s min and max.
+
+// QUICKSELECT - the k-th smallest in O(n) average, without sorting
+static int QuickSelect(int[] a, int k)              // k is 0-based
+{
+    int lo = 0, hi = a.Length - 1;
+    while (true)
+    {
+        if (lo == hi) return a[lo];
+        int p = Partition(a, lo, hi);               // the same partition as quicksort
+
+        if      (p == k) return a[p];
+        else if (p &lt;  k) lo = p + 1;                // recurse into ONE side only
+        else             hi = p - 1;
+    }
+}
+// Average O(n): n + n/2 + n/4 + ... = 2n. Worst case O(n^2), fixed in theory by
+// median-of-medians (O(n) worst) and in practice by a random pivot.
+// It MUTATES the array - say so, because it is sometimes disqualifying.
+
+// Top-k, three ways and their complexities - the comparison worth giving:
+//   sort then take k        O(n log n)   simplest
+//   bounded heap of size k  O(n log k)   best for streams, does not mutate
+//   quickselect             O(n) average mutates, no order among the k
+
+// RADIX SORT - counting sort per digit, least significant first. O(d * (n + b))
+// for d digits in base b. Worth naming for &quot;sort a large array of fixed-width
+// integers or strings&quot;; rarely worth writing in an interview.
+
+// WHEN TO MENTION ANY OF THIS: when the interviewer says values are bounded.
+// &quot;The values are ages 0-120&quot; or &quot;the characters are lowercase letters&quot; is an
+// invitation to beat O(n log n), and noticing it is the point of the question.</code></pre><pre data-lang="python" hidden><code>def counting_sort(a: list[int], max_value: int) -&gt; list[int]:
+    counts = [0] * (max_value + 1)
+    for x in a:
+        counts[x] += 1
+
+    for i in range(1, len(counts)):          # prefix sums -&gt; end positions
+        counts[i] += counts[i - 1]
+
+    result = [0] * len(a)
+    for x in reversed(a):                    # backwards keeps it stable
+        counts[x] -= 1
+        result[counts[x]] = x
+    return result
+
+def bucket_sort(a: list[float]) -&gt; None:
+    &quot;&quot;&quot;Values in [0, 1).&quot;&quot;&quot;
+    n = len(a)
+    buckets: list[list[float]] = [[] for _ in range(n)]
+    for x in a:
+        buckets[int(x * n)].append(x)
+    for b in buckets:
+        b.sort()
+    a[:] = [x for b in buckets for x in b]
+
+import random
+
+def quickselect(a: list[int], k: int) -&gt; int:
+    &quot;&quot;&quot;k-th smallest, 0-based. Mutates `a`.&quot;&quot;&quot;
+    lo, hi = 0, len(a) - 1
+    while True:
+        if lo == hi:
+            return a[lo]
+        p = partition(a, lo, hi)
+        if   p == k: return a[p]
+        elif p &lt;  k: lo = p + 1
+        else:        hi = p - 1
+
+def partition(a: list[int], lo: int, hi: int) -&gt; int:
+    r = random.randint(lo, hi)
+    a[r], a[hi] = a[hi], a[r]
+    pivot, i = a[hi], lo - 1
+    for j in range(lo, hi):
+        if a[j] &lt; pivot:
+            i += 1
+            a[i], a[j] = a[j], a[i]
+    a[i + 1], a[hi] = a[hi], a[i + 1]
+    return i + 1
+
+# The stdlib equivalents, which you should name even if asked to hand-roll
+import heapq
+heapq.nsmallest(k, items)          # O(n log k)
+heapq.nlargest(k, items)
+sorted(items)[k]                   # O(n log n)
+# statistics.median uses a sort; there is no quickselect in the stdlib
+
+# Counting sort shows up implicitly whenever you index by a bounded value
+from collections import Counter
+counts = Counter(ages)                                  # ages are 0..120
+sorted_ages = [age for age in range(121) for _ in range(counts[age])]</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The signal here is noticing the <em>constraint</em>. When an interviewer says "the values are integers between 0 and 100" or "the characters are lowercase letters", they are inviting you to beat O(n log n), and counting or bucket sort is the expected answer. For k-th element, give all three options with complexities and name the trade-offs: quickselect is O(n) average but mutates the array, a bounded heap is O(n log k) and works on a stream, sorting is O(n log n) and simplest.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement counting sort and verify it is stable by sorting records with equal keys.</li><li>Implement quickselect and find the median without sorting.</li><li>Solve "maximum gap" in O(n) with bucketing and work out why the bucket width is (max−min)/(n−1).</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://leetcode.com/tag/binary-search/" target="_blank" rel="noopener">LeetCode: binary search</a> — the tag, by frequency</li><li><a href="https://en.wikipedia.org/wiki/Binary_search_algorithm#Implementation_issues" target="_blank" rel="noopener">Binary search implementation issues</a> — including the overflow bug that shipped for 20 years</li><li><a href="https://learn.microsoft.com/dotnet/api/system.array.sort" target="_blank" rel="noopener">Array.Sort</a> — introsort: quicksort, heapsort and insertion sort combined</li><li><a href="https://github.com/python/cpython/blob/main/Objects/listsort.txt" target="_blank" rel="noopener">Timsort, described by its author</a> — why Python's sort is stable and adaptive</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

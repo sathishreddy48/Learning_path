@@ -29,10 +29,13 @@
     dockerfile: 'FROM RUN COPY ADD WORKDIR ENV ARG EXPOSE CMD ENTRYPOINT USER HEALTHCHECK LABEL VOLUME AS',
     kql: 'let where summarize project extend order by take top join union render count countif sum avg min max percentile bin ago distinct asc desc and or not has contains startswith in between',
     xml: '',
-    sql: 'SELECT FROM WHERE AND OR NOT IN GROUP BY ORDER BY LIMIT JOIN ON AS INSERT UPDATE DELETE CREATE TABLE'
+    sql: 'SELECT FROM WHERE AND OR NOT IN GROUP BY ORDER BY LIMIT JOIN ON AS INSERT UPDATE DELETE CREATE TABLE',
+    proto: 'syntax package import option service rpc message enum returns stream repeated optional required reserved map oneof extend true false '
+         + 'double float int32 int64 uint32 uint64 sint32 sint64 fixed32 fixed64 bool string bytes',
+    graphql: 'query mutation subscription fragment on type input interface union enum scalar schema implements extend directive true false null'
   };
   /* line-comment marker per language; languages absent here use '//' */
-  var LINE_COMMENT = { python: '#', yaml: '#', bash: '#', hcl: '#', dockerfile: '#', xml: null, json: '//' };
+  var LINE_COMMENT = { python: '#', yaml: '#', bash: '#', hcl: '#', dockerfile: '#', graphql: '#', xml: null, json: '//' };
   var TYPES = {
     csharp: /\b([A-Z][A-Za-z0-9_]*)(?=\s*[<(\.\s\[]|\b)/g,
     python: /\b([A-Z][A-Za-z0-9_]*)\b/g

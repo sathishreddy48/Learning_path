@@ -1,0 +1,814 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arrays, Strings, Two Pointers &amp; Sliding Window — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="dsa-arrays">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › DSA › Topic 18 of 36</div>
+  <h1>Arrays, Strings, Two Pointers &amp; Sliding Window</h1>
+  <p class="lede">The largest family of interview problems, and the one where a single idea — move an index instead of re-scanning — converts O(n²) into O(n) again and again. If you only have time for one page before an interview, make it this one.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#arrays-strings">Arrays and strings</a></li><li><a href="#two-pointers">Two pointers</a></li><li><a href="#fast-slow">Fast and slow pointers</a></li><li><a href="#sliding-window">Sliding window</a></li><li><a href="#prefix-sums">Prefix sums and difference arrays</a></li><li><a href="#intervals">Intervals: merge, insert and overlap</a></li><li><a href="#matrix">Matrix traversal: spiral, rotate and in-place marking</a></li></ol>
+  </div>
+
+<section id="arrays-strings"><h2 id="arrays-strings">Arrays and strings</h2><p>Know the basics cold: in-place reversal, building results with <code>StringBuilder</code>/list-join, <code>Span&lt;T&gt;</code> for slicing without allocation, and <code>Array.Sort</code> + custom comparers. Canonical: reverse words in a string; check anagram.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Reverse a string in place (char array)
+static string Reverse(string s)
+{
+    var a = s.ToCharArray();
+    Array.Reverse(a);
+    return new string(a);
+}
+
+// Reverse the words: &quot;the sky is blue&quot; → &quot;blue is sky the&quot;
+static string ReverseWords(string s) =&gt;
+    string.Join(&#x27; &#x27;, s.Split(&#x27; &#x27;, StringSplitOptions.RemoveEmptyEntries).Reverse());
+
+// Anagram check: O(n) with a fixed-size count array
+static bool IsAnagram(string a, string b)
+{
+    if (a.Length != b.Length) return false;
+    var counts = new int[26];
+    for (int i = 0; i &lt; a.Length; i++) { counts[a[i] - &#x27;a&#x27;]++; counts[b[i] - &#x27;a&#x27;]--; }
+    return counts.All(c =&gt; c == 0);
+}
+
+// Rotate array right by k in place: reverse all, reverse first k, reverse rest
+static void Rotate(int[] nums, int k)
+{
+    k %= nums.Length;
+    Array.Reverse(nums); Array.Reverse(nums, 0, k); Array.Reverse(nums, k, nums.Length - k);
+}
+
+// Slicing without copying
+ReadOnlySpan&lt;char&gt; first3 = &quot;hello&quot;.AsSpan(0, 3);
+int[] tail = nums[2..];            // range (copies)</code></pre><pre data-lang="python" hidden><code>def reverse(s: str) -&gt; str:
+    return s[::-1]
+
+def reverse_words(s: str) -&gt; str:
+    return &quot; &quot;.join(reversed(s.split()))
+
+from collections import Counter
+def is_anagram(a: str, b: str) -&gt; bool:
+    return len(a) == len(b) and Counter(a) == Counter(b)
+
+def rotate(nums: list[int], k: int) -&gt; None:
+    k %= len(nums)
+    nums[:] = nums[-k:] + nums[:-k]      # in place via slice assignment
+
+# Slicing copies; use memoryview for bytes if it matters
+first3 = &quot;hello&quot;[:3]
+tail = nums[2:]</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The opener in a lot of loops, and the scoring is on care rather than cleverness: handle empty input, state whether you are mutating the caller's array, and know that <code>string</code> is immutable so every concatenation in a loop is a new allocation. If you reach for <code>Substring</code> repeatedly, say that <code>AsSpan</code> would avoid the per-step allocation.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Valid palindrome ignoring non-alphanumerics (two pointers).</li><li>Longest common prefix of an array of strings.</li><li>Group anagrams (dictionary keyed by sorted string or count tuple).</li></ul></div></section>
+<section id="two-pointers"><h2 id="two-pointers">Two pointers</h2><p>Two indices moving toward each other (sorted input) or in the same direction (fast/slow). Turns O(n²) pair searches into O(n). Canonical: two-sum on sorted array, container with most water, remove duplicates in place.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Pair with target sum in a sorted array
+static (int, int)? PairSum(int[] a, int target)
+{
+    int l = 0, r = a.Length - 1;
+    while (l &lt; r)
+    {
+        int s = a[l] + a[r];
+        if (s == target) return (l, r);
+        if (s &lt; target) l++; else r--;
+    }
+    return null;
+}
+
+// Container with most water
+static int MaxArea(int[] h)
+{
+    int l = 0, r = h.Length - 1, best = 0;
+    while (l &lt; r)
+    {
+        best = Math.Max(best, Math.Min(h[l], h[r]) * (r - l));
+        if (h[l] &lt; h[r]) l++; else r--;
+    }
+    return best;
+}
+
+// Remove duplicates from sorted array in place (slow/fast)
+static int RemoveDuplicates(int[] a)
+{
+    if (a.Length == 0) return 0;
+    int w = 1;
+    for (int r = 1; r &lt; a.Length; r++) if (a[r] != a[w - 1]) a[w++] = a[r];
+    return w;
+}
+
+// 3Sum: sort + fix one + two pointers, skipping duplicates
+static IList&lt;IList&lt;int&gt;&gt; ThreeSum(int[] nums)
+{
+    Array.Sort(nums); var res = new List&lt;IList&lt;int&gt;&gt;();
+    for (int i = 0; i &lt; nums.Length - 2; i++)
+    {
+        if (i &gt; 0 &amp;&amp; nums[i] == nums[i - 1]) continue;
+        int l = i + 1, r = nums.Length - 1;
+        while (l &lt; r)
+        {
+            int s = nums[i] + nums[l] + nums[r];
+            if (s == 0) { res.Add(new[] { nums[i], nums[l], nums[r] }); l++; r--; while (l &lt; r &amp;&amp; nums[l] == nums[l - 1]) l++; }
+            else if (s &lt; 0) l++; else r--;
+        }
+    }
+    return res;
+}</code></pre><pre data-lang="python" hidden><code>def pair_sum(a: list[int], target: int):
+    l, r = 0, len(a) - 1
+    while l &lt; r:
+        s = a[l] + a[r]
+        if s == target: return (l, r)
+        if s &lt; target: l += 1
+        else: r -= 1
+    return None
+
+def max_area(h: list[int]) -&gt; int:
+    l, r, best = 0, len(h) - 1, 0
+    while l &lt; r:
+        best = max(best, min(h[l], h[r]) * (r - l))
+        if h[l] &lt; h[r]: l += 1
+        else: r -= 1
+    return best
+
+def remove_duplicates(a: list[int]) -&gt; int:
+    if not a: return 0
+    w = 1
+    for r in range(1, len(a)):
+        if a[r] != a[w - 1]:
+            a[w] = a[r]; w += 1
+    return w
+
+def three_sum(nums: list[int]) -&gt; list[list[int]]:
+    nums.sort(); res = []
+    for i in range(len(nums) - 2):
+        if i and nums[i] == nums[i - 1]: continue
+        l, r = i + 1, len(nums) - 1
+        while l &lt; r:
+            s = nums[i] + nums[l] + nums[r]
+            if s == 0:
+                res.append([nums[i], nums[l], nums[r]]); l += 1; r -= 1
+                while l &lt; r and nums[l] == nums[l - 1]: l += 1
+            elif s &lt; 0: l += 1
+            else: r -= 1
+    return res</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The trigger phrase is "sorted" — the moment the input is sorted, a nested loop is almost always replaceable by two converging pointers, taking O(n²) to O(n). Be ready to justify the move you make at each step ("the sum is too small, so only increasing the left value can help"), because that argument <em>is</em> the correctness proof and interviewers ask for it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Trapping rain water.</li><li>Sort colours (Dutch national flag, three pointers).</li><li>Move zeroes to the end preserving order.</li></ul></div></section>
+<section id="fast-slow"><h2 id="fast-slow">Fast and slow pointers</h2><p>The other two-pointer family: both move forward, at different speeds. It answers questions about structure rather than values — is there a cycle, where is the middle, where does the cycle begin — and it does so in O(1) space where the obvious solution uses a <code>HashSet</code>.</p><p>Floyd's cycle detection is the canonical one and the explanation is worth rehearsing: if there is a cycle, the fast pointer gains one position per step on the slow pointer, so it must eventually land on it. Then reset one pointer to the head, advance both one step at a time, and they meet at the cycle's start — which falls out of the algebra of the distances.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Middle of a list in one pass (for even lengths this gives the SECOND middle)
+static ListNode? Middle(ListNode? head)
+{
+    ListNode? slow = head, fast = head;
+    while (fast?.Next is not null) { slow = slow!.Next; fast = fast.Next.Next; }
+    return slow;
+}
+
+// Cycle detection - O(1) space, where the HashSet version is O(n)
+static bool HasCycle(ListNode? head)
+{
+    ListNode? slow = head, fast = head;
+    while (fast?.Next is not null)
+    {
+        slow = slow!.Next;
+        fast = fast.Next.Next;
+        if (ReferenceEquals(slow, fast)) return true;   // the gap closes by 1 per step
+    }
+    return false;
+}
+
+// Where the cycle STARTS - the part worth being able to derive
+static ListNode? CycleStart(ListNode? head)
+{
+    ListNode? slow = head, fast = head;
+    while (fast?.Next is not null)
+    {
+        slow = slow!.Next;
+        fast = fast.Next.Next;
+        if (!ReferenceEquals(slow, fast)) continue;
+
+        // Let a = head-&gt;start, b = start-&gt;meeting, c = meeting-&gt;start (round the loop).
+        // slow walked a+b, fast walked a+b+(b+c)*k, and fast = 2*slow, so a = c + (k-1)L.
+        // Therefore walking a from the head and c from the meeting point converges
+        // on the start.
+        var p = head;
+        while (!ReferenceEquals(p, slow)) { p = p!.Next; slow = slow!.Next; }
+        return p;
+    }
+    return null;
+}
+
+// The same trick on an ARRAY: &quot;find the duplicate&quot; where values are 1..n and the
+// array is read-only. Treat i -&gt; nums[i] as a linked list; the duplicate is the
+// entry point of the cycle.
+static int FindDuplicate(int[] nums)
+{
+    int slow = nums[0], fast = nums[0];
+    do { slow = nums[slow]; fast = nums[nums[fast]]; } while (slow != fast);
+
+    slow = nums[0];
+    while (slow != fast) { slow = nums[slow]; fast = nums[fast]; }
+    return slow;
+}
+// O(n) time, O(1) space, input untouched - the constraints that rule out
+// sorting (mutates) and a HashSet (O(n) space).
+
+// Nth from the end: advance fast by n, then move both
+static ListNode? NthFromEnd(ListNode? head, int n)
+{
+    ListNode? fast = head;
+    for (int i = 0; i &lt; n; i++) { if (fast is null) return null; fast = fast.Next; }
+    ListNode? slow = head;
+    while (fast is not null) { slow = slow!.Next; fast = fast.Next; }
+    return slow;
+}
+
+// Palindrome list in O(1) space: find the middle, reverse the second half, compare
+static bool IsPalindrome(ListNode? head)
+{
+    ListNode? slow = head, fast = head;
+    while (fast?.Next is not null) { slow = slow!.Next; fast = fast.Next.Next; }
+
+    ListNode? prev = null;
+    while (slow is not null) { var next = slow.Next; slow.Next = prev; prev = slow; slow = next; }
+
+    ListNode? a = head, b = prev;
+    while (b is not null) { if (a!.Val != b.Val) return false; a = a.Next; b = b.Next; }
+    return true;
+}</code></pre><pre data-lang="python" hidden><code>def middle(head):
+    slow = fast = head
+    while fast and fast.next:
+        slow, fast = slow.next, fast.next.next
+    return slow
+
+def has_cycle(head) -&gt; bool:
+    slow = fast = head
+    while fast and fast.next:
+        slow, fast = slow.next, fast.next.next
+        if slow is fast:                   # `is`, not ==: identity, not value
+            return True
+    return False
+
+def cycle_start(head):
+    slow = fast = head
+    while fast and fast.next:
+        slow, fast = slow.next, fast.next.next
+        if slow is fast:
+            p = head
+            while p is not slow:           # a = c + (k-1)L, so these converge
+                p, slow = p.next, slow.next
+            return p
+    return None
+
+# The array version: values 1..n, read-only input
+def find_duplicate(nums: list[int]) -&gt; int:
+    slow = fast = nums[0]
+    while True:
+        slow = nums[slow]
+        fast = nums[nums[fast]]
+        if slow == fast:
+            break
+    slow = nums[0]
+    while slow != fast:
+        slow, fast = nums[slow], nums[fast]
+    return slow
+
+def nth_from_end(head, n: int):
+    fast = head
+    for _ in range(n):
+        if fast is None:
+            return None
+        fast = fast.next
+    slow = head
+    while fast:
+        slow, fast = slow.next, fast.next
+    return slow
+
+def is_palindrome(head) -&gt; bool:
+    slow = fast = head
+    while fast and fast.next:
+        slow, fast = slow.next, fast.next.next
+
+    prev = None
+    while slow:
+        slow.next, prev, slow = prev, slow, slow.next
+
+    a, b = head, prev
+    while b:
+        if a.val != b.val:
+            return False
+        a, b = a.next, b.next
+    return True</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Floyd's algorithm is asked often enough that you should be able to write it without thinking <em>and</em> explain why the second phase finds the entry point. The strong extra move is recognising the array version: "find the duplicate number" with values in 1..n, a read-only array and O(1) space is the same algorithm in disguise, and the constraints are the tell — read-only rules out sorting, O(1) space rules out a set, which leaves exactly this.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write cycle detection and cycle-start from memory, then derive why phase two works.</li><li>Solve "find the duplicate number" with O(1) space and an unmodifiable array.</li><li>Check a linked list for palindromicity in O(1) space, then restore the list afterwards.</li></ul></div></section>
+<section id="sliding-window"><h2 id="sliding-window">Sliding window</h2><p>A window <code>[l, r]</code> over a sequence, expanded with <code>r</code> and shrunk with <code>l</code> while a condition holds; state kept in a counter or running sum. Canonical: longest substring without repeats, minimum window substring, max sum subarray of size k.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Longest substring without repeating characters
+static int LengthOfLongestSubstring(string s)
+{
+    var last = new Dictionary&lt;char, int&gt;();
+    int best = 0, l = 0;
+    for (int r = 0; r &lt; s.Length; r++)
+    {
+        if (last.TryGetValue(s[r], out var idx) &amp;&amp; idx &gt;= l) l = idx + 1;   // jump past the repeat
+        last[s[r]] = r;
+        best = Math.Max(best, r - l + 1);
+    }
+    return best;
+}
+
+// Fixed window: max sum of k consecutive
+static int MaxSumK(int[] a, int k)
+{
+    int sum = a.Take(k).Sum(), best = sum;
+    for (int r = k; r &lt; a.Length; r++) { sum += a[r] - a[r - k]; best = Math.Max(best, sum); }
+    return best;
+}
+
+// Minimum window substring containing all chars of t
+static string MinWindow(string s, string t)
+{
+    var need = new Dictionary&lt;char, int&gt;();
+    foreach (var c in t) need[c] = need.GetValueOrDefault(c) + 1;
+    int missing = t.Length, l = 0, bestL = 0, bestLen = int.MaxValue;
+    for (int r = 0; r &lt; s.Length; r++)
+    {
+        if (need.TryGetValue(s[r], out var n)) { if (n &gt; 0) missing--; need[s[r]] = n - 1; }
+        while (missing == 0)
+        {
+            if (r - l + 1 &lt; bestLen) { bestLen = r - l + 1; bestL = l; }
+            if (need.TryGetValue(s[l], out var m)) { need[s[l]] = m + 1; if (m + 1 &gt; 0) missing++; }
+            l++;
+        }
+    }
+    return bestLen == int.MaxValue ? &quot;&quot; : s.Substring(bestL, bestLen);
+}</code></pre><pre data-lang="python" hidden><code>def length_of_longest_substring(s: str) -&gt; int:
+    last: dict[str, int] = {}
+    best = l = 0
+    for r, c in enumerate(s):
+        if c in last and last[c] &gt;= l:
+            l = last[c] + 1
+        last[c] = r
+        best = max(best, r - l + 1)
+    return best
+
+def max_sum_k(a: list[int], k: int) -&gt; int:
+    s = best = sum(a[:k])
+    for r in range(k, len(a)):
+        s += a[r] - a[r - k]; best = max(best, s)
+    return best
+
+from collections import Counter
+def min_window(s: str, t: str) -&gt; str:
+    need = Counter(t); missing = len(t)
+    l = 0; best = (0, float(&quot;inf&quot;))
+    for r, c in enumerate(s):
+        if need[c] &gt; 0: missing -= 1
+        need[c] -= 1
+        while missing == 0:
+            if r - l + 1 &lt; best[1] - best[0]: best = (l, r + 1)
+            need[s[l]] += 1
+            if need[s[l]] &gt; 0: missing += 1
+            l += 1
+    return &quot;&quot; if best[1] == float(&quot;inf&quot;) else s[best[0]:best[1]]</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The highest-frequency pattern in the whole set. Have both templates ready: fixed size (add the entering element, remove the leaving one, no inner loop) and variable size (expand right always, shrink left <em>while</em> the invariant is violated). The question that catches people is the complexity of the variable version — it looks nested but each index enters and leaves the window at most once, so it is O(n), and saying that unprompted is worth a lot.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Longest repeating character replacement (k swaps).</li><li>Permutation in string.</li><li>Sliding window maximum (monotonic deque).</li></ul></div></section>
+<section id="prefix-sums"><h2 id="prefix-sums">Prefix sums and difference arrays</h2><p>When a problem asks repeatedly about the sum of a range, precompute once: <code>prefix[i]</code> is the sum of everything before <code>i</code>, so any range sum is one subtraction. Build is O(n), every query is O(1), where the naive version is O(n) per query.</p><p>The <strong>difference array</strong> is the mirror image: when you need many range <em>updates</em> and one final read, record only the deltas at the boundaries and take a prefix sum at the end. O(1) per update instead of O(n).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// PREFIX SUM: build once, query forever
+static int[] BuildPrefix(int[] nums)
+{
+    var prefix = new int[nums.Length + 1];           // length + 1 avoids an if
+    for (int i = 0; i &lt; nums.Length; i++)
+        prefix[i + 1] = prefix[i] + nums[i];
+    return prefix;
+}
+// sum of nums[l..r] inclusive:
+static int RangeSum(int[] prefix, int l, int r) =&gt; prefix[r + 1] - prefix[l];
+
+// The off-by-one is the whole difficulty. With the +1 convention:
+//   prefix[0] = 0, prefix[k] = sum of the first k elements
+//   nums[l..r] = prefix[r+1] - prefix[l]
+
+// 2-D prefix sum: inclusion-exclusion
+static int[,] Build2D(int[,] g)
+{
+    int rows = g.GetLength(0), cols = g.GetLength(1);
+    var p = new int[rows + 1, cols + 1];
+    for (int r = 0; r &lt; rows; r++)
+        for (int c = 0; c &lt; cols; c++)
+            p[r + 1, c + 1] = g[r, c] + p[r, c + 1] + p[r + 1, c] - p[r, c];
+    return p;
+}
+static int Rect(int[,] p, int r1, int c1, int r2, int c2)
+    =&gt; p[r2 + 1, c2 + 1] - p[r1, c2 + 1] - p[r2 + 1, c1] + p[r1, c1];
+
+// RUNNING prefix, when you do not need the array - this is the common case
+static int MaxSubarray(int[] nums)      // Kadane, which is a prefix-sum argument
+{
+    int best = nums[0], current = nums[0];
+    for (int i = 1; i &lt; nums.Length; i++)
+    {
+        current = Math.Max(nums[i], current + nums[i]);   // extend, or start fresh
+        best = Math.Max(best, current);
+    }
+    return best;
+}
+
+// DIFFERENCE ARRAY: many range updates, one final read
+static int[] ApplyRangeUpdates(int n, (int L, int R, int Val)[] updates)
+{
+    var diff = new int[n + 1];
+    foreach (var (l, r, val) in updates)
+    {
+        diff[l] += val;                  // O(1) per update, not O(r - l)
+        diff[r + 1] -= val;
+    }
+    var result = new int[n];
+    int running = 0;
+    for (int i = 0; i &lt; n; i++) { running += diff[i]; result[i] = running; }
+    return result;
+}
+// Classic use: &quot;corporate flight bookings&quot;, &quot;car pooling&quot;, &quot;range addition&quot;.
+
+// The LINE SWEEP is the same idea on intervals: +1 at each start, -1 at each end,
+// then sweep to find the maximum concurrent count.
+static int MaxConcurrent((int Start, int End)[] intervals)
+{
+    var events = new List&lt;(int Time, int Delta)&gt;();
+    foreach (var (s, e) in intervals) { events.Add((s, 1)); events.Add((e, -1)); }
+    events.Sort((a, b) =&gt; a.Time != b.Time ? a.Time.CompareTo(b.Time)
+                                           : a.Delta.CompareTo(b.Delta));  // ends first
+    int running = 0, best = 0;
+    foreach (var (_, delta) in events) { running += delta; best = Math.Max(best, running); }
+    return best;
+}</code></pre><pre data-lang="python" hidden><code>from itertools import accumulate
+
+# PREFIX SUM - one line with accumulate
+prefix = [0] + list(accumulate(nums))        # prefix[k] = sum of first k
+def range_sum(l: int, r: int) -&gt; int:        # inclusive
+    return prefix[r + 1] - prefix[l]
+
+# 2-D
+def build_2d(g: list[list[int]]) -&gt; list[list[int]]:
+    rows, cols = len(g), len(g[0])
+    p = [[0] * (cols + 1) for _ in range(rows + 1)]
+    for r in range(rows):
+        for c in range(cols):
+            p[r + 1][c + 1] = g[r][c] + p[r][c + 1] + p[r + 1][c] - p[r][c]
+    return p
+
+def rect(p, r1, c1, r2, c2) -&gt; int:
+    return p[r2 + 1][c2 + 1] - p[r1][c2 + 1] - p[r2 + 1][c1] + p[r1][c1]
+
+# Kadane
+def max_subarray(nums: list[int]) -&gt; int:
+    best = current = nums[0]
+    for n in nums[1:]:
+        current = max(n, current + n)
+        best = max(best, current)
+    return best
+
+# DIFFERENCE ARRAY
+def apply_range_updates(n: int, updates: list[tuple[int, int, int]]) -&gt; list[int]:
+    diff = [0] * (n + 1)
+    for l, r, val in updates:
+        diff[l] += val
+        diff[r + 1] -= val
+    return list(accumulate(diff))[:n]
+
+# LINE SWEEP for maximum concurrency - &quot;meeting rooms II&quot;
+def max_concurrent(intervals: list[tuple[int, int]]) -&gt; int:
+    events = []
+    for s, e in intervals:
+        events.append((s, 1))
+        events.append((e, -1))
+    events.sort()                 # (time, delta): -1 sorts before +1 at equal time,
+                                  # which is what you want for touching intervals
+    running = best = 0
+    for _, delta in events:
+        running += delta
+        best = max(best, running)
+    return best</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The tell is "sum of a range" asked more than once, or "how many subarrays …". Build the prefix array and state that queries become O(1). Two extras that land: Kadane's algorithm is a prefix-sum argument in disguise (the best subarray ending here either extends the previous one or starts fresh), and the difference array answers "many range updates, one read" in O(1) per update — a pairing most candidates do not know exists. The line sweep for "meeting rooms II" is the same idea again.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Build a prefix array with the +1 convention and get every inclusive range query right first time.</li><li>Solve "range addition" with a difference array instead of updating each element.</li><li>Solve "meeting rooms II" with a line sweep and then again with a heap, and compare.</li></ul></div></section>
+<section id="intervals"><h2 id="intervals">Intervals: merge, insert and overlap</h2><p>Interval problems look varied and are almost all the same two steps: <strong>sort by start, then sweep once, comparing each interval with the last one you kept</strong>. Getting this reflex means you can write merge, insert, "can attend all meetings", "erase overlaps" and "minimum rooms" from the same skeleton.</p><p>The detail to pin down with the interviewer is whether touching intervals count as overlapping — <code>[1,2]</code> and <code>[2,3]</code>. It changes <code>&lt;</code> to <code>&lt;=</code> and it is a question worth asking rather than guessing.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// MERGE overlapping intervals - the base skeleton
+static int[][] Merge(int[][] intervals)
+{
+    if (intervals.Length == 0) return [];
+
+    Array.Sort(intervals, (a, b) =&gt; a[0].CompareTo(b[0]));      // sort by START
+
+    var merged = new List&lt;int[]&gt; { intervals[0] };
+    foreach (var current in intervals.AsSpan(1))
+    {
+        var last = merged[^1];
+        if (current[0] &lt;= last[1])                  // &lt;= : touching counts as overlap
+            last[1] = Math.Max(last[1], current[1]);   // extend in place
+        else
+            merged.Add(current);
+    }
+    return merged.ToArray();
+}
+// O(n log n) for the sort, O(n) for the sweep.
+
+// INSERT into an already-sorted, non-overlapping list - O(n), no sort needed
+static int[][] Insert(int[][] intervals, int[] newInterval)
+{
+    var result = new List&lt;int[]&gt;();
+    int i = 0, n = intervals.Length;
+
+    while (i &lt; n &amp;&amp; intervals[i][1] &lt; newInterval[0])        // entirely before
+        result.Add(intervals[i++]);
+
+    while (i &lt; n &amp;&amp; intervals[i][0] &lt;= newInterval[1])       // overlapping: absorb
+    {
+        newInterval[0] = Math.Min(newInterval[0], intervals[i][0]);
+        newInterval[1] = Math.Max(newInterval[1], intervals[i][1]);
+        i++;
+    }
+    result.Add(newInterval);
+
+    while (i &lt; n) result.Add(intervals[i++]);                // entirely after
+    return result.ToArray();
+}
+
+// CAN ATTEND ALL MEETINGS - sort, then look for any overlap
+static bool CanAttendAll(int[][] meetings)
+{
+    Array.Sort(meetings, (a, b) =&gt; a[0].CompareTo(b[0]));
+    for (int i = 1; i &lt; meetings.Length; i++)
+        if (meetings[i][0] &lt; meetings[i - 1][1]) return false;   // &lt; : touching is fine
+    return true;
+}
+
+// MINIMUM MEETING ROOMS - a min-heap of end times
+static int MinRooms(int[][] meetings)
+{
+    if (meetings.Length == 0) return 0;
+    Array.Sort(meetings, (a, b) =&gt; a[0].CompareTo(b[0]));
+
+    var ends = new PriorityQueue&lt;int, int&gt;();        // the earliest end is the top
+    foreach (var m in meetings)
+    {
+        if (ends.Count &gt; 0 &amp;&amp; ends.Peek() &lt;= m[0])
+            ends.Dequeue();                          // a room has freed up: reuse it
+        ends.Enqueue(m[1], m[1]);
+    }
+    return ends.Count;                               // rooms in use at the peak
+}
+
+// NON-OVERLAPPING: remove the fewest intervals. Greedy, and the counter-intuitive
+// part is that you sort by END, not by start.
+static int EraseOverlap(int[][] intervals)
+{
+    Array.Sort(intervals, (a, b) =&gt; a[1].CompareTo(b[1]));     // by END
+    int kept = 0, lastEnd = int.MinValue;
+    foreach (var iv in intervals)
+        if (iv[0] &gt;= lastEnd) { kept++; lastEnd = iv[1]; }
+    return intervals.Length - kept;
+}
+// Why by end: keeping the interval that finishes earliest leaves the most room
+// for everything after it. That exchange argument IS the proof - have it ready.
+
+// INTERSECTION of two sorted lists - two pointers
+static int[][] Intersect(int[][] a, int[][] b)
+{
+    var result = new List&lt;int[]&gt;();
+    int i = 0, j = 0;
+    while (i &lt; a.Length &amp;&amp; j &lt; b.Length)
+    {
+        int lo = Math.Max(a[i][0], b[j][0]), hi = Math.Min(a[i][1], b[j][1]);
+        if (lo &lt;= hi) result.Add([lo, hi]);
+        if (a[i][1] &lt; b[j][1]) i++; else j++;        // advance the one that ends first
+    }
+    return result.ToArray();
+}</code></pre><pre data-lang="python" hidden><code>import heapq
+
+def merge(intervals: list[list[int]]) -&gt; list[list[int]]:
+    if not intervals:
+        return []
+    intervals.sort()                      # by start, then end
+    merged = [intervals[0][:]]
+    for start, end in intervals[1:]:
+        if start &lt;= merged[-1][1]:        # &lt;= : touching counts as overlap
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+def insert(intervals: list[list[int]], new: list[int]) -&gt; list[list[int]]:
+    result, i, n = [], 0, len(intervals)
+    while i &lt; n and intervals[i][1] &lt; new[0]:
+        result.append(intervals[i]); i += 1
+    while i &lt; n and intervals[i][0] &lt;= new[1]:
+        new = [min(new[0], intervals[i][0]), max(new[1], intervals[i][1])]
+        i += 1
+    result.append(new)
+    result.extend(intervals[i:])
+    return result
+
+def can_attend_all(meetings: list[list[int]]) -&gt; bool:
+    meetings.sort()
+    return all(meetings[i][0] &gt;= meetings[i - 1][1] for i in range(1, len(meetings)))
+
+def min_rooms(meetings: list[list[int]]) -&gt; int:
+    if not meetings:
+        return 0
+    meetings.sort()
+    ends: list[int] = []
+    for start, end in meetings:
+        if ends and ends[0] &lt;= start:
+            heapq.heappop(ends)           # reuse the freed room
+        heapq.heappush(ends, end)
+    return len(ends)
+
+def erase_overlap(intervals: list[list[int]]) -&gt; int:
+    intervals.sort(key=lambda iv: iv[1])  # by END - the greedy exchange argument
+    kept, last_end = 0, float(&quot;-inf&quot;)
+    for start, end in intervals:
+        if start &gt;= last_end:
+            kept += 1
+            last_end = end
+    return len(intervals) - kept
+
+def intersect(a: list[list[int]], b: list[list[int]]) -&gt; list[list[int]]:
+    result, i, j = [], 0, 0
+    while i &lt; len(a) and j &lt; len(b):
+        lo, hi = max(a[i][0], b[j][0]), min(a[i][1], b[j][1])
+        if lo &lt;= hi:
+            result.append([lo, hi])
+        if a[i][1] &lt; b[j][1]: i += 1
+        else:                 j += 1
+    return result</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Ask whether touching intervals overlap before you write anything — it is a one-line question that changes the answer and shows you read carefully. Then the discriminating detail: merge and "can attend all" sort by <strong>start</strong>, but "remove the fewest overlapping intervals" sorts by <strong>end</strong>, and you should be able to give the exchange argument for why (keeping the earliest finisher leaves the most room for the rest). Greedy problems are usually marked by being asked for the proof, not the code.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write merge from memory, then adapt the same skeleton to insert without re-sorting.</li><li>Solve "minimum meeting rooms" with a heap and with a line sweep.</li><li>Explain why "erase overlap intervals" sorts by end rather than start.</li></ul></div></section>
+<section id="matrix"><h2 id="matrix">Matrix traversal: spiral, rotate and in-place marking</h2><p>Grid problems reward two habits: write the bounds check once as a helper rather than inline four times, and know the in-place tricks, because "do it without extra space" is the standard follow-up.</p><p>The in-place trick worth internalising is <strong>using the matrix itself as the marker</strong>: for "set matrix zeroes" you use row 0 and column 0 as the flags; for "game of life" you encode both the old and new state in one integer with a second bit. Both come up.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The four directions, written once
+static readonly (int R, int C)[] Dirs = [(0, 1), (1, 0), (0, -1), (-1, 0)];
+static readonly (int R, int C)[] Dirs8 =
+    [(0,1), (1,1), (1,0), (1,-1), (0,-1), (-1,-1), (-1,0), (-1,1)];
+
+static bool InBounds(int r, int c, int rows, int cols)
+    =&gt; r &gt;= 0 &amp;&amp; r &lt; rows &amp;&amp; c &gt;= 0 &amp;&amp; c &lt; cols;
+
+// SPIRAL ORDER - four shrinking boundaries. The second pair of loops needs a
+// guard, which is the bug everyone hits on a single remaining row or column.
+static IList&lt;int&gt; Spiral(int[][] m)
+{
+    var result = new List&lt;int&gt;();
+    if (m.Length == 0) return result;
+
+    int top = 0, bottom = m.Length - 1, left = 0, right = m[0].Length - 1;
+    while (top &lt;= bottom &amp;&amp; left &lt;= right)
+    {
+        for (int c = left; c &lt;= right; c++)  result.Add(m[top][c]);
+        top++;
+        for (int r = top; r &lt;= bottom; r++)  result.Add(m[r][right]);
+        right--;
+
+        if (top &lt;= bottom)                   // &lt;- the guard
+        {
+            for (int c = right; c &gt;= left; c--) result.Add(m[bottom][c]);
+            bottom--;
+        }
+        if (left &lt;= right)                   // &lt;- and this one
+        {
+            for (int r = bottom; r &gt;= top; r--) result.Add(m[r][left]);
+            left++;
+        }
+    }
+    return result;
+}
+
+// ROTATE 90 degrees clockwise, in place: transpose, then reverse each row
+static void Rotate(int[][] m)
+{
+    int n = m.Length;
+    for (int r = 0; r &lt; n; r++)
+        for (int c = r + 1; c &lt; n; c++)              // c starts at r+1: upper triangle
+            (m[r][c], m[c][r]) = (m[c][r], m[r][c]);
+
+    foreach (var row in m) Array.Reverse(row);
+}
+// Counter-clockwise: transpose, then reverse the COLUMNS (i.e. reverse the row order).
+
+// SET MATRIX ZEROES in O(1) space - use row 0 and column 0 as the flags
+static void SetZeroes(int[][] m)
+{
+    int rows = m.Length, cols = m[0].Length;
+    bool firstRow = false, firstCol = false;
+
+    for (int c = 0; c &lt; cols; c++) if (m[0][c] == 0) firstRow = true;
+    for (int r = 0; r &lt; rows; r++) if (m[r][0] == 0) firstCol = true;
+
+    for (int r = 1; r &lt; rows; r++)                   // record into the margins
+        for (int c = 1; c &lt; cols; c++)
+            if (m[r][c] == 0) { m[r][0] = 0; m[0][c] = 0; }
+
+    for (int r = 1; r &lt; rows; r++)                   // apply
+        for (int c = 1; c &lt; cols; c++)
+            if (m[r][0] == 0 || m[0][c] == 0) m[r][c] = 0;
+
+    if (firstRow) for (int c = 0; c &lt; cols; c++) m[0][c] = 0;   // margins LAST
+    if (firstCol) for (int r = 0; r &lt; rows; r++) m[r][0] = 0;
+}
+
+// GAME OF LIFE in place - two bits per cell: bit 0 is the old state, bit 1 the new
+static void GameOfLife(int[][] board)
+{
+    int rows = board.Length, cols = board[0].Length;
+    for (int r = 0; r &lt; rows; r++)
+        for (int c = 0; c &lt; cols; c++)
+        {
+            int live = 0;
+            foreach (var (dr, dc) in Dirs8)
+            {
+                int nr = r + dr, nc = c + dc;
+                if (InBounds(nr, nc, rows, cols)) live += board[nr][nc] &amp; 1;  // OLD bit
+            }
+            bool alive = (board[r][c] &amp; 1) == 1;
+            if (alive ? live is 2 or 3 : live == 3) board[r][c] |= 2;         // NEW bit
+        }
+    for (int r = 0; r &lt; rows; r++)
+        for (int c = 0; c &lt; cols; c++) board[r][c] &gt;&gt;= 1;                     // commit
+
+// DIAGONALS: cells on the same \ diagonal share (r - c); on / they share (r + c)
+}</code></pre><pre data-lang="python" hidden><code>DIRS  = ((0, 1), (1, 0), (0, -1), (-1, 0))
+DIRS8 = ((0,1), (1,1), (1,0), (1,-1), (0,-1), (-1,-1), (-1,0), (-1,1))
+
+def in_bounds(r, c, rows, cols) -&gt; bool:
+    return 0 &lt;= r &lt; rows and 0 &lt;= c &lt; cols
+
+def spiral(m: list[list[int]]) -&gt; list[int]:
+    result = []
+    if not m:
+        return result
+    top, bottom, left, right = 0, len(m) - 1, 0, len(m[0]) - 1
+    while top &lt;= bottom and left &lt;= right:
+        result.extend(m[top][c] for c in range(left, right + 1));  top += 1
+        result.extend(m[r][right] for r in range(top, bottom + 1)); right -= 1
+        if top &lt;= bottom:
+            result.extend(m[bottom][c] for c in range(right, left - 1, -1)); bottom -= 1
+        if left &lt;= right:
+            result.extend(m[r][left] for r in range(bottom, top - 1, -1));   left += 1
+    return result
+
+# The Pythonic spiral, worth knowing but say the manual one first
+def spiral_short(m):
+    result = []
+    while m:
+        result += m.pop(0)                    # take the top row
+        m = [list(row) for row in zip(*m)][::-1]   # rotate the rest anticlockwise
+    return result
+
+def rotate(m: list[list[int]]) -&gt; None:
+    n = len(m)
+    for r in range(n):
+        for c in range(r + 1, n):
+            m[r][c], m[c][r] = m[c][r], m[r][c]    # transpose
+    for row in m:
+        row.reverse()
+# or, not in place:  rotated = [list(row) for row in zip(*m[::-1])]
+
+def set_zeroes(m: list[list[int]]) -&gt; None:
+    rows, cols = len(m), len(m[0])
+    first_row = any(m[0][c] == 0 for c in range(cols))
+    first_col = any(m[r][0] == 0 for r in range(rows))
+
+    for r in range(1, rows):
+        for c in range(1, cols):
+            if m[r][c] == 0:
+                m[r][0] = m[0][c] = 0
+
+    for r in range(1, rows):
+        for c in range(1, cols):
+            if m[r][0] == 0 or m[0][c] == 0:
+                m[r][c] = 0
+
+    if first_row:
+        m[0] = [0] * cols
+    if first_col:
+        for r in range(rows):
+            m[r][0] = 0
+
+def game_of_life(board: list[list[int]]) -&gt; None:
+    rows, cols = len(board), len(board[0])
+    for r in range(rows):
+        for c in range(cols):
+            live = sum(board[r+dr][c+dc] &amp; 1
+                       for dr, dc in DIRS8 if in_bounds(r+dr, c+dc, rows, cols))
+            if board[r][c] &amp; 1:
+                if live in (2, 3): board[r][c] |= 2
+            elif live == 3:        board[r][c] |= 2
+    for r in range(rows):
+        for c in range(cols):
+            board[r][c] &gt;&gt;= 1
+
+# Diagonals: same \ diagonal =&gt; same (r - c); same / diagonal =&gt; same (r + c)
+from collections import defaultdict
+diagonals = defaultdict(list)
+for r in range(rows):
+    for c in range(cols):
+        diagonals[r - c].append(m[r][c])</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Write the bounds check and the direction array as named helpers before the algorithm — it reads as experience and removes the most common source of off-by-one errors. For rotation, know the decomposition (transpose then reverse rows) rather than trying to derive index arithmetic live. And when asked for O(1) extra space on a grid, the answer is almost always "encode the information in the matrix itself": the margins for set-zeroes, a second bit for game of life.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write spiral order and get the single-row and single-column cases right first time.</li><li>Rotate a matrix in place both clockwise and anticlockwise.</li><li>Solve "set matrix zeroes" in O(1) extra space and explain why the margins are written last.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://neetcode.io/roadmap" target="_blank" rel="noopener">NeetCode roadmap</a> — the arrays and sliding-window tracks</li><li><a href="https://leetcode.com/tag/two-pointers/" target="_blank" rel="noopener">LeetCode: two pointers</a> — the tag, sorted by frequency</li><li><a href="https://leetcode.com/tag/sliding-window/" target="_blank" rel="noopener">LeetCode: sliding window</a> — same, for windows</li><li><a href="https://learn.microsoft.com/dotnet/api/system.span-1" target="_blank" rel="noopener">Span&lt;T&gt;</a> — slicing without allocating</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

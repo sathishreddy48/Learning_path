@@ -893,7 +893,18 @@ function writeDashboard(curriculum, counts) {
   fs.writeFileSync(path.join(OUT, 'index.html'), html, 'utf8');
 }
 
+/* The DotNet site is hand-authored, but its topic count is advertised on the
+   root landing page. Read it from that site's own curriculum rather than
+   hardcoding a number here that goes stale the moment a topic is added. */
+function dotnetTopicCount() {
+  const src = fs.readFileSync(path.join(DOTNET_ASSETS, 'js', 'curriculum.js'), 'utf8');
+  const w = {};
+  new Function('window', src)(w);          // the file only assigns window.CURRICULUM
+  return w.CURRICULUM.topics.length;
+}
+
 function writeRootLanding(counts) {
+  const dotnetTopics = dotnetTopicCount();
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -924,12 +935,12 @@ function writeRootLanding(counts) {
     <a class="path-card" href="DotNet/index.html">
       <h2>C# &amp; .NET →</h2>
       <p>The language core through threading, Web API, security, data access and patterns, then the Azure platform and the DevOps practice that ships it. Every sample paired with Python.</p>
-      <span class="meta">23 topics · C# | Python tabs</span>
+      <span class="meta">${dotnetTopics} topics · C# | Python tabs</span>
     </a>
     <a class="path-card sd" href="SystemDesign/index.html">
       <h2>System Design →</h2>
       <p>Alex Xu's Insider's Guide, Volumes 1 and 2 — the scaling story, the recurring building blocks, and 28 end-to-end designs from URL shorteners to stock exchanges.</p>
-      <span class="meta">${counts.chapters} chapters · ${counts.sections} sections · 2 interactive explainers</span>
+      <span class="meta">${counts.chapters} chapters · ${counts.sections} sections · ${counts.animations} interactive explainers</span>
     </a>
   </div>
 
@@ -1020,6 +1031,7 @@ async function main() {
     sections: stats.sections,
     images: stats.images,
     mermaidInlined: stats.mermaidInlined,
+    animations: stats.animations,
   };
   writeDashboard(curriculum, counts);
   writeRootLanding(counts);

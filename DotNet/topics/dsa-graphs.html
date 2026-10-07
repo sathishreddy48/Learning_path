@@ -1,0 +1,1157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Graphs, Union-Find &amp; Shortest Paths — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="dsa-graphs">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › DSA › Topic 23 of 36</div>
+  <h1>Graphs, Union-Find &amp; Shortest Paths</h1>
+  <p class="lede">Most graph problems are not labelled as graph problems. A grid is a graph, a set of prerequisites is a graph, a word ladder is a graph, and a state machine is a graph — so the skill is recognising that nodes and edges are hiding in the problem, then picking the right traversal.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#representations">Representations: adjacency list, matrix and implicit graphs</a></li><li><a href="#graphs">BFS and DFS on graphs and grids</a></li><li><a href="#components">Connected components, flood fill and bipartite checking</a></li><li><a href="#topological">Topological sort: Kahn and DFS</a></li><li><a href="#union-find">Union-Find (disjoint set union)</a></li><li><a href="#dijkstra">Dijkstra and 0-1 BFS</a></li><li><a href="#other-shortest-paths">Bellman-Ford, Floyd-Warshall and MSTs</a></li></ol>
+  </div>
+
+<section id="representations"><h2 id="representations">Representations: adjacency list, matrix and implicit graphs</h2><p>Three ways to hold a graph, and the choice follows from density. An <strong>adjacency list</strong> is O(V + E) space and iterating a node's neighbours is O(degree) — the default. An <strong>adjacency matrix</strong> is O(V²) space but answers "is there an edge?" in O(1), which is worth it only for dense graphs or Floyd-Warshall. An <strong>implicit graph</strong> has no data structure at all: the neighbours are computed from the current state, which is how grids, word ladders and puzzle states work.</p><p>Recognising the implicit case is the valuable part — "minimum number of moves" over any kind of state is BFS over a graph you never build.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// ADJACENCY LIST - the default
+var graph = new Dictionary&lt;int, List&lt;int&gt;&gt;();
+void AddEdge(int u, int v)
+{
+    (graph.TryGetValue(u, out var a) ? a : graph[u] = []).Add(v);
+    (graph.TryGetValue(v, out var b) ? b : graph[v] = []).Add(u);   // undirected
+}
+
+// From an edge list, which is how problems hand it to you
+static List&lt;int&gt;[] Build(int n, int[][] edges, bool directed = false)
+{
+    var adj = new List&lt;int&gt;[n];
+    for (int i = 0; i &lt; n; i++) adj[i] = [];
+    foreach (var e in edges)
+    {
+        adj[e[0]].Add(e[1]);
+        if (!directed) adj[e[1]].Add(e[0]);      // forgetting this is the #1 bug
+    }
+    return adj;
+}
+
+// WEIGHTED: carry the weight in the tuple
+static List&lt;(int To, int Weight)&gt;[] BuildWeighted(int n, int[][] edges)
+{
+    var adj = new List&lt;(int, int)&gt;[n];
+    for (int i = 0; i &lt; n; i++) adj[i] = [];
+    foreach (var e in edges) { adj[e[0]].Add((e[1], e[2])); adj[e[1]].Add((e[0], e[2])); }
+    return adj;
+}
+
+// ADJACENCY MATRIX - O(1) edge test, O(V^2) space. For dense graphs only.
+var matrix = new int[n, n];
+matrix[u, v] = weight;
+
+// IMPLICIT - the one to recognise. No structure; neighbours are COMPUTED.
+static readonly (int R, int C)[] Dirs = [(0,1), (1,0), (0,-1), (-1,0)];
+
+static IEnumerable&lt;(int R, int C)&gt; Neighbours((int R, int C) cell, char[][] grid)
+{
+    foreach (var (dr, dc) in Dirs)
+    {
+        int r = cell.R + dr, c = cell.C + dc;
+        if (r &gt;= 0 &amp;&amp; r &lt; grid.Length &amp;&amp; c &gt;= 0 &amp;&amp; c &lt; grid[0].Length &amp;&amp; grid[r][c] != &#x27;#&#x27;)
+            yield return (r, c);
+    }
+}
+
+// A WORD LADDER is a graph where neighbours are &quot;words one letter away&quot;
+static IEnumerable&lt;string&gt; WordNeighbours(string word, HashSet&lt;string&gt; dictionary)
+{
+    var chars = word.ToCharArray();
+    for (int i = 0; i &lt; chars.Length; i++)
+    {
+        char original = chars[i];
+        for (char c = &#x27;a&#x27;; c &lt;= &#x27;z&#x27;; c++)
+        {
+            if (c == original) continue;
+            chars[i] = c;
+            var candidate = new string(chars);
+            if (dictionary.Contains(candidate)) yield return candidate;
+        }
+        chars[i] = original;
+    }
+}
+// 26 * length candidates per word, which beats comparing against every word in
+// the dictionary when the dictionary is large. Choosing between those two is
+// itself the interesting decision.
+
+// A STATE MACHINE is a graph: nodes are states, edges are legal moves.
+// &quot;Minimum operations to turn X into Y&quot; is BFS over states, every time.
+
+// THE QUESTIONS TO ASK before writing anything:
+//   directed or undirected?
+//   weighted or unweighted?
+//   can it have cycles?
+//   is it connected, or are there several components?
+//   self-loops? parallel edges? negative weights?
+// Each one changes the algorithm, and asking is scored.</code></pre><pre data-lang="python" hidden><code>from collections import defaultdict, deque
+
+# ADJACENCY LIST
+graph: dict[int, list[int]] = defaultdict(list)
+def add_edge(u: int, v: int, directed: bool = False) -&gt; None:
+    graph[u].append(v)
+    if not directed:
+        graph[v].append(u)
+
+def build(n: int, edges: list[list[int]], directed: bool = False) -&gt; list[list[int]]:
+    adj: list[list[int]] = [[] for _ in range(n)]
+    for u, v in edges:
+        adj[u].append(v)
+        if not directed:
+            adj[v].append(u)
+    return adj
+
+# WEIGHTED
+def build_weighted(n: int, edges: list[list[int]]) -&gt; list[list[tuple[int, int]]]:
+    adj: list[list[tuple[int, int]]] = [[] for _ in range(n)]
+    for u, v, w in edges:
+        adj[u].append((v, w))
+        adj[v].append((u, w))
+    return adj
+
+# IMPLICIT
+DIRS = ((0, 1), (1, 0), (0, -1), (-1, 0))
+
+def neighbours(cell: tuple[int, int], grid: list[list[str]]):
+    r, c = cell
+    for dr, dc in DIRS:
+        nr, nc = r + dr, c + dc
+        if 0 &lt;= nr &lt; len(grid) and 0 &lt;= nc &lt; len(grid[0]) and grid[nr][nc] != &quot;#&quot;:
+            yield (nr, nc)
+
+def word_neighbours(word: str, dictionary: set[str]):
+    for i in range(len(word)):
+        for c in &quot;abcdefghijklmnopqrstuvwxyz&quot;:
+            if c == word[i]:
+                continue
+            candidate = word[:i] + c + word[i + 1:]
+            if candidate in dictionary:
+                yield candidate
+
+# The wildcard-bucket alternative, which is faster for long words:
+#   buckets[&quot;h*t&quot;] = [&quot;hot&quot;, &quot;hat&quot;, ...]  built once, O(1) neighbour lookup
+buckets: dict[str, list[str]] = defaultdict(list)
+for w in dictionary:
+    for i in range(len(w)):
+        buckets[w[:i] + &quot;*&quot; + w[i + 1:]].append(w)
+
+# QUESTIONS FIRST: directed? weighted? cyclic? connected? negative weights?</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Say the five clarifying questions out loud — directed, weighted, cyclic, connected, negative weights — before writing a line. Each one changes the algorithm, and asking is scored directly. The bigger signal is recognising an implicit graph: "minimum number of moves/transformations/steps" over <em>any</em> kind of state is BFS over a graph you never materialise, and spotting that in a word-ladder or puzzle problem is the whole insight.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Build an adjacency list from an edge list and deliberately forget the reverse edge; see what breaks.</li><li>Model a word ladder as a graph and compare the two neighbour strategies.</li><li>Find a problem that is not described as a graph and express it as one.</li></ul></div></section>
+<section id="graphs"><h2 id="graphs">BFS and DFS on graphs and grids</h2><p>Represent graphs as adjacency lists (<code>Dictionary&lt;int, List&lt;int&gt;&gt;</code>) or treat grids as implicit graphs. BFS (queue) for shortest path in unweighted graphs and level order; DFS (recursion or explicit stack) for connectivity, cycles and topological sort. Canonical: number of islands, clone graph, course schedule.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// BFS shortest path (unweighted)
+static int ShortestPath(Dictionary&lt;int, List&lt;int&gt;&gt; g, int src, int dst)
+{
+    var dist = new Dictionary&lt;int, int&gt; { [src] = 0 };
+    var q = new Queue&lt;int&gt;(); q.Enqueue(src);
+    while (q.Count &gt; 0)
+    {
+        var u = q.Dequeue();
+        if (u == dst) return dist[u];
+        foreach (var v in g.GetValueOrDefault(u, new()))
+            if (dist.TryAdd(v, dist[u] + 1)) q.Enqueue(v);
+    }
+    return -1;
+}
+
+// DFS on a grid: number of islands
+static int NumIslands(char[][] grid)
+{
+    int rows = grid.Length, cols = grid[0].Length, count = 0;
+    void Sink(int r, int c)
+    {
+        if (r &lt; 0 || c &lt; 0 || r &gt;= rows || c &gt;= cols || grid[r][c] != &#x27;1&#x27;) return;
+        grid[r][c] = &#x27;0&#x27;;
+        Sink(r + 1, c); Sink(r - 1, c); Sink(r, c + 1); Sink(r, c - 1);
+    }
+    for (int r = 0; r &lt; rows; r++) for (int c = 0; c &lt; cols; c++) if (grid[r][c] == &#x27;1&#x27;) { count++; Sink(r, c); }
+    return count;
+}
+
+// Topological sort (Kahn) — course schedule
+static bool CanFinish(int n, int[][] prereqs)
+{
+    var adj = new List&lt;int&gt;[n]; var indeg = new int[n];
+    for (int i = 0; i &lt; n; i++) adj[i] = new();
+    foreach (var p in prereqs) { adj[p[1]].Add(p[0]); indeg[p[0]]++; }
+    var q = new Queue&lt;int&gt;(Enumerable.Range(0, n).Where(i =&gt; indeg[i] == 0));
+    int seen = 0;
+    while (q.Count &gt; 0) { var u = q.Dequeue(); seen++; foreach (var v in adj[u]) if (--indeg[v] == 0) q.Enqueue(v); }
+    return seen == n;                       // false = cycle
+}
+
+// Dijkstra with PriorityQueue (.NET 6+)
+static int[] Dijkstra(List&lt;(int to, int w)&gt;[] g, int src)
+{
+    var dist = Enumerable.Repeat(int.MaxValue, g.Length).ToArray(); dist[src] = 0;
+    var pq = new PriorityQueue&lt;int, int&gt;(); pq.Enqueue(src, 0);
+    while (pq.TryDequeue(out var u, out var d))
+    {
+        if (d &gt; dist[u]) continue;
+        foreach (var (v, w) in g[u]) if (d + w &lt; dist[v]) { dist[v] = d + w; pq.Enqueue(v, dist[v]); }
+    }
+    return dist;
+}</code></pre><pre data-lang="python" hidden><code>from collections import deque, defaultdict
+import heapq
+
+def shortest_path(g: dict[int, list[int]], src: int, dst: int) -&gt; int:
+    dist = {src: 0}; q = deque([src])
+    while q:
+        u = q.popleft()
+        if u == dst: return dist[u]
+        for v in g.get(u, []):
+            if v not in dist:
+                dist[v] = dist[u] + 1; q.append(v)
+    return -1
+
+def num_islands(grid: list[list[str]]) -&gt; int:
+    rows, cols = len(grid), len(grid[0]); count = 0
+    def sink(r, c):
+        if r &lt; 0 or c &lt; 0 or r &gt;= rows or c &gt;= cols or grid[r][c] != &quot;1&quot;: return
+        grid[r][c] = &quot;0&quot;
+        for dr, dc in ((1,0),(-1,0),(0,1),(0,-1)): sink(r + dr, c + dc)
+    for r in range(rows):
+        for c in range(cols):
+            if grid[r][c] == &quot;1&quot;: count += 1; sink(r, c)
+    return count
+    # note: recursion limit ~1000 — use an explicit stack for big grids
+
+def can_finish(n: int, prereqs: list[list[int]]) -&gt; bool:
+    adj = defaultdict(list); indeg = [0] * n
+    for a, b in prereqs: adj[b].append(a); indeg[a] += 1
+    q = deque(i for i in range(n) if indeg[i] == 0); seen = 0
+    while q:
+        u = q.popleft(); seen += 1
+        for v in adj[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0: q.append(v)
+    return seen == n
+
+def dijkstra(g: list[list[tuple[int, int]]], src: int) -&gt; list[int]:
+    dist = [float(&quot;inf&quot;)] * len(g); dist[src] = 0
+    pq = [(0, src)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d &gt; dist[u]: continue
+        for v, w in g[u]:
+            if d + w &lt; dist[v]:
+                dist[v] = d + w; heapq.heappush(pq, (dist[v], v))
+    return dist</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Know which one each question wants. <strong>BFS</strong> for shortest path in an <em>unweighted</em> graph and for anything level-by-level; <strong>DFS</strong> for reachability, components, cycle detection and anything needing the full path. The two bugs interviewers watch for: marking visited at <em>dequeue</em> rather than at <em>enqueue</em>, which lets the same node enter the queue many times, and recursing without a visited set so a cycle loops forever.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Clone graph (BFS with a visited map).</li><li>Rotting oranges (multi-source BFS).</li><li>Word ladder.</li><li>Detect cycle in a directed graph with DFS colours.</li></ul></div></section>
+<section id="components"><h2 id="components">Connected components, flood fill and bipartite checking</h2><p>Three variations on "traverse from every unvisited node". <strong>Counting components</strong> is a loop over all nodes, starting a traversal from each unvisited one and counting the starts. <strong>Flood fill</strong> and "number of islands" are the same thing on a grid. <strong>Bipartite checking</strong> adds a two-colouring: colour each node the opposite of its parent, and the graph is bipartite exactly when no edge joins two nodes of the same colour.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// COUNT CONNECTED COMPONENTS
+static int CountComponents(int n, int[][] edges)
+{
+    var adj = Build(n, edges);
+    var seen = new bool[n];
+    int components = 0;
+
+    for (int start = 0; start &lt; n; start++)
+    {
+        if (seen[start]) continue;
+        components++;                            // a new component begins here
+
+        var stack = new Stack&lt;int&gt;();
+        stack.Push(start);
+        seen[start] = true;
+        while (stack.Count &gt; 0)
+            foreach (var next in adj[stack.Pop()])
+                if (!seen[next]) { seen[next] = true; stack.Push(next); }
+    }
+    return components;
+}
+
+// NUMBER OF ISLANDS - the same loop on an implicit grid, sinking as it goes
+static int NumIslands(char[][] grid)
+{
+    int rows = grid.Length, cols = grid[0].Length, count = 0;
+
+    void Sink(int r, int c)
+    {
+        if (r &lt; 0 || r &gt;= rows || c &lt; 0 || c &gt;= cols || grid[r][c] != &#x27;1&#x27;) return;
+        grid[r][c] = &#x27;0&#x27;;                        // the grid IS the visited set
+        Sink(r + 1, c); Sink(r - 1, c); Sink(r, c + 1); Sink(r, c - 1);
+    }
+
+    for (int r = 0; r &lt; rows; r++)
+        for (int c = 0; c &lt; cols; c++)
+            if (grid[r][c] == &#x27;1&#x27;) { count++; Sink(r, c); }
+    return count;
+}
+// Mutating the input is O(1) space but destructive - SAY that you are doing it
+// and offer a separate visited array if the caller needs the grid intact.
+// On a 1000x1000 all-land grid the recursion is 10^6 deep: use an explicit
+// stack, or BFS, for anything that large.
+
+// BIPARTITE - two-colour it; an edge between same-coloured nodes disproves it
+static bool IsBipartite(int[][] graph)
+{
+    var colour = new int[graph.Length];          // 0 = uncoloured, 1 and -1
+    for (int start = 0; start &lt; graph.Length; start++)
+    {
+        if (colour[start] != 0) continue;        // every COMPONENT must be checked
+
+        var queue = new Queue&lt;int&gt;();
+        queue.Enqueue(start);
+        colour[start] = 1;
+
+        while (queue.Count &gt; 0)
+        {
+            int node = queue.Dequeue();
+            foreach (var next in graph[node])
+            {
+                if (colour[next] == colour[node]) return false;   // odd cycle
+                if (colour[next] != 0) continue;
+                colour[next] = -colour[node];
+                queue.Enqueue(next);
+            }
+        }
+    }
+    return true;
+}
+// A graph is bipartite iff it contains no odd-length cycle. Worth saying -
+// it is the mathematical fact the algorithm is detecting.
+
+// CYCLE DETECTION, UNDIRECTED: a cycle exists if you reach a visited node that
+// is not the one you came from
+static bool HasCycleUndirected(int n, List&lt;int&gt;[] adj)
+{
+    var seen = new bool[n];
+    bool Dfs(int node, int parent)
+    {
+        seen[node] = true;
+        foreach (var next in adj[node])
+        {
+            if (!seen[next]) { if (Dfs(next, node)) return true; }
+            else if (next != parent) return true;          // the `parent` check
+        }
+        return false;
+    }
+    for (int i = 0; i &lt; n; i++) if (!seen[i] &amp;&amp; Dfs(i, -1)) return true;
+    return false;
+}
+
+// CYCLE DETECTION, DIRECTED: three colours. A back-edge to a node still ON THE
+// STACK is a cycle; an edge to a finished node is not.
+static bool HasCycleDirected(int n, List&lt;int&gt;[] adj)
+{
+    var state = new int[n];                      // 0 unvisited, 1 in progress, 2 done
+    bool Dfs(int node)
+    {
+        state[node] = 1;
+        foreach (var next in adj[node])
+        {
+            if (state[next] == 1) return true;   // back-edge: a cycle
+            if (state[next] == 0 &amp;&amp; Dfs(next)) return true;
+        }
+        state[node] = 2;
+        return false;
+    }
+    for (int i = 0; i &lt; n; i++) if (state[i] == 0 &amp;&amp; Dfs(i)) return true;
+    return false;
+}
+// The directed and undirected cases need DIFFERENT algorithms - using the
+// undirected one on a directed graph is a classic error.</code></pre><pre data-lang="python" hidden><code>from collections import deque
+
+def count_components(n: int, edges: list[list[int]]) -&gt; int:
+    adj = build(n, edges)
+    seen = [False] * n
+    components = 0
+    for start in range(n):
+        if seen[start]:
+            continue
+        components += 1
+        stack = [start]
+        seen[start] = True
+        while stack:
+            for nxt in adj[stack.pop()]:
+                if not seen[nxt]:
+                    seen[nxt] = True
+                    stack.append(nxt)
+    return components
+
+def num_islands(grid: list[list[str]]) -&gt; int:
+    rows, cols = len(grid), len(grid[0])
+    count = 0
+
+    def sink(r: int, c: int) -&gt; None:
+        stack = [(r, c)]                        # iterative: 10^6 depth is common
+        while stack:
+            r, c = stack.pop()
+            if not (0 &lt;= r &lt; rows and 0 &lt;= c &lt; cols) or grid[r][c] != &quot;1&quot;:
+                continue
+            grid[r][c] = &quot;0&quot;
+            stack.extend(((r+1,c), (r-1,c), (r,c+1), (r,c-1)))
+
+    for r in range(rows):
+        for c in range(cols):
+            if grid[r][c] == &quot;1&quot;:
+                count += 1
+                sink(r, c)
+    return count
+
+def is_bipartite(graph: list[list[int]]) -&gt; bool:
+    colour = [0] * len(graph)
+    for start in range(len(graph)):
+        if colour[start]:
+            continue
+        queue = deque([start])
+        colour[start] = 1
+        while queue:
+            node = queue.popleft()
+            for nxt in graph[node]:
+                if colour[nxt] == colour[node]:
+                    return False
+                if not colour[nxt]:
+                    colour[nxt] = -colour[node]
+                    queue.append(nxt)
+    return True
+
+def has_cycle_undirected(n: int, adj: list[list[int]]) -&gt; bool:
+    seen = [False] * n
+    def dfs(node: int, parent: int) -&gt; bool:
+        seen[node] = True
+        for nxt in adj[node]:
+            if not seen[nxt]:
+                if dfs(nxt, node):
+                    return True
+            elif nxt != parent:
+                return True
+        return False
+    return any(not seen[i] and dfs(i, -1) for i in range(n))
+
+def has_cycle_directed(n: int, adj: list[list[int]]) -&gt; bool:
+    UNVISITED, IN_PROGRESS, DONE = 0, 1, 2
+    state = [UNVISITED] * n
+    def dfs(node: int) -&gt; bool:
+        state[node] = IN_PROGRESS
+        for nxt in adj[node]:
+            if state[nxt] == IN_PROGRESS:
+                return True
+            if state[nxt] == UNVISITED and dfs(nxt):
+                return True
+        state[node] = DONE
+        return False
+    return any(state[i] == UNVISITED and dfs(i) for i in range(n))</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The detail that separates answers is that <strong>directed and undirected cycle detection are different algorithms</strong>: undirected needs the "ignore the node I came from" parent check, directed needs three states because an edge to an already-finished node is not a cycle. Using the undirected version on a directed graph is a common and quietly wrong answer. For islands, say explicitly whether you are mutating the input, and note that a large grid needs an iterative traversal because the recursion can go a million frames deep.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Count components, then adapt the same loop to number-of-islands.</li><li>Implement both cycle detections and construct a directed graph the undirected one gets wrong.</li><li>Check bipartiteness on a graph with several components and confirm you start from each.</li></ul></div></section>
+<section id="topological"><h2 id="topological">Topological sort: Kahn and DFS</h2><p>A linear ordering of a directed acyclic graph where every edge points forwards. The giveaway wording is "prerequisites", "dependencies", "build order", "course schedule" — and the ordering exists <strong>if and only if there is no cycle</strong>, so topological sort doubles as cycle detection on a directed graph.</p><p>Two implementations. <strong>Kahn's</strong> is BFS on in-degrees: repeatedly take a node with in-degree zero and remove it; if you finish with fewer than V nodes, there was a cycle. <strong>DFS</strong> pushes each node onto a stack after its descendants, and the reversed finish order is the answer. Kahn's is easier to get right and tells you about the cycle for free, so prefer it.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// KAHN - BFS on in-degrees. The version to default to.
+static int[] TopoSort(int n, int[][] edges)      // edges: [from, to]
+{
+    var adj = new List&lt;int&gt;[n];
+    for (int i = 0; i &lt; n; i++) adj[i] = [];
+    var inDegree = new int[n];
+
+    foreach (var e in edges) { adj[e[0]].Add(e[1]); inDegree[e[1]]++; }
+
+    var queue = new Queue&lt;int&gt;();
+    for (int i = 0; i &lt; n; i++) if (inDegree[i] == 0) queue.Enqueue(i);
+
+    var order = new List&lt;int&gt;(n);
+    while (queue.Count &gt; 0)
+    {
+        int node = queue.Dequeue();
+        order.Add(node);
+        foreach (var next in adj[node])
+            if (--inDegree[next] == 0) queue.Enqueue(next);   // now unblocked
+    }
+
+    // fewer than n nodes emitted =&gt; something never reached in-degree 0 =&gt; a cycle
+    return order.Count == n ? order.ToArray() : [];
+}
+// O(V + E). The cycle check is free, which is why &quot;can you finish all courses?&quot;
+// is just `TopoSort(...).Length == n`.
+
+// COURSE SCHEDULE - the canonical phrasing
+static bool CanFinish(int numCourses, int[][] prerequisites)
+    =&gt; TopoSort(numCourses, prerequisites.Select(p =&gt; new[] { p[1], p[0] }).ToArray())
+       .Length == numCourses;
+// Note the swap: [course, prerequisite] means the EDGE goes prerequisite -&gt; course.
+// Getting this direction backwards is the most common bug in the problem.
+
+// DFS VERSION - reverse finish order
+static int[] TopoSortDfs(int n, List&lt;int&gt;[] adj)
+{
+    var state = new int[n];                      // 0 unvisited, 1 in progress, 2 done
+    var order = new Stack&lt;int&gt;();
+
+    bool Dfs(int node)
+    {
+        state[node] = 1;
+        foreach (var next in adj[node])
+        {
+            if (state[next] == 1) return false;              // cycle
+            if (state[next] == 0 &amp;&amp; !Dfs(next)) return false;
+        }
+        state[node] = 2;
+        order.Push(node);                        // pushed AFTER its descendants
+        return true;
+    }
+
+    for (int i = 0; i &lt; n; i++)
+        if (state[i] == 0 &amp;&amp; !Dfs(i)) return [];
+    return order.ToArray();                      // Stack enumerates top-first
+}
+
+// LEXICOGRAPHICALLY SMALLEST ordering: swap Kahn&#x27;s queue for a PriorityQueue
+var ready = new PriorityQueue&lt;int, int&gt;();
+// ...then always take the smallest available node. A nice follow-up to offer.
+
+// ALIEN DICTIONARY - the hard, satisfying application. Derive edges by comparing
+// adjacent words at their first differing character, then topologically sort.
+static string AlienOrder(string[] words)
+{
+    var adj = new Dictionary&lt;char, HashSet&lt;char&gt;&gt;();
+    var inDegree = new Dictionary&lt;char, int&gt;();
+    foreach (var w in words) foreach (var c in w)
+    { adj.TryAdd(c, []); inDegree.TryAdd(c, 0); }
+
+    for (int i = 0; i + 1 &lt; words.Length; i++)
+    {
+        string a = words[i], b = words[i + 1];
+        if (a.Length &gt; b.Length &amp;&amp; a.StartsWith(b)) return &quot;&quot;;   // invalid input
+        for (int j = 0; j &lt; Math.Min(a.Length, b.Length); j++)
+        {
+            if (a[j] == b[j]) continue;
+            if (adj[a[j]].Add(b[j])) inDegree[b[j]]++;           // first difference
+            break;                                                // ONLY the first
+        }
+    }
+
+    var queue = new Queue&lt;char&gt;(inDegree.Where(kv =&gt; kv.Value == 0).Select(kv =&gt; kv.Key));
+    var sb = new StringBuilder();
+    while (queue.Count &gt; 0)
+    {
+        char c = queue.Dequeue();
+        sb.Append(c);
+        foreach (var next in adj[c]) if (--inDegree[next] == 0) queue.Enqueue(next);
+    }
+    return sb.Length == inDegree.Count ? sb.ToString() : &quot;&quot;;     // cycle =&gt; no order
+}</code></pre><pre data-lang="python" hidden><code>from collections import deque, defaultdict
+import heapq
+
+def topo_sort(n: int, edges: list[list[int]]) -&gt; list[int]:
+    adj: list[list[int]] = [[] for _ in range(n)]
+    in_degree = [0] * n
+    for u, v in edges:
+        adj[u].append(v)
+        in_degree[v] += 1
+
+    queue = deque(i for i in range(n) if in_degree[i] == 0)
+    order: list[int] = []
+    while queue:
+        node = queue.popleft()
+        order.append(node)
+        for nxt in adj[node]:
+            in_degree[nxt] -= 1
+            if in_degree[nxt] == 0:
+                queue.append(nxt)
+
+    return order if len(order) == n else []      # short =&gt; a cycle
+
+def can_finish(num_courses: int, prerequisites: list[list[int]]) -&gt; bool:
+    # [course, prereq] means the edge is prereq -&gt; course
+    edges = [[prereq, course] for course, prereq in prerequisites]
+    return len(topo_sort(num_courses, edges)) == num_courses
+
+def topo_sort_dfs(n: int, adj: list[list[int]]) -&gt; list[int]:
+    UNVISITED, IN_PROGRESS, DONE = 0, 1, 2
+    state = [UNVISITED] * n
+    order: list[int] = []
+
+    def dfs(node: int) -&gt; bool:
+        state[node] = IN_PROGRESS
+        for nxt in adj[node]:
+            if state[nxt] == IN_PROGRESS:
+                return False
+            if state[nxt] == UNVISITED and not dfs(nxt):
+                return False
+        state[node] = DONE
+        order.append(node)                       # appended AFTER its descendants
+        return True
+
+    for i in range(n):
+        if state[i] == UNVISITED and not dfs(i):
+            return []
+    return order[::-1]                           # reversed finish order
+
+# Lexicographically smallest: a heap instead of a deque
+def topo_sort_smallest(n: int, edges: list[list[int]]) -&gt; list[int]:
+    adj: list[list[int]] = [[] for _ in range(n)]
+    in_degree = [0] * n
+    for u, v in edges:
+        adj[u].append(v); in_degree[v] += 1
+
+    ready = [i for i in range(n) if in_degree[i] == 0]
+    heapq.heapify(ready)
+    order = []
+    while ready:
+        node = heapq.heappop(ready)
+        order.append(node)
+        for nxt in adj[node]:
+            in_degree[nxt] -= 1
+            if in_degree[nxt] == 0:
+                heapq.heappush(ready, nxt)
+    return order if len(order) == n else []
+
+# The stdlib has one, and it is worth naming (3.9+)
+from graphlib import TopologicalSorter
+ts = TopologicalSorter({&quot;course2&quot;: {&quot;course1&quot;}, &quot;course3&quot;: {&quot;course2&quot;}})
+list(ts.static_order())            # raises CycleError on a cycle</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Recognise it from "prerequisites", "dependencies" or "build order", and say immediately that a topological order exists if and only if the graph is acyclic — which makes "can you finish all the courses?" the same question. Prefer Kahn's and explain why: the cycle detection falls out of the node count for free. The bug to guard against out loud is edge direction: "[course, prerequisite]" means the edge runs prerequisite → course, and reversing it silently produces a wrong answer that passes the simple tests.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement Kahn's algorithm and use the node count as the cycle check.</li><li>Solve "course schedule II" and get the edge direction right first time.</li><li>Produce the lexicographically smallest valid ordering with a heap.</li></ul></div></section>
+<section id="union-find"><h2 id="union-find">Union-Find (disjoint set union)</h2><p>A structure for "are these two things in the same group?" and "merge these two groups", both in effectively O(1). It is the right answer whenever connectivity is being built up <em>incrementally</em> — where a DFS would have to re-run after every added edge.</p><p>Two optimisations make it fast and you should include both: <strong>path compression</strong> (point every node directly at the root during <code>Find</code>) and <strong>union by rank or size</strong> (attach the smaller tree under the larger). Together they give O(α(n)) amortised, where α is the inverse Ackermann function — under 5 for any input that exists.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class UnionFind
+{
+    private readonly int[] _parent;
+    private readonly int[] _size;
+    public int Components { get; private set; }
+
+    public UnionFind(int n)
+    {
+        _parent = new int[n];
+        _size = new int[n];
+        for (int i = 0; i &lt; n; i++) { _parent[i] = i; _size[i] = 1; }
+        Components = n;
+    }
+
+    // PATH COMPRESSION - every node on the way up is repointed at the root
+    public int Find(int x)
+    {
+        while (_parent[x] != x)
+        {
+            _parent[x] = _parent[_parent[x]];    // path HALVING: one line, iterative,
+            x = _parent[x];                      // no recursion to blow the stack
+        }
+        return x;
+    }
+
+    // UNION BY SIZE - the smaller tree hangs off the larger
+    public bool Union(int a, int b)
+    {
+        int rootA = Find(a), rootB = Find(b);
+        if (rootA == rootB) return false;        // already together
+
+        if (_size[rootA] &lt; _size[rootB]) (rootA, rootB) = (rootB, rootA);
+        _parent[rootB] = rootA;
+        _size[rootA] += _size[rootB];
+        Components--;
+        return true;                             // true == &quot;this edge merged two groups&quot;
+    }
+
+    public bool Connected(int a, int b) =&gt; Find(a) == Find(b);
+    public int  SizeOf(int x) =&gt; _size[Find(x)];
+}
+// O(alpha(n)) amortised per operation - effectively constant.
+// Union returning a bool is what makes Kruskal and cycle detection one-liners.
+
+// COUNT COMPONENTS - just merge every edge and read the counter
+static int CountComponents(int n, int[][] edges)
+{
+    var uf = new UnionFind(n);
+    foreach (var e in edges) uf.Union(e[0], e[1]);
+    return uf.Components;
+}
+
+// CYCLE DETECTION in an undirected graph - an edge joining two nodes already
+// in the same set closes a cycle
+static bool HasCycle(int n, int[][] edges)
+{
+    var uf = new UnionFind(n);
+    foreach (var e in edges) if (!uf.Union(e[0], e[1])) return true;
+    return false;
+}
+
+// VALID TREE - connected AND acyclic: exactly n-1 edges, all of which merge
+static bool ValidTree(int n, int[][] edges)
+{
+    if (edges.Length != n - 1) return false;
+    var uf = new UnionFind(n);
+    foreach (var e in edges) if (!uf.Union(e[0], e[1])) return false;
+    return true;
+}
+
+// ACCOUNTS MERGE / friend circles / &quot;number of provinces&quot; - all the same shape:
+// map each item to an index, union everything that belongs together, group by root.
+
+// REDUNDANT CONNECTION - the first edge whose Union returns false
+static int[] FindRedundant(int[][] edges)
+{
+    var uf = new UnionFind(edges.Length + 1);
+    foreach (var e in edges) if (!uf.Union(e[0], e[1])) return e;
+    return [];
+}
+
+// WHEN UNION-FIND BEATS DFS: edges arrive one at a time and you must answer
+// connectivity after each. DFS is O(V+E) per query; union-find is ~O(1).
+// WHEN IT DOES NOT: union-find cannot SPLIT a set, and it cannot give you the
+// path between two nodes - only whether one exists.</code></pre><pre data-lang="python" hidden><code>class UnionFind:
+    __slots__ = (&quot;parent&quot;, &quot;size&quot;, &quot;components&quot;)
+
+    def __init__(self, n: int) -&gt; None:
+        self.parent = list(range(n))
+        self.size = [1] * n
+        self.components = n
+
+    def find(self, x: int) -&gt; int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]   # path halving
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int) -&gt; bool:
+        root_a, root_b = self.find(a), self.find(b)
+        if root_a == root_b:
+            return False
+        if self.size[root_a] &lt; self.size[root_b]:
+            root_a, root_b = root_b, root_a
+        self.parent[root_b] = root_a
+        self.size[root_a] += self.size[root_b]
+        self.components -= 1
+        return True
+
+    def connected(self, a: int, b: int) -&gt; bool:
+        return self.find(a) == self.find(b)
+
+    def size_of(self, x: int) -&gt; int:
+        return self.size[self.find(x)]
+
+
+def count_components(n: int, edges: list[list[int]]) -&gt; int:
+    uf = UnionFind(n)
+    for u, v in edges:
+        uf.union(u, v)
+    return uf.components
+
+def has_cycle(n: int, edges: list[list[int]]) -&gt; bool:
+    uf = UnionFind(n)
+    return any(not uf.union(u, v) for u, v in edges)
+
+def valid_tree(n: int, edges: list[list[int]]) -&gt; bool:
+    if len(edges) != n - 1:
+        return False
+    uf = UnionFind(n)
+    return all(uf.union(u, v) for u, v in edges)
+
+# For non-integer items, map to indices first - or use a dict-backed version
+class UnionFindDict:
+    def __init__(self) -&gt; None:
+        self.parent: dict = {}
+
+    def find(self, x):
+        self.parent.setdefault(x, x)
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a, b) -&gt; bool:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return False
+        self.parent[rb] = ra
+        return True
+
+# ACCOUNTS MERGE - union emails that share an account, then group by root
+from collections import defaultdict
+def accounts_merge(accounts: list[list[str]]) -&gt; list[list[str]]:
+    uf = UnionFindDict()
+    owner: dict[str, str] = {}
+    for name, *emails in accounts:
+        for email in emails:
+            owner[email] = name
+            uf.union(emails[0], email)
+
+    groups: dict[str, list[str]] = defaultdict(list)
+    for email in owner:
+        groups[uf.find(email)].append(email)
+
+    return [[owner[root]] + sorted(emails) for root, emails in groups.items()]</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Be able to write it in about fifteen lines with both optimisations and say the complexity properly: O(α(n)) amortised, effectively constant. The question worth pre-empting is when union-find beats DFS — when edges arrive incrementally and connectivity must be answered after each one, because DFS would re-run from scratch every time. Also know its limits: it cannot split a set and it cannot give you the path, only whether one exists. Making <code>Union</code> return a bool is the small design choice that turns cycle detection and Kruskal into one-liners.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write union-find with path compression and union by size from memory.</li><li>Solve "number of provinces" and "redundant connection" with it.</li><li>Solve "accounts merge", mapping strings to sets.</li></ul></div></section>
+<section id="dijkstra"><h2 id="dijkstra">Dijkstra and 0-1 BFS</h2><p>Shortest path with <strong>non-negative</strong> weights. It is BFS with a priority queue instead of a plain queue: always expand the closest unfinalised node, and because weights are non-negative, the first time you pop a node you have its final distance.</p><p>That non-negativity condition is the question. With a negative edge the greedy finalisation is invalid — a longer-looking path could later be reduced — and you need Bellman-Ford instead.</p><p>The implementation detail: .NET's <code>PriorityQueue</code> has no decrease-key, so use <strong>lazy deletion</strong> — push the improved distance as a new entry and skip stale pops. And if every weight is 0 or 1, skip the heap entirely: a deque with zero-weight edges pushed to the front gives the same answer in O(V + E).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// DIJKSTRA with lazy deletion
+static int[] Dijkstra(int n, List&lt;(int To, int Weight)&gt;[] adj, int source)
+{
+    var dist = new int[n];
+    Array.Fill(dist, int.MaxValue);
+    dist[source] = 0;
+
+    var pq = new PriorityQueue&lt;int, int&gt;();      // (node, distance)
+    pq.Enqueue(source, 0);
+
+    while (pq.TryDequeue(out int node, out int d))
+    {
+        if (d &gt; dist[node]) continue;            // LAZY DELETION: a stale entry
+
+        foreach (var (next, weight) in adj[node])
+        {
+            int candidate = d + weight;
+            if (candidate &gt;= dist[next]) continue;
+            dist[next] = candidate;
+            pq.Enqueue(next, candidate);         // push a NEW entry, do not update
+        }
+    }
+    return dist;
+}
+// O((V + E) log V). The `if (d &gt; dist[node]) continue;` line is what makes the
+// lazy approach correct - without it you reprocess stale entries and the
+// complexity degrades. It is the line interviewers look for.
+
+// RECONSTRUCTING THE PATH - keep a predecessor array
+static List&lt;int&gt; ShortestPath(int n, List&lt;(int, int)&gt;[] adj, int source, int target)
+{
+    var dist = new int[n]; Array.Fill(dist, int.MaxValue); dist[source] = 0;
+    var prev = new int[n]; Array.Fill(prev, -1);
+
+    var pq = new PriorityQueue&lt;int, int&gt;();
+    pq.Enqueue(source, 0);
+    while (pq.TryDequeue(out int node, out int d))
+    {
+        if (d &gt; dist[node]) continue;
+        if (node == target) break;               // early exit: we are finalised
+        foreach (var (next, w) in adj[node])
+            if (d + w &lt; dist[next]) { dist[next] = d + w; prev[next] = node; pq.Enqueue(next, d + w); }
+    }
+
+    if (dist[target] == int.MaxValue) return [];          // unreachable
+    var path = new List&lt;int&gt;();
+    for (int at = target; at != -1; at = prev[at]) path.Add(at);
+    path.Reverse();
+    return path;
+}
+
+// 0-1 BFS - every weight is 0 or 1, so a DEQUE replaces the heap: O(V + E)
+static int[] ZeroOneBfs(int n, List&lt;(int To, int Weight)&gt;[] adj, int source)
+{
+    var dist = new int[n];
+    Array.Fill(dist, int.MaxValue);
+    dist[source] = 0;
+
+    var deque = new LinkedList&lt;int&gt;();
+    deque.AddFirst(source);
+
+    while (deque.Count &gt; 0)
+    {
+        int node = deque.First!.Value;
+        deque.RemoveFirst();
+
+        foreach (var (next, weight) in adj[node])
+        {
+            if (dist[node] + weight &gt;= dist[next]) continue;
+            dist[next] = dist[node] + weight;
+            if (weight == 0) deque.AddFirst(next);        // free: same &quot;layer&quot;
+            else             deque.AddLast(next);         // costs 1: next layer
+        }
+    }
+    return dist;
+}
+// Classic use: &quot;minimum obstacles to remove to reach the end&quot; on a grid, where
+// moving into an empty cell costs 0 and breaking a wall costs 1.
+
+// VARIANTS the same loop solves, with the relaxation changed:
+//   PATH WITH MAXIMUM PROBABILITY  - a MAX-heap, multiply instead of add
+//   NETWORK DELAY TIME             - Dijkstra, answer = max over all dist
+//   CHEAPEST FLIGHTS WITH K STOPS  - Dijkstra breaks (the stop limit is a second
+//                                    dimension); use Bellman-Ford with k rounds,
+//                                    or make the state (node, stopsUsed)
+//   SWIM IN RISING WATER / PATH WITH MINIMUM EFFORT
+//                                  - &quot;minimise the maximum edge on the path&quot;:
+//                                    relax with max(d, w) instead of d + w
+
+// A* is Dijkstra with a heuristic added to the priority: priority = dist +
+// estimatedRemaining. It is correct whenever the heuristic never overestimates.</code></pre><pre data-lang="python" hidden><code>import heapq
+from collections import deque
+
+def dijkstra(n: int, adj: list[list[tuple[int, int]]], source: int) -&gt; list[float]:
+    dist = [float(&quot;inf&quot;)] * n
+    dist[source] = 0
+    pq: list[tuple[int, int]] = [(0, source)]        # (distance, node)
+
+    while pq:
+        d, node = heapq.heappop(pq)
+        if d &gt; dist[node]:                           # stale entry
+            continue
+        for nxt, weight in adj[node]:
+            candidate = d + weight
+            if candidate &lt; dist[nxt]:
+                dist[nxt] = candidate
+                heapq.heappush(pq, (candidate, nxt))
+    return dist
+# Distance FIRST in the tuple, so the heap orders by it.
+
+def shortest_path(n, adj, source: int, target: int) -&gt; list[int]:
+    dist = [float(&quot;inf&quot;)] * n
+    dist[source] = 0
+    prev = [-1] * n
+    pq = [(0, source)]
+
+    while pq:
+        d, node = heapq.heappop(pq)
+        if d &gt; dist[node]:
+            continue
+        if node == target:
+            break
+        for nxt, w in adj[node]:
+            if d + w &lt; dist[nxt]:
+                dist[nxt] = d + w
+                prev[nxt] = node
+                heapq.heappush(pq, (d + w, nxt))
+
+    if dist[target] == float(&quot;inf&quot;):
+        return []
+    path, at = [], target
+    while at != -1:
+        path.append(at)
+        at = prev[at]
+    return path[::-1]
+
+def zero_one_bfs(n: int, adj, source: int) -&gt; list[float]:
+    dist = [float(&quot;inf&quot;)] * n
+    dist[source] = 0
+    dq = deque([source])
+    while dq:
+        node = dq.popleft()
+        for nxt, weight in adj[node]:
+            if dist[node] + weight &lt; dist[nxt]:
+                dist[nxt] = dist[node] + weight
+                if weight == 0: dq.appendleft(nxt)   # same layer
+                else:           dq.append(nxt)       # next layer
+    return dist
+
+# &quot;Minimise the maximum edge&quot; - change only the relaxation
+def minimum_effort(heights: list[list[int]]) -&gt; int:
+    rows, cols = len(heights), len(heights[0])
+    effort = [[float(&quot;inf&quot;)] * cols for _ in range(rows)]
+    effort[0][0] = 0
+    pq = [(0, 0, 0)]
+    while pq:
+        e, r, c = heapq.heappop(pq)
+        if (r, c) == (rows - 1, cols - 1):
+            return e
+        if e &gt; effort[r][c]:
+            continue
+        for dr, dc in ((1,0), (-1,0), (0,1), (0,-1)):
+            nr, nc = r + dr, c + dc
+            if 0 &lt;= nr &lt; rows and 0 &lt;= nc &lt; cols:
+                step = max(e, abs(heights[nr][nc] - heights[r][c]))   # MAX, not +
+                if step &lt; effort[nr][nc]:
+                    effort[nr][nc] = step
+                    heapq.heappush(pq, (step, nr, nc))
+    return 0</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>State the precondition before writing anything: Dijkstra requires non-negative weights, because it finalises a node the first time it is popped and a negative edge could later reduce an already-finalised distance. The implementation detail that gets looked for is lazy deletion — neither <code>PriorityQueue</code> nor <code>heapq</code> has decrease-key, so you push a new entry and skip stale pops with <code>if (d &gt; dist[node]) continue;</code>. 0-1 BFS is a strong thing to offer unprompted when all weights are 0 or 1: a deque instead of a heap, O(V + E) instead of O(E log V).</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write Dijkstra with lazy deletion and reconstruct the path with a predecessor array.</li><li>Solve "path with minimum effort" by changing only the relaxation step.</li><li>Solve a 0-1 weighted grid with a deque and compare it to the heap version.</li></ul></div></section>
+<section id="other-shortest-paths"><h2 id="other-shortest-paths">Bellman-Ford, Floyd-Warshall and MSTs</h2><p>The rest of the shortest-path toolkit, mostly needed so you can say why you are <em>not</em> using them. <strong>Bellman-Ford</strong> relaxes every edge V−1 times: O(V·E), slower than Dijkstra but it tolerates negative weights and detects negative cycles (if a V-th pass still improves something, one exists). <strong>Floyd-Warshall</strong> is all-pairs in O(V³) and is fifteen lines, which makes it the right answer for small dense graphs.</p><p>A <strong>minimum spanning tree</strong> answers a different question: connect every node at minimum total cost. <strong>Kruskal</strong> sorts the edges and adds any that does not create a cycle (union-find does the check); <strong>Prim</strong> grows one tree with a heap. Kruskal is easier to write if you already have union-find.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// BELLMAN-FORD - handles negative weights, detects negative cycles. O(V*E).
+static (int[] Dist, bool HasNegativeCycle) BellmanFord(int n, int[][] edges, int source)
+{
+    var dist = new int[n];
+    Array.Fill(dist, int.MaxValue);
+    dist[source] = 0;
+
+    for (int pass = 0; pass &lt; n - 1; pass++)     // V-1 passes is always enough
+    {
+        bool changed = false;
+        foreach (var e in edges)
+        {
+            if (dist[e[0]] == int.MaxValue) continue;          // unreachable
+            if (dist[e[0]] + e[2] &gt;= dist[e[1]]) continue;
+            dist[e[1]] = dist[e[0]] + e[2];
+            changed = true;
+        }
+        if (!changed) break;                     // early exit when it settles
+    }
+
+    // a V-th pass that still improves something proves a negative cycle
+    foreach (var e in edges)
+        if (dist[e[0]] != int.MaxValue &amp;&amp; dist[e[0]] + e[2] &lt; dist[e[1]])
+            return (dist, true);
+
+    return (dist, false);
+}
+// WHY V-1 PASSES: any shortest path has at most V-1 edges, and pass k
+// guarantees every shortest path of k edges is correct. That is the proof.
+
+// CHEAPEST FLIGHTS WITHIN K STOPS - Bellman-Ford shines here, because
+// &quot;at most k stops&quot; is exactly &quot;k+1 relaxation passes&quot;
+static int FindCheapestPrice(int n, int[][] flights, int src, int dst, int k)
+{
+    var dist = new int[n];
+    Array.Fill(dist, int.MaxValue);
+    dist[src] = 0;
+
+    for (int i = 0; i &lt;= k; i++)
+    {
+        var snapshot = (int[])dist.Clone();      // use the PREVIOUS round&#x27;s values,
+        foreach (var f in flights)               // or one pass can use multiple hops
+        {
+            if (snapshot[f[0]] == int.MaxValue) continue;
+            dist[f[1]] = Math.Min(dist[f[1]], snapshot[f[0]] + f[2]);
+        }
+    }
+    return dist[dst] == int.MaxValue ? -1 : dist[dst];
+}
+// The clone is essential and is the bug people ship: without it, one pass can
+// chain several flights and you exceed the stop limit.
+
+// FLOYD-WARSHALL - all pairs, O(V^3), fifteen lines
+static int[,] FloydWarshall(int n, int[][] edges)
+{
+    const int INF = 1_000_000_000;
+    var d = new int[n, n];
+    for (int i = 0; i &lt; n; i++)
+        for (int j = 0; j &lt; n; j++) d[i, j] = i == j ? 0 : INF;
+    foreach (var e in edges) d[e[0], e[1]] = Math.Min(d[e[0], e[1]], e[2]);
+
+    for (int k = 0; k &lt; n; k++)                  // the INTERMEDIATE node is OUTERMOST
+        for (int i = 0; i &lt; n; i++)
+            for (int j = 0; j &lt; n; j++)
+                if (d[i, k] + d[k, j] &lt; d[i, j]) d[i, j] = d[i, k] + d[k, j];
+
+    return d;
+}
+// The k loop MUST be outermost - it is the DP dimension (&quot;paths using only the
+// first k nodes as intermediates&quot;). Putting it inside gives wrong answers, and
+// it is the single most common Floyd-Warshall bug.
+// A negative d[i,i] afterwards means a negative cycle through i.
+
+// KRUSKAL - sort the edges, add any that merges two components. Needs union-find.
+static int MstKruskal(int n, int[][] edges)      // edges: [u, v, weight]
+{
+    Array.Sort(edges, (a, b) =&gt; a[2].CompareTo(b[2]));
+    var uf = new UnionFind(n);
+    int total = 0, used = 0;
+
+    foreach (var e in edges)
+    {
+        if (!uf.Union(e[0], e[1])) continue;     // would close a cycle: skip
+        total += e[2];
+        if (++used == n - 1) break;              // a tree has exactly n-1 edges
+    }
+    return used == n - 1 ? total : -1;           // -1 == the graph is disconnected
+}
+// O(E log E) for the sort, which dominates. Union returning a bool is what
+// makes the cycle check one line.
+
+// PRIM - grow a single tree from any node, always taking the cheapest edge out
+static int MstPrim(int n, List&lt;(int To, int Weight)&gt;[] adj)
+{
+    var inTree = new bool[n];
+    var pq = new PriorityQueue&lt;int, int&gt;();
+    pq.Enqueue(0, 0);
+    int total = 0, count = 0;
+
+    while (pq.TryDequeue(out int node, out int weight))
+    {
+        if (inTree[node]) continue;              // lazy deletion again
+        inTree[node] = true;
+        total += weight;
+        count++;
+        foreach (var (next, w) in adj[node])
+            if (!inTree[next]) pq.Enqueue(next, w);
+    }
+    return count == n ? total : -1;
+}
+// O(E log V). Prefer Prim on a DENSE graph, Kruskal on a SPARSE one or when
+// you already have union-find to hand.
+
+// THE CHOICE, in one table
+//   unweighted shortest path          BFS                 O(V + E)
+//   weights all 0 or 1                0-1 BFS (deque)     O(V + E)
+//   non-negative weights              Dijkstra            O(E log V)
+//   negative weights / cycle check    Bellman-Ford        O(V * E)
+//   all pairs, small dense graph      Floyd-Warshall      O(V^3)
+//   connect everything, min cost      Kruskal / Prim      O(E log E)</code></pre><pre data-lang="python" hidden><code>import heapq
+
+def bellman_ford(n: int, edges: list[list[int]], source: int):
+    dist = [float(&quot;inf&quot;)] * n
+    dist[source] = 0
+
+    for _ in range(n - 1):
+        changed = False
+        for u, v, w in edges:
+            if dist[u] != float(&quot;inf&quot;) and dist[u] + w &lt; dist[v]:
+                dist[v] = dist[u] + w
+                changed = True
+        if not changed:
+            break
+
+    has_negative_cycle = any(
+        dist[u] != float(&quot;inf&quot;) and dist[u] + w &lt; dist[v] for u, v, w in edges)
+    return dist, has_negative_cycle
+
+def find_cheapest_price(n, flights, src, dst, k) -&gt; int:
+    dist = [float(&quot;inf&quot;)] * n
+    dist[src] = 0
+    for _ in range(k + 1):
+        snapshot = dist[:]                       # the clone is ESSENTIAL
+        for u, v, w in flights:
+            if snapshot[u] + w &lt; dist[v]:
+                dist[v] = snapshot[u] + w
+    return -1 if dist[dst] == float(&quot;inf&quot;) else dist[dst]
+
+def floyd_warshall(n: int, edges: list[list[int]]) -&gt; list[list[float]]:
+    INF = float(&quot;inf&quot;)
+    d = [[0 if i == j else INF for j in range(n)] for i in range(n)]
+    for u, v, w in edges:
+        d[u][v] = min(d[u][v], w)
+
+    for k in range(n):                           # intermediate node: OUTERMOST
+        dk = d[k]
+        for i in range(n):
+            dik = d[i][k]
+            if dik == INF:
+                continue
+            di = d[i]
+            for j in range(n):
+                if dik + dk[j] &lt; di[j]:
+                    di[j] = dik + dk[j]
+    return d
+
+def mst_kruskal(n: int, edges: list[list[int]]) -&gt; int:
+    edges.sort(key=lambda e: e[2])
+    uf = UnionFind(n)
+    total = used = 0
+    for u, v, w in edges:
+        if uf.union(u, v):
+            total += w
+            used += 1
+            if used == n - 1:
+                break
+    return total if used == n - 1 else -1
+
+def mst_prim(n: int, adj: list[list[tuple[int, int]]]) -&gt; int:
+    in_tree = [False] * n
+    pq: list[tuple[int, int]] = [(0, 0)]
+    total = count = 0
+    while pq:
+        weight, node = heapq.heappop(pq)
+        if in_tree[node]:
+            continue
+        in_tree[node] = True
+        total += weight
+        count += 1
+        for nxt, w in adj[node]:
+            if not in_tree[nxt]:
+                heapq.heappush(pq, (w, nxt))
+    return total if count == n else -1
+
+# The choice
+#   unweighted               BFS
+#   weights 0 or 1           0-1 BFS with a deque
+#   non-negative             Dijkstra
+#   negative / cycle check   Bellman-Ford
+#   all pairs, small dense   Floyd-Warshall
+#   minimum spanning tree    Kruskal (sparse) / Prim (dense)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>You are unlikely to be asked to implement these cold; you are likely to be asked <em>which</em> one and why. Have the selection table ready, and have the two reasons Bellman-Ford exists: negative weights, and negative-cycle detection via a V-th pass that still improves something. Two concrete bug-level details worth volunteering: in Floyd-Warshall the intermediate-node loop must be outermost (it is the DP dimension), and in "cheapest flights within k stops" each round must relax against a snapshot of the previous round or one pass chains several hops and silently exceeds the limit.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement Bellman-Ford and detect a negative cycle with the extra pass.</li><li>Write Floyd-Warshall, then move the k loop inside and find the wrong answer it produces.</li><li>Build an MST with both Kruskal and Prim and check they agree on the total.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://leetcode.com/tag/graph/" target="_blank" rel="noopener">LeetCode: graph</a> — the tag, by frequency</li><li><a href="https://leetcode.com/tag/union-find/" target="_blank" rel="noopener">LeetCode: union find</a> — a small, very learnable set</li><li><a href="https://cp-algorithms.com/graph/dijkstra.html" target="_blank" rel="noopener">cp-algorithms: Dijkstra</a> — the careful version, with proofs</li><li><a href="https://visualgo.net/en/graphds" target="_blank" rel="noopener">VisuAlgo: graphs</a> — watch the traversals run</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

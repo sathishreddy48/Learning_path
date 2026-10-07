@@ -1,0 +1,947 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hashing, Sets &amp; Counting — C# Learning Path</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="dsa-hashing">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › DSA › Topic 19 of 36</div>
+  <h1>Hashing, Sets &amp; Counting</h1>
+  <p class="lede">Trading space for time. A dictionary or a set turns "have I seen this before?" from an O(n) scan into an O(1) lookup, and that one substitution solves a startling proportion of interview problems. This page covers the idiomatic forms and the two places the trick breaks down.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#frequency-map">Dictionary frequency map</a></li><li><a href="#sets">HashSet: membership, dedup and "visited"</a></li><li><a href="#grouping">Grouping by a derived key</a></li><li><a href="#prefix-map">Prefix sums plus a map: subarray counting</a></li><li><a href="#custom-keys">Custom keys, GetHashCode and tuples</a></li><li><a href="#bucketing">Bucketing and top-k</a></li><li><a href="#lru">The LRU cache</a></li><li><a href="#when-not">When hashing is the wrong answer</a></li></ol>
+  </div>
+
+<section id="frequency-map"><h2 id="frequency-map">Dictionary frequency map</h2><p>The single most common interview structure: count things in a <code>Dictionary&lt;TKey,int&gt;</code> then answer a question about the counts. Canonical: two-sum, first unique character, top-k frequent elements.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Two Sum: O(n) with a value→index map
+static int[] TwoSum(int[] nums, int target)
+{
+    var seen = new Dictionary&lt;int, int&gt;();
+    for (int i = 0; i &lt; nums.Length; i++)
+    {
+        if (seen.TryGetValue(target - nums[i], out var j)) return new[] { j, i };
+        seen[nums[i]] = i;
+    }
+    return Array.Empty&lt;int&gt;();
+}
+
+// First unique character
+static int FirstUnique(string s)
+{
+    var counts = new Dictionary&lt;char, int&gt;();
+    foreach (var c in s) counts[c] = counts.GetValueOrDefault(c) + 1;
+    for (int i = 0; i &lt; s.Length; i++) if (counts[s[i]] == 1) return i;
+    return -1;
+}
+
+// Top-k frequent: count, then sort or heap
+static int[] TopK(int[] nums, int k) =&gt;
+    nums.GroupBy(n =&gt; n)
+        .OrderByDescending(g =&gt; g.Count())
+        .Take(k)
+        .Select(g =&gt; g.Key)
+        .ToArray();
+
+// Idiom: CollectionsMarshal.GetValueRefOrAddDefault avoids double lookup (hot loops)
+ref var count = ref CollectionsMarshal.GetValueRefOrAddDefault(counts, key, out _);
+count++;</code></pre><pre data-lang="python" hidden><code>from collections import Counter, defaultdict
+
+def two_sum(nums: list[int], target: int) -&gt; list[int]:
+    seen: dict[int, int] = {}
+    for i, n in enumerate(nums):
+        if target - n in seen:
+            return [seen[target - n], i]
+        seen[n] = i
+    return []
+
+def first_unique(s: str) -&gt; int:
+    counts = Counter(s)
+    return next((i for i, c in enumerate(s) if counts[c] == 1), -1)
+
+def top_k(nums: list[int], k: int) -&gt; list[int]:
+    return [n for n, _ in Counter(nums).most_common(k)]
+
+# defaultdict for grouping
+groups = defaultdict(list)
+for word in words:
+    groups[&quot;&quot;.join(sorted(word))].append(word)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The most common single structure in the whole interview set, so the idioms matter: <code>GetValueOrDefault</code> or <code>CollectionsMarshal.GetValueRefOrAddDefault</code> in C#, <code>Counter</code> in Python. If the alphabet is fixed and small — lowercase letters, digits, ASCII — say that an <code>int[26]</code> beats a dictionary on both time and space, because it is a real optimisation that costs nothing to mention.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Subarray sum equals k (prefix-sum + map).</li><li>Longest consecutive sequence (HashSet).</li><li>Ransom note / can construct.</li></ul></div></section>
+<section id="sets"><h2 id="sets">HashSet: membership, dedup and "visited"</h2><p>When you only need to know <em>whether</em> something is present, a set is the answer and it comes up in three guises: membership tests inside a loop (which is what turns O(n·m) into O(n+m)), deduplication, and the "visited" set that makes graph traversal terminate.</p><p>The C# detail worth knowing: <code>HashSet&lt;T&gt;.Add</code> returns <code>false</code> if the element was already present, so you get the test and the insert in one lookup instead of <code>Contains</code> followed by <code>Add</code>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The substitution that fixes most accidental O(n^2)
+foreach (var x in a) if (b.Contains(x)) { }          // List.Contains: O(n * m)
+
+var lookup = b.ToHashSet();
+foreach (var x in a) if (lookup.Contains(x)) { }     // O(n + m)
+
+// Add returns false when it was already there - one lookup, not two
+var seen = new HashSet&lt;int&gt;();
+foreach (var x in nums)
+    if (!seen.Add(x)) return x;                      // first duplicate
+
+// Deduplicate while PRESERVING order (a plain HashSet does not promise order)
+static List&lt;T&gt; Distinct&lt;T&gt;(IEnumerable&lt;T&gt; items)
+{
+    var seen = new HashSet&lt;T&gt;();
+    var result = new List&lt;T&gt;();
+    foreach (var item in items) if (seen.Add(item)) result.Add(item);
+    return result;
+}
+//  LINQ&#x27;s .Distinct() already preserves order; say so rather than reimplementing it.
+
+// LONGEST CONSECUTIVE SEQUENCE - the classic &quot;set makes it O(n)&quot; problem.
+// Sorting is O(n log n); this is O(n) by only starting a run at its true start.
+static int LongestConsecutive(int[] nums)
+{
+    var set = nums.ToHashSet();
+    int best = 0;
+
+    foreach (var n in set)
+    {
+        if (set.Contains(n - 1)) continue;       // not the start of a run: skip
+        int length = 1;
+        while (set.Contains(n + length)) length++;
+        best = Math.Max(best, length);
+    }
+    return best;
+}
+// The inner while looks nested, but each value is visited by exactly one run,
+// so the total work is O(n). Say that - it is the question you will be asked.
+
+// VISITED: what stops a graph traversal looping forever
+var visited = new HashSet&lt;(int R, int C)&gt;();     // tuples hash structurally
+if (visited.Add((r, c))) { /* first time here */ }
+
+// Set algebra, which occasionally is the whole answer
+var a1 = new HashSet&lt;int&gt;([1, 2, 3]);
+a1.IntersectWith([2, 3, 4]);                     // {2, 3}   - mutates a1
+a1.UnionWith([5]);  a1.ExceptWith([2]);  a1.SymmetricExceptWith([9]);
+a1.IsSubsetOf(other); a1.Overlaps(other);
+
+// HAPPY NUMBER - a set to detect the cycle (or Floyd&#x27;s, for O(1) space)
+static bool IsHappy(int n)
+{
+    var seen = new HashSet&lt;int&gt;();
+    while (n != 1 &amp;&amp; seen.Add(n))
+        n = n.ToString().Sum(c =&gt; (c - &#x27;0&#x27;) * (c - &#x27;0&#x27;));
+    return n == 1;
+}</code></pre><pre data-lang="python" hidden><code># The substitution
+for x in a:
+    if x in b_list: ...          # O(n * m)
+
+lookup = set(b_list)
+for x in a:
+    if x in lookup: ...          # O(n + m)
+
+# First duplicate
+seen: set[int] = set()
+for x in nums:
+    if x in seen:
+        return x
+    seen.add(x)
+
+# Dedup preserving order - dict keys are insertion-ordered since 3.7
+ordered_unique = list(dict.fromkeys(items))      # the idiom worth knowing
+
+def longest_consecutive(nums: list[int]) -&gt; int:
+    s = set(nums)
+    best = 0
+    for n in s:
+        if n - 1 in s:                 # only start at the beginning of a run
+            continue
+        length = 1
+        while n + length in s:
+            length += 1
+        best = max(best, length)
+    return best
+# O(n) total: each value participates in exactly one run
+
+# Visited - tuples are hashable, lists are not
+visited: set[tuple[int, int]] = set()
+if (r, c) not in visited:
+    visited.add((r, c))
+
+# Set algebra reads beautifully in Python and is often the whole solution
+a &amp; b        # intersection
+a | b        # union
+a - b        # difference
+a ^ b        # symmetric difference
+a &lt;= b       # subset
+a.isdisjoint(b)
+
+# &quot;Intersection of two arrays&quot; is one line
+list(set(nums1) &amp; set(nums2))
+
+def is_happy(n: int) -&gt; bool:
+    seen: set[int] = set()
+    while n != 1 and n not in seen:
+        seen.add(n)
+        n = sum(int(d) ** 2 for d in str(n))
+    return n == 1
+
+# frozenset when you need a set as a KEY - e.g. grouping anagrams by letter set
+groups: dict[frozenset, list[str]] = {}
+groups.setdefault(frozenset(word), []).append(word)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The reflex to demonstrate is replacing <code>List.Contains</code> inside a loop with a set — it is the single most common accidental O(n²) and spotting it unprompted scores well. "Longest consecutive sequence" is the canonical set problem and the follow-up is always why the inner <code>while</code> does not make it quadratic: each value belongs to exactly one run, so the total work across all runs is O(n). Have that argument ready.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Solve "longest consecutive sequence" in O(n) and justify the complexity of the inner loop.</li><li>Find the first duplicate using <code>Add</code>'s return value, with one lookup per element.</li><li>Deduplicate preserving order in both languages without writing a loop in Python.</li></ul></div></section>
+<section id="grouping"><h2 id="grouping">Grouping by a derived key</h2><p>A whole family of problems reduces to: compute a <em>canonical key</em> for each item, then bucket by it. Anagrams group by their sorted letters; points on a line group by slope; strings group by their shape. The work is choosing the key, and the key must be cheap and must collide exactly when the items should group.</p><p>For anagrams there are two keys worth knowing: the sorted string (O(k log k) per word, trivially correct) and the 26-element count vector rendered as a string (O(k), better when words are long).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// GROUP ANAGRAMS - key by the sorted letters
+static IList&lt;IList&lt;string&gt;&gt; GroupAnagrams(string[] words)
+{
+    var groups = new Dictionary&lt;string, List&lt;string&gt;&gt;();
+    foreach (var word in words)
+    {
+        var key = string.Concat(word.OrderBy(c =&gt; c));         // O(k log k)
+        if (!groups.TryGetValue(key, out var bucket))
+            groups[key] = bucket = [];
+        bucket.Add(word);
+    }
+    return groups.Values.Cast&lt;IList&lt;string&gt;&gt;().ToList();
+}
+
+// The O(k) key: a count vector, when words are long enough for it to matter
+static string CountKey(string word)
+{
+    var counts = new int[26];
+    foreach (var c in word) counts[c - &#x27;a&#x27;]++;
+    return string.Join(&#x27;,&#x27;, counts);        // or build it with a StringBuilder
+}
+// O(n * k) total instead of O(n * k log k). Mention the trade-off, then pick.
+
+// LINQ says it directly, and in an interview this is fine once you have shown
+// you know what it costs
+var grouped = words.GroupBy(w =&gt; string.Concat(w.OrderBy(c =&gt; c)))
+                   .Select(g =&gt; g.ToList())
+                   .ToList();
+
+// ISOMORPHIC STRINGS / WORD PATTERN - the key is the SHAPE
+static string Shape(string s)
+{
+    var map = new Dictionary&lt;char, int&gt;();
+    var sb = new StringBuilder();
+    foreach (var c in s)
+    {
+        if (!map.TryGetValue(c, out int id)) map[c] = id = map.Count;
+        sb.Append(id).Append(&#x27;,&#x27;);
+    }
+    return sb.ToString();
+}
+// &quot;egg&quot; -&gt; &quot;0,1,1,&quot;   &quot;add&quot; -&gt; &quot;0,1,1,&quot;   same shape, so isomorphic
+
+// MAX POINTS ON A LINE - key by the normalised slope from each point
+static int MaxPoints(int[][] points)
+{
+    if (points.Length &lt;= 2) return points.Length;
+    int best = 0;
+
+    for (int i = 0; i &lt; points.Length; i++)
+    {
+        var slopes = new Dictionary&lt;(int, int), int&gt;();
+        for (int j = i + 1; j &lt; points.Length; j++)
+        {
+            int dy = points[j][1] - points[i][1], dx = points[j][0] - points[i][0];
+            int g = Gcd(Math.Abs(dy), Math.Abs(dx));
+            if (g != 0) { dy /= g; dx /= g; }
+            if (dx &lt; 0 || (dx == 0 &amp;&amp; dy &lt; 0)) { dx = -dx; dy = -dy; }   // canonicalise
+            var key = (dy, dx);
+            slopes[key] = slopes.GetValueOrDefault(key) + 1;
+            best = Math.Max(best, slopes[key]);
+        }
+    }
+    return best + 1;
+}
+static int Gcd(int a, int b) =&gt; b == 0 ? a : Gcd(b, a % b);
+// Note the key is a reduced INTEGER pair, never a double - floating point
+// equality as a dictionary key is a correctness bug.
+
+// GROUP BY A COMPUTED BUCKET - &quot;k-diff pairs&quot;, &quot;divide by k&quot;, &quot;same remainder&quot;
+var byRemainder = nums.GroupBy(n =&gt; ((n % k) + k) % k);   // handles negatives</code></pre><pre data-lang="python" hidden><code>from collections import defaultdict
+from math import gcd
+
+def group_anagrams(words: list[str]) -&gt; list[list[str]]:
+    groups: dict[str, list[str]] = defaultdict(list)
+    for word in words:
+        groups[&quot;&quot;.join(sorted(word))].append(word)        # O(k log k) key
+    return list(groups.values())
+
+# The O(k) key: a tuple of counts, which is hashable for free
+def group_anagrams_linear(words: list[str]) -&gt; list[list[str]]:
+    groups: dict[tuple, list[str]] = defaultdict(list)
+    for word in words:
+        counts = [0] * 26
+        for c in word:
+            counts[ord(c) - ord(&quot;a&quot;)] += 1
+        groups[tuple(counts)].append(word)                # tuple: hashable
+    return list(groups.values())
+
+# ISOMORPHIC - key by shape
+def shape(s: str) -&gt; tuple:
+    mapping: dict[str, int] = {}
+    return tuple(mapping.setdefault(c, len(mapping)) for c in s)
+
+shape(&quot;egg&quot;) == shape(&quot;add&quot;)      # True
+
+# MAX POINTS ON A LINE
+def max_points(points: list[list[int]]) -&gt; int:
+    if len(points) &lt;= 2:
+        return len(points)
+    best = 0
+    for i, (x1, y1) in enumerate(points):
+        slopes: dict[tuple[int, int], int] = defaultdict(int)
+        for x2, y2 in points[i + 1:]:
+            dy, dx = y2 - y1, x2 - x1
+            g = gcd(abs(dy), abs(dx)) or 1
+            dy, dx = dy // g, dx // g
+            if dx &lt; 0 or (dx == 0 and dy &lt; 0):            # canonicalise direction
+                dy, dx = -dy, -dx
+            slopes[(dy, dx)] += 1
+            best = max(best, slopes[(dy, dx)])
+    return best + 1
+# Integer pairs as the key - never a float slope
+
+# Grouping with a negative-safe modulo
+by_remainder: dict[int, list[int]] = defaultdict(list)
+for n in nums:
+    by_remainder[n % k].append(n)       # Python&#x27;s % is already non-negative for k&gt;0
+
+# itertools.groupby needs SORTED input - a very common Python interview bug
+from itertools import groupby
+for key, group in groupby(sorted(words, key=len), key=len):
+    print(key, list(group))             # correct, because it was sorted first</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The reusable idea is worth naming out loud: "I will compute a canonical key per item and bucket by it." Then justify the key you chose. For anagrams, offering both keys and their complexities (sorted string O(k log k), count vector O(k)) is a cheap way to show you think about cost rather than reaching for the first thing that works. Two correctness details that get probed: never use a floating-point slope as a dictionary key, and in Python <code>itertools.groupby</code> only groups <em>adjacent</em> items, so it needs sorted input.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Group anagrams with both key strategies and state when each is better.</li><li>Solve "isomorphic strings" by comparing shapes rather than building two maps.</li><li>Use <code>itertools.groupby</code> on unsorted input and observe what goes wrong.</li></ul></div></section>
+<section id="prefix-map"><h2 id="prefix-map">Prefix sums plus a map: subarray counting</h2><p>The single most useful compound technique on this page, and the one that most often appears as the "hard" question. The pattern: as you sweep, keep a running prefix sum and a map from <em>prefix value</em> → how many times it has occurred. A subarray summing to <code>k</code> ends at <code>i</code> exactly when <code>prefix[i] - k</code> has been seen before, so the count of such earlier prefixes is the number of qualifying subarrays ending here.</p><p>The trick generalises further than people expect: with <code>prefix % k</code> as the key it counts subarrays divisible by k, and by mapping 0→−1 and 1→+1 it counts the longest subarray with equal zeroes and ones.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// SUBARRAY SUM EQUALS K - count, O(n)
+static int SubarraySum(int[] nums, int k)
+{
+    var counts = new Dictionary&lt;int, int&gt; { [0] = 1 };    // the empty prefix: vital
+    int sum = 0, result = 0;
+
+    foreach (var n in nums)
+    {
+        sum += n;
+        // every earlier prefix equal to (sum - k) ends a qualifying subarray here
+        result += counts.GetValueOrDefault(sum - k);
+        counts[sum] = counts.GetValueOrDefault(sum) + 1;
+    }
+    return result;
+}
+// The [0] = 1 seed is what makes a subarray starting at index 0 count. Omitting
+// it is the single most common bug in this pattern.
+
+// The same shape, asking for the LONGEST rather than the count: store the FIRST
+// index at which each prefix appeared, and never overwrite it.
+static int LongestSubarraySum(int[] nums, int k)
+{
+    var firstIndex = new Dictionary&lt;int, int&gt; { [0] = -1 };
+    int sum = 0, best = 0;
+
+    for (int i = 0; i &lt; nums.Length; i++)
+    {
+        sum += nums[i];
+        if (firstIndex.TryGetValue(sum - k, out int j)) best = Math.Max(best, i - j);
+        if (!firstIndex.ContainsKey(sum)) firstIndex[sum] = i;   // FIRST only
+    }
+    return best;
+}
+
+// CONTIGUOUS ARRAY - longest subarray with equal 0s and 1s.
+// Map 0 -&gt; -1, 1 -&gt; +1, and the question becomes &quot;longest subarray summing to 0&quot;.
+static int FindMaxLength(int[] nums)
+{
+    var firstIndex = new Dictionary&lt;int, int&gt; { [0] = -1 };
+    int sum = 0, best = 0;
+
+    for (int i = 0; i &lt; nums.Length; i++)
+    {
+        sum += nums[i] == 0 ? -1 : 1;
+        if (firstIndex.TryGetValue(sum, out int j)) best = Math.Max(best, i - j);
+        else firstIndex[sum] = i;
+    }
+    return best;
+}
+
+// SUBARRAY SUMS DIVISIBLE BY K - key on the remainder instead of the sum
+static int SubarraysDivByK(int[] nums, int k)
+{
+    var counts = new int[k];
+    counts[0] = 1;
+    int sum = 0, result = 0;
+
+    foreach (var n in nums)
+    {
+        sum = ((sum + n) % k + k) % k;      // non-negative remainder: C# % can be &lt; 0
+        result += counts[sum]++;
+    }
+    return result;
+}
+
+// CONTINUOUS SUBARRAY SUM - is there a subarray of length &gt;= 2 summing to a
+// multiple of k? Same remainder map, but store the index and require a gap.
+static bool CheckSubarraySum(int[] nums, int k)
+{
+    var firstIndex = new Dictionary&lt;int, int&gt; { [0] = -1 };
+    int sum = 0;
+    for (int i = 0; i &lt; nums.Length; i++)
+    {
+        sum = ((sum + nums[i]) % k + k) % k;
+        if (firstIndex.TryGetValue(sum, out int j)) { if (i - j &gt;= 2) return true; }
+        else firstIndex[sum] = i;
+    }
+    return false;
+}
+
+// WHY NOT A SLIDING WINDOW? Because these arrays contain NEGATIVE numbers, so
+// the sum is not monotonic as the window grows and shrinking the left edge does
+// not reliably reduce it. With all-positive values a sliding window works and is
+// O(1) space - knowing which applies is the real question here.</code></pre><pre data-lang="python" hidden><code>from collections import defaultdict
+
+def subarray_sum(nums: list[int], k: int) -&gt; int:
+    counts: dict[int, int] = defaultdict(int)
+    counts[0] = 1                      # the empty prefix - do not omit
+    total = result = 0
+    for n in nums:
+        total += n
+        result += counts[total - k]
+        counts[total] += 1
+    return result
+
+def longest_subarray_sum(nums: list[int], k: int) -&gt; int:
+    first: dict[int, int] = {0: -1}
+    total = best = 0
+    for i, n in enumerate(nums):
+        total += n
+        if total - k in first:
+            best = max(best, i - first[total - k])
+        if total not in first:         # FIRST occurrence only
+            first[total] = i
+    return best
+
+def find_max_length(nums: list[int]) -&gt; int:
+    &quot;&quot;&quot;Longest subarray with equal 0s and 1s.&quot;&quot;&quot;
+    first: dict[int, int] = {0: -1}
+    total = best = 0
+    for i, n in enumerate(nums):
+        total += 1 if n else -1
+        if total in first:
+            best = max(best, i - first[total])
+        else:
+            first[total] = i
+    return best
+
+def subarrays_div_by_k(nums: list[int], k: int) -&gt; int:
+    counts = [0] * k
+    counts[0] = 1
+    total = result = 0
+    for n in nums:
+        total = (total + n) % k        # Python&#x27;s % is always non-negative for k&gt;0
+        result += counts[total]
+        counts[total] += 1
+    return result
+
+def check_subarray_sum(nums: list[int], k: int) -&gt; bool:
+    first: dict[int, int] = {0: -1}
+    total = 0
+    for i, n in enumerate(nums):
+        total = (total + n) % k
+        if total in first:
+            if i - first[total] &gt;= 2:
+                return True
+        else:
+            first[total] = i
+    return False
+
+# Sliding window only works when all values are positive - then the sum is
+# monotonic in the window size. With negatives you need the prefix map.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>This is often the problem that decides the round, and there are three things to get right. Seed the map with <code>{0: 1}</code> (or <code>{0: -1}</code> for the longest variant) or subarrays starting at index 0 are missed. Store the <em>first</em> index and never overwrite it when you want the longest. And be ready for "why not a sliding window?" — because negative values break the monotonicity a window relies on, which is exactly why the map is needed.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Solve "subarray sum equals k", then remove the <code>{0:1}</code> seed and find which test breaks.</li><li>Solve "contiguous array" by mapping 0 to −1 and explain the transformation.</li><li>Work out why a sliding window solves "minimum size subarray sum" but not "subarray sum equals k".</li></ul></div></section>
+<section id="custom-keys"><h2 id="custom-keys">Custom keys, GetHashCode and tuples</h2><p>When the key is not a primitive, you need a type that hashes and compares correctly. Getting it wrong is a silent bug: entries go into the dictionary and can never be found again, which looks like a logic error rather than a hashing one.</p><p>The contract is short — equal objects must produce equal hashes, and the hash must not change while the object is a key. In practice: use a tuple, a record or a value tuple and let the compiler generate it.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Value tuples hash and compare STRUCTURALLY - the default answer for a
+// composite key, and no code to write
+var visited = new HashSet&lt;(int R, int C)&gt;();
+visited.Add((1, 2));
+visited.Contains((1, 2));                // true
+
+var memo = new Dictionary&lt;(int Index, int Remaining), long&gt;();
+
+// Records: the same, with names
+public readonly record struct Cell(int Row, int Col);
+var grid = new Dictionary&lt;Cell, char&gt;();
+
+// By hand, when you must. Three members, all of them:
+public sealed class Point : IEquatable&lt;Point&gt;
+{
+    public int X { get; }                // IMMUTABLE - the hash must not change
+    public int Y { get; }
+    public Point(int x, int y) =&gt; (X, Y) = (x, y);
+
+    public bool Equals(Point? other) =&gt; other is not null &amp;&amp; X == other.X &amp;&amp; Y == other.Y;
+    public override bool Equals(object? o) =&gt; Equals(o as Point);
+    public override int GetHashCode() =&gt; HashCode.Combine(X, Y);
+}
+
+// THE BUG: a mutable key
+public class MutableKey { public string Name = &quot;&quot;; /* Equals/GetHashCode on Name */ }
+var set = new HashSet&lt;MutableKey&gt;();
+var key = new MutableKey { Name = &quot;a&quot; };
+set.Add(key);                            // bucketed by hash(&quot;a&quot;)
+key.Name = &quot;b&quot;;                          // the hash moved; the entry did not
+set.Contains(key);                       // FALSE - still in the set, unfindable
+
+// ARRAYS ARE NOT STRUCTURAL - this catches people constantly
+var byArray = new Dictionary&lt;int[], string&gt;();
+byArray[new[] { 1, 2 }] = &quot;x&quot;;
+byArray.ContainsKey(new[] { 1, 2 });     // FALSE - reference equality
+
+// Fixes: a tuple, a string key, or a structural comparer
+var byTuple = new Dictionary&lt;(int, int), string&gt;();
+var byJoined = new Dictionary&lt;string, string&gt;();
+byJoined[string.Join(&#x27;,&#x27;, arr)] = &quot;x&quot;;
+var structural = new Dictionary&lt;int[], string&gt;(
+    EqualityComparer&lt;int[]&gt;.Create(
+        (a, b) =&gt; a.AsSpan().SequenceEqual(b),
+        a =&gt; { var h = new HashCode(); foreach (var x in a) h.Add(x); return h.ToHashCode(); }));
+
+// STRINGS: pick the comparison deliberately
+var ordinal = new Dictionary&lt;string, int&gt;(StringComparer.Ordinal);            // fastest
+var caseless = new Dictionary&lt;string, int&gt;(StringComparer.OrdinalIgnoreCase);
+// The culture-aware default is slower and locale-dependent. For identifiers,
+// keys, paths and protocol tokens, Ordinal is both faster and more correct.
+
+// A custom comparer without a custom type - &quot;group by SKU&quot;
+var bySku = products.Distinct(EqualityComparer&lt;Product&gt;.Create(
+    (a, b) =&gt; a!.Sku == b!.Sku, p =&gt; p.Sku.GetHashCode()));</code></pre><pre data-lang="python" hidden><code># Tuples hash structurally - the default composite key
+visited: set[tuple[int, int]] = set()
+visited.add((1, 2))
+(1, 2) in visited                   # True
+
+memo: dict[tuple[int, int], int] = {}
+
+# frozenset when ORDER should not matter
+groups: dict[frozenset[str], list] = {}
+groups[frozenset(&quot;abc&quot;)] = []
+frozenset(&quot;cba&quot;) in groups          # True
+
+# Frozen dataclasses: __hash__ and __eq__ generated
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Cell:
+    row: int
+    col: int
+
+grid: dict[Cell, str] = {Cell(1, 2): &quot;x&quot;}
+Cell(1, 2) in grid                  # True
+
+# By hand
+class Point:
+    __slots__ = (&quot;x&quot;, &quot;y&quot;)
+    def __init__(self, x: int, y: int) -&gt; None:
+        object.__setattr__(self, &quot;x&quot;, x)
+        object.__setattr__(self, &quot;y&quot;, y)
+    def __eq__(self, other: object) -&gt; bool:
+        return isinstance(other, Point) and (self.x, self.y) == (other.x, other.y)
+    def __hash__(self) -&gt; int:
+        return hash((self.x, self.y))
+
+# Python ENFORCES the contract that C# only warns about: defining __eq__ sets
+# __hash__ to None, so the class becomes unhashable until you define __hash__.
+class Broken:
+    def __eq__(self, o): return True
+# {Broken()}   -&gt;  TypeError: unhashable type: &#x27;Broken&#x27;
+
+# UNHASHABLE TYPES: list, dict, set. Convert at the boundary.
+key = [1, 2]
+# d[key] = &quot;x&quot;                      # TypeError
+d[tuple(key)] = &quot;x&quot;                 # fine
+d[frozenset(some_set)] = &quot;x&quot;        # fine
+
+# The mutable-key bug exists here too, and Python will not stop you
+@dataclass(unsafe_hash=True)        # hashable but NOT frozen - a loaded gun
+class Mutable:
+    name: str
+
+k = Mutable(&quot;a&quot;)
+s = {k}
+k.name = &quot;b&quot;
+print(k in s)                       # False
+
+# Nested structures as keys: convert recursively, or use a canonical string
+import json
+key = json.dumps(nested, sort_keys=True)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The question is "what makes a good hash key?" and the complete answer is: immutable, with <code>Equals</code> and <code>GetHashCode</code> consistent, and the hash stable for as long as the object is a key. Have the failure mode concrete — mutate a hashed field and the entry is in the collection but unfindable. The detail most people miss in C# is that arrays compare by <em>reference</em>, so <code>int[]</code> as a dictionary key silently never matches; in Python the equivalent is that lists are unhashable, which at least fails loudly.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Use an <code>int[]</code> as a dictionary key in C# and watch every lookup miss.</li><li>Put a mutable object in a <code>HashSet</code>, change a hashed field, and prove it is lost.</li><li>Write a structural comparer for an array key and verify lookups now succeed.</li></ul></div></section>
+<section id="bucketing"><h2 id="bucketing">Bucketing and top-k</h2><p>"The k most frequent" has three solutions and knowing all three with their complexities is a strong answer: sort the counts O(n log n); a bounded min-heap of size k O(n log k); or <strong>bucket sort by frequency</strong> O(n), which works because a frequency cannot exceed n, so you can index buckets by count directly.</p><p>The bucket version is the one that impresses, because it beats the "obvious optimal" heap answer and the reason is a constraint on the data rather than a cleverer algorithm.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// 1. SORT - O(n log n). Fine, and the first thing to say.
+static int[] TopKSort(int[] nums, int k) =&gt;
+    nums.GroupBy(n =&gt; n)
+        .OrderByDescending(g =&gt; g.Count())
+        .Take(k).Select(g =&gt; g.Key).ToArray();
+
+// 2. BOUNDED MIN-HEAP - O(n log k). Better when k is much smaller than n,
+//    and the right answer for a STREAM, where you cannot hold everything.
+static int[] TopKHeap(int[] nums, int k)
+{
+    var counts = new Dictionary&lt;int, int&gt;();
+    foreach (var n in nums) counts[n] = counts.GetValueOrDefault(n) + 1;
+
+    var heap = new PriorityQueue&lt;int, int&gt;();        // min-heap on frequency
+    foreach (var (value, count) in counts)
+    {
+        heap.Enqueue(value, count);
+        if (heap.Count &gt; k) heap.Dequeue();          // evict the least frequent
+    }
+    return heap.UnorderedItems.Select(x =&gt; x.Element).ToArray();
+}
+
+// 3. BUCKET BY FREQUENCY - O(n). A count cannot exceed n, so index by it.
+static int[] TopKBucket(int[] nums, int k)
+{
+    var counts = new Dictionary&lt;int, int&gt;();
+    foreach (var n in nums) counts[n] = counts.GetValueOrDefault(n) + 1;
+
+    var buckets = new List&lt;int&gt;[nums.Length + 1];    // buckets[f] = values seen f times
+    foreach (var (value, count) in counts)
+        (buckets[count] ??= []).Add(value);
+
+    var result = new List&lt;int&gt;(k);
+    for (int f = buckets.Length - 1; f &gt;= 1 &amp;&amp; result.Count &lt; k; f--)
+        if (buckets[f] is { } bucket)
+            foreach (var v in bucket)
+            {
+                result.Add(v);
+                if (result.Count == k) break;
+            }
+    return result.ToArray();
+}
+// O(n) time, O(n) space. The insight is that frequency is BOUNDED by n, which
+// is what makes a counting-sort-style bucket legal.
+
+// The same bucketing idea elsewhere:
+
+// SORT CHARACTERS BY FREQUENCY
+static string FrequencySort(string s)
+{
+    var counts = new Dictionary&lt;char, int&gt;();
+    foreach (var c in s) counts[c] = counts.GetValueOrDefault(c) + 1;
+
+    var buckets = new List&lt;char&gt;[s.Length + 1];
+    foreach (var (c, n) in counts) (buckets[n] ??= []).Add(c);
+
+    var sb = new StringBuilder(s.Length);
+    for (int f = buckets.Length - 1; f &gt;= 1; f--)
+        if (buckets[f] is { } bucket)
+            foreach (var c in bucket) sb.Append(c, f);
+    return sb.ToString();
+}
+
+// TOP K FREQUENT WORDS - ties broken alphabetically, so the heap comparer
+// has to handle two keys. This is where a heap beats bucketing.
+var heap = new PriorityQueue&lt;string, (int Count, string Word)&gt;(
+    Comparer&lt;(int Count, string Word)&gt;.Create((a, b) =&gt;
+        a.Count != b.Count ? a.Count.CompareTo(b.Count)
+                           : b.Word.CompareTo(a.Word)));   // reverse for the min-heap</code></pre><pre data-lang="python" hidden><code>from collections import Counter
+import heapq
+
+# 1. SORT / Counter.most_common - O(n log n), and one line
+def top_k_sort(nums: list[int], k: int) -&gt; list[int]:
+    return [v for v, _ in Counter(nums).most_common(k)]
+
+# 2. HEAP - O(n log k)
+def top_k_heap(nums: list[int], k: int) -&gt; list[int]:
+    counts = Counter(nums)
+    return heapq.nlargest(k, counts.keys(), key=counts.get)
+# or by hand, which is what to write if asked not to use the library:
+def top_k_heap_manual(nums: list[int], k: int) -&gt; list[int]:
+    counts = Counter(nums)
+    heap: list[tuple[int, int]] = []
+    for value, count in counts.items():
+        heapq.heappush(heap, (count, value))
+        if len(heap) &gt; k:
+            heapq.heappop(heap)          # evict the least frequent
+    return [v for _, v in heap]
+
+# 3. BUCKET - O(n)
+def top_k_bucket(nums: list[int], k: int) -&gt; list[int]:
+    counts = Counter(nums)
+    buckets: list[list[int]] = [[] for _ in range(len(nums) + 1)]
+    for value, count in counts.items():
+        buckets[count].append(value)
+
+    result: list[int] = []
+    for freq in range(len(buckets) - 1, 0, -1):
+        for value in buckets[freq]:
+            result.append(value)
+            if len(result) == k:
+                return result
+    return result
+
+def frequency_sort(s: str) -&gt; str:
+    counts = Counter(s)
+    buckets: list[list[str]] = [[] for _ in range(len(s) + 1)]
+    for c, n in counts.items():
+        buckets[n].append(c)
+    return &quot;&quot;.join(c * freq
+                   for freq in range(len(buckets) - 1, 0, -1)
+                   for c in buckets[freq])
+
+# Ties broken alphabetically - negate the count so one sort key does both
+def top_k_words(words: list[str], k: int) -&gt; list[str]:
+    counts = Counter(words)
+    return heapq.nsmallest(k, counts.keys(), key=lambda w: (-counts[w], w))</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Offer all three and let the interviewer pick: sort O(n log n), bounded heap O(n log k), bucket O(n). Volunteering the bucket solution with its justification — a frequency cannot exceed n, so it can index an array directly — is the part that stands out, because most candidates stop at the heap and call it optimal. The follow-up worth anticipating is the streaming version, where you cannot bucket because you cannot hold everything: that is where the bounded heap is genuinely the right answer.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Solve "top k frequent elements" all three ways and state each complexity.</li><li>Solve "sort characters by frequency" with bucketing.</li><li>Handle "top k frequent words" where ties break alphabetically, and work out why bucketing gets awkward.</li></ul></div></section>
+<section id="lru"><h2 id="lru">The LRU cache</h2><p>A near-universal interview question, and the one that most clearly tests whether you can combine two structures. The requirement is O(1) <code>Get</code> and O(1) <code>Put</code> with eviction of the least recently used entry — which no single structure gives you.</p><p>The answer is a <strong>hash map plus a doubly linked list</strong>: the map gives O(1) lookup <em>of the node</em>, and because you hold the node, unlinking and re-inserting it at the front is O(1) too. A singly linked list does not work, because removing a node requires its predecessor.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Dictionary&lt;K, LinkedListNode&lt;V&gt;&gt; + LinkedList&lt;V&gt;.
+// The map finds the node in O(1); holding the node makes removal O(1).
+public class LruCache&lt;TKey, TValue&gt; where TKey : notnull
+{
+    private readonly int _capacity;
+    private readonly Dictionary&lt;TKey, LinkedListNode&lt;(TKey Key, TValue Value)&gt;&gt; _map;
+    private readonly LinkedList&lt;(TKey Key, TValue Value)&gt; _order = new();
+    //   front = most recently used, back = least recently used
+
+    public LruCache(int capacity)
+    {
+        _capacity = capacity &gt; 0 ? capacity : throw new ArgumentOutOfRangeException();
+        _map = new Dictionary&lt;TKey, LinkedListNode&lt;(TKey, TValue)&gt;&gt;(capacity);
+    }
+
+    public bool TryGet(TKey key, out TValue value)
+    {
+        if (!_map.TryGetValue(key, out var node)) { value = default!; return false; }
+
+        _order.Remove(node);                 // O(1) - we hold the node
+        _order.AddFirst(node);               // O(1) - reuses the same node object
+        value = node.Value.Value;
+        return true;
+    }
+
+    public void Put(TKey key, TValue value)
+    {
+        if (_map.TryGetValue(key, out var existing))
+        {
+            existing.Value = (key, value);    // update in place
+            _order.Remove(existing);
+            _order.AddFirst(existing);
+            return;
+        }
+
+        if (_map.Count == _capacity)
+        {
+            var lru = _order.Last!;          // evict from the BACK
+            _order.RemoveLast();
+            _map.Remove(lru.Value.Key);      // this is why the node stores the KEY
+        }
+
+        _map[key] = _order.AddFirst((key, value));
+    }
+}
+// Storing the key inside the node is the detail people miss: on eviction you
+// have the node and need to remove its entry from the map, which needs the key.
+
+// Why not a singly linked list? Removing a node needs its PREDECESSOR, so you
+// would scan - O(n). Why not a List&lt;T&gt;? Removing from the middle shifts - O(n).
+// Why not SortedDictionary by timestamp? O(log n), not O(1).
+
+// If asked to write the list by hand (common, to stop you using the BCL):
+public class Node
+{
+    public int Key, Value;
+    public Node? Prev, Next;
+}
+// Use sentinel head and tail nodes - they remove every null check from the
+// unlink/insert code, which is where the bugs are.
+private readonly Node _head = new(), _tail = new();
+// constructor: _head.Next = _tail; _tail.Prev = _head;
+
+private void Unlink(Node n) { n.Prev!.Next = n.Next; n.Next!.Prev = n.Prev; }
+private void PushFront(Node n)
+{
+    n.Next = _head.Next; n.Prev = _head;
+    _head.Next!.Prev = n; _head.Next = n;
+}
+
+// LFU is the harder follow-up: a frequency map plus a map from frequency to a
+// list of nodes at that frequency, plus a running minimum frequency.</code></pre><pre data-lang="python" hidden><code>from collections import OrderedDict
+
+# OrderedDict is the hash-map-plus-linked-list, already built. move_to_end and
+# popitem are both O(1), which is exactly the pair you need.
+class LRUCache:
+    def __init__(self, capacity: int) -&gt; None:
+        self.capacity = capacity
+        self.cache: OrderedDict[int, int] = OrderedDict()
+
+    def get(self, key: int) -&gt; int:
+        if key not in self.cache:
+            return -1
+        self.cache.move_to_end(key)             # O(1), to the MRU end
+        return self.cache[key]
+
+    def put(self, key: int, value: int) -&gt; None:
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        if len(self.cache) &gt; self.capacity:
+            self.cache.popitem(last=False)      # O(1), evict the LRU end
+
+# Say that OrderedDict IS a dict plus a doubly linked list before you use it -
+# otherwise it looks like you are dodging the question. Then offer the manual
+# version if they want it.
+
+class Node:
+    __slots__ = (&quot;key&quot;, &quot;value&quot;, &quot;prev&quot;, &quot;next&quot;)
+    def __init__(self, key=0, value=0):
+        self.key, self.value = key, value
+        self.prev = self.next = None
+
+class LRUCacheManual:
+    def __init__(self, capacity: int) -&gt; None:
+        self.capacity = capacity
+        self.map: dict[int, Node] = {}
+        self.head, self.tail = Node(), Node()    # sentinels: no null checks anywhere
+        self.head.next, self.tail.prev = self.tail, self.head
+
+    def _unlink(self, node: Node) -&gt; None:
+        node.prev.next, node.next.prev = node.next, node.prev
+
+    def _push_front(self, node: Node) -&gt; None:
+        node.next, node.prev = self.head.next, self.head
+        self.head.next.prev = self.head.next = node
+
+    def get(self, key: int) -&gt; int:
+        node = self.map.get(key)
+        if node is None:
+            return -1
+        self._unlink(node)
+        self._push_front(node)
+        return node.value
+
+    def put(self, key: int, value: int) -&gt; None:
+        node = self.map.get(key)
+        if node:
+            node.value = value
+            self._unlink(node)
+            self._push_front(node)
+            return
+        if len(self.map) == self.capacity:
+            lru = self.tail.prev
+            self._unlink(lru)
+            del self.map[lru.key]                # the node stores the key for this
+        node = Node(key, value)
+        self.map[key] = node
+        self._push_front(node)
+
+# functools.lru_cache is the decorator version, for memoising a function
+from functools import lru_cache
+@lru_cache(maxsize=128)
+def expensive(n: int) -&gt; int: ...</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Asked constantly, so have the design sentence ready before any code: "a hash map for O(1) lookup, and a doubly linked list for O(1) reordering and eviction — the map stores the <em>node</em>, not the value, which is what makes unlinking O(1)." Then anticipate the two follow-ups: why not a singly linked list (removal needs the predecessor) and why the node stores its own key (on eviction you have the node and must delete its map entry). In Python, say that <code>OrderedDict</code> <em>is</em> this structure before you use it, then offer to write it manually.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement an LRU cache with a hand-written doubly linked list and sentinel nodes.</li><li>Explain why a singly linked list cannot give O(1) eviction.</li><li>Extend it to LFU — a frequency map, a map from frequency to nodes, and a running minimum.</li></ul></div></section>
+<section id="when-not"><h2 id="when-not">When hashing is the wrong answer</h2><p>A dictionary is the right answer often enough that reaching for it becomes automatic — and interviewers probe exactly that. There are four situations where it is wrong, and naming one unprompted is a strong signal.</p><ul><li><strong>You need order.</strong> A hash map has none. "The k smallest", "the next larger key", "a range query" all want a sorted structure or a heap.</li><li><strong>O(1) space is required.</strong> "Find the duplicate without modifying the array and in constant space" exists precisely to rule out a set — the answer is cycle detection or index marking.</li><li><strong>The alphabet is tiny and fixed.</strong> For lowercase letters an <code>int[26]</code> beats a dictionary on both time and memory, with no hashing at all.</li><li><strong>Keys share a prefix structure.</strong> Autocomplete and prefix search want a trie; a hash map can only answer exact-match questions.</li></ul><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// 1. YOU NEED ORDER ---------------------------------------------------------
+// &quot;the next key larger than x&quot; - a dictionary cannot answer this
+var sorted = new SortedDictionary&lt;int, string&gt;();
+var set = new SortedSet&lt;int&gt;();
+var range = set.GetViewBetween(lo, hi);         // O(log n + k)
+// or a heap, when you only need the extreme
+var heap = new PriorityQueue&lt;string, int&gt;();
+
+// 2. O(1) SPACE IS REQUIRED -------------------------------------------------
+// &quot;find the duplicate, do not modify the array, O(1) space&quot; - the constraints
+// are there to rule out both sorting and a HashSet. Floyd&#x27;s cycle detection:
+static int FindDuplicate(int[] nums)
+{
+    int slow = nums[0], fast = nums[0];
+    do { slow = nums[slow]; fast = nums[nums[fast]]; } while (slow != fast);
+    slow = nums[0];
+    while (slow != fast) { slow = nums[slow]; fast = nums[fast]; }
+    return slow;
+}
+
+// &quot;find all numbers missing from 1..n, O(1) space&quot; - mark by negating in place
+static IList&lt;int&gt; FindDisappeared(int[] nums)
+{
+    foreach (var n in nums)
+    {
+        int i = Math.Abs(n) - 1;
+        if (nums[i] &gt; 0) nums[i] = -nums[i];     // the array IS the visited set
+    }
+    var missing = new List&lt;int&gt;();
+    for (int i = 0; i &lt; nums.Length; i++) if (nums[i] &gt; 0) missing.Add(i + 1);
+    return missing;
+}
+
+// &quot;the single number, every other appears twice&quot; - XOR, O(1) space
+static int SingleNumber(int[] nums) =&gt; nums.Aggregate(0, (a, b) =&gt; a ^ b);
+
+// 3. A TINY FIXED ALPHABET --------------------------------------------------
+static bool IsAnagram(string a, string b)
+{
+    if (a.Length != b.Length) return false;
+    var counts = new int[26];                    // no hashing, no allocation
+    for (int i = 0; i &lt; a.Length; i++) { counts[a[i] - &#x27;a&#x27;]++; counts[b[i] - &#x27;a&#x27;]--; }
+    return counts.All(c =&gt; c == 0);
+}
+// Say the assumption out loud: &quot;this assumes lowercase ASCII - for full Unicode
+// I would use a dictionary.&quot; That caveat is itself the signal.
+
+// 4. PREFIX STRUCTURE -------------------------------------------------------
+// &quot;all words starting with &#x27;pre&#x27;&quot; - a dictionary can only answer exact match.
+// A trie answers it in O(prefix + results). See the Trees &amp; Tries page.
+
+// 5. THE QUIET ONE: hashing is O(1) AVERAGE, not worst case. With adversarial
+// keys every entry can collide and lookups degrade to O(n). It is why .NET
+// randomises string hashing per process, and why &quot;O(1) average&quot; is the honest
+// phrasing in an interview.</code></pre><pre data-lang="python" hidden><code>import bisect, heapq
+from functools import reduce
+from operator import xor
+
+# 1. ORDER - Python has no built-in balanced tree
+sorted_list: list[int] = []
+bisect.insort(sorted_list, x)              # O(n) insert, O(log n) search
+i = bisect.bisect_left(sorted_list, x)
+# heapq when you only need the extreme
+heapq.heappush(heap, x)
+# sortedcontainers for real O(log n) insert - name it, it is the standard answer
+# from sortedcontainers import SortedList
+
+# 2. O(1) SPACE
+def find_duplicate(nums: list[int]) -&gt; int:
+    slow = fast = nums[0]
+    while True:
+        slow, fast = nums[slow], nums[nums[fast]]
+        if slow == fast:
+            break
+    slow = nums[0]
+    while slow != fast:
+        slow, fast = nums[slow], nums[fast]
+    return slow
+
+def find_disappeared(nums: list[int]) -&gt; list[int]:
+    for n in nums:
+        i = abs(n) - 1
+        if nums[i] &gt; 0:
+            nums[i] = -nums[i]             # mark in place
+    return [i + 1 for i, n in enumerate(nums) if n &gt; 0]
+
+def single_number(nums: list[int]) -&gt; int:
+    return reduce(xor, nums, 0)
+
+# 3. A TINY FIXED ALPHABET
+def is_anagram(a: str, b: str) -&gt; bool:
+    if len(a) != len(b):
+        return False
+    counts = [0] * 26
+    for ca, cb in zip(a, b):
+        counts[ord(ca) - 97] += 1
+        counts[ord(cb) - 97] -= 1
+    return not any(counts)
+# Counter(a) == Counter(b) is clearer and fine; mention the array version as
+# the constant-space-over-a-fixed-alphabet alternative.
+
+# 4. PREFIX STRUCTURE -&gt; a trie
+
+# 5. O(1) AVERAGE, not worst case. Python randomises str hashing per process
+# (PYTHONHASHSEED) for exactly this reason.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Being able to say when <em>not</em> to use your favourite tool is a seniority signal. The highest-value version: read the constraints as instructions. "Do not modify the array" plus "O(1) space" is the interviewer telling you a hash set is off the table and cycle detection or index marking is wanted. Similarly "lowercase English letters" is an invitation to use <code>int[26]</code>, and "find all words with this prefix" is an invitation to build a trie.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Solve "find all numbers disappeared from an array" in O(1) space by marking in place.</li><li>Solve "single number" with XOR and explain why it works.</li><li>For three problems you solved with a dictionary, work out whether a sorted structure or an array would have been better.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://leetcode.com/tag/hash-table/" target="_blank" rel="noopener">LeetCode: hash table</a> — the tag, by frequency</li><li><a href="https://learn.microsoft.com/dotnet/api/system.collections.generic.dictionary-2" target="_blank" rel="noopener">Dictionary&lt;K,V&gt;</a> — the API, including TryAdd and GetValueRefOrAddDefault</li><li><a href="https://docs.python.org/3/library/collections.html" target="_blank" rel="noopener">Python collections</a> — Counter, defaultdict, OrderedDict</li><li><a href="https://learn.microsoft.com/dotnet/api/system.object.gethashcode" target="_blank" rel="noopener">GetHashCode</a> — the contract you must honour for a custom key</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

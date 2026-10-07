@@ -3,22 +3,231 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Testing (essentials) — C# Learning Path</title>
+<title>Testing — C# Learning Path</title>
 <link rel="stylesheet" href="../assets/css/site.css">
 </head>
 <body data-root="../" data-topic="testing">
 <div class="layout">
 <main class="main">
 
-  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › C# & .NET › Topic 7 of 23</div>
-  <h1>Testing (essentials)</h1>
-  <p class="lede">Enough testing to be credible in an interview and productive on a team: the xUnit shape, how to isolate with mocks, readable assertions, and one integration test that boots the real API in memory. pytest equivalents on every sample.</p>
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › C# &amp; .NET › Topic 12 of 36</div>
+  <h1>Testing</h1>
+  <p class="lede">Enough testing to be credible in an interview and productive on a team: the xUnit shape, how to isolate, what to test and what not to, and how to test the things that are genuinely hard — time, randomness, a real database and an outbound HTTP call. pytest equivalents on every sample. The questions here are rarely about syntax; they are about judgement, and "how much do you mock?" is a question with a wrong answer.</p>
 
   <div class="toc">
     <h4>On this page</h4>
-    <ol><li><a href="#xunit-basics">xUnit basics and Arrange-Act-Assert</a></li><li><a href="#theory">Data-driven tests: [Theory], [InlineData], [MemberData]</a></li><li><a href="#moq">Isolating with Moq</a></li><li><a href="#fluent-assertions">Readable assertions with FluentAssertions</a></li><li><a href="#integration">One integration test with WebApplicationFactory</a></li></ol>
+    <ol><li><a href="#what-to-test">What to test: the pyramid, the trophy and the ice-cream cone</a></li><li><a href="#tdd">TDD: red, green, refactor on a real example</a></li><li><a href="#xunit-basics">xUnit basics and Arrange-Act-Assert</a></li><li><a href="#theory">Data-driven tests: [Theory], [InlineData], [MemberData]</a></li><li><a href="#test-doubles">Test doubles: dummy, stub, spy, mock, fake — and when to stop</a></li><li><a href="#moq">Isolating with Moq</a></li><li><a href="#fluent-assertions">Readable assertions with FluentAssertions</a></li><li><a href="#time-async">Testing time, async and randomness</a></li><li><a href="#testcontainers">Integration testing with Testcontainers and a real database</a></li><li><a href="#state-reset">Resetting state between tests</a></li><li><a href="#http-stubbing">Stubbing outbound HTTP</a></li><li><a href="#integration">One integration test with WebApplicationFactory</a></li><li><a href="#snapshots">Snapshot testing with Verify</a></li><li><a href="#coverage">Coverage, mutation testing and what the numbers mean</a></li><li><a href="#flaky">Flaky tests: causes and fixes</a></li><li><a href="#other-frameworks">NUnit and MSTest: what differs from xUnit</a></li><li><a href="#ci">Tests in CI: parallelism, categories and what gates the build</a></li></ol>
   </div>
 
+<section id="what-to-test"><h2 id="what-to-test">What to test: the pyramid, the trophy and the ice-cream cone</h2><p>Before any syntax: what deserves a test. The <strong>pyramid</strong> says many fast unit tests, fewer integration tests, very few end-to-end — because cost and flakiness rise with scope while the chance of catching a bug does not rise as fast. The <strong>testing trophy</strong> argues the middle layer should be the fattest, because most real bugs live in the wiring between units rather than inside them. The <strong>ice-cream cone</strong> is the anti-pattern: a handful of unit tests under a mountain of slow, flaky UI tests.</p><p>The useful answer in an interview is not which diagram you prefer, but the heuristic: <strong>test behaviour at the boundary where it is observable, with the least machinery that gives you confidence</strong>. For most .NET services that means a lot of plain unit tests on domain logic and a healthy number of integration tests through <code>WebApplicationFactory</code> against a real database.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// WHAT TO TEST ------------------------------------------------------------
+
+// YES: logic with branches, edge cases and rules
+[Fact]
+public void Discount_is_capped_at_fifty_percent()
+{
+    var order = Order.Place(customer, [Line(&quot;ABC&quot;, 1, 100m)]);
+    order.ApplyDiscount(0.9m);
+    order.Total.Should().Be(new Money(50m, &quot;USD&quot;));     // the RULE, not the code path
+}
+
+// NO: a property with no behaviour. This tests the compiler.
+[Fact]
+public void Name_returns_name()
+{
+    var c = new Customer { Name = &quot;Ada&quot; };
+    c.Name.Should().Be(&quot;Ada&quot;);                          // delete this test
+}
+
+// NO: a test that reimplements the implementation. It passes when both are wrong.
+[Fact]
+public void Total_is_sum_of_lines()
+{
+    var expected = order.Lines.Sum(l =&gt; l.Quantity * l.UnitPrice);   // same code
+    order.Total.Amount.Should().Be(expected);
+}
+// YES: assert a literal you worked out by hand
+[Fact]
+public void Total_of_two_lines()
+{
+    var order = Order.Place(customer, [Line(&quot;A&quot;, 2, 10m), Line(&quot;B&quot;, 1, 5.50m)]);
+    order.Total.Should().Be(new Money(25.50m, &quot;USD&quot;));
+}
+
+// TEST BEHAVIOUR, NOT IMPLEMENTATION ---------------------------------------
+
+// Brittle: asserts HOW, so any refactor breaks it even when nothing is wrong
+[Fact]
+public void Brittle()
+{
+    sut.Place(order);
+    _repo.Verify(r =&gt; r.Add(It.IsAny&lt;Order&gt;()), Times.Once);
+    _repo.Verify(r =&gt; r.SaveChanges(), Times.Once);
+    _mapper.Verify(m =&gt; m.Map&lt;OrderDto&gt;(It.IsAny&lt;Order&gt;()), Times.Once);
+}
+
+// Durable: asserts WHAT, so the implementation is free to change
+[Fact]
+public async Task Placing_an_order_makes_it_retrievable()
+{
+    var id = await sut.Place(new PlaceOrder(customer, lines));
+    var found = await sut.Get(id);
+    found.Should().NotBeNull();
+    found!.Total.Should().Be(new Money(25.50m, &quot;USD&quot;));
+}
+
+// Naming: the failure should read as a sentence in the CI log
+//   Method_Scenario_ExpectedResult
+[Fact] public void Pay_WhenAlreadyPaid_Throws() { }
+//   or the &quot;should&quot; form
+[Fact] public void Should_throw_when_paying_an_already_paid_order() { }</code></pre><pre data-lang="python" hidden><code>import pytest
+
+# YES: the rule
+def test_discount_is_capped_at_fifty_percent():
+    order = Order.place(customer, [Line(&quot;ABC&quot;, 1, Decimal(&quot;100&quot;))])
+    order.apply_discount(Decimal(&quot;0.9&quot;))
+    assert order.total == Money(Decimal(&quot;50&quot;), &quot;USD&quot;)
+
+# NO: tests the language
+def test_name_returns_name():
+    assert Customer(name=&quot;Ada&quot;).name == &quot;Ada&quot;          # delete
+
+# NO: reimplements the implementation
+def test_total_is_sum_of_lines():
+    expected = sum(l.quantity * l.unit_price for l in order.lines)
+    assert order.total.amount == expected               # proves nothing
+
+# YES: a literal you worked out by hand
+def test_total_of_two_lines():
+    order = Order.place(customer, [Line(&quot;A&quot;, 2, Decimal(&quot;10&quot;)),
+                                   Line(&quot;B&quot;, 1, Decimal(&quot;5.50&quot;))])
+    assert order.total == Money(Decimal(&quot;25.50&quot;), &quot;USD&quot;)
+
+# Behaviour over implementation
+def test_placing_an_order_makes_it_retrievable(sut):
+    order_id = sut.place(PlaceOrder(customer, lines))
+    found = sut.get(order_id)
+    assert found is not None
+    assert found.total == Money(Decimal(&quot;25.50&quot;), &quot;USD&quot;)
+
+# Naming: pytest prints the function name on failure, so make it a sentence
+def test_pay_raises_when_order_is_already_paid(): ...
+
+# Markers are how you separate the layers and run them independently
+#   pyproject.toml:
+#     [tool.pytest.ini_options]
+#     markers = [&quot;unit&quot;, &quot;integration&quot;, &quot;e2e&quot;]
+@pytest.mark.integration
+def test_against_a_real_database(): ...
+#   pytest -m &quot;not integration&quot;</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"How do you decide what to test?" is a judgement question and a surprising number of answers are "everything, aim for 100% coverage". A better one: test behaviour that has rules in it, at the boundary where the behaviour is observable, and skip tests that only restate the implementation. Two things worth volunteering — a test that recomputes the expected value with the same algorithm passes when both are wrong, and a test asserting a sequence of mock calls breaks on every refactor while catching nothing.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Find a test in your codebase that would break under a pure refactor and rewrite it to assert behaviour.</li><li>Delete every test that only exercises a property getter and see whether coverage tells you anything useful.</li><li>Categorise your suite into unit / integration / e2e and work out which shape it actually is.</li></ul></div></section>
+<section id="tdd"><h2 id="tdd">TDD: red, green, refactor on a real example</h2><p>Write a failing test, make it pass in the simplest way, then clean up with the test as your safety net. The discipline that makes it work is the first step: <strong>run the test and watch it fail</strong>, because a test you never saw fail might be asserting nothing.</p><p>You do not need to claim you practise TDD on everything — few people do. What is worth being able to say is where it genuinely pays: a pure function with fiddly rules, a bug you are about to fix (write the failing test first, and you have a regression test for free), and any API whose shape you are unsure of, because writing the call site first is the fastest way to find out it is awkward.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The worked example: a discount rule nobody has implemented yet.
+
+// --- RED: write the test, run it, WATCH IT FAIL ---
+[Fact]
+public void No_discount_below_the_threshold()
+{
+    var result = DiscountCalculator.For(new Money(99m, &quot;USD&quot;));
+    result.Should().Be(Money.Zero(&quot;USD&quot;));
+}
+//   error CS0103: &#x27;DiscountCalculator&#x27; does not exist      &lt;- red
+
+// --- GREEN: the simplest thing that passes. Yes, really this simple. ---
+public static class DiscountCalculator
+{
+    public static Money For(Money total) =&gt; Money.Zero(total.Currency);
+}
+//   passing. The implementation is obviously incomplete - that is the point:
+//   the next test is what forces it to grow.
+
+// --- RED again: the next behaviour ---
+[Fact]
+public void Ten_percent_from_one_hundred()
+    =&gt; DiscountCalculator.For(new Money(100m, &quot;USD&quot;))
+        .Should().Be(new Money(10m, &quot;USD&quot;));
+
+// --- GREEN ---
+public static Money For(Money total) =&gt;
+    total.Amount &gt;= 100m ? new Money(total.Amount * 0.1m, total.Currency)
+                         : Money.Zero(total.Currency);
+
+// --- RED: the cap ---
+[Fact]
+public void Discount_is_capped_at_fifty()
+    =&gt; DiscountCalculator.For(new Money(10_000m, &quot;USD&quot;))
+        .Should().Be(new Money(50m, &quot;USD&quot;));
+
+// --- GREEN ---
+public static Money For(Money total)
+{
+    if (total.Amount &lt; Threshold) return Money.Zero(total.Currency);
+    var raw = total.Amount * Rate;
+    return new Money(Math.Min(raw, Cap), total.Currency);
+}
+
+// --- REFACTOR: now, with four green tests holding the behaviour still ---
+public static class DiscountCalculator
+{
+    private const decimal Threshold = 100m, Rate = 0.1m, Cap = 50m;
+
+    public static Money For(Money total) =&gt; total.Amount switch
+    {
+        &lt; Threshold =&gt; Money.Zero(total.Currency),
+        var amount  =&gt; new Money(Math.Min(amount * Rate, Cap), total.Currency),
+    };
+}
+
+// THE BUG-FIX WORKFLOW, which is the easiest TDD to justify to a team:
+//   1. reproduce the bug as a failing test        (red - and now it is documented)
+//   2. fix it                                     (green)
+//   3. the test stays                             (it can never regress silently)
+[Fact]  // regression: #4821 - rounding dropped a cent on 3-way splits
+public void Splitting_ten_three_ways_loses_nothing()
+{
+    var parts = new Money(10m, &quot;USD&quot;).SplitEvenly(3);
+    parts.Should().HaveCount(3);
+    parts.Aggregate(Money.Zero(&quot;USD&quot;), (a, b) =&gt; a + b)
+         .Should().Be(new Money(10m, &quot;USD&quot;));
+}</code></pre><pre data-lang="python" hidden><code># --- RED ---
+def test_no_discount_below_the_threshold():
+    assert discount_for(Money(Decimal(&quot;99&quot;), &quot;USD&quot;)) == Money.zero(&quot;USD&quot;)
+#   NameError: name &#x27;discount_for&#x27; is not defined
+
+# --- GREEN: the simplest thing ---
+def discount_for(total: Money) -&gt; Money:
+    return Money.zero(total.currency)
+
+# --- RED ---
+def test_ten_percent_from_one_hundred():
+    assert discount_for(Money(Decimal(&quot;100&quot;), &quot;USD&quot;)) == Money(Decimal(&quot;10&quot;), &quot;USD&quot;)
+
+# --- GREEN ---
+def discount_for(total: Money) -&gt; Money:
+    if total.amount &lt; 100:
+        return Money.zero(total.currency)
+    return Money(total.amount * Decimal(&quot;0.1&quot;), total.currency)
+
+# --- RED: the cap ---
+def test_discount_is_capped_at_fifty():
+    assert discount_for(Money(Decimal(&quot;10000&quot;), &quot;USD&quot;)) == Money(Decimal(&quot;50&quot;), &quot;USD&quot;)
+
+# --- GREEN, then REFACTOR with the tests holding ---
+THRESHOLD, RATE, CAP = Decimal(&quot;100&quot;), Decimal(&quot;0.1&quot;), Decimal(&quot;50&quot;)
+
+def discount_for(total: Money) -&gt; Money:
+    if total.amount &lt; THRESHOLD:
+        return Money.zero(total.currency)
+    return Money(min(total.amount * RATE, CAP), total.currency)
+
+# Watch it fail first - pytest makes this easy
+#   pytest -k test_discount_is_capped_at_fifty -x
+
+# The bug-fix workflow
+import pytest
+
+@pytest.mark.regression          # issue #4821
+def test_splitting_ten_three_ways_loses_nothing():
+    parts = Money(Decimal(&quot;10&quot;), &quot;USD&quot;).split_evenly(3)
+    assert len(parts) == 3
+    assert sum(parts, Money.zero(&quot;USD&quot;)) == Money(Decimal(&quot;10&quot;), &quot;USD&quot;)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"Do you do TDD?" is best answered honestly and specifically rather than yes or no. The version that lands: not for everything, but always for a bug fix — reproduce it as a failing test first, so the fix is verified and the regression test is free — and for pure logic with fiddly rules, where the tests drive out the edge cases faster than reading the requirements does. If you are asked to demonstrate it live, narrate the red step explicitly; people forget to run the failing test and that is the step being assessed.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take your next bug and write the failing test before touching the code.</li><li>TDD a small pure function and resist implementing more than the current test demands.</li><li>Deliberately write a test that cannot fail (assert on a constant) and notice how it looks identical to a real one in the CI output.</li></ul></div></section>
 <section id="xunit-basics"><h2 id="xunit-basics">xUnit basics and Arrange-Act-Assert</h2><p>A test class per unit, a <code>[Fact]</code> per behaviour, named so a failure reads like a sentence. Structure every test as Arrange / Act / Assert. xUnit creates a new instance of the class per test, so the constructor is your setup and <code>IDisposable</code> is teardown.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code>dotnet new xunit -n Shop.Tests
 dotnet add Shop.Tests reference Shop
 dotnet add Shop.Tests package FluentAssertions
@@ -95,7 +304,7 @@ async def test_checkout_empty_cart_returns_failure(cart):
 @pytest.fixture(scope=&quot;module&quot;)
 def db():
     engine = create_engine(&quot;sqlite://&quot;); Base.metadata.create_all(engine)
-    yield engine</code></pre></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write tests for a <code>Money</code> type: addition, different currencies throw, equality. Name each test as a sentence.</li></ul></div></section>
+    yield engine</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The warm-up is usually "how do you structure a test?" — Arrange / Act / Assert, one behaviour per test, named so the failure reads as a sentence. The xUnit-specific detail worth having: a new instance of the test class is constructed <em>per test</em>, so the constructor is your setup and there is no <code>[SetUp]</code>; shared expensive state goes in a fixture via <code>IClassFixture&lt;T&gt;</code>, not a static field.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write tests for a <code>Money</code> type: addition, different currencies throw, equality. Name each test as a sentence.</li></ul></div></section>
 <section id="theory"><h2 id="theory">Data-driven tests: [Theory], [InlineData], [MemberData]</h2><p>One test body, many inputs. <code>[InlineData]</code> for literals, <code>[MemberData]</code>/<code>[ClassData]</code> for objects. Each case shows up as its own test in the runner. pytest's <code>@pytest.mark.parametrize</code> is identical.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class PasswordPolicyTests
 {
     [Theory]
@@ -135,7 +344,133 @@ def test_is_strong_returns_expected(password, expected):
     (Order(total=100), 90),
 ], ids=[&quot;under-50&quot;, &quot;over-50&quot;])
 def test_price_applies_discount_over_50(order, expected):
-    assert price(order) == expected</code></pre></div></section>
+    assert price(order) == expected</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Expect "how do you test the same logic over many inputs?" — <code>[Theory]</code> with <code>[InlineData]</code> for constants, <code>[MemberData]</code>/<code>[ClassData]</code> when the cases need code to build. The judgement question behind it is when <em>not</em> to: if the expected value is computed by reimplementing the logic in the test, the test proves nothing.</p></div></section>
+<section id="test-doubles"><h2 id="test-doubles">Test doubles: dummy, stub, spy, mock, fake — and when to stop</h2><p>People say "mock" for all five, and being precise is a cheap way to sound experienced. <strong>Dummy</strong>: passed to satisfy a signature, never used. <strong>Stub</strong>: returns canned answers, no assertions. <strong>Spy</strong>: a stub that records what happened so you can check afterwards. <strong>Mock</strong>: pre-programmed with expectations that fail the test if unmet. <strong>Fake</strong>: a real working implementation that is unsuitable for production — an in-memory repository, SQLite in place of SQL Server.</p><p>The judgement half: <strong>mock what you own and what has a side effect you cannot afford</strong> — a payment gateway, an email sender, the clock. Do not mock value objects, the language, or types you do not own (mock your own wrapper around them instead). Over-mocking produces a suite that passes while the system is broken, because every collaborator has been replaced by your assumption about it.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// DUMMY: required by the signature, never touched
+var sut = new OrderService(repo, logger: NullLogger&lt;OrderService&gt;.Instance);
+
+// STUB: canned answers, no assertions about how it was used
+var catalogue = new Mock&lt;IProductCatalogue&gt;();
+catalogue.Setup(c =&gt; c.GetPrice(&quot;ABC&quot;)).ReturnsAsync(new Money(10m, &quot;USD&quot;));
+// NSubstitute: catalogue.GetPrice(&quot;ABC&quot;).Returns(new Money(10m, &quot;USD&quot;));
+
+// SPY: a hand-written recorder. Often clearer than a mocking framework.
+public class SpyEmailSender : IEmailSender
+{
+    public List&lt;(string To, string Subject)&gt; Sent { get; } = [];
+    public Task Send(string to, string subject, string body, CancellationToken ct)
+    {
+        Sent.Add((to, subject));
+        return Task.CompletedTask;
+    }
+}
+
+var spy = new SpyEmailSender();
+await sut.Place(order);
+spy.Sent.Should().ContainSingle(e =&gt; e.To == &quot;ada@example.com&quot;);
+
+// MOCK: expectation baked in, verified
+var gateway = new Mock&lt;IPaymentGateway&gt;(MockBehavior.Strict);   // strict: any
+gateway.Setup(g =&gt; g.Charge(It.Is&lt;Money&gt;(m =&gt; m.Amount == 25.50m)))  // unconfigured
+       .ReturnsAsync(PaymentResult.Success).Verifiable();            // call throws
+await sut.Pay(order);
+gateway.Verify();
+
+// FAKE: a real implementation, just not production-grade
+public class InMemoryOrderRepository : IOrderRepository
+{
+    private readonly Dictionary&lt;OrderId, Order&gt; _store = [];
+    public Task&lt;Order?&gt; Get(OrderId id, CancellationToken ct)
+        =&gt; Task.FromResult(_store.GetValueOrDefault(id));
+    public Task Add(Order order, CancellationToken ct)
+    {
+        if (!_store.TryAdd(order.Id, order))
+            throw new DuplicateKeyException(order.Id);   // behaves like the real one
+        return Task.CompletedTask;
+    }
+}
+// A good fake enforces the real one&#x27;s CONTRACT. One that silently accepts
+// duplicates hides exactly the bug you were trying to catch.
+
+// WHAT NOT TO MOCK --------------------------------------------------------
+
+// Do not mock a value object. Just construct one.
+var money = new Mock&lt;Money&gt;();          // pointless, and often impossible
+var money2 = new Money(10m, &quot;USD&quot;);     // this
+
+// Do not mock a type you do not own. Wrap it, and mock your wrapper -
+// otherwise your test encodes your ASSUMPTION about a third party&#x27;s behaviour,
+// and stays green when they change it.
+var http = new Mock&lt;HttpClient&gt;();              // sealed-ish, awkward, wrong layer
+public interface IPaymentGateway { }            // your wrapper
+var gateway2 = new Mock&lt;IPaymentGateway&gt;();     // right layer
+
+// OVER-MOCKING: every collaborator replaced, so the test asserts the plan
+// rather than the outcome. It passes when the wiring is wrong.
+[Fact]
+public async Task Over_mocked()
+{
+    _repo.Setup(...); _mapper.Setup(...); _validator.Setup(...);
+    _clock.Setup(...); _bus.Setup(...); _cache.Setup(...);
+    await _sut.Place(cmd);
+    _repo.Verify(...); _bus.Verify(...);
+}
+// Six mocks is a design smell before it is a testing smell: the class has six
+// collaborators. Consider testing one layer out, with real objects inside.</code></pre><pre data-lang="python" hidden><code>from unittest.mock import Mock, MagicMock, AsyncMock, call
+import pytest
+
+# DUMMY
+sut = OrderService(repo, logger=Mock())
+
+# STUB
+catalogue = Mock()
+catalogue.get_price.return_value = Money(Decimal(&quot;10&quot;), &quot;USD&quot;)
+# async:
+catalogue = AsyncMock()
+catalogue.get_price.return_value = Money(Decimal(&quot;10&quot;), &quot;USD&quot;)
+
+# SPY: a hand-written recorder, or Mock&#x27;s own call history
+class SpyEmailSender:
+    def __init__(self) -&gt; None:
+        self.sent: list[tuple[str, str]] = []
+    async def send(self, to: str, subject: str, body: str) -&gt; None:
+        self.sent.append((to, subject))
+
+spy = SpyEmailSender()
+await sut.place(order)
+assert (&quot;ada@example.com&quot;, &quot;Order placed&quot;) in spy.sent
+
+# or with Mock
+sender = AsyncMock()
+await sut.place(order)
+sender.send.assert_awaited_once_with(&quot;ada@example.com&quot;, &quot;Order placed&quot;, ANY)
+
+# MOCK with strict behaviour: spec stops you mocking methods that do not exist
+gateway = AsyncMock(spec=PaymentGateway)        # &lt;- always pass spec=
+gateway.charge.return_value = PaymentResult.SUCCESS
+await sut.pay(order)
+gateway.charge.assert_awaited_once()
+# gateway.chrage(...)   -&gt; AttributeError, because of spec. Without spec it
+#                          silently returns a Mock and the test passes.
+
+# FAKE
+class InMemoryOrderRepository(OrderRepository):
+    def __init__(self) -&gt; None:
+        self._store: dict[OrderId, Order] = {}
+    async def get(self, order_id): return self._store.get(order_id)
+    async def add(self, order) -&gt; None:
+        if order.id in self._store:
+            raise DuplicateKey(order.id)        # enforce the real contract
+        self._store[order.id] = order
+
+# WHAT NOT TO MOCK: value objects, and things you do not own
+money = Money(Decimal(&quot;10&quot;), &quot;USD&quot;)             # construct it
+
+# patch() the boundary YOU own, by the name where it is LOOKED UP
+from unittest.mock import patch
+with patch(&quot;shop.services.orders.payment_gateway&quot;) as gw:   # not shop.gateways.x
+    ...
+# This is the single most common patch mistake: patching where the thing is
+# defined rather than where the code under test imported it.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Using the vocabulary precisely is a quick credibility win: stub returns, spy records, mock asserts, fake implements. The question with a wrong answer is "how much do you mock?" — and the wrong answer is "everything that is not the class under test". Say that you mock what you own and what has an expensive or irreversible side effect, that you wrap third-party types rather than mocking them directly, and that a test with six mocks is telling you the class has six collaborators. Be ready to say what over-mocking costs: a green suite over a broken system, because every collaborator was replaced by your assumption about it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take a test with four mocks and rewrite it with real objects and one fake; compare which breaks on a refactor.</li><li>Write a fake repository that enforces the real contract — duplicate keys, concurrency, the lot.</li><li>Find a test that mocks a type you do not own and move the seam to a wrapper you do.</li></ul></div></section>
 <section id="moq"><h2 id="moq">Isolating with Moq</h2><p>Mock the interfaces around the unit so the test runs fast and deterministically. Set up return values, verify calls, and — importantly — do not over-verify; assert outcomes, not implementation details. Python's <code>unittest.mock</code> is built in.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public class OrderServiceTests
 {
     private readonly Mock&lt;IOrderRepo&gt; _repo = new();
@@ -244,7 +579,606 @@ assert total == pytest.approx(0.3)
 
 # Timing
 import time
-t0 = time.perf_counter(); await service.report(); assert time.perf_counter() - t0 &lt; 1.0</code></pre></div></section>
+t0 = time.perf_counter(); await service.report(); assert time.perf_counter() - t0 &lt; 1.0</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Nobody cares which assertion library you use; they care that a failure message tells you what went wrong without opening the debugger. Be able to say why <code>result.Should().BeEquivalentTo(expected)</code> beats asserting eight properties individually — one failure shows every difference, and adding a property does not silently go untested. Note the licence change in FluentAssertions 8 if the team is picking one today; <a href="https://github.com/shouldly/shouldly" target="_blank" rel="noopener">Shouldly</a> and xUnit's own asserts are the usual alternatives.</p></div></section>
+<section id="time-async"><h2 id="time-async">Testing time, async and randomness</h2><p>Anything that reads the ambient clock, sleeps, or uses a random number is untestable until you inject it. <code>Thread.Sleep(5000)</code> in a test is both slow and flaky; <code>DateTime.UtcNow</code> inside the code under test means you cannot write "what happens the day a subscription expires" without waiting for it.</p><p>.NET 8 added <strong><code>TimeProvider</code></strong>, which is now the standard answer: inject it, use <code>FakeTimeProvider</code> in tests, and advance time instantly. It covers <code>GetUtcNow</code>, <code>CreateTimer</code> and <code>Delay</code>, so a <code>PeriodicTimer</code>-driven background service becomes testable without sleeping.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// UNTESTABLE: ambient time, ambient randomness, real sleeping
+public class SubscriptionService
+{
+    public bool IsExpired(Subscription s) =&gt; DateTime.UtcNow &gt; s.ExpiresAt;   // ambient
+    public string NewCode() =&gt; Guid.NewGuid().ToString(&quot;N&quot;)[..8];             // ambient
+    public async Task Poll() { while (true) { await Task.Delay(60_000); } }   // real
+}
+
+// TESTABLE: inject the clock (TimeProvider, .NET 8+) and the randomness
+public class SubscriptionService(TimeProvider time, Func&lt;string&gt; codeFactory)
+{
+    public bool IsExpired(Subscription s) =&gt; time.GetUtcNow() &gt; s.ExpiresAt;
+    public string NewCode() =&gt; codeFactory();
+
+    public async Task Poll(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(1), time);  // &lt;- time
+        while (await timer.WaitForNextTickAsync(ct)) await Check(ct);
+    }
+}
+
+// Production
+builder.Services.AddSingleton(TimeProvider.System);
+
+// Test: advance time instantly, no sleeping
+// dotnet add package Microsoft.Extensions.TimeProvider.Testing
+[Fact]
+public void Subscription_expires_the_moment_the_date_passes()
+{
+    var time = new FakeTimeProvider(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
+    var sut = new SubscriptionService(time, () =&gt; &quot;TESTCODE&quot;);
+    var sub = new Subscription(ExpiresAt: new DateTimeOffset(2026, 1, 2, 0, 0, 0, TimeSpan.Zero));
+
+    sut.IsExpired(sub).Should().BeFalse();
+
+    time.Advance(TimeSpan.FromDays(1));          // instant
+    sut.IsExpired(sub).Should().BeFalse();       // exactly on the boundary
+
+    time.Advance(TimeSpan.FromTicks(1));
+    sut.IsExpired(sub).Should().BeTrue();
+}
+
+[Fact]
+public async Task Poll_runs_once_a_minute()
+{
+    var time = new FakeTimeProvider();
+    var sut = new SubscriptionService(time, () =&gt; &quot;X&quot;);
+    using var cts = new CancellationTokenSource();
+    var task = sut.Poll(cts.Token);
+
+    time.Advance(TimeSpan.FromMinutes(3));       // three ticks, zero milliseconds
+    await cts.CancelAsync();
+    _checks.Should().Be(3);
+}
+
+// Pre-.NET 8, or when you want a narrower seam: your own IClock
+public interface IClock { DateTimeOffset UtcNow { get; } }
+public sealed class SystemClock : IClock { public DateTimeOffset UtcNow =&gt; DateTimeOffset.UtcNow; }
+
+// ASYNC TESTS -------------------------------------------------------------
+
+// Return Task, never async void - the runner cannot observe async void and the
+// test &quot;passes&quot; while the assertion throws on another thread.
+[Fact] public async Task Correct() =&gt; (await sut.Get(id)).Should().NotBeNull();
+// [Fact] public async void Wrong() { }        // never
+
+// Asserting that something throws, asynchronously
+await FluentActions.Awaiting(() =&gt; sut.Pay(paidOrder))
+    .Should().ThrowAsync&lt;DomainException&gt;().WithMessage(&quot;*already paid*&quot;);
+
+// Cancellation: assert that the token is honoured, not that the method is slow
+[Fact]
+public async Task Honours_cancellation()
+{
+    using var cts = new CancellationTokenSource();
+    await cts.CancelAsync();
+    await FluentActions.Awaiting(() =&gt; sut.LongRunning(cts.Token))
+        .Should().ThrowAsync&lt;OperationCanceledException&gt;();
+}
+
+// NEVER do this: a sleep to &quot;wait for&quot; a background operation. It is slow on a
+// fast machine and flaky on a loaded CI agent.
+await Task.Delay(500);
+_result.Should().NotBeNull();
+// Wait for the CONDITION instead, with a timeout
+await WaitUntil(() =&gt; _result is not null, TimeSpan.FromSeconds(5));</code></pre><pre data-lang="python" hidden><code>from datetime import datetime, timezone, timedelta
+import pytest, asyncio
+
+# UNTESTABLE
+class SubscriptionService:
+    def is_expired(self, sub) -&gt; bool:
+        return datetime.now(timezone.utc) &gt; sub.expires_at    # ambient
+
+# TESTABLE: inject the clock
+from typing import Callable
+
+class SubscriptionService:
+    def __init__(self, now: Callable[[], datetime], code_factory: Callable[[], str]):
+        self._now, self._code_factory = now, code_factory
+
+    def is_expired(self, sub) -&gt; bool:
+        return self._now() &gt; sub.expires_at
+
+# Test
+def test_subscription_expires_the_moment_the_date_passes():
+    current = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    sut = SubscriptionService(lambda: current, lambda: &quot;TESTCODE&quot;)
+    sub = Subscription(expires_at=datetime(2026, 1, 2, tzinfo=timezone.utc))
+
+    assert not sut.is_expired(sub)
+    current = datetime(2026, 1, 2, 0, 0, 1, tzinfo=timezone.utc)
+    assert sut.is_expired(sub)
+
+# freezegun / time-machine: the FakeTimeProvider equivalent, no injection needed
+import time_machine
+
+@time_machine.travel(&quot;2026-01-01 00:00:00 +0000&quot;)
+def test_with_frozen_time():
+    assert datetime.now(timezone.utc).year == 2026
+
+def test_advancing(time_machine):
+    time_machine.move_to(&quot;2026-01-01&quot;)
+    assert is_expired(sub) is False
+    time_machine.shift(timedelta(days=2))
+    assert is_expired(sub) is True
+
+# Async tests
+#   pip install pytest-asyncio  /  [tool.pytest.ini_options] asyncio_mode = &quot;auto&quot;
+@pytest.mark.asyncio
+async def test_get_returns_the_order(sut):
+    assert await sut.get(order_id) is not None
+
+@pytest.mark.asyncio
+async def test_paying_twice_raises(sut):
+    with pytest.raises(DomainError, match=&quot;already paid&quot;):
+        await sut.pay(paid_order)
+
+@pytest.mark.asyncio
+async def test_honours_cancellation(sut):
+    task = asyncio.create_task(sut.long_running())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+# Never sleep to wait for something; poll the condition with a timeout
+async def wait_until(predicate, timeout=5.0, interval=0.01):
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(interval)
+
+# Randomness: seed it, or inject it
+import random
+def test_deterministic():
+    rng = random.Random(42)              # seeded, reproducible
+    assert pick(rng, items) == &quot;expected&quot;</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A strong practical question is "how would you test that a subscription expires after 30 days?" — and the answer that fails is "set the date 30 days ago in the fixture", which tests the data rather than the clock. Inject <code>TimeProvider</code>, use <code>FakeTimeProvider</code>, advance instantly, and assert the boundary on both sides. Two details that land: <code>PeriodicTimer</code> takes a <code>TimeProvider</code>, so even a polling background service is testable without sleeping; and <code>async void</code> tests are invisible to the runner, so a failing assertion inside one reports as a pass.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Replace every <code>DateTime.UtcNow</code> in one class with <code>TimeProvider</code> and test a date boundary from both sides.</li><li>Test a <code>BackgroundService</code> that polls every minute, without the test taking a minute.</li><li>Find a <code>Task.Delay</code> in a test and replace it with a condition poll.</li></ul></div></section>
+<section id="testcontainers"><h2 id="testcontainers">Integration testing with Testcontainers and a real database</h2><p>The in-memory database provider is the trap here. <code>UseInMemoryDatabase</code> is not a relational database: it ignores constraints, foreign keys, column types, transactions, concurrency tokens and raw SQL, and it translates LINQ differently. Tests pass against it and fail against SQL Server — which is the exact opposite of what an integration test is for. EF's own documentation now recommends against it.</p><p><strong>Testcontainers</strong> starts the real database in Docker for the test run, so you test against the engine you ship on. Combine it with <code>WebApplicationFactory</code> (already covered below) and you have a test that exercises routing, DI, middleware, EF translation and real SQL — the layer where most bugs actually live.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// dotnet add package Testcontainers.MsSql   (or Testcontainers.PostgreSql)
+
+// One container for the whole test collection - starting it per test is far
+// too slow. ICollectionFixture shares it; IAsyncLifetime handles start/stop.
+public class DatabaseFixture : IAsyncLifetime
+{
+    public MsSqlContainer Container { get; } = new MsSqlBuilder()
+        .WithImage(&quot;mcr.microsoft.com/mssql/server:2022-latest&quot;)
+        .WithCleanUp(true)
+        .Build();
+
+    public string ConnectionString =&gt; Container.GetConnectionString();
+
+    public async Task InitializeAsync()
+    {
+        await Container.StartAsync();
+
+        // Apply the REAL migrations - this also tests that they apply cleanly
+        var options = new DbContextOptionsBuilder&lt;AppDbContext&gt;()
+            .UseSqlServer(ConnectionString).Options;
+        await using var db = new AppDbContext(options);
+        await db.Database.MigrateAsync();
+    }
+
+    public Task DisposeAsync() =&gt; Container.DisposeAsync().AsTask();
+}
+
+[CollectionDefinition(&quot;database&quot;)]
+public class DatabaseCollection : ICollectionFixture&lt;DatabaseFixture&gt; { }
+
+// The factory, pointed at the container
+public class ApiFactory(DatabaseFixture db) : WebApplicationFactory&lt;Program&gt;
+{
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.UseEnvironment(&quot;Testing&quot;);
+        builder.ConfigureTestServices(services =&gt;
+        {
+            services.RemoveAll&lt;DbContextOptions&lt;AppDbContext&gt;&gt;();
+            services.AddDbContext&lt;AppDbContext&gt;(o =&gt; o.UseSqlServer(db.ConnectionString));
+
+            // Replace only what you genuinely cannot run: external paid services
+            services.RemoveAll&lt;IPaymentGateway&gt;();
+            services.AddSingleton&lt;IPaymentGateway, FakePaymentGateway&gt;();
+        });
+    }
+}
+
+[Collection(&quot;database&quot;)]
+public class OrderApiTests(DatabaseFixture db) : IAsyncLifetime
+{
+    private ApiFactory _factory = null!;
+    private HttpClient _client = null!;
+
+    public Task InitializeAsync()
+    {
+        _factory = new ApiFactory(db);
+        _client = _factory.CreateClient();
+        return Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task Placing_an_order_persists_it()
+    {
+        var response = await _client.PostAsJsonAsync(&quot;/orders&quot;,
+            new { customerId = Guid.NewGuid(), lines = new[] { new { sku = &quot;ABC&quot;, quantity = 2 } } });
+
+        response.StatusCode.Should().Be(HttpStatusCode.Created);
+
+        // Verify against the REAL database, not a mock&#x27;s call log
+        using var scope = _factory.Services.CreateScope();
+        var context = scope.ServiceProvider.GetRequiredService&lt;AppDbContext&gt;();
+        var saved = await context.Orders.Include(o =&gt; o.Lines).SingleAsync();
+        saved.Lines.Should().ContainSingle(l =&gt; l.Sku == &quot;ABC&quot; &amp;&amp; l.Quantity == 2);
+    }
+
+    [Fact]
+    public async Task Duplicate_external_ref_is_rejected_by_the_unique_index()
+    {
+        // This test is impossible against UseInMemoryDatabase: it ignores the index.
+        await _client.PostAsJsonAsync(&quot;/orders&quot;, new { externalRef = &quot;X&quot; });
+        var second = await _client.PostAsJsonAsync(&quot;/orders&quot;, new { externalRef = &quot;X&quot; });
+        second.StatusCode.Should().Be(HttpStatusCode.Conflict);
+    }
+
+    public Task DisposeAsync() { _factory.Dispose(); return Task.CompletedTask; }
+}
+
+// Other containers you will want, all the same shape:
+new RedisBuilder().Build();
+new RabbitMqBuilder().Build();
+new LocalStackBuilder().Build();         // S3, SQS, etc.
+new WireMockBuilder().Build();           // a stub HTTP server
+
+// WHAT NOT TO USE
+services.AddDbContext&lt;AppDbContext&gt;(o =&gt; o.UseInMemoryDatabase(&quot;test&quot;));
+//   no constraints, no FKs, no transactions, no raw SQL, different LINQ
+//   translation. Green tests, red production. EF now advises against it.
+//   SQLite in-memory is closer (real SQL, real transactions) but still differs
+//   on types, collation and concurrency - acceptable, not equivalent.</code></pre><pre data-lang="python" hidden><code># pip install testcontainers[postgres] pytest-asyncio
+
+import pytest
+from testcontainers.postgres import PostgresContainer
+from sqlalchemy import create_engine
+
+# Session-scoped: one container for the whole run
+@pytest.fixture(scope=&quot;session&quot;)
+def postgres():
+    with PostgresContainer(&quot;postgres:16-alpine&quot;) as container:
+        yield container
+
+@pytest.fixture(scope=&quot;session&quot;)
+def engine(postgres):
+    eng = create_engine(postgres.get_connection_url())
+    run_migrations(eng)                  # the REAL migrations
+    return eng
+
+# The app, pointed at the container
+@pytest.fixture
+def client(engine, monkeypatch):
+    from fastapi.testclient import TestClient
+    from shop.api.main import app, get_session
+
+    def override_session():
+        with Session(engine) as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_payment_gateway] = lambda: FakePaymentGateway()
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+def test_placing_an_order_persists_it(client, engine):
+    response = client.post(&quot;/orders&quot;, json={
+        &quot;customer_id&quot;: str(uuid.uuid4()),
+        &quot;lines&quot;: [{&quot;sku&quot;: &quot;ABC&quot;, &quot;quantity&quot;: 2}],
+    })
+    assert response.status_code == 201
+
+    with Session(engine) as session:               # verify in the REAL database
+        saved = session.execute(select(Order)).scalar_one()
+        assert saved.lines[0].sku == &quot;ABC&quot;
+
+def test_duplicate_external_ref_is_rejected(client):
+    client.post(&quot;/orders&quot;, json={&quot;external_ref&quot;: &quot;X&quot;})
+    assert client.post(&quot;/orders&quot;, json={&quot;external_ref&quot;: &quot;X&quot;}).status_code == 409
+
+# Other containers
+from testcontainers.redis import RedisContainer
+from testcontainers.localstack import LocalStackContainer
+
+# WHAT NOT TO USE: sqlite:///:memory: as a stand-in for PostgreSQL.
+# Same trap as EF InMemory - different types, no ARRAY/JSONB, different
+# constraint enforcement, no real concurrency.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>If integration testing comes up, "we used the EF in-memory provider" is a weak answer and you should be able to say why: it is not a relational database, so it ignores constraints, foreign keys, transactions and raw SQL, and it translates LINQ differently — tests go green while production breaks. Testcontainers is the answer, with two practical details that show you have run it: share one container per collection rather than per test, and apply the real migrations in the fixture so that migration failures are caught by the test suite too.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write an integration test that only passes against a real database — a unique index violation is the easiest.</li><li>Share one container across a test collection and measure the suite time against one-per-test.</li><li>Run the same test suite against the in-memory provider and a container, and find a disagreement.</li></ul></div></section>
+<section id="state-reset"><h2 id="state-reset">Resetting state between tests</h2><p>Once tests share a database they share state, and order-dependence creeps in: the suite passes locally and fails in CI because the runner parallelised differently. <strong>Every test must leave the database as it found it</strong>, and there are three ways to arrange that.</p><p><strong>Respawn</strong> deletes the data in dependency order and is the usual choice — fast, keeps the schema, no transaction constraints. <strong>A transaction per test, rolled back</strong> is faster still but breaks as soon as the code under test manages its own transaction, which an integration test usually does. <strong>A fresh container or database per test</strong> is bulletproof and far too slow for anything but a handful of tests.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// RESPAWN: delete all data between tests, keep the schema
+// dotnet add package Respawn
+
+public class DatabaseFixture : IAsyncLifetime
+{
+    private Respawner _respawner = null!;
+    private DbConnection _connection = null!;
+
+    public async Task InitializeAsync()
+    {
+        await Container.StartAsync();
+        await Migrate();
+
+        _connection = new SqlConnection(ConnectionString);
+        await _connection.OpenAsync();
+
+        _respawner = await Respawner.CreateAsync(_connection, new RespawnerOptions
+        {
+            DbAdapter = DbAdapter.SqlServer,
+            TablesToIgnore = [&quot;__EFMigrationsHistory&quot;, &quot;Countries&quot;],   // reference data
+            SchemasToInclude = [&quot;dbo&quot;],
+        });
+    }
+
+    public Task ResetAsync() =&gt; _respawner.ResetAsync(_connection);
+}
+
+// Reset before EACH test. Before, not after: a crashed test still leaves a
+// clean slate for the next one.
+[Collection(&quot;database&quot;)]
+public class OrderApiTests(DatabaseFixture db) : IAsyncLifetime
+{
+    public async Task InitializeAsync() =&gt; await db.ResetAsync();
+    public Task DisposeAsync() =&gt; Task.CompletedTask;
+}
+
+// TRANSACTION PER TEST: fastest, but limited
+public class TransactionalTest : IAsyncLifetime
+{
+    private IDbContextTransaction _tx = null!;
+
+    public async Task InitializeAsync()
+        =&gt; _tx = await _db.Database.BeginTransactionAsync();
+
+    public async Task DisposeAsync() =&gt; await _tx.RollbackAsync();   // never commits
+}
+// Breaks when: the code under test calls BeginTransaction itself (nested
+// transactions are not supported), when it spans connections, or when you want
+// to assert on data from a second connection - which is most API tests.
+
+// PARALLELISM: the other half of the problem.
+// xUnit runs test COLLECTIONS in parallel and tests within one sequentially.
+// Sharing a database means they must be in one collection, which serialises them.
+[Collection(&quot;database&quot;)]        // one at a time against the shared database
+
+// To parallelise, give each collection its own database on the same container:
+public async Task&lt;string&gt; CreateDatabase(string name)
+{
+    await using var master = new SqlConnection(MasterConnectionString);
+    await master.ExecuteAsync($&quot;CREATE DATABASE [{name}]&quot;);
+    return ConnectionString.Replace(&quot;master&quot;, name);
+}
+
+// Or turn parallelism off entirely while you are stabilising:
+// AssemblyInfo.cs:
+[assembly: CollectionBehavior(DisableTestParallelization = true)]
+
+// DETERMINISTIC DATA: never depend on what a previous test left behind
+[Fact]
+public async Task Bad()
+{
+    var orders = await _client.GetFromJsonAsync&lt;List&lt;OrderDto&gt;&gt;(&quot;/orders&quot;);
+    orders.Should().HaveCount(3);          // depends on the whole suite&#x27;s history
+}
+
+[Fact]
+public async Task Good()
+{
+    var customerId = Guid.NewGuid();       // unique to THIS test
+    await Seed(customerId, count: 3);
+    var orders = await _client.GetFromJsonAsync&lt;List&lt;OrderDto&gt;&gt;($&quot;/orders?customerId={customerId}&quot;);
+    orders.Should().HaveCount(3);          // true regardless of anything else
+}</code></pre><pre data-lang="python" hidden><code>import pytest
+from sqlalchemy import text
+
+# TRUNCATE between tests - the Respawn equivalent
+@pytest.fixture(autouse=True)
+def reset_database(engine):
+    yield
+    with engine.begin() as conn:
+        conn.execute(text(&quot;&quot;&quot;
+            TRUNCATE TABLE order_lines, orders, customers RESTART IDENTITY CASCADE
+        &quot;&quot;&quot;))
+
+# Better: discover the tables so the list cannot go stale
+@pytest.fixture(autouse=True)
+def reset_database(engine):
+    yield
+    with engine.begin() as conn:
+        tables = conn.execute(text(&quot;&quot;&quot;
+            SELECT tablename FROM pg_tables
+            WHERE schemaname = &#x27;public&#x27; AND tablename &lt;&gt; &#x27;alembic_version&#x27;
+        &quot;&quot;&quot;)).scalars().all()
+        if tables:
+            conn.execute(text(
+                f&#x27;TRUNCATE TABLE {&quot;, &quot;.join(tables)} RESTART IDENTITY CASCADE&#x27;))
+
+# TRANSACTION PER TEST with a SAVEPOINT, so nested begins still work
+@pytest.fixture
+def session(engine):
+    connection = engine.connect()
+    trans = connection.begin()
+    sess = Session(bind=connection, join_transaction_mode=&quot;create_savepoint&quot;)
+    yield sess
+    sess.close()
+    trans.rollback()                     # nothing is ever committed
+    connection.close()
+
+# PARALLELISM: pytest-xdist, with a database per worker
+@pytest.fixture(scope=&quot;session&quot;)
+def engine(postgres, worker_id):         # worker_id is &quot;gw0&quot;, &quot;gw1&quot;, ... or &quot;master&quot;
+    url = postgres.get_connection_url()
+    db_name = f&quot;test_{worker_id}&quot;
+    create_database(url, db_name)
+    eng = create_engine(url.rsplit(&quot;/&quot;, 1)[0] + f&quot;/{db_name}&quot;)
+    run_migrations(eng)
+    return eng
+#   pytest -n 4
+
+# DETERMINISTIC DATA: scope every assertion to data this test created
+def test_good(client):
+    customer_id = str(uuid.uuid4())      # unique to this test
+    seed(customer_id, count=3)
+    orders = client.get(f&quot;/orders?customer_id={customer_id}&quot;).json()
+    assert len(orders) == 3</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"How do you stop integration tests interfering with each other?" The complete answer names all three options and picks one with a reason: Respawn (or a truncate) before each test as the default, a rolled-back transaction when the code under test does not manage its own, and a database per test only when you can afford it. Then the detail that shows you have been bitten: reset <em>before</em> the test rather than after, so a crashed test does not poison the next one, and scope every assertion to data the test itself created rather than to a global count.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Add Respawn to an integration suite and verify tests pass in any order with <code>--randomize</code>.</li><li>Write a test that passes alone and fails in the suite, then find out which test it depends on.</li><li>Parallelise with a database per worker and measure the suite time.</li></ul></div></section>
+<section id="http-stubbing"><h2 id="http-stubbing">Stubbing outbound HTTP</h2><p>Code that calls another service needs the call controlled: real calls make tests slow, flaky, and dependent on someone else's uptime and data. There are two good seams and one bad habit.</p><p>The <strong>bad habit</strong> is mocking <code>HttpClient</code> — its methods are not virtual in a useful way and you end up testing the mock. The two good seams: a custom <strong><code>DelegatingHandler</code></strong> injected through <code>IHttpClientFactory</code> (fast, in-process, no network, and it also tests your <code>HttpClient</code> configuration), or <strong>WireMock.Net</strong>, a real HTTP server on localhost (slower, but it exercises serialisation, headers, status codes and timeouts for real — and it can simulate latency and failures).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// --- SEAM 1: a DelegatingHandler. Fast, in-process, no socket. ---
+public class StubHandler(Func&lt;HttpRequestMessage, HttpResponseMessage&gt; respond)
+    : HttpMessageHandler
+{
+    public List&lt;HttpRequestMessage&gt; Requests { get; } = [];
+
+    protected override Task&lt;HttpResponseMessage&gt; SendAsync(
+        HttpRequestMessage request, CancellationToken ct)
+    {
+        Requests.Add(request);
+        return Task.FromResult(respond(request));
+    }
+}
+
+[Fact]
+public async Task Rate_is_read_from_the_upstream_response()
+{
+    var stub = new StubHandler(_ =&gt; new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = JsonContent.Create(new { rate = 1.23m }),
+    });
+
+    var client = new HttpClient(stub) { BaseAddress = new Uri(&quot;https://rates.test&quot;) };
+    var sut = new RateService(client);
+
+    (await sut.GetRate(&quot;USD&quot;, &quot;EUR&quot;)).Should().Be(1.23m);
+    stub.Requests.Should().ContainSingle()
+        .Which.RequestUri!.PathAndQuery.Should().Be(&quot;/rates?from=USD&amp;to=EUR&quot;);
+}
+
+// Through the factory, so the registered policies and headers are exercised too
+builder.ConfigureTestServices(services =&gt;
+{
+    services.AddHttpClient&lt;RateService&gt;()
+            .ConfigurePrimaryHttpMessageHandler(() =&gt; stub);
+});
+
+// Testing the RESILIENCE policy, which is the thing people forget to test
+[Fact]
+public async Task Retries_three_times_on_503()
+{
+    var attempts = 0;
+    var stub = new StubHandler(_ =&gt;
+    {
+        attempts++;
+        return new HttpResponseMessage(attempts &lt; 3 ? HttpStatusCode.ServiceUnavailable
+                                                    : HttpStatusCode.OK);
+    });
+    // ... assert attempts == 3 and the call ultimately succeeded
+
+    // and the negative case: the circuit breaker opens
+}
+
+// --- SEAM 2: WireMock.Net. A real server, so serialisation and timeouts are real. ---
+// dotnet add package WireMock.Net
+
+public class RateServiceTests : IAsyncLifetime
+{
+    private WireMockServer _server = null!;
+
+    public Task InitializeAsync()
+    {
+        _server = WireMockServer.Start();
+        return Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task Reads_the_rate()
+    {
+        _server.Given(Request.Create()
+                .WithPath(&quot;/rates&quot;).UsingGet()
+                .WithParam(&quot;from&quot;, &quot;USD&quot;))
+            .RespondWith(Response.Create()
+                .WithStatusCode(200)
+                .WithHeader(&quot;Content-Type&quot;, &quot;application/json&quot;)
+                .WithBodyAsJson(new { rate = 1.23m }));
+
+        var sut = new RateService(new HttpClient { BaseAddress = new Uri(_server.Url!) });
+        (await sut.GetRate(&quot;USD&quot;, &quot;EUR&quot;)).Should().Be(1.23m);
+
+        _server.LogEntries.Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task Times_out_cleanly_when_upstream_hangs()
+    {
+        _server.Given(Request.Create().WithPath(&quot;/rates&quot;).UsingGet())
+            .RespondWith(Response.Create()
+                .WithDelay(TimeSpan.FromSeconds(10)));         // simulated latency
+
+        var client = new HttpClient { BaseAddress = new Uri(_server.Url!),
+                                      Timeout = TimeSpan.FromMilliseconds(200) };
+        await FluentActions.Awaiting(() =&gt; new RateService(client).GetRate(&quot;USD&quot;, &quot;EUR&quot;))
+            .Should().ThrowAsync&lt;TaskCanceledException&gt;();
+    }
+
+    public Task DisposeAsync() { _server.Stop(); return Task.CompletedTask; }
+}
+
+// --- WHAT NOT TO DO ---
+var mock = new Mock&lt;HttpClient&gt;();        // not usefully virtual; you test the mock
+var mock2 = new Mock&lt;IHttpClientFactory&gt;();   // stubs the factory, not the traffic</code></pre><pre data-lang="python" hidden><code># SEAM 1: respx (for httpx) - intercepts at the transport, no socket
+import httpx, respx, pytest
+
+@respx.mock
+async def test_rate_is_read_from_the_upstream_response():
+    route = respx.get(&quot;https://rates.test/rates&quot;, params={&quot;from&quot;: &quot;USD&quot;, &quot;to&quot;: &quot;EUR&quot;}) \
+                 .mock(return_value=httpx.Response(200, json={&quot;rate&quot;: 1.23}))
+
+    async with httpx.AsyncClient(base_url=&quot;https://rates.test&quot;) as client:
+        rate = await RateService(client).get_rate(&quot;USD&quot;, &quot;EUR&quot;)
+
+    assert rate == 1.23
+    assert route.called
+    assert route.call_count == 1
+
+# Testing the retry policy
+@respx.mock
+async def test_retries_three_times_on_503():
+    route = respx.get(&quot;https://rates.test/rates&quot;).mock(side_effect=[
+        httpx.Response(503), httpx.Response(503), httpx.Response(200, json={&quot;rate&quot;: 1.0}),
+    ])
+    async with httpx.AsyncClient(base_url=&quot;https://rates.test&quot;) as client:
+        await RateService(client).get_rate(&quot;USD&quot;, &quot;EUR&quot;)
+    assert route.call_count == 3
+
+# requests-mock / responses are the equivalents for the requests library
+
+# SEAM 2: a real stub server - pytest-httpserver, or WireMock in a container
+from pytest_httpserver import HTTPServer
+
+def test_reads_the_rate(httpserver: HTTPServer):
+    httpserver.expect_request(&quot;/rates&quot;, query_string=&quot;from=USD&amp;to=EUR&quot;) \
+              .respond_with_json({&quot;rate&quot;: 1.23})
+
+    rate = RateService(httpx.Client(base_url=httpserver.url_for(&quot;/&quot;))).get_rate(&quot;USD&quot;, &quot;EUR&quot;)
+    assert rate == 1.23
+
+# Simulated latency, for timeout tests
+def test_times_out_cleanly(httpserver: HTTPServer):
+    def slow(request):
+        import time; time.sleep(10)
+        return Response(&quot;{}&quot;)
+    httpserver.expect_request(&quot;/rates&quot;).respond_with_handler(slow)
+
+    client = httpx.Client(base_url=httpserver.url_for(&quot;/&quot;), timeout=0.2)
+    with pytest.raises(httpx.TimeoutException):
+        RateService(client).get_rate(&quot;USD&quot;, &quot;EUR&quot;)
+
+# VCR: record real responses once, replay them forever. Convenient, and it goes
+# stale silently - which is the argument against it.
+import vcr
+@vcr.use_cassette(&quot;fixtures/rates.yaml&quot;)
+def test_with_recorded_response(): ...</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>"How do you test code that calls another service?" Name the seam, not just the tool: a <code>DelegatingHandler</code> through <code>IHttpClientFactory</code> for fast in-process stubbing, or a real stub server like WireMock when you need serialisation, headers, timeouts and simulated latency to be real. Say explicitly that you do not mock <code>HttpClient</code> itself. The detail that stands out is testing the <em>failure</em> paths — that your retry policy fires exactly three times, that the circuit breaker opens, that a hanging upstream produces a clean timeout rather than a thread pileup — because almost nobody tests those and they are what breaks in production.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a stub handler and assert on the exact outbound URL and headers.</li><li>Test that a Polly retry policy fires the expected number of times on 503.</li><li>Simulate a 10-second upstream delay and assert your timeout produces a clean failure.</li></ul></div></section>
 <section id="integration"><h2 id="integration">One integration test with WebApplicationFactory</h2><p>Boot the real API in memory, swap the database for SQLite/Testcontainers, and call it with <code>HttpClient</code>. One or two of these per feature catch the wiring bugs unit tests cannot: routing, DI, serialization, middleware, auth. FastAPI's <code>TestClient</code> does the same.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// dotnet add package Microsoft.AspNetCore.Mvc.Testing
 public class ApiFactory : WebApplicationFactory&lt;Program&gt;
 {
@@ -320,10 +1254,629 @@ def test_post_invalid_returns_problem(client):
     assert any(e[&quot;loc&quot;][-1] == &quot;qty&quot; for e in resp.json()[&quot;detail&quot;])
 
 # Real database: `testcontainers` package — PostgresContainer(&quot;postgres:16&quot;)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Test pyramid: many unit, some integration, few end-to-end. Know what <code>WebApplicationFactory</code> replaces (the real host, on an in-memory server) and how to swap services for the test.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Add one integration test to a project you have, that fails when you remove <code>app.UseAuthorization()</code>.</li></ul></div></section>
+<section id="snapshots"><h2 id="snapshots">Snapshot testing with Verify</h2><p>When the thing under test produces a large object, document or payload, asserting property by property is tedious and misses the properties you forgot. <strong>Snapshot testing</strong> serialises the result, stores it as a committed file, and fails the test when the output changes — turning review of the <em>diff</em> into the assertion.</p><p>It fits generated output: API responses, serialised DTOs, generated SQL, source-generator output, emails, reports. It fits badly where the output is small (a plain assertion is clearer) or genuinely volatile (you end up re-approving noise, and people start approving without reading — which is the failure mode to name).</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// dotnet add package Verify.Xunit
+
+[UsesVerify]
+public class OrderResponseTests
+{
+    [Fact]
+    public async Task Order_response_shape()
+    {
+        var response = await _client.GetAsync($&quot;/orders/{id}&quot;);
+        var dto = await response.Content.ReadFromJsonAsync&lt;OrderDto&gt;();
+
+        await Verify(dto);
+        //  first run  -&gt; writes OrderResponseTests.Order_response_shape.received.txt
+        //                and FAILS, so you review and accept it
+        //  accepted   -&gt; renamed to .verified.txt and COMMITTED
+        //  later runs -&gt; compared against the committed file
+    }
+}
+
+// Volatile values must be scrubbed, or every run fails
+[Fact]
+public async Task Order_response_shape_scrubbed()
+{
+    await Verify(dto)
+        .ScrubMember&lt;OrderDto&gt;(o =&gt; o.CreatedAt)     // timestamps
+        .ScrubMember&lt;OrderDto&gt;(o =&gt; o.Id)            // generated ids
+        .ScrubInlineGuids()
+        .ScrubLinesContaining(&quot;TraceId&quot;);
+}
+
+// Global settings, once per assembly
+public static class VerifyConfig
+{
+    [ModuleInitializer]
+    public static void Init()
+    {
+        VerifierSettings.ScrubInlineGuids();
+        VerifierSettings.IgnoreMember&lt;OrderDto&gt;(o =&gt; o.CreatedAt);
+        VerifierSettings.UseStrictJson();
+        DiffEngine.DiffRunner.Disabled = Environment.GetEnvironmentVariable(&quot;CI&quot;) == &quot;true&quot;;
+        //   do NOT launch a diff tool on the build agent
+    }
+}
+
+// Parameterised snapshots: one file per case
+[Theory]
+[InlineData(&quot;pending&quot;)]
+[InlineData(&quot;paid&quot;)]
+[InlineData(&quot;shipped&quot;)]
+public Task Response_per_status(string status)
+    =&gt; Verify(Build(status)).UseParameters(status);
+//   -&gt; Response_per_status_pending.verified.txt, _paid, _shipped
+
+// Excellent fit: assert the SQL EF generates, so a silent translation change
+// shows up as a reviewable diff
+[Fact]
+public Task Order_query_sql()
+    =&gt; Verify(_db.Orders
+        .Where(o =&gt; o.CustomerId == _id &amp;&amp; o.Status == &quot;paid&quot;)
+        .OrderByDescending(o =&gt; o.PlacedAt)
+        .ToQueryString());
+
+// Also excellent: source-generator output
+[Fact]
+public Task Generator_output() =&gt; Verify(RunGenerator(source));
+
+// POOR fit: a small value. Just assert it.
+[Fact] public Task Bad() =&gt; Verify(order.Total);        // Should().Be(25.50m)
+
+// The failure mode to be honest about: when a snapshot changes on every run,
+// people stop reading the diff and start approving it reflexively. At that
+// point the test is worse than no test, because it looks like coverage.
+//   dotnet verify accept      &lt;- the command that makes this easy, and dangerous</code></pre><pre data-lang="python" hidden><code># pip install syrupy          (or pytest-snapshot / snapshottest)
+
+def test_order_response_shape(client, snapshot):
+    response = client.get(f&quot;/orders/{order_id}&quot;)
+    assert response.json() == snapshot
+#   first run:  pytest --snapshot-update   -&gt; writes __snapshots__/test_api.ambr
+#   committed, then compared on every later run
+
+# Scrubbing volatile values
+from syrupy.extensions.json import JSONSnapshotExtension
+from syrupy.matchers import path_type
+
+def test_scrubbed(client, snapshot):
+    response = client.get(f&quot;/orders/{order_id}&quot;)
+    assert response.json() == snapshot(matcher=path_type({
+        &quot;id&quot;: (str,),            # match the TYPE, not the value
+        &quot;created_at&quot;: (str,),
+    }))
+
+# Parameterised: one snapshot per case, automatically
+@pytest.mark.parametrize(&quot;status&quot;, [&quot;pending&quot;, &quot;paid&quot;, &quot;shipped&quot;])
+def test_response_per_status(status, snapshot):
+    assert build(status) == snapshot
+
+# Snapshotting generated SQL - the same excellent use case
+def test_order_query_sql(snapshot):
+    q = select(Order).where(Order.customer_id == cid, Order.status == &quot;paid&quot;)
+    assert str(q.compile(engine, compile_kwargs={&quot;literal_binds&quot;: True})) == snapshot
+
+# CI must never update snapshots - it would make every diff self-approving
+#   pytest                      # compares
+#   pytest --snapshot-update    # local only; never in the pipeline
+
+# Unused snapshots are reported, which stops the files rotting
+#   pytest --snapshot-details</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Worth raising yourself if you are asked how you test something with a large output. Define it (serialise, commit, diff on change), give a fitting use — an API contract, generated SQL, a source generator's output — and then name the two failure modes, because that is the part that shows experience: unscrubbed volatile fields make the test fail every run, and a snapshot that changes constantly trains people to approve without reading, at which point it is worse than no test because it looks like coverage.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Snapshot an API response, then add a field and review the diff as the assertion.</li><li>Snapshot the SQL EF generates for a query, then change the LINQ and see the translation change.</li><li>Forget to scrub a timestamp and watch the test fail on every run.</li></ul></div></section>
+<section id="coverage"><h2 id="coverage">Coverage, mutation testing and what the numbers mean</h2><p>Coverage measures which lines <em>executed</em> during the test run. It does not measure whether anything was asserted. A test that calls every method and asserts nothing reports 100% — which is why coverage is useful as a <strong>floor and a finder of untested areas</strong>, and useless as a target.</p><p><strong>Mutation testing</strong> is the honest version: it changes your code — flips a <code>&gt;</code> to <code>&gt;=</code>, removes a statement, inverts a condition — reruns the tests, and reports which mutants <em>survived</em>. A surviving mutant is a change to your logic that no test noticed. It is slow, so run it on the domain layer and in nightly CI rather than per commit.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="bash">Shell</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="bash"><code># Coverage: coverlet is built into the test SDK
+dotnet test --collect:&quot;XPlat Code Coverage&quot;
+#   -&gt; TestResults/&lt;guid&gt;/coverage.cobertura.xml
+
+# A readable report
+dotnet tool install -g dotnet-reportgenerator-globaltool
+reportgenerator -reports:&quot;**/coverage.cobertura.xml&quot; -targetdir:coveragereport \
+                -reporttypes:Html
+
+# Gate the build, but on a FLOOR, not a target - and exclude generated code
+dotnet test --collect:&quot;XPlat Code Coverage&quot; \
+  -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Threshold=70
+
+# runsettings is the maintainable way to express the exclusions
+cat coverlet.runsettings
+# &lt;Configuration&gt;
+#   &lt;Format&gt;cobertura&lt;/Format&gt;
+#   &lt;Exclude&gt;[*.Tests]*,[*]*.Migrations.*&lt;/Exclude&gt;
+#   &lt;ExcludeByAttribute&gt;GeneratedCodeAttribute,ExcludeFromCodeCoverage&lt;/ExcludeByAttribute&gt;
+#   &lt;SkipAutoProps&gt;true&lt;/SkipAutoProps&gt;
+# &lt;/Configuration&gt;
+dotnet test --settings coverlet.runsettings
+
+# MUTATION TESTING with Stryker.NET - the number that actually means something
+dotnet tool install -g dotnet-stryker
+dotnet stryker --project Shop.Domain.csproj --mutation-level Standard
+
+#   Killed:    212   a test caught the change            &lt;- good
+#   Survived:   18   NO test noticed the change          &lt;- these are the gaps
+#   Timeout:     3   the change caused an infinite loop  (counts as killed)
+#   No coverage: 9   the line never ran at all
+#   Mutation score: 88.3%
+
+#   Example of a survivor it will report:
+#     if (total.Amount &gt;= Threshold)        original
+#     if (total.Amount &gt;  Threshold)        mutant - SURVIVED
+#   meaning: no test exercises exactly the boundary value. That is a real gap
+#   that 100% line coverage would never have told you about.
+
+# Slow by design: it reruns the suite per mutant. Scope it.
+dotnet stryker --project Shop.Domain.csproj --since:main     # changed code only
+#   nightly for the whole domain, per-PR for the diff</code></pre><pre data-lang="python" hidden><code># Coverage
+pip install pytest-cov
+pytest --cov=shop --cov-report=term-missing --cov-report=html
+
+#   Name                    Stmts   Miss  Cover   Missing
+#   shop/domain/orders.py      142      8    94%   88-91, 103, 157-159
+#                                                  ^ the useful column
+
+# Branch coverage is strictly better than line coverage - it catches the
+# `if` whose false path is never taken
+pytest --cov=shop --cov-branch --cov-fail-under=70
+
+# pyproject.toml
+# [tool.coverage.run]
+# branch = true
+# omit = [&quot;*/migrations/*&quot;, &quot;*/tests/*&quot;]
+# [tool.coverage.report]
+# exclude_lines = [&quot;pragma: no cover&quot;, &quot;if TYPE_CHECKING:&quot;, &quot;raise NotImplementedError&quot;]
+
+# MUTATION TESTING with mutmut
+pip install mutmut
+mutmut run --paths-to-mutate shop/domain/
+mutmut results
+mutmut show 42                 # the exact surviving mutant
+
+#   - shop/domain/orders.py:88
+#   -     if total.amount &gt;= THRESHOLD:
+#   +     if total.amount &gt; THRESHOLD:
+#   SURVIVED
+
+# cosmic-ray is the other option; both are slow, so scope them the same way:
+# the domain layer, nightly, or only changed files on a PR.
+
+# The point of either tool, in one line: coverage tells you what RAN,
+# mutation testing tells you what was CHECKED.</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A good trap question is "what coverage do you aim for?" and the answer that shows judgement is that coverage is a floor and a gap-finder, not a target, because a test that asserts nothing still reports 100%. Follow with mutation testing as the metric that measures whether your tests actually check anything, and give the concrete example — a surviving <code>&gt;=</code>-to-<code>&gt;</code> mutant means no test exercises the boundary, which line coverage can never reveal. Add the practical constraint (it is slow, so nightly or diff-scoped) so it does not sound theoretical.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a test with no assertions and confirm it still produces coverage.</li><li>Run Stryker or mutmut on one domain class and fix every surviving mutant.</li><li>Switch from line coverage to branch coverage and see which number moves.</li></ul></div></section>
+<section id="flaky"><h2 id="flaky">Flaky tests: causes and fixes</h2><p>A flaky test is worse than no test, because it trains the team to re-run the build instead of reading the failure — and then a real failure gets re-run too. Treat flakiness as a bug with a root cause, not as background noise.</p><p>The causes are a short list and nearly always one of: <strong>time</strong> (sleeps, real clocks, timezone or DST), <strong>shared state</strong> (test order, a static field, a shared database row), <strong>concurrency</strong> (a race between the test and a background task), <strong>external dependencies</strong> (a real network call), <strong>non-determinism</strong> (unseeded randomness, <code>Guid.NewGuid()</code> in an assertion, dictionary ordering), and <strong>resources</strong> (ports, files, CI agents slower than your laptop).</p><p>Retry attributes are the wrong fix and worth saying so: they hide the signal, and a flaky test retried three times is a 1-in-8 failure you will now see only on the worst day.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// 1. TIME ------------------------------------------------------------------
+// flaky: passes on a fast machine, fails on a loaded CI agent
+await _sut.StartBackgroundWork();
+await Task.Delay(100);
+_result.Should().NotBeNull();
+
+// fixed: wait for the condition, with a generous timeout
+await WaitUntilAsync(() =&gt; _result is not null, TimeSpan.FromSeconds(5));
+
+static async Task WaitUntilAsync(Func&lt;bool&gt; condition, TimeSpan timeout)
+{
+    using var cts = new CancellationTokenSource(timeout);
+    while (!condition())
+    {
+        cts.Token.ThrowIfCancellationRequested();
+        await Task.Delay(10, cts.Token);
+    }
+}
+
+// flaky: fails at midnight, and for anyone outside your timezone
+var expected = DateTime.Today.AddDays(30);
+// fixed: inject the clock (see the TimeProvider section)
+
+// flaky: fails on 29 February and when DST shifts
+var later = now.AddDays(1);
+// fixed: pin the timezone and the date in the test
+
+// 2. SHARED STATE ------------------------------------------------------------
+// flaky: a static field carries across tests, and xUnit parallelises collections
+public static class Cache { public static Dictionary&lt;string, Order&gt; Items = []; }
+// fixed: inject the cache, or reset it in the constructor, or make it non-static
+
+// flaky: asserts a global count, so any other test that inserts breaks it
+orders.Should().HaveCount(3);
+// fixed: scope to data this test created
+orders.Where(o =&gt; o.CustomerId == _thisTestsCustomer).Should().HaveCount(3);
+
+// 3. ORDER DEPENDENCE --------------------------------------------------------
+// Find it: xUnit randomises collection order by default, but within a class
+// tests run in a stable order. Shuffle deliberately to flush out dependencies.
+[assembly: TestCollectionOrderer(&quot;Shop.Tests.RandomOrderer&quot;, &quot;Shop.Tests&quot;)]
+
+// 4. NON-DETERMINISM ---------------------------------------------------------
+// flaky: dictionary and HashSet enumeration order is not guaranteed
+result.Keys.First().Should().Be(&quot;a&quot;);
+// fixed: order explicitly, or assert on the set
+result.Keys.Should().BeEquivalentTo([&quot;a&quot;, &quot;b&quot;]);     // order-insensitive
+result.Keys.OrderBy(k =&gt; k).First().Should().Be(&quot;a&quot;);
+
+// flaky: unseeded randomness
+var id = Guid.NewGuid();
+result.Id.Should().Be(id);                 // only if you injected the factory
+// fixed: inject it
+var sut = new Service(idFactory: () =&gt; KnownId);
+
+// flaky: floating point
+(0.1 + 0.2).Should().Be(0.3);              // false
+(0.1 + 0.2).Should().BeApproximately(0.3, 1e-9);    // or use decimal
+
+// 5. CONCURRENCY -------------------------------------------------------------
+// flaky: a race between the test&#x27;s assertion and a fire-and-forget task
+_ = Task.Run(() =&gt; _sut.Process());        // nothing awaits this
+_sut.Done.Should().BeTrue();
+// fixed: await it, or expose a completion signal to await
+
+// 6. RESOURCES ---------------------------------------------------------------
+// flaky: a hard-coded port collides when tests run in parallel
+var server = new TestServer(port: 5000);
+// fixed: let the OS pick
+var server2 = WireMockServer.Start();      // ephemeral port
+
+// flaky: a shared temp file
+File.WriteAllText(&quot;/tmp/test.txt&quot;, data);
+// fixed: a unique directory per test, cleaned up
+var dir = Directory.CreateTempSubdirectory();
+
+// FINDING them: run the suite repeatedly and track which fail intermittently
+//   for i in {1..50}; do dotnet test --filter Category=Unit || echo &quot;FAIL $i&quot;; done
+// Most CI systems can report flaky tests across runs - turn that on.
+
+// WHAT NOT TO DO: a retry attribute. It hides the signal and converts a
+// 50% flake into a 12% flake you will chase for months.
+[Retry(3)]                                 // no</code></pre><pre data-lang="python" hidden><code>import pytest, asyncio, uuid, tempfile, pathlib
+
+# 1. TIME
+# flaky
+await sut.start_background_work()
+await asyncio.sleep(0.1)
+assert result is not None
+
+# fixed
+async def wait_until(predicate, timeout=5.0, interval=0.01):
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(interval)
+
+await wait_until(lambda: result is not None)
+
+# 2. SHARED STATE: module-level mutable state leaks between tests
+_cache: dict = {}                      # flaky
+
+@pytest.fixture(autouse=True)          # fixed
+def clear_cache():
+    _cache.clear()
+    yield
+    _cache.clear()
+
+# 3. ORDER DEPENDENCE: find it by shuffling
+#   pip install pytest-randomly        # shuffles by default, prints the seed
+#   pytest -p randomly --randomly-seed=12345    # reproduce a failure
+
+# 4. NON-DETERMINISM
+# flaky: set ordering
+assert list(result)[0] == &quot;a&quot;
+# fixed
+assert set(result) == {&quot;a&quot;, &quot;b&quot;}
+assert sorted(result)[0] == &quot;a&quot;
+
+# flaky: floats
+assert 0.1 + 0.2 == 0.3                # False
+assert 0.1 + 0.2 == pytest.approx(0.3)
+
+# flaky: unseeded randomness
+import random
+def test_deterministic():
+    rng = random.Random(42)            # seeded
+
+# 5. CONCURRENCY: a task nobody awaits
+task = asyncio.create_task(sut.process())      # flaky if you assert immediately
+await task                                      # fixed
+
+# 6. RESOURCES: unique per test
+@pytest.fixture
+def temp_dir():
+    with tempfile.TemporaryDirectory() as d:
+        yield pathlib.Path(d)
+
+# FINDING them
+#   pip install pytest-repeat
+#   pytest --count=50 -x tests/test_orders.py
+#   pytest -p no:randomly      # to confirm order dependence is the cause
+
+# WHAT NOT TO DO
+#   pip install pytest-rerunfailures
+#   pytest --reruns 3          # hides the problem; use only to TRIAGE, never
+#                              # as the permanent fix, and alert on rerun counts</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A good culture question: "what do you do about a flaky test?" The answer that signals seniority is that you treat it as a bug with a root cause, quarantine it so it stops blocking the build, and fix or delete it within a sprint — never leave a retry on it, because a retried flake is a signal you have deliberately hidden. Be able to list the causes quickly (time, shared state, order, concurrency, external calls, non-determinism, resources) and say how you find them: run the suite fifty times, randomise the order, and look at the CI system's own flaky-test report.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Run your suite 50 times in a loop and see whether anything fails intermittently.</li><li>Randomise test order and find the pair with a hidden dependency.</li><li>Replace every <code>Task.Delay</code> in your tests with a condition poll and measure the suite time.</li></ul></div></section>
+<section id="other-frameworks"><h2 id="other-frameworks">NUnit and MSTest: what differs from xUnit</h2><p>Worth 60 seconds of preparation because you may well join a team using one of the others, and the differences are small but visible. The one that matters conceptually is <strong>test class lifetime</strong>: xUnit constructs a new instance of the test class for every test, which makes shared mutable state impossible by default; NUnit and MSTest reuse one instance and give you explicit setup/teardown attributes instead.</p><p>The other difference worth naming is parallelism: xUnit parallelises <em>across collections</em> by default, which is why shared-fixture tests must be grouped into a collection.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// ---------------- xUnit ----------------
+public class CartTests : IDisposable            // ctor = setup, Dispose = teardown
+{
+    private readonly Cart _cart = new();        // FRESH per test
+
+    [Fact]
+    public void Adding_an_item_increases_the_count() { }
+
+    [Theory]
+    [InlineData(1, 2, 3)]
+    [MemberData(nameof(Cases))]
+    public void Sums(int a, int b, int expected) { }
+
+    public void Dispose() { }
+}
+// shared expensive state
+public class DbFixture : IAsyncLifetime { }
+public class Tests : IClassFixture&lt;DbFixture&gt; { }        // per test class
+[CollectionDefinition(&quot;db&quot;)] public class C : ICollectionFixture&lt;DbFixture&gt; { }
+[Collection(&quot;db&quot;)] public class Tests2 { }               // across classes
+
+// ---------------- NUnit ----------------
+[TestFixture]
+public class CartTests
+{
+    private Cart _cart = null!;                 // ONE instance for the whole fixture
+
+    [OneTimeSetUp]    public void BeforeAll() { }
+    [SetUp]           public void BeforeEach() =&gt; _cart = new Cart();   // reset here
+    [TearDown]        public void AfterEach() { }
+    [OneTimeTearDown] public void AfterAll() { }
+
+    [Test] public void Adding_an_item_increases_the_count() { }
+
+    [TestCase(1, 2, ExpectedResult = 3)]
+    [TestCaseSource(nameof(Cases))]
+    public int Sums(int a, int b) =&gt; a + b;
+
+    [Test, Repeat(10), Retry(3), Timeout(2000)]   // built-in, unlike xUnit
+    public void Flaky() { }
+}
+
+// ---------------- MSTest ----------------
+[TestClass]
+public class CartTests
+{
+    public TestContext TestContext { get; set; } = null!;
+
+    [ClassInitialize] public static void BeforeAll(TestContext c) { }
+    [TestInitialize]  public void BeforeEach() { }
+    [TestCleanup]     public void AfterEach() { }
+    [ClassCleanup]    public static void AfterAll() { }
+
+    [TestMethod] public void Adding_an_item_increases_the_count() { }
+
+    [DataTestMethod]
+    [DataRow(1, 2, 3)]
+    [DynamicData(nameof(Cases))]
+    public void Sums(int a, int b, int expected) { }
+}
+
+// ---------------- The mapping ----------------
+//  concept           xUnit                 NUnit              MSTest
+//  ---------------   -------------------   ----------------   -------------------
+//  test              [Fact]                [Test]             [TestMethod]
+//  parameterised     [Theory]+[InlineData] [TestCase]         [DataRow]
+//  per-test setup    constructor           [SetUp]            [TestInitialize]
+//  per-test teardown IDisposable           [TearDown]         [TestCleanup]
+//  class setup       IClassFixture         [OneTimeSetUp]     [ClassInitialize]
+//  instance lifetime NEW per test          ONE per fixture    ONE per class
+//  skip              [Fact(Skip=&quot;...&quot;)]    [Ignore(&quot;...&quot;)]    [Ignore]
+//  expected throw    Assert.Throws         Assert.Throws      Assert.ThrowsException
+//  parallelism       collections, default  opt-in, [Parallelizable]  opt-in
+//  built-in retry    no (by design)        [Retry]            no
+
+// xUnit&#x27;s position on [Retry] is deliberate and worth knowing: the author&#x27;s
+// view is that a test needing a retry is a broken test, so the framework does
+// not make hiding it convenient.</code></pre><pre data-lang="python" hidden><code># Python has the same split: pytest (the xUnit-style one everyone uses) and
+# unittest (the xUnit-pattern one in the stdlib).
+
+# ---------------- pytest ----------------
+import pytest
+
+@pytest.fixture
+def cart():                               # fresh per test, like xUnit&#x27;s ctor
+    c = Cart()
+    yield c
+    c.dispose()                           # teardown after the yield
+
+def test_adding_an_item_increases_the_count(cart):
+    cart.add(item)
+    assert cart.count == 1
+
+@pytest.mark.parametrize(&quot;a,b,expected&quot;, [(1, 2, 3), (2, 2, 4)])
+def test_sums(a, b, expected):
+    assert a + b == expected
+
+@pytest.fixture(scope=&quot;session&quot;)          # IClassFixture / ICollectionFixture
+def database(): ...
+
+@pytest.fixture(scope=&quot;module&quot;)
+def expensive(): ...
+
+# ---------------- unittest (stdlib) ----------------
+import unittest
+
+class CartTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls): ...              # [OneTimeSetUp] / [ClassInitialize]
+    def setUp(self): self.cart = Cart()   # [SetUp] / [TestInitialize]
+    def tearDown(self): ...               # [TearDown] / [TestCleanup]
+    @classmethod
+    def tearDownClass(cls): ...
+
+    def test_adding_an_item(self):
+        self.cart.add(item)
+        self.assertEqual(self.cart.count, 1)
+
+    def test_raises(self):
+        with self.assertRaises(ValueError):
+            self.cart.add(None)
+
+# Instance lifetime: unittest creates a NEW instance per test method, like
+# xUnit - so the Python stdlib matches xUnit rather than NUnit here.
+
+# Parallelism is opt-in, via a plugin
+#   pytest -n auto         (pytest-xdist)
+
+# Retry: a plugin, not core - the same stance as xUnit
+#   pytest --reruns 3      (pytest-rerunfailures)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Rarely asked directly, but "we use NUnit here, is that a problem?" is common and the right answer is a confident no plus one substantive difference. The one to give: xUnit constructs a new test-class instance per test so shared mutable state cannot leak, whereas NUnit reuses the fixture instance and relies on <code>[SetUp]</code> to reset it. A good follow-on is xUnit's deliberate omission of <code>[Retry]</code> — the position being that a test needing a retry is a broken test — which signals you have thought about flakiness rather than just the API.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Port one test class from xUnit to NUnit and notice what the instance-lifetime difference changes.</li><li>Find out what your test framework does about parallelism by default.</li><li>Write the same parameterised test in all three frameworks.</li></ul></div></section>
+<section id="ci"><h2 id="ci">Tests in CI: parallelism, categories and what gates the build</h2><p>The suite has to be fast enough that people run it and reliable enough that a red build means something. That is a pipeline design problem as much as a testing one: split by speed, run the fast tests on every push, gate the merge on the right subset, and publish results so a failure is readable without opening logs.</p><p>The decision to be able to defend is <strong>what blocks a merge</strong>. Unit and integration tests, yes. End-to-end against a shared environment, usually not — they are slow and flaky enough that gating on them means the team routinely overrides the gate, which is worse than not having it.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="yaml">YAML</button><button role="tab" aria-selected="false" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="yaml"><code># GitHub Actions: fast tests on every push, slow ones in parallel
+name: ci
+on: [push, pull_request]
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: &#x27;8.0.x&#x27; }
+
+      - run: dotnet restore --locked-mode          # fail if the lock file drifts
+      - run: dotnet build -c Release --no-restore -warnaserror
+
+      - name: Unit tests
+        run: &gt;
+          dotnet test --no-build -c Release
+          --filter &quot;Category!=Integration&amp;Category!=E2E&quot;
+          --logger &quot;trx;LogFileName=unit.trx&quot;
+          --collect:&quot;XPlat Code Coverage&quot;
+          -- RunConfiguration.MaxCpuCount=0        # all cores
+
+      - uses: dorny/test-reporter@v1               # readable failures in the PR
+        if: always()
+        with: { name: Unit tests, path: &#x27;**/unit.trx&#x27;, reporter: dotnet-trx }
+
+      - uses: codecov/codecov-action@v4
+        with: { files: &#x27;**/coverage.cobertura.xml&#x27; }
+
+  integration:
+    runs-on: ubuntu-latest                          # Docker is available, so
+    steps:                                          # Testcontainers just works
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: &#x27;8.0.x&#x27; }
+      - run: dotnet test --filter &quot;Category=Integration&quot; --logger trx
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: &quot;false&quot;     # leave the reaper ON in CI
+
+  mutation:
+    if: github.event_name == &#x27;schedule&#x27;             # nightly, not per PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: dotnet tool install -g dotnet-stryker
+      - run: dotnet stryker --project Shop.Domain.csproj --break-at 80
+
+# Branch protection decides what actually gates the merge:
+#   required: unit, integration
+#   not required: e2e, mutation   (they run, they inform, they do not block)</code></pre><pre data-lang="csharp" hidden><code>// Categorising so the filters above work. xUnit uses traits.
+[Trait(&quot;Category&quot;, &quot;Integration&quot;)]
+public class OrderApiTests { }
+
+[Fact, Trait(&quot;Category&quot;, &quot;E2E&quot;)]
+public async Task Checkout_end_to_end() { }
+
+//   dotnet test --filter &quot;Category!=Integration&quot;
+//   dotnet test --filter &quot;Category=Integration|Category=E2E&quot;
+//   dotnet test --filter &quot;FullyQualifiedName~Orders&quot;
+
+// A custom attribute is tidier than repeating the trait
+public sealed class IntegrationTestAttribute : FactAttribute
+{
+    public IntegrationTestAttribute()
+    {
+        if (Environment.GetEnvironmentVariable(&quot;DOCKER_HOST&quot;) is null
+            &amp;&amp; !OperatingSystem.IsLinux())
+            Skip = &quot;Docker is not available&quot;;       // skip, do not fail, locally
+    }
+}
+
+// PARALLELISM ---------------------------------------------------------------
+// xUnit: collections run in parallel, tests within a collection do not.
+// xunit.runner.json:
+//   { &quot;parallelizeAssembly&quot;: true, &quot;parallelizeTestCollections&quot;: true,
+//     &quot;maxParallelThreads&quot;: -1 }
+
+// Anything sharing a resource must be in ONE collection, which serialises it
+[Collection(&quot;database&quot;)] public class A { }
+[Collection(&quot;database&quot;)] public class B { }     // A and B never run concurrently
+
+// Turn it off while stabilising
+[assembly: CollectionBehavior(DisableTestParallelization = true)]
+
+// CI-SPECIFIC CONCERNS ------------------------------------------------------
+
+// Agents are slower than your laptop. Timeouts must be generous or you create
+// flakes that only happen in CI.
+private static readonly TimeSpan Timeout =
+    Environment.GetEnvironmentVariable(&quot;CI&quot;) is null
+        ? TimeSpan.FromSeconds(2)
+        : TimeSpan.FromSeconds(10);
+
+// Never let a tool write files in CI that a human was supposed to review
+DiffEngine.DiffRunner.Disabled = true;          // Verify: no diff tool on an agent
+//   and never run `--snapshot-update` / `dotnet verify accept` in a pipeline
+
+// Fail on warnings, so the build stays clean
+//   &lt;TreatWarningsAsErrors&gt;true&lt;/TreatWarningsAsErrors&gt;
+
+// WHAT TO GATE ON, and the reasoning to be able to give:
+//   build + analyzers      YES   fast, deterministic
+//   unit tests             YES   fast, deterministic
+//   integration tests      YES   slower, still deterministic with containers
+//   coverage floor         YES   a floor (e.g. &quot;must not drop&quot;), not a target
+//   e2e against staging    NO    slow and shared; run it, report it, do not block
+//   mutation score         NO    nightly; informs the team, does not gate the PR
+//
+// Gating on something flaky teaches people to re-run or override the gate,
+// which costs you the gates that were working.</code></pre><pre data-lang="python" hidden><code># pyproject.toml - markers are the Category equivalent
+# [tool.pytest.ini_options]
+# markers = [
+#   &quot;integration: needs a database or a container&quot;,
+#   &quot;e2e: runs against a deployed environment&quot;,
+# ]
+# addopts = &quot;--strict-markers -ra&quot;      # typo in a marker name = error
+
+import pytest
+
+@pytest.mark.integration
+def test_against_a_real_database(): ...
+
+# Selecting
+#   pytest -m &quot;not integration and not e2e&quot;
+#   pytest -m integration
+#   pytest -k &quot;orders and not slow&quot;
+
+# Parallelism
+#   pytest -n auto                       # pytest-xdist, one worker per core
+#   pytest -n 4 --dist loadscope         # keep a class&#x27;s tests on one worker,
+#                                        # so class-scoped fixtures are not rebuilt
+
+# The pipeline
+# name: ci
+# on: [push, pull_request]
+# jobs:
+#   unit:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: actions/setup-python@v5
+#         with: { python-version: &#x27;3.12&#x27;, cache: pip }
+#       - run: pip install -r requirements-dev.txt
+#       - run: ruff check . &amp;&amp; mypy shop
+#       - run: pytest -m &quot;not integration&quot; -n auto --cov=shop --cov-report=xml
+#               --junitxml=junit.xml
+#       - uses: codecov/codecov-action@v4
+#   integration:
+#     runs-on: ubuntu-latest              # Docker available for testcontainers
+#     steps:
+#       - run: pytest -m integration --junitxml=junit-integration.xml
+
+# CI agents are slow - scale the timeouts
+import os
+TIMEOUT = 10.0 if os.getenv(&quot;CI&quot;) else 2.0
+
+# Never update snapshots in CI
+#   pytest                      # compares
+#   NOT: pytest --snapshot-update</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>A pipeline question as much as a testing one, and the differentiating part is <em>what gates the merge</em>. Say: build, analyzers, unit and integration tests gate; end-to-end tests and mutation scores run but do not block, because gating on something flaky teaches the team to override gates and you lose the ones that worked. Practical details that land: categorise tests so the fast ones run on every push, give CI agents more generous timeouts than your laptop, and never let a snapshot tool auto-approve in a pipeline.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Split your suite into fast and slow jobs and measure the time to first red.</li><li>Add a test-results reporter so a CI failure is readable from the PR without opening logs.</li><li>Write down what currently blocks a merge in your pipeline and whether each gate earns it.</li></ul></div></section>
 
   <div class="further">
     <h2 id="further-reading">Further reading</h2>
-    <ul><li><a href="https://learn.microsoft.com/dotnet/core/testing/unit-testing-with-dotnet-test" target="_blank" rel="noopener">Unit testing C# with xUnit</a></li><li><a href="https://learn.microsoft.com/aspnet/core/test/integration-tests" target="_blank" rel="noopener">Integration tests in ASP.NET Core</a> — WebApplicationFactory</li><li><a href="https://github.com/devlooped/moq/wiki/Quickstart" target="_blank" rel="noopener">Moq quickstart</a></li><li><a href="https://fluentassertions.com/introduction" target="_blank" rel="noopener">FluentAssertions docs</a></li><li><a href="https://docs.pytest.org/" target="_blank" rel="noopener">pytest docs</a></li><li><a href="https://fastapi.tiangolo.com/tutorial/testing/" target="_blank" rel="noopener">Testing FastAPI</a></li></ul>
+    <ul><li><a href="https://xunit.net/docs/getting-started/v3/getting-started" target="_blank" rel="noopener">xUnit documentation</a> — fixtures, collections, parallelism</li><li><a href="https://martinfowler.com/bliki/TestDouble.html" target="_blank" rel="noopener">Fowler: test doubles</a> — the dummy/stub/spy/mock/fake vocabulary, from the source</li><li><a href="https://martinfowler.com/articles/practical-test-pyramid.html" target="_blank" rel="noopener">The practical test pyramid</a> — what each layer is for</li><li><a href="https://dotnet.testcontainers.org/" target="_blank" rel="noopener">Testcontainers for .NET</a> — real dependencies in Docker, per test run</li><li><a href="https://github.com/VerifyTests/Verify" target="_blank" rel="noopener">Verify</a> — snapshot testing</li><li><a href="https://learn.microsoft.com/dotnet/core/testing/" target="_blank" rel="noopener">Microsoft testing docs</a> — the official overview</li></ul>
   </div>
 
   <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>

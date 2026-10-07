@@ -93,6 +93,54 @@ window.CURRICULUM = {
           ]
         },
         {
+          "id": "modern-csharp",
+          "label": "Modern C# (8 → 13)",
+          "href": "topics/modern-csharp.html",
+          "blurb": "What the language gained after C# 7: nullable reference types, records, pattern matching, required members, primary constructors, collection expressions and generic math.",
+          "sections": [
+            {
+              "hash": "#nullable",
+              "label": "Nullable reference types and the annotation context"
+            },
+            {
+              "hash": "#records",
+              "label": "Records, with-expressions and value equality"
+            },
+            {
+              "hash": "#patterns",
+              "label": "Pattern matching: switch expressions, property, positional and list patterns"
+            },
+            {
+              "hash": "#ranges",
+              "label": "Ranges, indices and slicing"
+            },
+            {
+              "hash": "#init-required",
+              "label": "init, required and object initialisation"
+            },
+            {
+              "hash": "#primary-ctor",
+              "label": "Primary constructors and collection expressions"
+            },
+            {
+              "hash": "#interface-members",
+              "label": "Default interface members and static abstract members"
+            },
+            {
+              "hash": "#terse",
+              "label": "Target-typed new, file-scoped namespaces, global usings, top-level statements"
+            },
+            {
+              "hash": "#async-streams",
+              "label": "IAsyncEnumerable and await foreach"
+            },
+            {
+              "hash": "#version-map",
+              "label": "What landed in which version"
+            }
+          ]
+        },
+        {
           "id": "threading",
           "label": "Threading & Async",
           "href": "topics/threading.html",
@@ -149,6 +197,54 @@ window.CURRICULUM = {
           ]
         },
         {
+          "id": "dotnet-platform",
+          "label": ".NET Platform & Hosting",
+          "href": "topics/dotnet-platform.html",
+          "blurb": "The runtime and the host: .NET Framework vs Core vs 8/9, SDKs and TFMs, the generic host, BackgroundService, configuration precedence, the options pattern, ILogger, JIT vs Native AOT and trimming.",
+          "sections": [
+            {
+              "hash": "#runtimes",
+              "label": ".NET Framework, .NET Core and .NET 5–10"
+            },
+            {
+              "hash": "#sdk-tfm",
+              "label": "SDKs, runtimes, TFMs and global.json"
+            },
+            {
+              "hash": "#host",
+              "label": "The generic host, IHostedService and BackgroundService"
+            },
+            {
+              "hash": "#configuration",
+              "label": "Configuration providers and precedence"
+            },
+            {
+              "hash": "#options",
+              "label": "The options pattern: IOptions, IOptionsSnapshot, IOptionsMonitor and validation"
+            },
+            {
+              "hash": "#logging",
+              "label": "ILogger, log levels, scopes and structured logging"
+            },
+            {
+              "hash": "#di-advanced",
+              "label": "DI beyond lifetimes: captive dependencies, keyed services, factories"
+            },
+            {
+              "hash": "#jit-aot",
+              "label": "JIT, tiered compilation, ReadyToRun and Native AOT"
+            },
+            {
+              "hash": "#trimming",
+              "label": "Trimming, single-file and container-ready publishing"
+            },
+            {
+              "hash": "#cli",
+              "label": "The dotnet CLI and what to reach for when"
+            }
+          ]
+        },
+        {
           "id": "web-api",
           "label": "ASP.NET Core Web API",
           "href": "topics/web-api.html",
@@ -201,6 +297,46 @@ window.CURRICULUM = {
             {
               "hash": "#caching-ratelimit",
               "label": "Caching and rate limiting"
+            }
+          ]
+        },
+        {
+          "id": "communication",
+          "label": "APIs Beyond REST",
+          "href": "topics/communication.html",
+          "blurb": "When REST is the wrong shape: gRPC for service-to-service, SignalR and WebSockets for push, GraphQL for client-driven queries, and streaming responses.",
+          "sections": [
+            {
+              "hash": "#choosing",
+              "label": "Choosing between REST, gRPC, GraphQL and messaging"
+            },
+            {
+              "hash": "#grpc-basics",
+              "label": "gRPC in .NET: proto, codegen and the four call types"
+            },
+            {
+              "hash": "#grpc-production",
+              "label": "Deadlines, interceptors, errors and gRPC-Web"
+            },
+            {
+              "hash": "#signalr",
+              "label": "SignalR: hubs, groups and scale-out"
+            },
+            {
+              "hash": "#websockets-sse",
+              "label": "Raw WebSockets and server-sent events"
+            },
+            {
+              "hash": "#graphql",
+              "label": "GraphQL with HotChocolate: schema, resolvers and DataLoader"
+            },
+            {
+              "hash": "#streaming",
+              "label": "Streaming responses and backpressure"
+            },
+            {
+              "hash": "#contracts",
+              "label": "Contracts and versioning across protocols"
             }
           ]
         },
@@ -301,6 +437,62 @@ window.CURRICULUM = {
           ]
         },
         {
+          "id": "sql-databases",
+          "label": "SQL & Database Fundamentals",
+          "href": "topics/sql-databases.html",
+          "blurb": "The SQL round: joins, CTEs and window functions, index design, reading an execution plan, isolation levels and deadlocks, keyset pagination, and when not to use a relational database.",
+          "sections": [
+            {
+              "hash": "#modelling",
+              "label": "Modelling, normalisation and when to denormalise"
+            },
+            {
+              "hash": "#joins",
+              "label": "Joins, set operators and NULL"
+            },
+            {
+              "hash": "#aggregates-ctes",
+              "label": "Aggregates, GROUP BY, HAVING and CTEs"
+            },
+            {
+              "hash": "#windows",
+              "label": "Window functions and running totals"
+            },
+            {
+              "hash": "#indexes",
+              "label": "Indexes: clustered, non-clustered, covering and composite"
+            },
+            {
+              "hash": "#plans",
+              "label": "Reading an execution plan"
+            },
+            {
+              "hash": "#sargable",
+              "label": "SARGability and query anti-patterns"
+            },
+            {
+              "hash": "#transactions",
+              "label": "Transactions, isolation levels and the anomalies each allows"
+            },
+            {
+              "hash": "#locking",
+              "label": "Locking, blocking and deadlocks"
+            },
+            {
+              "hash": "#pagination",
+              "label": "Paging, keyset pagination and counting at scale"
+            },
+            {
+              "hash": "#procs-views",
+              "label": "Stored procedures, views and functions"
+            },
+            {
+              "hash": "#sql-vs-nosql",
+              "label": "SQL vs NoSQL: choosing the store"
+            }
+          ]
+        },
+        {
           "id": "design-patterns",
           "label": "Design Patterns & SOLID",
           "href": "topics/design-patterns.html",
@@ -381,11 +573,67 @@ window.CURRICULUM = {
           ]
         },
         {
-          "id": "testing",
-          "label": "Testing (essentials)",
-          "href": "topics/testing.html",
-          "blurb": "A deliberately short page: xUnit basics and AAA, data-driven tests, Moq, FluentAssertions, and one end-to-end integration test with WebApplicationFactory. pytest alongside.",
+          "id": "architecture-ddd",
+          "label": "Clean Architecture & DDD",
+          "href": "topics/architecture-ddd.html",
+          "blurb": "Layering that survives contact with a real codebase: the dependency rule, entities and value objects, aggregates, bounded contexts, domain events, CQRS, event sourcing — and the case against all of it.",
           "sections": [
+            {
+              "hash": "#layers",
+              "label": "Layered, Onion, Hexagonal and Clean — one idea, four names"
+            },
+            {
+              "hash": "#entities-values",
+              "label": "Entities, value objects and invariants"
+            },
+            {
+              "hash": "#aggregates",
+              "label": "Aggregates and aggregate roots"
+            },
+            {
+              "hash": "#bounded-contexts",
+              "label": "Bounded contexts, ubiquitous language and context mapping"
+            },
+            {
+              "hash": "#domain-events",
+              "label": "Domain events and integration events"
+            },
+            {
+              "hash": "#application-services",
+              "label": "Application services, use cases and the MediatR shape"
+            },
+            {
+              "hash": "#cqrs",
+              "label": "CQRS: separate models, and how far to take it"
+            },
+            {
+              "hash": "#event-sourcing",
+              "label": "Event sourcing: streams, projections and snapshots"
+            },
+            {
+              "hash": "#vertical-slice",
+              "label": "Vertical slice architecture, and the case against layers"
+            },
+            {
+              "hash": "#persistence",
+              "label": "Persisting the domain without leaking it"
+            }
+          ]
+        },
+        {
+          "id": "testing",
+          "label": "Testing",
+          "href": "topics/testing.html",
+          "blurb": "The shape of a good test suite: the pyramid, TDD, test doubles, testing time and async, Testcontainers against a real database, HTTP stubbing, snapshots, coverage, flaky tests and CI.",
+          "sections": [
+            {
+              "hash": "#what-to-test",
+              "label": "What to test: the pyramid, the trophy and the ice-cream cone"
+            },
+            {
+              "hash": "#tdd",
+              "label": "TDD: red, green, refactor on a real example"
+            },
             {
               "hash": "#xunit-basics",
               "label": "xUnit basics and Arrange-Act-Assert"
@@ -393,6 +641,10 @@ window.CURRICULUM = {
             {
               "hash": "#theory",
               "label": "Data-driven tests: [Theory], [InlineData], [MemberData]"
+            },
+            {
+              "hash": "#test-doubles",
+              "label": "Test doubles: dummy, stub, spy, mock, fake — and when to stop"
             },
             {
               "hash": "#moq",
@@ -403,60 +655,44 @@ window.CURRICULUM = {
               "label": "Readable assertions with FluentAssertions"
             },
             {
+              "hash": "#time-async",
+              "label": "Testing time, async and randomness"
+            },
+            {
+              "hash": "#testcontainers",
+              "label": "Integration testing with Testcontainers and a real database"
+            },
+            {
+              "hash": "#state-reset",
+              "label": "Resetting state between tests"
+            },
+            {
+              "hash": "#http-stubbing",
+              "label": "Stubbing outbound HTTP"
+            },
+            {
               "hash": "#integration",
               "label": "One integration test with WebApplicationFactory"
-            }
-          ]
-        },
-        {
-          "id": "dsa",
-          "label": "Data Structures & Algorithms in C#",
-          "href": "topics/dsa.html",
-          "blurb": "The patterns behind most coding-round questions — frequency maps, two pointers, sliding window, stacks, linked lists, binary search, BFS/DFS, heaps, DP — each in idiomatic C# and Python.",
-          "sections": [
-            {
-              "hash": "#arrays-strings",
-              "label": "Arrays and strings"
             },
             {
-              "hash": "#frequency-map",
-              "label": "Dictionary frequency map"
+              "hash": "#snapshots",
+              "label": "Snapshot testing with Verify"
             },
             {
-              "hash": "#two-pointers",
-              "label": "Two pointers"
+              "hash": "#coverage",
+              "label": "Coverage, mutation testing and what the numbers mean"
             },
             {
-              "hash": "#sliding-window",
-              "label": "Sliding window"
+              "hash": "#flaky",
+              "label": "Flaky tests: causes and fixes"
             },
             {
-              "hash": "#stack-queue",
-              "label": "Stack and queue patterns"
+              "hash": "#other-frameworks",
+              "label": "NUnit and MSTest: what differs from xUnit"
             },
             {
-              "hash": "#linked-list",
-              "label": "Linked lists"
-            },
-            {
-              "hash": "#binary-search",
-              "label": "Binary search"
-            },
-            {
-              "hash": "#sorting",
-              "label": "Sorting and comparers"
-            },
-            {
-              "hash": "#graphs",
-              "label": "BFS and DFS on graphs and grids"
-            },
-            {
-              "hash": "#heap",
-              "label": "Heaps and PriorityQueue"
-            },
-            {
-              "hash": "#dp",
-              "label": "Dynamic programming — an introduction"
+              "hash": "#ci",
+              "label": "Tests in CI: parallelism, categories and what gates the build"
             }
           ]
         },
@@ -505,6 +741,50 @@ window.CURRICULUM = {
             {
               "hash": "#profiling",
               "label": "Profiling and diagnostics in production"
+            }
+          ]
+        },
+        {
+          "id": "advanced-csharp",
+          "label": "Advanced C# & Internals",
+          "href": "topics/advanced-csharp.html",
+          "blurb": "Reflection, attributes, expression trees, source generators, dynamic, closures, unsafe and P/Invoke, AssemblyLoadContext, IL, and the equality contracts.",
+          "sections": [
+            {
+              "hash": "#reflection",
+              "label": "Reflection, Type, Activator and attributes"
+            },
+            {
+              "hash": "#expression-trees",
+              "label": "Expression trees and how LINQ providers use them"
+            },
+            {
+              "hash": "#source-generators",
+              "label": "Source generators"
+            },
+            {
+              "hash": "#dynamic",
+              "label": "dynamic and the DLR"
+            },
+            {
+              "hash": "#closures",
+              "label": "Delegates, closures and captured variables"
+            },
+            {
+              "hash": "#unsafe-interop",
+              "label": "unsafe, pointers, fixed and P/Invoke"
+            },
+            {
+              "hash": "#assembly-loading",
+              "label": "AssemblyLoadContext, plugins and unloading"
+            },
+            {
+              "hash": "#il",
+              "label": "Reading IL and decompiled output"
+            },
+            {
+              "hash": "#equality",
+              "label": "Equals, GetHashCode and the comparison contracts"
             }
           ]
         },
@@ -589,6 +869,269 @@ window.CURRICULUM = {
             {
               "hash": "#config-secrets",
               "label": "Configuration, secrets and containers"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "algorithms",
+      "label": "DSA",
+      "blurb": "Interview algorithms in C# with Python alongside — one page per pattern, each with its canonical problem.",
+      "topics": [
+        {
+          "id": "dsa",
+          "label": "Foundations & Complexity",
+          "href": "topics/dsa.html",
+          "blurb": "How to run the 45 minutes, Big-O said out loud, the cost of every C# collection, recursion and stack depth, and the map from problem wording to pattern.",
+          "sections": [
+            {
+              "hash": "#the-45-minutes",
+              "label": "How to run the 45 minutes"
+            },
+            {
+              "hash": "#big-o",
+              "label": "Big-O: time, space, amortised — and how to say it"
+            },
+            {
+              "hash": "#collection-costs",
+              "label": "What every C# collection costs (and the Python equivalent)"
+            },
+            {
+              "hash": "#arrays-vs-list",
+              "label": "Arrays, List<T> and Span<T>"
+            },
+            {
+              "hash": "#recursion-basics",
+              "label": "Recursion, the call stack and depth limits"
+            },
+            {
+              "hash": "#choosing",
+              "label": "Reading the problem: which pattern is this?"
+            }
+          ]
+        },
+        {
+          "id": "dsa-arrays",
+          "label": "Arrays, Strings & Windows",
+          "href": "topics/dsa-arrays.html",
+          "blurb": "In-place array and string work, converging and fast/slow pointers, fixed and variable sliding windows, prefix sums, intervals and matrix traversal.",
+          "sections": [
+            {
+              "hash": "#arrays-strings",
+              "label": "Arrays and strings"
+            },
+            {
+              "hash": "#two-pointers",
+              "label": "Two pointers"
+            },
+            {
+              "hash": "#fast-slow",
+              "label": "Fast and slow pointers"
+            },
+            {
+              "hash": "#sliding-window",
+              "label": "Sliding window"
+            },
+            {
+              "hash": "#prefix-sums",
+              "label": "Prefix sums and difference arrays"
+            },
+            {
+              "hash": "#intervals",
+              "label": "Intervals: merge, insert and overlap"
+            },
+            {
+              "hash": "#matrix",
+              "label": "Matrix traversal: spiral, rotate and in-place marking"
+            }
+          ]
+        },
+        {
+          "id": "dsa-hashing",
+          "label": "Hashing, Sets & Counting",
+          "href": "topics/dsa-hashing.html",
+          "blurb": "Frequency maps, HashSet membership, grouping by a derived key, prefix-sum plus map, custom keys and GetHashCode, bucketing for top-k, the LRU cache, and when hashing is the wrong answer.",
+          "sections": [
+            {
+              "hash": "#frequency-map",
+              "label": "Dictionary frequency map"
+            },
+            {
+              "hash": "#sets",
+              "label": "HashSet: membership, dedup and \"visited\""
+            },
+            {
+              "hash": "#grouping",
+              "label": "Grouping by a derived key"
+            },
+            {
+              "hash": "#prefix-map",
+              "label": "Prefix sums plus a map: subarray counting"
+            },
+            {
+              "hash": "#custom-keys",
+              "label": "Custom keys, GetHashCode and tuples"
+            },
+            {
+              "hash": "#bucketing",
+              "label": "Bucketing and top-k"
+            },
+            {
+              "hash": "#lru",
+              "label": "The LRU cache"
+            },
+            {
+              "hash": "#when-not",
+              "label": "When hashing is the wrong answer"
+            }
+          ]
+        },
+        {
+          "id": "dsa-linear",
+          "label": "Stacks, Queues & Lists",
+          "href": "topics/dsa-linear.html",
+          "blurb": "Stack matching and evaluation, the monotonic stack, deques and sliding-window maximum, linked-list surgery with dummy heads, min-stack, and iterators with yield return.",
+          "sections": [
+            {
+              "hash": "#stack-queue",
+              "label": "Stack and queue patterns"
+            },
+            {
+              "hash": "#monotonic",
+              "label": "The monotonic stack"
+            },
+            {
+              "hash": "#deque",
+              "label": "Deques and the sliding-window maximum"
+            },
+            {
+              "hash": "#linked-list",
+              "label": "Linked lists"
+            },
+            {
+              "hash": "#list-surgery",
+              "label": "Dummy heads, in-place partitioning and k-way merge"
+            },
+            {
+              "hash": "#stack-designs",
+              "label": "Min-stack, queue from stacks and other designs"
+            },
+            {
+              "hash": "#iterators",
+              "label": "Iterators and yield return"
+            }
+          ]
+        },
+        {
+          "id": "dsa-search-sort",
+          "label": "Binary Search & Sorting",
+          "href": "topics/dsa-search-sort.html",
+          "blurb": "The off-by-one-proof binary search template, lower and upper bound, binary search on the answer, rotated and 2-D search, comparers and stability, quicksort and mergesort from memory, counting sort and quickselect.",
+          "sections": [
+            {
+              "hash": "#binary-search",
+              "label": "Binary search"
+            },
+            {
+              "hash": "#bounds",
+              "label": "Lower bound, upper bound and Array.BinarySearch"
+            },
+            {
+              "hash": "#search-answer",
+              "label": "Binary search on the answer"
+            },
+            {
+              "hash": "#rotated",
+              "label": "Rotated arrays and 2-D search"
+            },
+            {
+              "hash": "#sorting",
+              "label": "Sorting and comparers"
+            },
+            {
+              "hash": "#writing-sorts",
+              "label": "Writing quicksort and mergesort from memory"
+            },
+            {
+              "hash": "#linear-sorts",
+              "label": "Counting sort, bucket sort and quickselect"
+            }
+          ]
+        },
+        {
+          "id": "dsa-trees",
+          "label": "Trees, Tries & Heaps",
+          "href": "topics/dsa-trees.html",
+          "blurb": "Traversals recursive and iterative, level-order BFS, BST operations, lowest common ancestor, serialise and deserialise, tries, heaps and PriorityQueue, top-k and merge-k, and the sorted collections .NET gives you.",
+          "sections": [
+            {
+              "hash": "#traversals",
+              "label": "Traversals: recursive and iterative"
+            },
+            {
+              "hash": "#bfs-levels",
+              "label": "Level-order BFS, depth and views"
+            },
+            {
+              "hash": "#bst",
+              "label": "BSTs: search, insert, validate and k-th smallest"
+            },
+            {
+              "hash": "#lca-serialise",
+              "label": "Lowest common ancestor and serialisation"
+            },
+            {
+              "hash": "#tries",
+              "label": "Tries: prefix search and word problems"
+            },
+            {
+              "hash": "#heap",
+              "label": "Heaps and PriorityQueue"
+            },
+            {
+              "hash": "#heap-patterns",
+              "label": "Top-k, merge-k and the two-heap median"
+            },
+            {
+              "hash": "#sorted-collections",
+              "label": "What .NET gives you: SortedSet, SortedDictionary and SortedList"
+            }
+          ]
+        },
+        {
+          "id": "dsa-graphs",
+          "label": "Graphs & Shortest Paths",
+          "href": "topics/dsa-graphs.html",
+          "blurb": "Representations, BFS and DFS, connected components, cycle detection and bipartite checking, topological sort, union-find, Dijkstra, Bellman-Ford and Floyd-Warshall, and minimum spanning trees.",
+          "sections": [
+            {
+              "hash": "#representations",
+              "label": "Representations: adjacency list, matrix and implicit graphs"
+            },
+            {
+              "hash": "#graphs",
+              "label": "BFS and DFS on graphs and grids"
+            },
+            {
+              "hash": "#components",
+              "label": "Connected components, flood fill and bipartite checking"
+            },
+            {
+              "hash": "#topological",
+              "label": "Topological sort: Kahn and DFS"
+            },
+            {
+              "hash": "#union-find",
+              "label": "Union-Find (disjoint set union)"
+            },
+            {
+              "hash": "#dijkstra",
+              "label": "Dijkstra and 0-1 BFS"
+            },
+            {
+              "hash": "#other-shortest-paths",
+              "label": "Bellman-Ford, Floyd-Warshall and MSTs"
             }
           ]
         }
