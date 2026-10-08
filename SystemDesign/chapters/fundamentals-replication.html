@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Replication, Quorums and Consensus — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="fundamentals-replication">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Distributed Fundamentals › Fundamentals 2 of 4</div>
+  <h1>Replication, Quorums and Consensus</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#leader-based-replication">Leader-based replication</a></li><li><a href="#quorums">Quorums</a></li><li><a href="#consensus">Consensus</a></li><li><a href="#choosing-between-them">Choosing between them</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>Replication is why distributed systems survive machine failure, and it is also the source of nearly every hard problem in them. This page covers the three mechanisms that keep copies in agreement — leader-based replication, quorums, and consensus protocols — and the failure modes each one leaves open.</p>
+<p><strong>The one-sentence version:</strong> replication is easy until two replicas disagree, and the entire field is about who decides which one is right — a designated leader, a majority vote, or the reader at read time.</p>
+<p>This underpins the partitioning in <a href="05-consistent-hashing.html">Chapter 5</a> and <a href="06-key-value-store.html">Chapter 6</a>, and it is where &quot;what happens when the primary dies?&quot; leads in any chapter.</p>
+</section>
+<section id="leader-based-replication">
+<h2 id="leader-based-replication">Leader-based replication</h2>
+<h3 id="explanation">Explanation</h3>
+<p>One replica is the leader; all writes go through it, and it ships its changes to followers. This is what PostgreSQL, MySQL, Kafka partitions and most message brokers do, and it is the default worth proposing first because it makes write ordering trivial: the leader's order <em>is</em> the order.</p>
+<p>The design choice inside it is when the leader acknowledges a write.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Leader acks after</th>
+<th>Loses data on leader failure?</th>
+<th>Write latency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Asynchronous</strong></td>
+<td>Writing locally</td>
+<td>Yes — anything not yet shipped</td>
+<td>Lowest</td>
+</tr>
+<tr>
+<td><strong>Semi-synchronous</strong></td>
+<td>One follower confirms</td>
+<td>Only if both fail together</td>
+<td>One extra round trip</td>
+</tr>
+<tr>
+<td><strong>Synchronous (all)</strong></td>
+<td>Every follower confirms</td>
+<td>No</td>
+<td>Slowest follower sets the pace</td>
+</tr>
+<tr>
+<td><strong>Quorum</strong></td>
+<td>A majority confirms</td>
+<td>No, if failover picks a quorum member</td>
+<td>Median follower sets the pace</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Fully synchronous replication to <em>all</em> followers is almost never used: one slow or dead follower stalls every write. Quorum acknowledgement is the usual compromise — durable against a minority failing, and paced by the median rather than the worst replica.</p>
+<h3 id="failover-and-what-it-costs">Failover, and what it costs</h3>
+<p>When the leader dies, something must choose a new one. That is harder than it sounds, and the problems are worth naming:</p>
+<ul>
+<li><strong>Detecting the failure.</strong> You cannot distinguish a dead leader from a slow one or an unreachable one. Timeouts are a guess; too short causes spurious failovers, too long means a long outage.</li>
+<li><strong>Lost writes.</strong> With asynchronous replication, writes the old leader acknowledged but never shipped are gone. If the old leader rejoins, it must discard them — and if those writes were visible to users, the system has silently lost acknowledged data.</li>
+<li><strong>Split brain.</strong> The old leader may not know it was replaced and keeps accepting writes. Now there are two leaders and two divergent histories.</li>
+</ul>
+<div class="callout callout-note">
+<span class="callout-title">Fencing is the standard defence</span>
+<p>every leadership term gets a monotonically increasing number (an epoch, term or fencing token). Followers and storage reject any request carrying a number older than the highest they have seen, so a deposed leader's writes are refused even if it still believes it is in charge. This is the single most useful mechanism to be able to name when asked about split brain — it converts &quot;we hope the old leader notices&quot; into a guarantee enforced by the receivers.</p>
+</div>
+</section>
+<section id="quorums">
+<h2 id="quorums">Quorums</h2>
+<h3 id="explanation-1">Explanation</h3>
+<p>With <code>N</code> replicas, require <code>W</code> to acknowledge a write and <code>R</code> to answer a read. If <code>R + W &gt; N</code>, every read quorum overlaps every write quorum by at least one replica, so a read is guaranteed to <em>see</em> at least one copy of the most recent write.</p>
+<p>Common settings:</p>
+<ul>
+<li><code>N=3, W=2, R=2</code> — the standard balanced choice. Tolerates one replica down for both reads and writes.</li>
+<li><code>N=3, W=3, R=1</code> — fast reads, writes fail if any replica is down.</li>
+<li><code>N=3, W=1, R=1</code> — fast everything, no overlap guarantee, eventual consistency.</li>
+</ul>
+<p>The knobs let you move latency between the read and write path without changing durability, which is the real reason the model is popular.</p>
+<h3 id="what-quorums-do-not-give-you">What quorums do not give you</h3>
+<p>Overlap means the read <em>touches</em> a replica with the newest value. It does not tell you <em>which</em> of the values returned is newest, and that is a separate problem:</p>
+<ul>
+<li><strong>You need versioning.</strong> Each value carries a version (a logical clock, a vector clock, or a wall-clock timestamp if you are willing to accept its flaws). Without it, &quot;newest&quot; is undefined.</li>
+<li><strong>Concurrent writes can both succeed.</strong> Two writes to disjoint quorums can both reach <code>W</code> replicas. Now there are two versions and no ordering between them; something has to merge or pick.</li>
+<li><strong>Reads can go backwards.</strong> A read hitting a different quorum next time may return an older value, unless read repair or a session guarantee prevents it.</li>
+</ul>
+<p>The gap is closed by two background mechanisms worth naming:</p>
+<ul>
+<li><strong>Read repair</strong> — when a read sees replicas disagree, it writes the winning value back to the stale ones. Cheap, but only fixes keys someone actually reads.</li>
+<li><strong>Anti-entropy</strong> — a background process comparing replicas and reconciling differences, usually with Merkle trees so the comparison is cheap. Fixes cold keys that read repair never touches.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>if you propose quorums, be ready for &quot;so is it strongly consistent?&quot; The accurate answer is no, not by itself — <code>R + W &gt; N</code> gives overlap, and you still need versioning plus a deterministic conflict rule, and even then you do not get linearizability without consensus for the ordering. Candidates who state <code>R + W &gt; N</code> as if it settled the question get pushed on it; candidates who volunteer the gap and then name read repair and anti-entropy as the practical patches are demonstrating the thing the question is testing.</p>
+</div>
+</section>
+<section id="consensus">
+<h2 id="consensus">Consensus</h2>
+<h3 id="explanation-2">Explanation</h3>
+<p>Consensus protocols — Paxos, and Raft, which is Paxos reorganised to be teachable — solve the hardest version of the problem: get a group of nodes to agree on an ordered log of entries, such that every node applies the same entries in the same order, even when some crash and the network drops and reorders messages.</p>
+<p>That is enough to build anything. A replicated state machine over an agreed log gives you a linearizable database, a lock service, or leader election for everything else.</p>
+<h3 id="raft-in-the-shape-you-should-be-able-to-describe">Raft in the shape you should be able to describe</h3>
+<p>Raft splits the problem into three pieces:</p>
+<ol>
+<li><strong>Leader election.</strong> Time is divided into <em>terms</em>. A follower that hears nothing from a leader becomes a candidate, increments the term and asks for votes. A node grants at most one vote per term, so a candidate winning a majority is unique. Randomised election timeouts stop candidates from repeatedly splitting the vote.</li>
+<li><strong>Log replication.</strong> The leader appends entries and sends them to followers. Once a majority has stored an entry it is <em>committed</em> and can be applied. Followers that have diverged are overwritten from the leader — the leader's log is authoritative by construction.</li>
+<li><strong>Safety.</strong> A node only votes for a candidate whose log is at least as up to date as its own. This guarantees a new leader already holds every committed entry, so committed entries are never lost.</li>
+</ol>
+<p>Two consequences worth stating:</p>
+<ul>
+<li><strong>A majority is required to make progress.</strong> With 5 nodes you tolerate 2 failures; with 3 you tolerate 1. An even cluster size buys nothing — 4 nodes tolerate the same single failure as 3 — which is why clusters are odd-numbered.</li>
+<li><strong>Consensus is expensive, so you use it sparingly.</strong> Systems do not run every write through Raft. They run <em>metadata</em> through it — who is the leader for this shard, which nodes hold which range — and let the data path use cheaper replication underneath. That division is the practical answer to &quot;would you use Raft here?&quot;</li>
+</ul>
+<h3 id="leases-the-cheap-approximation">Leases, the cheap approximation</h3>
+<p>A lease is a lock with an expiry: a node is granted leadership for a bounded period and must renew. It makes leadership cheap to check — no quorum round trip, just look at the clock — at the cost of depending on bounded clock drift between the grantor and the holder.</p>
+<div class="callout callout-note">
+<span class="callout-title">The subtlety worth knowing</span>
+<p>leases trade a correctness guarantee for latency, and the trade is only sound if clock drift stays within the margin you assumed. A holder whose clock runs slow may believe its lease is live after it has expired elsewhere — which is split brain again, arriving through the clock rather than the network. The standard defence is the same as before: pair the lease with a fencing token so stale holders are rejected by whoever receives their writes. This is a good example of why the <a href="fundamentals-time-and-order.html">time and ordering page</a> matters for correctness and not just for ordering.</p>
+</div>
+</section>
+<section id="choosing-between-them">
+<h2 id="choosing-between-them">Choosing between them</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>You need</th>
+<th>Reach for</th>
+<th>Because</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ordered writes, simple reasoning</td>
+<td>Single leader</td>
+<td>The leader's order is the order</td>
+</tr>
+<tr>
+<td>Survive leader failure without losing writes</td>
+<td>Quorum acknowledgement</td>
+<td>Majority holds every acked write</td>
+</tr>
+<tr>
+<td>Tunable read/write latency</td>
+<td>Quorums with R, W</td>
+<td>Move cost between the paths</td>
+</tr>
+<tr>
+<td>Agreement on metadata, leader election</td>
+<td>Raft / Paxos</td>
+<td>The only thing that actually solves it</td>
+</tr>
+<tr>
+<td>Cheap leadership checks</td>
+<td>Leases + fencing tokens</td>
+<td>No quorum round trip per check</td>
+</tr>
+<tr>
+<td>Maximum availability, writes always accepted</td>
+<td>Leaderless + conflict resolution</td>
+<td>No leader to lose</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>the move that lands here is scoping consensus to where it earns its cost. &quot;I would run Raft for the control plane — shard assignment and leader election — and use leader-based replication with quorum acks for the data path, so a write costs one round trip to a majority rather than a full consensus round&quot; is a complete, defensible architecture in one sentence, and it shows you know consensus is a tool rather than a layer. The follow-up is usually &quot;how many nodes?&quot;, and the answer is odd-numbered, 3 or 5, because an even cluster tolerates no more failures than the odd one below it.</p>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="fundamentals-consistency.html">Consistency models, CAP and PACELC</a> — what these mechanisms are buying.</li>
+<li><a href="fundamentals-time-and-order.html">Time, ordering and idempotency</a> — versioning, and why wall clocks mislead.</li>
+<li><a href="06-key-value-store.html">Chapter 6: Key-Value Store</a> — quorums, versioning and anti-entropy in one design.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

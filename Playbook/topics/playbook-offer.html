@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Offer &amp; Negotiation — Interview Playbook</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="playbook-offer">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › After the loop › Topic 5 of 5</div>
+  <h1>Offer &amp; Negotiation</h1>
+  <p class="lede">Four components that behave completely differently, why the headline number is usually the wrong comparison, how to negotiate without adversarial framing — and what to do with a rejection, which is the outcome most people get several of first.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#structure">How big-tech compensation is put together</a></li><li><a href="#negotiating">Negotiating</a></li><li><a href="#rejection">If it does not land</a></li></ol>
+  </div>
+
+<section id="structure"><h2 id="structure">How big-tech compensation is put together</h2><p>An offer is not a salary, and reading it as one is how people accept worse packages than they were offered. Four components,
+which behave completely differently.</p><div class="table-wrap"><table><thead><tr><th>Component</th><th>What it is</th><th>Behaviour over time</th><th>How negotiable</th></tr></thead><tbody><tr><td><strong>Base salary</strong></td><td>Cash, paid per pay period</td><td>Rises slowly; usually banded tightly by level</td><td>Least — often the most constrained piece</td></tr><tr><td><strong>Equity (RSUs)</strong></td><td>Stock granted at the offer, vesting over ~4 years</td><td>Value moves with the share price</td><td><strong>Usually the most negotiable</strong></td></tr><tr><td><strong>Signing bonus</strong></td><td>One-off cash, often paid across year 1 (sometimes year 2)</td><td>Does not recur</td><td>Quite negotiable — it is the easiest lever to pull</td></tr><tr><td><strong>Annual bonus</strong></td><td>A target percentage of base, performance-adjusted</td><td>Varies; some companies fold it into base instead</td><td>Rarely negotiable — it is formulaic</td></tr></tbody></table></div><p>Two structural features matter more than most people realise:</p>
+<ul>
+<li><strong>Vesting schedules are not all the same.</strong> A four-year grant may vest evenly (25/25/25/25), or front-load, or
+back-load. A back-loaded schedule means a headline four-year number that you only reach if you stay the full term — which makes
+year-one and year-two totals far more meaningful for comparison than the headline.</li>
+<li><strong>The cliff.</strong> Most grants vest nothing until a first milestone, commonly one year. Leaving before it usually
+means the equity is forfeited entirely.</li>
+<li><strong>Refreshers.</strong> Your initial grant decays as it vests. Companies issue additional grants over time to compensate,
+but policies vary widely and refreshers are rarely guaranteed in writing. A large initial grant with no refresher culture can mean a
+noticeable pay cut in year five.</li>
+</ul><div class="callout callout-warn"><span class="callout-title">Compare year-one and steady-state totals, not headline numbers</span><p>A "$400k offer" can mean very different things: a large
+signing bonus inflates year one and vanishes afterwards, while a back-loaded grant does the reverse. Build the actual year-by-year
+table for each offer — base, plus that year's vesting equity at a stated share price, plus that year's signing instalment, plus
+target bonus — and compare year 1, year 2 and year 4 side by side. Companies present the number that flatters them, and the
+difference between two offers frequently reverses once you do this.</p></div><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>OFFER COMPARISON  — build this before you respond to anything.
+Equity valued at today&#x27;s share price; say so, because it is an assumption.
+
+                        OFFER A               OFFER B
+  Level                 Senior (L5)           Mid (L4)      &lt;- not comparable!
+  Base                  180,000               195,000
+  Equity (4yr total)    400,000               240,000
+  Vesting               25/25/25/25           10/20/30/40   &lt;- back-loaded
+  Signing               50,000 (yr 1)         20,000 (yr 1)
+  Target bonus          15%                   10%
+
+  YEAR 1                180 + 100 + 50 + 27 = 357
+  YEAR 2                180 + 100 + 0  + 27 = 307
+  YEAR 3                180 + 100 + 0  + 27 = 307
+  YEAR 4                180 + 100 + 0  + 27 = 307
+
+  YEAR 1                195 + 24  + 20 + 20 = 259
+  YEAR 2                195 + 48  + 0  + 20 = 263
+  YEAR 3                195 + 72  + 0  + 20 = 287
+  YEAR 4                195 + 96  + 0  + 20 = 311
+
+  &gt;&gt; B looks competitive by year 4 and is far behind for three years.
+  &gt;&gt; B is also a LEVEL LOWER, which affects the next decade, not just
+     the next four years. Level is usually worth more than the delta.
+
+ALSO WEIGH, because they are real and they are not in the table:
+  · the level, and how long it takes to climb from it
+  · the team and the manager — the largest single input to whether you
+    stay, and the thing most likely to make the money irrelevant
+  · what you will actually work on, and whether it builds your next move
+  · location, remote policy, relocation support
+  · vesting cliff vs how long you realistically expect to stay
+  · how volatile the stock is, and whether it is public at all</code></pre><pre data-lang="python" hidden><code>OFFER COMPARISON  - build this before you respond to anything.
+Equity valued at today&#x27;s share price; say so, because it is an assumption.
+
+                        OFFER A               OFFER B
+  Level                 Senior (L5)           Mid (L4)      &lt;- not comparable!
+  Base                  180,000               195,000
+  Equity (4yr total)    400,000               240,000
+  Vesting               25/25/25/25           10/20/30/40   &lt;- back-loaded
+  Signing               50,000 (yr 1)         20,000 (yr 1)
+  Target bonus          15%                   10%
+
+  YEAR 1                180 + 100 + 50 + 27 = 357
+  YEAR 2                180 + 100 + 0  + 27 = 307
+  YEAR 3                180 + 100 + 0  + 27 = 307
+  YEAR 4                180 + 100 + 0  + 27 = 307
+
+  YEAR 1                195 + 24  + 20 + 20 = 259
+  YEAR 2                195 + 48  + 0  + 20 = 263
+  YEAR 3                195 + 72  + 0  + 20 = 287
+  YEAR 4                195 + 96  + 0  + 20 = 311
+
+  &gt;&gt; B looks competitive by year 4 and is far behind for three years.
+  &gt;&gt; B is also a LEVEL LOWER, which affects the next decade, not just
+     the next four years. Level is usually worth more than the delta.
+
+ALSO WEIGH, because they are real and they are not in the table:
+  · the level, and how long it takes to climb from it
+  · the team and the manager - the largest single input to whether you
+    stay, and the thing most likely to make the money irrelevant
+  · what you will actually work on, and whether it builds your next move
+  · location, remote policy, relocation support
+  · vesting cliff vs how long you realistically expect to stay
+  · how volatile the stock is, and whether it is public at all</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The numbers above are illustrative, not benchmarks — bands differ enormously by company, level, location and year,
+and anything written down goes stale fast. Get your actual ranges from current sources: levels.fyi and similar aggregators for
+public data, and more usefully, people you know at that company and level. The <em>method</em> on this page is what transfers; the
+figures are not.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Build the year-by-year table for any offer you receive, before you reply to it. It takes ten minutes and it regularly changes the ranking.</li><li>Work out what your current package is worth on the same basis. Most people cannot say, which makes comparison impossible.</li></ul></div></section>
+
+<section id="negotiating"><h2 id="negotiating">Negotiating</h2><p>Negotiation makes people uncomfortable and so they skip it, which is expensive: the first number is rarely the best number, and
+recruiters expect a conversation. Done politely, it has essentially no downside — offers are not withdrawn because a candidate
+asked.</p>
+<ol>
+<li><strong>Do not give a number first, for as long as you reasonably can.</strong> The earlier you anchor, the more likely you
+anchor low. Redirect to the band for the level — see the deflection on the
+<a href="playbook-pipeline.html#screen">recruiter screen page</a>.</li>
+<li><strong>Be enthusiastic and specific.</strong> "I want to work here, and I would like to make the numbers work" is the whole
+tone. Adversarial framing makes recruiters defensive and is not necessary.</li>
+<li><strong>Ask for a specific thing, with a reason.</strong> "Could you look at the equity component?" with a reason attached beats
+"is there any flexibility?", which invites a no.</li>
+<li><strong>Competing offers are the strongest lever</strong>, which is the practical argument for interviewing at several places in
+the same window rather than sequentially. Be straightforward about them; do not invent one.</li>
+<li><strong>Negotiate level before money where you can.</strong> A level is worth more over a career than any one-off adjustment,
+and it compounds into every subsequent band and every future offer.</li>
+<li><strong>Get it in writing before you resign anything.</strong> Verbal agreements get forgotten, and the person who made it may
+not be the person who processes it.</li>
+</ol><div class="callout callout-note"><span class="callout-title">The timing that makes this easy</span><p>The reason to cluster your loops into a single few-week window is almost entirely this
+step. Offers typically come with a response deadline, and a competing offer is only leverage while both are live. Starting your
+least-favourite processes first and your favourite last — which is also what the <a href="playbook-levels.html#targeting">cooldown
+argument</a> suggests — tends to land them in roughly the right order. If an offer arrives early and you are still interviewing, it
+is completely normal to ask for an extension; recruiters grant them routinely, and asking costs nothing.</p></div><div class="callout callout-warn"><span class="callout-title">Do not resign before everything is signed</span><p>Written, countersigned, background check cleared, start date agreed. Offers
+are occasionally rescinded — reorganisations, hiring freezes, failed checks — and a resignation you cannot take back is a bad
+position to be in. Also read what you are signing: notice periods, non-competes where enforceable, clawbacks on the signing bonus if
+you leave inside a year or two, and what happens to unvested equity. The signing-bonus clawback in particular surprises people.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>If the company genuinely will not move on money, there are other things that cost them less and may be worth more to
+you: a <strong>start date</strong> that gives you a month off, a <strong>sign-on adjustment</strong> rather than a base change, a
+<strong>written early review</strong> at six months, <strong>team placement</strong>, or <strong>remote or relocation terms</strong>.
+Asking "if the band is fixed, what else is flexible?" is a good question and often produces something. And if the answer is genuinely
+nothing — some companies run strict levelling bands by policy — then you have learned that, and you can decide on the offer as it
+stands rather than wondering.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write your counter-offer email before you need it. Three sentences: enthusiasm, the specific ask, the reason.</li><li>Rehearse the "what are you looking for?" deflection until it is comfortable. It is the moment that sets the anchor.</li></ul></div></section>
+
+<section id="rejection"><h2 id="rejection">If it does not land</h2><p>Most people fail several loops before they pass one, including people who are clearly good at the job. The process has a high
+false-negative rate by design — companies optimise against hiring the wrong person, not against missing the right one — so a
+rejection carries much less information about you than it feels like it does.</p>
+<p>What is worth doing afterwards:</p>
+<ul>
+<li><strong>Ask for feedback.</strong> Often you get nothing useful for legal reasons, occasionally you get a sentence that is worth
+the asking. It costs one email.</li>
+<li><strong>Write your own debrief within 24 hours</strong>, while you remember. Every question, how it went, where you stalled,
+what you would do differently. This is far more valuable than official feedback and nobody can withhold it.</li>
+<li><strong>Find the pattern across loops.</strong> One rejection is noise. Three rejections that all stalled in the system design
+round is a signal, and it tells you exactly what to work on.</li>
+<li><strong>Note the cooldown and diarise the date.</strong> Reapplying is normal and people do get hired on a second or third
+attempt.</li>
+</ul><div class="callout callout-note"><span class="callout-title">The variance is real</span><p>Outcomes depend on which interviewers you drew, which problems they chose, whether the team was
+hiring urgently, how you slept, and how the first round went. The same candidate can get a strong hire at one company and a rejection
+at a comparable one in the same month. This is not a reason to prepare less — preparation is what moves your average — but it is a
+reason not to over-read any single result, and a strong reason to run several processes rather than pinning everything on one.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The most useful habit after any loop, passed or failed, is the <strong>self-debrief</strong>. Write down every question
+you were asked, what you said, and the moment it started going well or badly. Across three or four loops this becomes the most
+accurate map of your weaknesses you will ever have — more accurate than mock feedback, because it is drawn from the real thing. It
+also makes the next loop materially easier, because question types repeat far more than people expect, and you will have already
+thought about most of what you are asked.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write the self-debrief within 24 hours of every loop. Keep them in one file.</li><li>After three loops, read them together and find the pattern. Prepare against that, not against a generic plan.</li></ul></div></section>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Compensation structures and bands vary widely and change; the figures here are illustrative, not benchmarks.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

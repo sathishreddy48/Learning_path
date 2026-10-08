@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Elevator Bank — Low-Level Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="lld-elevator">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Worked designs › Topic 4 of 7</div>
+  <h1>Design an Elevator Bank</h1>
+  <p class="lede">The prompt that rewards asking first: hall calls and car calls are different things, a bank needs a dispatcher as well as a scheduler, and the sweep every real lift uses has a name. Tick-driven so it stays deterministic and testable.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#scope">Requirements: the two questions that matter</a></li><li><a href="#model">The model: a car is a state machine, the bank is a dispatcher</a></li><li><a href="#code">The implementation</a></li><li><a href="#followups">Follow-ups and the hard parts</a></li></ol>
+  </div>
+
+<section id="scope"><h2 id="scope">Requirements: the two questions that matter</h2><p>An elevator bank is the LLD prompt that most rewards asking before coding, because two questions completely change the problem
+and candidates routinely guess wrong on both.</p>
+<ol>
+<li><strong>One elevator or a bank?</strong> One elevator is a scheduling problem inside a single state machine. A bank is also a
+<em>dispatch</em> problem — which car answers this request — and dispatch is where the interesting design lives. Assume a bank
+unless told otherwise; it is the more interesting answer and it degrades gracefully to one car.</li>
+<li><strong>Who requests what?</strong> There are two genuinely different requests and conflating them is the classic modelling
+error. An <strong>external (hall) call</strong> comes from a floor and carries a <em>direction</em> but no destination — someone
+pressed Up on floor 3. An <strong>internal (car) call</strong> comes from inside a car and carries a <em>destination</em> but no
+direction. They are dispatched differently and they belong in different queues.</li>
+</ol><div class="table-wrap"><table><thead><tr><th>You ask</th><th>Typical answer</th><th>What it decides</th></tr></thead><tbody><tr><td>One car or several?</td><td>Several</td><td>A dispatcher exists, and it is a strategy</td></tr><tr><td>Hall calls and car calls both?</td><td>Yes</td><td>Two request types, not one</td></tr><tr><td>Does the car move one floor per tick?</td><td>Yes, simulate in steps</td><td>A <code>Step()</code> method; time is injected, not real</td></tr><tr><td>Capacity limits?</td><td>Usually "ignore"</td><td>Cut it unless offered — it is a whole extra dimension</td></tr><tr><td>Express cars, service modes, fire recall?</td><td>Usually out of scope</td><td>Name them as future work to show awareness</td></tr><tr><td>Is the dispatch rule fixed?</td><td>"What would you do?"</td><td><code>IDispatchStrategy</code> — the main seam</td></tr></tbody></table></div><p>Scope it to: a bank of N cars, hall calls with a direction, car calls with a destination, a tick-driven simulation, and a
+pluggable dispatcher. That is a full 45 minutes.</p><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Say the hall-call versus car-call distinction out loud in the first two minutes. It is the single clearest signal that
+you have thought about elevators rather than about queues, and it immediately gives the interviewer something to engage with. The
+second-best move is to propose the <strong>tick-driven simulation</strong> — "I will give the controller a <code>Step()</code> that
+advances everything one floor, so the whole thing is deterministic and testable" — because the alternative, real timers, makes the
+design untestable and you will not get to show it working.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write the difference between a hall call and a car call in one sentence each, from memory.</li><li>List three things you would explicitly cut from this prompt in the first minute.</li></ul></div></section>
+
+<section id="model"><h2 id="model">The model: a car is a state machine, the bank is a dispatcher</h2><p>Each car is a small state machine with a direction and two sets of pending stops. The bank holds the cars and a dispatcher that
+decides which car answers a hall call. That split is the design: <strong>the car knows how to serve stops, the dispatcher knows
+which car should get them</strong>, and neither needs to know the other's rules.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>ElevatorSystem            (entry point; the bank)
+ ├── Elevator*               each an independent state machine
+ │     - currentFloor : int
+ │     - direction : Direction (Up | Down | Idle)
+ │     - stops : SortedSet&lt;int&gt;       &lt;- where it must stop
+ ├── IDispatchStrategy       aggregation — injected, swappable
+ └── pendingHallCalls        calls nobody has been assigned yet
+
+Direction  : Up | Down | Idle
+HallCall   : (floor, direction)        &lt;- from a landing: no destination
+CarCall    : (carId, destinationFloor) &lt;- from inside:   no direction
+
+Responsibilities:
+  Elevator        serves its own stops in the current direction, then reverses.
+  IDispatchStrategy  picks the best car for a hall call.
+  ElevatorSystem  routes requests and advances the simulation one tick.</code></pre><pre data-lang="python" hidden><code>ElevatorSystem            (entry point; the bank)
+ ├── Elevator*               each an independent state machine
+ │     - current_floor : int
+ │     - direction : Direction (UP | DOWN | IDLE)
+ │     - stops : set[int]              &lt;- where it must stop
+ ├── DispatchStrategy        aggregation — injected, swappable
+ └── pending_hall_calls      calls nobody has been assigned yet
+
+Direction  : UP | DOWN | IDLE
+HallCall   : (floor, direction)        &lt;- from a landing: no destination
+CarCall    : (car_id, destination)     &lt;- from inside:   no direction
+
+Responsibilities:
+  Elevator          serves its own stops in the current direction, then reverses.
+  DispatchStrategy  picks the best car for a hall call.
+  ElevatorSystem    routes requests and advances the simulation one tick.</code></pre></div><div class="callout callout-note"><span class="callout-title">The LOOK algorithm, which is what a real elevator does</span><p>Elevators do not serve requests first-come-first-served, and
+saying so earns credit. They sweep: <strong>keep going in the current direction, stopping at every pending stop on the way, and
+reverse only when there is nothing further ahead.</strong> That is the LOOK disk-scheduling algorithm, and it is why a lift that
+passes your floor going the other way does not stop. It is both more efficient and more fair than FCFS, which can starve a
+high floor indefinitely. Naming it — "this is essentially the elevator algorithm, LOOK" — is a nice touch because the algorithm is
+literally named after the problem.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Simulate by hand: a car at floor 1 going up with stops at 3 and 7, and a new stop at 2. Where does it go, and why not to 2 first?</li><li>Work out what FCFS would do with ten requests arriving from alternating ends, and convince yourself LOOK is better.</li></ul></div></section>
+
+<section id="code"><h2 id="code">The implementation</h2><p>The car first — it is self-contained and it is where the algorithm lives — then the dispatcher, then the bank. Complete and
+runnable, with time modelled as explicit ticks.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public enum Direction { Idle, Up, Down }
+
+public sealed class Elevator(int id, int currentFloor, int minFloor, int maxFloor)
+{
+    private readonly SortedSet&lt;int&gt; _stops = [];
+
+    public int Id { get; } = id;
+    public int CurrentFloor { get; private set; } = currentFloor;
+    public Direction Direction { get; private set; } = Direction.Idle;
+    public IReadOnlyCollection&lt;int&gt; Stops =&gt; _stops;
+    public bool IsIdle =&gt; Direction == Direction.Idle &amp;&amp; _stops.Count == 0;
+
+    public void AddStop(int floor)
+    {
+        if (floor &lt; minFloor || floor &gt; maxFloor)
+            throw new ArgumentOutOfRangeException(nameof(floor));
+        if (floor == CurrentFloor &amp;&amp; Direction == Direction.Idle) return;  // already here
+        _stops.Add(floor);
+        if (Direction == Direction.Idle)
+            Direction = floor &gt; CurrentFloor ? Direction.Up : Direction.Down;
+    }
+
+    /// One tick: move a floor, or open the doors here. Returns true if it stopped.
+    public bool Step()
+    {
+        if (_stops.Count == 0) { Direction = Direction.Idle; return false; }
+
+        if (_stops.Remove(CurrentFloor))          // doors open at this floor
+        {
+            if (_stops.Count == 0) Direction = Direction.Idle;
+            else ReorientIfNothingAhead();
+            return true;
+        }
+
+        ReorientIfNothingAhead();
+        CurrentFloor += Direction == Direction.Up ? 1 : -1;
+
+        if (_stops.Remove(CurrentFloor))          // arrived at a stop
+        {
+            if (_stops.Count == 0) Direction = Direction.Idle;
+            else ReorientIfNothingAhead();
+            return true;
+        }
+        return false;
+    }
+
+    // LOOK: only reverse when there is nothing further in this direction.
+    private void ReorientIfNothingAhead()
+    {
+        bool anyAbove = _stops.Any(f =&gt; f &gt; CurrentFloor);
+        bool anyBelow = _stops.Any(f =&gt; f &lt; CurrentFloor);
+        if (Direction == Direction.Up &amp;&amp; !anyAbove) Direction = anyBelow ? Direction.Down : Direction.Idle;
+        else if (Direction == Direction.Down &amp;&amp; !anyBelow) Direction = anyAbove ? Direction.Up : Direction.Idle;
+        else if (Direction == Direction.Idle &amp;&amp; (anyAbove || anyBelow))
+            Direction = anyAbove ? Direction.Up : Direction.Down;
+    }
+
+    /// Would this car pass &#x27;floor&#x27; travelling &#x27;heading&#x27; without reversing?
+    public bool IsOnTheWay(int floor, Direction heading) =&gt; Direction switch
+    {
+        Direction.Idle =&gt; true,
+        Direction.Up   =&gt; heading == Direction.Up   &amp;&amp; floor &gt;= CurrentFloor,
+        Direction.Down =&gt; heading == Direction.Down &amp;&amp; floor &lt;= CurrentFloor,
+        _ =&gt; false,
+    };
+}
+
+// ---- the seam ----------------------------------------------------------
+public readonly record struct HallCall(int Floor, Direction Heading);
+
+public interface IDispatchStrategy
+{
+    Elevator? Select(IReadOnlyList&lt;Elevator&gt; cars, HallCall call);
+}
+
+/// Simplest defensible rule: nearest car, preferring one already heading your way.
+public sealed class NearestCar : IDispatchStrategy
+{
+    public Elevator? Select(IReadOnlyList&lt;Elevator&gt; cars, HallCall call) =&gt;
+        cars.OrderBy(c =&gt; c.IsOnTheWay(call.Floor, call.Heading) ? 0 : 1)
+            .ThenBy(c =&gt; Math.Abs(c.CurrentFloor - call.Floor))
+            .ThenBy(c =&gt; c.Stops.Count)            // tie-break: least loaded
+            .FirstOrDefault();
+}
+
+/// Alternative: spread the load. Same interface, different policy.
+public sealed class LeastBusy : IDispatchStrategy
+{
+    public Elevator? Select(IReadOnlyList&lt;Elevator&gt; cars, HallCall call) =&gt;
+        cars.OrderBy(c =&gt; c.Stops.Count)
+            .ThenBy(c =&gt; Math.Abs(c.CurrentFloor - call.Floor))
+            .FirstOrDefault();
+}
+
+// ---- the bank ----------------------------------------------------------
+public sealed class ElevatorSystem(IReadOnlyList&lt;Elevator&gt; cars, IDispatchStrategy dispatch)
+{
+    public IReadOnlyList&lt;Elevator&gt; Cars { get; } = cars;
+
+    /// A landing button: direction known, destination not.
+    public Elevator RequestFromFloor(int floor, Direction heading)
+    {
+        var car = dispatch.Select(Cars, new HallCall(floor, heading))
+                  ?? throw new InvalidOperationException(&quot;No car available.&quot;);
+        car.AddStop(floor);
+        return car;
+    }
+
+    /// A button inside a car: destination known, direction not.
+    public void RequestFromInside(int carId, int destination) =&gt;
+        Cars.Single(c =&gt; c.Id == carId).AddStop(destination);
+
+    /// Advance every car one tick. Returns the cars that opened their doors.
+    public IReadOnlyList&lt;Elevator&gt; Step() =&gt;
+        Cars.Where(c =&gt; c.Step()).ToList();
+}</code></pre><pre data-lang="python" hidden><code>from __future__ import annotations
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Protocol
+
+class Direction(Enum):
+    IDLE = auto(); UP = auto(); DOWN = auto()
+
+class Elevator:
+    def __init__(self, id: int, current_floor: int, min_floor: int, max_floor: int) -&gt; None:
+        self.id = id
+        self.current_floor = current_floor
+        self.direction = Direction.IDLE
+        self._min, self._max = min_floor, max_floor
+        self._stops: set[int] = set()
+
+    @property
+    def stops(self) -&gt; set[int]:
+        return set(self._stops)
+
+    @property
+    def is_idle(self) -&gt; bool:
+        return self.direction is Direction.IDLE and not self._stops
+
+    def add_stop(self, floor: int) -&gt; None:
+        if not self._min &lt;= floor &lt;= self._max:
+            raise ValueError(f&quot;floor {floor} out of range&quot;)
+        if floor == self.current_floor and self.direction is Direction.IDLE:
+            return                                        # already here
+        self._stops.add(floor)
+        if self.direction is Direction.IDLE:
+            self.direction = Direction.UP if floor &gt; self.current_floor else Direction.DOWN
+
+    def step(self) -&gt; bool:
+        &quot;&quot;&quot;One tick: move a floor, or open the doors here. True if it stopped.&quot;&quot;&quot;
+        if not self._stops:
+            self.direction = Direction.IDLE
+            return False
+
+        if self.current_floor in self._stops:             # doors open here
+            self._stops.discard(self.current_floor)
+            self._reorient()
+            return True
+
+        self._reorient()
+        self.current_floor += 1 if self.direction is Direction.UP else -1
+
+        if self.current_floor in self._stops:             # arrived at a stop
+            self._stops.discard(self.current_floor)
+            self._reorient()
+            return True
+        return False
+
+    def _reorient(self) -&gt; None:
+        &quot;&quot;&quot;LOOK: only reverse when there is nothing further this way.&quot;&quot;&quot;
+        if not self._stops:
+            self.direction = Direction.IDLE
+            return
+        above = any(f &gt; self.current_floor for f in self._stops)
+        below = any(f &lt; self.current_floor for f in self._stops)
+        if self.direction is Direction.UP and not above:
+            self.direction = Direction.DOWN if below else Direction.IDLE
+        elif self.direction is Direction.DOWN and not below:
+            self.direction = Direction.UP if above else Direction.IDLE
+        elif self.direction is Direction.IDLE:
+            self.direction = Direction.UP if above else Direction.DOWN
+
+    def is_on_the_way(self, floor: int, heading: Direction) -&gt; bool:
+        if self.direction is Direction.IDLE:
+            return True
+        if self.direction is Direction.UP:
+            return heading is Direction.UP and floor &gt;= self.current_floor
+        return heading is Direction.DOWN and floor &lt;= self.current_floor
+
+# ---- the seam ----------------------------------------------------------
+@dataclass(frozen=True)
+class HallCall:
+    floor: int
+    heading: Direction
+
+class DispatchStrategy(Protocol):
+    def select(self, cars: list[Elevator], call: HallCall) -&gt; Elevator | None: ...
+
+class NearestCar:
+    &quot;&quot;&quot;Nearest car, preferring one already heading your way.&quot;&quot;&quot;
+    def select(self, cars: list[Elevator], call: HallCall) -&gt; Elevator | None:
+        if not cars:
+            return None
+        return min(cars, key=lambda c: (
+            0 if c.is_on_the_way(call.floor, call.heading) else 1,
+            abs(c.current_floor - call.floor),
+            len(c.stops),
+            c.id,
+        ))
+
+class LeastBusy:
+    &quot;&quot;&quot;Same interface, different policy.&quot;&quot;&quot;
+    def select(self, cars: list[Elevator], call: HallCall) -&gt; Elevator | None:
+        if not cars:
+            return None
+        return min(cars, key=lambda c: (len(c.stops),
+                                        abs(c.current_floor - call.floor), c.id))
+
+# ---- the bank ----------------------------------------------------------
+class ElevatorSystem:
+    def __init__(self, cars: list[Elevator], dispatch: DispatchStrategy) -&gt; None:
+        self.cars = cars
+        self._dispatch = dispatch
+
+    def request_from_floor(self, floor: int, heading: Direction) -&gt; Elevator:
+        &quot;&quot;&quot;A landing button: direction known, destination not.&quot;&quot;&quot;
+        car = self._dispatch.select(self.cars, HallCall(floor, heading))
+        if car is None:
+            raise RuntimeError(&quot;No car available.&quot;)
+        car.add_stop(floor)
+        return car
+
+    def request_from_inside(self, car_id: int, destination: int) -&gt; None:
+        &quot;&quot;&quot;A button inside a car: destination known, direction not.&quot;&quot;&quot;
+        next(c for c in self.cars if c.id == car_id).add_stop(destination)
+
+    def step(self) -&gt; list[Elevator]:
+        &quot;&quot;&quot;Advance every car one tick; return the ones that opened doors.&quot;&quot;&quot;
+        return [c for c in self.cars if c.step()]</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The method worth pointing at is <code>IsOnTheWay</code>. It is three lines, and it is the entire reason the dispatcher
+can be smart: a car travelling up past your floor is a <em>much</em> better answer than a closer car travelling down, and without
+that predicate the dispatcher can only compare distances. Candidates who dispatch purely on <code>Math.Abs(current - floor)</code>
+produce a system where pressing Up gets you a car that then takes you down first — and interviewers do test exactly that scenario.
+The other thing to volunteer is that <strong>time is a parameter, not a thread</strong>: <code>Step()</code> makes the whole system
+deterministic, so you can assert on an exact sequence of floors. Any design here that uses real timers cannot be demonstrated in the
+room.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Trace a car at floor 5 going up with stops {2, 8}: which floor does it reach first, and when does <code>_reorient</code> flip it?</li><li>Write the test "a car going up past floor 3 is preferred over a closer car going down".</li><li>Implement a third dispatcher that minimises total waiting time across all pending calls, and say why it is harder to justify.</li></ul></div></section>
+
+<section id="followups"><h2 id="followups">Follow-ups and the hard parts</h2><div class="table-wrap"><table><thead><tr><th>Follow-up</th><th>The answer</th></tr></thead><tbody><tr><td>"Spread the load instead"</td><td>Inject <code>LeastBusy</code> — one class, nothing else moves</td></tr><tr><td>"Add capacity limits"</td><td><code>Elevator</code> gains occupancy; dispatch skips full cars; a full car must still <em>stop</em> for its own car calls</td></tr><tr><td>"Express cars that only serve 10+"</td><td>A served-floors predicate on the car; the dispatcher filters on it</td></tr><tr><td>"Fire recall / maintenance mode"</td><td>A car-level mode that clears stops and overrides dispatch — a state machine on the car</td></tr><tr><td>"Minimise average wait, not distance"</td><td>A dispatcher that simulates each candidate assignment and scores it; say it is a cost function, and that it is where real systems get complicated</td></tr><tr><td>"Make the hall call persist if no car can take it"</td><td>The pending-calls queue, re-dispatched each tick — the piece most designs leave out</td></tr></tbody></table></div><p>That last one is the most common gap. In the implementation above, <code>RequestFromFloor</code> assigns a car immediately and
+permanently. Real banks do better: hold the call, and re-evaluate each tick, because a better car may become available. Mentioning
+it is enough; implementing it is a nice extension if time allows.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Deferred dispatch: hold hall calls and re-evaluate every tick, so a car
+// that frees up can steal a call it is now better placed to serve.
+public sealed class DeferredElevatorSystem(IReadOnlyList&lt;Elevator&gt; cars, IDispatchStrategy dispatch)
+{
+    private readonly HashSet&lt;HallCall&gt; _pending = [];
+
+    public void RequestFromFloor(int floor, Direction heading) =&gt;
+        _pending.Add(new HallCall(floor, heading));        // set: dedupes repeats
+
+    public IReadOnlyList&lt;Elevator&gt; Step()
+    {
+        foreach (var call in _pending.ToList())
+        {
+            var car = dispatch.Select(cars, call);
+            // Only commit when a car can serve it without reversing.
+            if (car is not null &amp;&amp; car.IsOnTheWay(call.Floor, call.Heading))
+            {
+                car.AddStop(call.Floor);
+                _pending.Remove(call);
+            }
+        }
+        return cars.Where(c =&gt; c.Step()).ToList();
+    }
+}</code></pre><pre data-lang="python" hidden><code>class DeferredElevatorSystem:
+    &quot;&quot;&quot;Hold hall calls and re-evaluate every tick, so a car that frees up can
+    steal a call it is now better placed to serve.&quot;&quot;&quot;
+    def __init__(self, cars: list[Elevator], dispatch: DispatchStrategy) -&gt; None:
+        self.cars = cars
+        self._dispatch = dispatch
+        self._pending: set[HallCall] = set()        # set: dedupes repeats
+
+    def request_from_floor(self, floor: int, heading: Direction) -&gt; None:
+        self._pending.add(HallCall(floor, heading))
+
+    def step(self) -&gt; list[Elevator]:
+        for call in list(self._pending):
+            car = self._dispatch.select(self.cars, call)
+            # Only commit when a car can serve it without reversing.
+            if car is not None and car.is_on_the_way(call.floor, call.heading):
+                car.add_stop(call.floor)
+                self._pending.discard(call)
+        return [c for c in self.cars if c.step()]</code></pre></div><div class="callout callout-warn"><span class="callout-title">Starvation, the question you should raise yourself</span><p>Pure LOOK can starve. If calls keep arriving above a car, it may
+never reverse to serve the person waiting below. Real systems bound this — a call older than N ticks gets priority, or the sweep is
+forced to complete to the end of its range before reversing. <strong>Raising starvation before the interviewer does is one of the
+highest-value moves available in this problem</strong>, because it shows you are reasoning about the algorithm's failure mode rather
+than just implementing it. You do not have to solve it; naming it and proposing an ageing policy is a complete answer.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>If you are running short on time, cut the dispatcher to "nearest car" and spend the remaining minutes on the car's
+state machine instead — the <code>Step</code>/<code>_reorient</code> pair is what is actually being graded, because it is where the
+correctness lives and where off-by-ones hide. A perfect dispatcher attached to a car that reverses at the wrong moment is a worse
+answer than a crude dispatcher attached to a car that provably sweeps correctly. And when you demonstrate it, <strong>print the
+floor sequence over ten ticks</strong> rather than describing it; a concrete trace is the fastest way to convince an interviewer that
+the thing works.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement ageing: a hall call older than N ticks outranks direction matching. Check that LOOK still holds for everything else.</li><li>Add capacity and get the subtle case right: a full car must still stop for the car calls of people already inside it.</li><li>Produce a ten-tick trace for three cars and six mixed calls, and check it by hand.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://en.wikipedia.org/wiki/Elevator_algorithm" target="_blank" rel="noopener">The elevator algorithm (SCAN/LOOK)</a> — the sweep, and its disk-scheduling origin</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Twelve-Week Plan — Interview Playbook</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="playbook-plan">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Preparing › Topic 4 of 5</div>
+  <h1>The Twelve-Week Plan</h1>
+  <p class="lede">A schedule across all four tracks, with the ratios shifting by phase and by the level you are targeting — plus the drill tracker that measures the one thing that actually predicts your performance: the fraction of problems you can solve unaided.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#principles">Four principles that decide whether the plan works</a></li><li><a href="#plan">The twelve-week plan</a></li><li><a href="#drill">The drill tracker</a></li></ol>
+  </div>
+
+<section id="principles"><h2 id="principles">Four principles that decide whether the plan works</h2><p>Most preparation plans fail the same four ways. Fix these and the schedule almost does not matter; ignore them and no schedule
+helps.</p>
+<ol>
+<li><strong>Recall, not recognition.</strong> Reading a solution produces the feeling of understanding and almost none of the
+ability. You have learned a problem when you can reproduce it cold a week later, from the idea alone. Everything below is built
+around re-solving rather than re-reading.</li>
+<li><strong>Spaced repetition over volume.</strong> Two hundred problems solved once is worse preparation than eighty problems
+solved three times at widening intervals. The second and third passes are where the pattern actually lands, and they are the passes
+people skip because they feel less productive.</li>
+<li><strong>Out loud, always.</strong> Every round is scored partly on communication, and silent practice trains the opposite
+habit. If you do nothing else differently, narrate.</li>
+<li><strong>Proportional to your level.</strong> A senior candidate grinding algorithms and a mid-level candidate reading
+distributed systems papers are both optimising the thing that cannot move their outcome. See the
+<a href="playbook-loop.html#rounds">weighting table</a>.</li>
+</ol><div class="callout callout-warn"><span class="callout-title">Twelve weeks is a shape, not a prescription</span><p>If you have six weeks, run the plan below at double pace and cut the
+second pass on the lower-frequency topics. If you have six months, run it once and then repeat the drill cycle. If you are already
+strong in one track, compress it to a revision pass and spend the time on your weakest. The <em>ordering</em> is what matters:
+foundations before patterns, patterns before mixed practice, and mock interviews in the last third rather than at the end.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The single most common planning error is leaving mocks until the final week. Interviewing is a separate skill from
+problem-solving, it is learned only by doing it under observation, and the feedback from your first mock will change what you spend
+the rest of your preparation on. Do your first mock in <strong>week five</strong>, when you are not ready — being bad at it is the
+point, and finding out in week five is recoverable in a way that finding out in week eleven is not.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Be honest about which of the four principles you currently violate. It is usually the first two.</li></ul></div></section>
+
+<section id="plan"><h2 id="plan">The twelve-week plan</h2><p>Roughly 10–12 hours a week. The four tracks map onto the four sites in this repo, and the ratios shift as the weeks go on.</p><div class="table-wrap"><table><thead><tr><th>Weeks</th><th>Focus</th><th>Coding</th><th>LLD</th><th>System design</th><th>Behavioural</th></tr></thead><tbody><tr><td><strong>1–3</strong></td><td>Foundations</td><td>60%</td><td>15%</td><td>15%</td><td>10%</td></tr><tr><td><strong>4–6</strong></td><td>Patterns and breadth</td><td>45%</td><td>20%</td><td>25%</td><td>10%</td></tr><tr><td><strong>7–9</strong></td><td>Depth and mixed practice</td><td>35%</td><td>20%</td><td>35%</td><td>10%</td></tr><tr><td><strong>10–12</strong></td><td>Mocks and revision</td><td>30%</td><td>15%</td><td>30%</td><td>25%</td></tr></tbody></table></div><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>WEEKS 1-3  ·  FOUNDATIONS
+  DSA        Foundations &amp; Complexity, then Arrays/Windows, Hashing,
+             Stacks/Queues/Lists. ~6 problems per topic, out loud.
+  LLD        The LLD Round, then Principles &amp; Patterns. Both short.
+  SysDes     Scaling, Back-of-the-Envelope, the Framework, and Patterns.
+  Behaviour  Write the story bank. Ten stories, STAR, numbers. One sitting.
+  Milestone  You can state the complexity of anything you write, and you
+             have a written story bank you have read back once.
+
+WEEKS 4-6  ·  PATTERNS AND BREADTH
+  DSA        Binary Search &amp; Sorting, Trees/Tries/Heaps, Graphs.
+             Start the spaced-repetition deck from week 1&#x27;s problems.
+  LLD        Parking Lot and Elevator, each attempted on a 45-min timer
+             BEFORE reading the worked version.
+  SysDes     Building Blocks (rate limiter, consistent hashing, key-value
+             store, unique IDs) + the four Distributed Fundamentals pages.
+  Behaviour  Say three stories out loud, timed to two minutes each.
+  &gt;&gt;&gt; FIRST MOCK IN WEEK 5. You will not be ready. Do it anyway.
+  Milestone  You can name the pattern for a problem you have not seen.
+
+WEEKS 7-9  ·  DEPTH AND MIXED PRACTICE
+  DSA        Recursion &amp; DP, then Backtracking — the two most-skipped
+             pages, and the ones that decide outcomes at the top end.
+             Mixed sets: random problems, no topic label, on a timer.
+  LLD        Vending Machine, Splitwise, Cache &amp; Rate Limiter. Timed.
+  SysDes     Six to eight full designs, 45 minutes each, whiteboard,
+             out loud, start to finish without stopping.
+  Behaviour  Have someone probe three stories with follow-ups.
+  Milestone  You can take an unseen problem to working code in 35 minutes
+             while talking, and drive a 45-minute design unaided.
+
+WEEKS 10-12  ·  MOCKS AND REVISION
+  All        2-3 mocks per week across different round types, with
+             different people. Act on the feedback within 48 hours.
+  DSA        Spaced-repetition deck only. Re-solve, do not re-read.
+  LLD        Re-derive two designs from the requirements alone.
+  SysDes     Revisit the designs closest to your target company&#x27;s domain.
+  Behaviour  Full behavioural mock. Deep-dive mock on your main project.
+  Milestone  Your last three mocks all ended in working solutions, and
+             you were not surprised by any question type.</code></pre><pre data-lang="python" hidden><code>WEEKS 1-3  ·  FOUNDATIONS
+  DSA        Foundations &amp; Complexity, then Arrays/Windows, Hashing,
+             Stacks/Queues/Lists. ~6 problems per topic, out loud.
+  LLD        The LLD Round, then Principles &amp; Patterns. Both short.
+  SysDes     Scaling, Back-of-the-Envelope, the Framework, and Patterns.
+  Behaviour  Write the story bank. Ten stories, STAR, numbers. One sitting.
+  Milestone  You can state the complexity of anything you write, and you
+             have a written story bank you have read back once.
+
+WEEKS 4-6  ·  PATTERNS AND BREADTH
+  DSA        Binary Search &amp; Sorting, Trees/Tries/Heaps, Graphs.
+             Start the spaced-repetition deck from week 1&#x27;s problems.
+  LLD        Parking Lot and Elevator, each attempted on a 45-min timer
+             BEFORE reading the worked version.
+  SysDes     Building Blocks (rate limiter, consistent hashing, key-value
+             store, unique IDs) + the four Distributed Fundamentals pages.
+  Behaviour  Say three stories out loud, timed to two minutes each.
+  &gt;&gt;&gt; FIRST MOCK IN WEEK 5. You will not be ready. Do it anyway.
+  Milestone  You can name the pattern for a problem you have not seen.
+
+WEEKS 7-9  ·  DEPTH AND MIXED PRACTICE
+  DSA        Recursion &amp; DP, then Backtracking - the two most-skipped
+             pages, and the ones that decide outcomes at the top end.
+             Mixed sets: random problems, no topic label, on a timer.
+  LLD        Vending Machine, Splitwise, Cache &amp; Rate Limiter. Timed.
+  SysDes     Six to eight full designs, 45 minutes each, whiteboard,
+             out loud, start to finish without stopping.
+  Behaviour  Have someone probe three stories with follow-ups.
+  Milestone  You can take an unseen problem to working code in 35 minutes
+             while talking, and drive a 45-minute design unaided.
+
+WEEKS 10-12  ·  MOCKS AND REVISION
+  All        2-3 mocks per week across different round types, with
+             different people. Act on the feedback within 48 hours.
+  DSA        Spaced-repetition deck only. Re-solve, do not re-read.
+  LLD        Re-derive two designs from the requirements alone.
+  SysDes     Revisit the designs closest to your target company&#x27;s domain.
+  Behaviour  Full behavioural mock. Deep-dive mock on your main project.
+  Milestone  Your last three mocks all ended in working solutions, and
+             you were not surprised by any question type.</code></pre></div><div class="callout callout-note"><span class="callout-title">Adjusting for your level</span><p><strong>Entry / new grad:</strong> push coding to 70–75% throughout and treat system design as
+familiarity rather than mastery. <strong>Senior:</strong> flip the weeks 7–12 ratios — system design, the deep-dive and behavioural
+should take over half your time, and coding becomes maintenance to stay sharp rather than a growth area.
+<strong>Returning after a long gap:</strong> add three weeks in front for the DSA foundations page and basic fluency, because
+everything downstream is slower if you are fighting the language.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Track completion rather than hours. "I studied for twelve hours this week" is not a measurement; "I solved fourteen
+problems, eleven unaided, and three went into the repeat deck" is. The second number — <em>unaided</em> — is the one that actually
+predicts your performance, because the interview is unaided by definition. If it is not climbing week over week, more hours of the
+same activity will not fix it; change the activity.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Put the twelve weeks in a calendar with specific sessions, not a vague intention. Protect the mock slots first — they are the ones that get dropped.</li><li>Define your own weekly milestone check and actually run it. A plan with no check is a wish.</li></ul></div></section>
+
+<section id="drill"><h2 id="drill">The drill tracker</h2><p>The visited-page markers on the four sites tell you what you have <em>read</em>. They do not tell you what you can
+<em>do</em>, and that gap is where most preparation quietly fails. Keep a separate, deliberately low-tech record of problems, and
+make the repeat schedule explicit.</p>
+<p>Three columns do almost all the work: when you last attempted it, whether you got it <strong>unaided</strong>, and when it is
+due again.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code># drills.md  — one line per problem. Plain text on purpose: the point is
+# that it is cheap enough that you actually keep it up.
+#
+# Status:  U = solved unaided
+#          H = needed a hint or a nudge
+#          F = looked at the solution
+#
+# Repeat schedule (double the gap each time you get a U):
+#   F or H  -&gt;  retry in 2 days
+#   first U -&gt;  +1 week
+#   second U - &gt; +3 weeks
+#   third U -&gt;  retired; you know it
+#
+| Problem                  | Pattern        | Last  | St | Due   | Notes                       |
+|--------------------------|----------------|-------|----|-------|-----------------------------|
+| Longest substring k dist | Sliding window | 03-02 | U  | 03-09 | shrink condition took 2 goes|
+| Course schedule II       | Topo sort      | 03-02 | H  | 03-04 | forgot the cycle check      |
+| Coin change II           | Knapsack       | 03-03 | F  | 03-05 | loop nesting — combinations |
+| Word search              | Backtracking   | 03-04 | U  | 03-11 | remembered to un-mark       |
+| LRU cache                | Design         | 03-04 | U  | 03-25 | 2nd U — sentinels help      |
+
+WEEKLY REVIEW (fifteen minutes, same slot every week):
+  1. Count this week&#x27;s U / H / F. Is the U fraction climbing?
+  2. Any pattern with two or more F? That is next week&#x27;s focus — not
+     more problems, but re-reading that topic page and re-deriving it.
+  3. Anything due that you skipped? Do it first, before new problems.
+  4. One sentence: what was the single biggest gap this week?</code></pre><pre data-lang="python" hidden><code># drills.md  - one line per problem. Plain text on purpose: the point is
+# that it is cheap enough that you actually keep it up.
+#
+# Status:  U = solved unaided
+#          H = needed a hint or a nudge
+#          F = looked at the solution
+#
+# Repeat schedule (double the gap each time you get a U):
+#   F or H  -&gt;  retry in 2 days
+#   first U -&gt;  +1 week
+#   second U -&gt; +3 weeks
+#   third U -&gt;  retired; you know it
+#
+| Problem                  | Pattern        | Last  | St | Due   | Notes                       |
+|--------------------------|----------------|-------|----|-------|-----------------------------|
+| Longest substring k dist | Sliding window | 03-02 | U  | 03-09 | shrink condition took 2 goes|
+| Course schedule II       | Topo sort      | 03-02 | H  | 03-04 | forgot the cycle check      |
+| Coin change II           | Knapsack       | 03-03 | F  | 03-05 | loop nesting - combinations |
+| Word search              | Backtracking   | 03-04 | U  | 03-11 | remembered to un-mark       |
+| LRU cache                | Design         | 03-04 | U  | 03-25 | 2nd U - sentinels help      |
+
+WEEKLY REVIEW (fifteen minutes, same slot every week):
+  1. Count this week&#x27;s U / H / F. Is the U fraction climbing?
+  2. Any pattern with two or more F? That is next week&#x27;s focus - not
+     more problems, but re-reading that topic page and re-deriving it.
+  3. Anything due that you skipped? Do it first, before new problems.
+  4. One sentence: what was the single biggest gap this week?</code></pre></div><div class="callout callout-note"><span class="callout-title">Why the &quot;unaided&quot; column is the only one that matters</span><p>Every other metric — problems attempted, hours spent, topics
+covered — can go up while your actual readiness stays flat, because they are all satisfied by reading solutions. The fraction you
+solve unaided cannot be gamed: it is the same thing the interview measures. If that fraction is not rising across weeks, something
+about your method is wrong, and the usual culprit is reaching for the solution too early. Set a hard rule — twenty-five minutes of
+genuine attempt before you look at anything — and the number starts moving.</p></div><div class="table-wrap"><table><thead><tr><th>Signal in the tracker</th><th>What it means</th><th>What to change</th></tr></thead><tbody><tr><td>Lots of F in one pattern</td><td>You have not learned the pattern, only the problems</td><td>Re-read the topic page; re-derive the canonical solution from scratch</td></tr><tr><td>U on first attempt, F on the repeat</td><td>You recognised it rather than recalling it</td><td>Lengthen the gaps; stop solving the same problem too soon</td></tr><tr><td>U fraction flat across weeks</td><td>Reading too early, or practising only what you can already do</td><td>Hard 25-minute rule; deliberately pick harder problems</td></tr><tr><td>Nothing ever retires</td><td>Gaps are too short, or you are not getting three Us</td><td>Follow the schedule; three clean Us really is enough</td></tr><tr><td>Tracker abandoned after week 2</td><td>It was too elaborate</td><td>Go back to five columns in a text file</td></tr></tbody></table></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Two habits that are worth more than any tooling. First, <strong>write the note</strong> — the last column. "Forgot the
+cycle check" is a sentence that stops you forgetting the cycle check, and skimming those notes before a round is the most efficient
+revision available to you. Second, <strong>keep a separate one-page list of your own recurring mistakes</strong>, across all
+patterns: off-by-one in binary search, forgetting to un-mark in backtracking, not handling the empty input. That page is usually
+shorter than people expect — most of us have about six characteristic errors — and reading it the morning of an interview is worth
+more than any last-minute problem.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Start the tracker today, even with three rows. The habit is what you are building, not the file.</li><li>Write your personal recurring-mistakes page. Add to it every time a mock surfaces one.</li><li>Set the hard 25-minute rule and keep it for one week. Watch what happens to the unaided fraction.</li></ul></div></section>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Adapt the plan to your level and your timeline; the ordering matters more than the weeks.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

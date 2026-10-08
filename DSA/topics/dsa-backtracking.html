@@ -1,0 +1,994 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backtracking — DSA</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="dsa-backtracking">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Patterns › Topic 9 of 9</div>
+  <h1>Backtracking</h1>
+  <p class="lede">Depth-first search over partial answers: choose, explore, un-choose. One skeleton covers subsets, permutations, grid paths and constraint puzzles — so the work is in the pruning, and in knowing when a backtrack can be memoised into a DP and when it cannot.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#the-template">The template: choose, explore, un-choose</a></li><li><a href="#combinations">Subsets and combinations, including duplicates</a></li><li><a href="#permutations">Permutations, with and without duplicates</a></li><li><a href="#grid-search">Backtracking on a grid: word search and path counting</a></li><li><a href="#constraints">Constraint puzzles: N-Queens and Sudoku</a></li><li><a href="#pruning">Pruning: the difference between hopeless and fast</a></li><li><a href="#memo-or-not">When to memoise a backtrack — and when you cannot</a></li></ol>
+  </div>
+
+<section id="the-template"><h2 id="the-template">The template: choose, explore, un-choose</h2><p>Backtracking is depth-first search over the space of partial answers. You build a candidate one decision at a time; when a
+decision cannot lead anywhere valid you undo it and try the next. Every problem in this family is the same four-line skeleton with
+different content in each line, so learn the skeleton as a skeleton and you will never stare at a blank screen.</p>
+<ol>
+<li><strong>Base case</strong> — the partial answer is complete: record a copy and return.</li>
+<li><strong>Loop over the choices</strong> available at this depth.</li>
+<li><strong>Choose</strong> — push onto the path. <strong>Recurse.</strong> <strong>Un-choose</strong> — pop it off again.</li>
+<li><strong>Prune</strong> — skip choices that cannot possibly work, before recursing.</li>
+</ol>
+<p>Two details matter more than they look. First, <strong>record a copy</strong>: the path is mutated all the way down, so appending
+the live list to your results gives you <em>n</em> references to one list that ends up empty. Second, the <strong>un-choose must
+exactly undo the choose</strong> — if you mutated two things on the way in, undo both on the way out. Most backtracking bugs are one
+of these two.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The skeleton. Everything in this page is this shape.
+static void Backtrack(State state, List&lt;Choice&gt; path, List&lt;List&lt;Choice&gt;&gt; results)
+{
+    if (IsComplete(state))
+    {
+        results.Add(new List&lt;Choice&gt;(path));   // ← COPY, not the live list
+        return;
+    }
+
+    foreach (var choice in ChoicesAt(state))
+    {
+        if (!IsValid(state, choice)) continue; // ← prune before recursing
+
+        path.Add(choice);                      // choose
+        Apply(state, choice);
+        Backtrack(state, path, results);       // explore
+        Undo(state, choice);                   // un-choose: undo BOTH mutations
+        path.RemoveAt(path.Count - 1);
+    }
+}
+
+// Worked instance: all subsets of a distinct-element array (the power set).
+static IList&lt;IList&lt;int&gt;&gt; Subsets(int[] nums)
+{
+    var results = new List&lt;IList&lt;int&gt;&gt;();
+    var path = new List&lt;int&gt;();
+    Go(0);
+    return results;
+
+    void Go(int start)
+    {
+        results.Add(new List&lt;int&gt;(path));      // every node is an answer here
+        for (int i = start; i &lt; nums.Length; i++)
+        {
+            path.Add(nums[i]);                 // choose
+            Go(i + 1);                         // explore: i+1 forbids reuse
+            path.RemoveAt(path.Count - 1);     // un-choose
+        }
+    }
+}</code></pre><pre data-lang="python" hidden><code># The skeleton. Everything in this page is this shape.
+def backtrack(state, path: list, results: list) -&gt; None:
+    if is_complete(state):
+        results.append(path[:])            # ← COPY, not the live list
+        return
+
+    for choice in choices_at(state):
+        if not is_valid(state, choice):
+            continue                       # ← prune before recursing
+
+        path.append(choice)                # choose
+        apply(state, choice)
+        backtrack(state, path, results)    # explore
+        undo(state, choice)                # un-choose: undo BOTH mutations
+        path.pop()
+
+# Worked instance: all subsets of a distinct-element array (the power set).
+def subsets(nums: list[int]) -&gt; list[list[int]]:
+    results: list[list[int]] = []
+    path: list[int] = []
+
+    def go(start: int) -&gt; None:
+        results.append(path[:])            # every node is an answer here
+        for i in range(start, len(nums)):
+            path.append(nums[i])           # choose
+            go(i + 1)                      # explore: i+1 forbids reuse
+            path.pop()                     # un-choose
+
+    go(0)
+    return results</code></pre></div><div class="callout callout-warn"><span class="callout-title">The copy, and the two index idioms</span><p><code>results.Add(path)</code> instead of
+<code>results.Add(new List&lt;int&gt;(path))</code> is the single most common bug in this entire family, and it is nasty because the
+program runs and returns the right <em>number</em> of answers — they are just all empty. In Python the equivalent slip is
+<code>results.append(path)</code> rather than <code>path[:]</code>.</p>
+<p>The other thing to get straight once and reuse forever is what you pass as the next start index:</p><ul>
+<li><code>Go(i + 1)</code> — each element used <strong>at most once</strong> (subsets, combinations).</li>
+<li><code>Go(i)</code> — each element may be <strong>reused</strong> (combination sum with unlimited repeats).</li>
+<li><code>Go(0)</code> plus a <code>used[]</code> array — <strong>order matters</strong> (permutations).</li>
+</ul></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Write the skeleton before you think about the problem. Genuinely — type the base case, the loop, the
+choose/recurse/un-choose, and <em>then</em> fill in what each means. It costs twenty seconds and it means you are never stuck in
+front of an empty editor, which is where candidates lose these questions. Say the complexity in the honest form: these are
+exponential, and the bound is <strong>number of nodes in the recursion tree × the cost of the work at each node</strong> — for
+subsets, <code>O(n · 2ⁿ)</code>, where the <code>n</code> is the copy, not the recursion. People who say just "<code>2ⁿ</code>"
+have forgotten the copy, and it is a cheap thing for an interviewer to catch.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write the power set three ways: backtracking, iteratively doubling the result list, and by enumerating bitmasks 0..2ⁿ−1.</li><li>Deliberately write the no-copy bug, run it, and look at the output — you will never make it again under pressure.</li><li>For each of the three start-index idioms above, name a problem that uses it.</li></ul></div></section>
+
+<section id="combinations"><h2 id="combinations">Subsets and combinations, including duplicates</h2><p>Combinations are subsets with a size or sum constraint; the only new idea is <strong>handling duplicate inputs without emitting
+duplicate answers</strong>, which comes up constantly and has one standard solution worth knowing cold.</p>
+<p><strong>Sort the input, then at each level skip a choice that equals the previous one</strong> — but only when the previous one
+was <em>not</em> taken at this level, which the condition <code>i &gt; start</code> expresses exactly. Sorting is what makes
+duplicates adjacent, and adjacency is what makes the skip cheap.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Subsets with duplicates in the input: sort, then skip repeats per level.
+static IList&lt;IList&lt;int&gt;&gt; SubsetsWithDup(int[] nums)
+{
+    Array.Sort(nums);                                  // duplicates now adjacent
+    var results = new List&lt;IList&lt;int&gt;&gt;();
+    var path = new List&lt;int&gt;();
+    Go(0);
+    return results;
+
+    void Go(int start)
+    {
+        results.Add(new List&lt;int&gt;(path));
+        for (int i = start; i &lt; nums.Length; i++)
+        {
+            // i &gt; start means &quot;this is not the first choice at this level&quot;,
+            // so an equal value here would repeat a sibling branch.
+            if (i &gt; start &amp;&amp; nums[i] == nums[i - 1]) continue;
+            path.Add(nums[i]);
+            Go(i + 1);
+            path.RemoveAt(path.Count - 1);
+        }
+    }
+}
+
+// Combination sum: unlimited reuse of each candidate. Note Go(i), not Go(i+1).
+static IList&lt;IList&lt;int&gt;&gt; CombinationSum(int[] candidates, int target)
+{
+    Array.Sort(candidates);                            // enables the break below
+    var results = new List&lt;IList&lt;int&gt;&gt;();
+    var path = new List&lt;int&gt;();
+    Go(0, target);
+    return results;
+
+    void Go(int start, int remaining)
+    {
+        if (remaining == 0) { results.Add(new List&lt;int&gt;(path)); return; }
+        for (int i = start; i &lt; candidates.Length; i++)
+        {
+            // Sorted, so once one candidate overshoots every later one does:
+            // break, not continue. This is the prune that makes it fast.
+            if (candidates[i] &gt; remaining) break;
+            path.Add(candidates[i]);
+            Go(i, remaining - candidates[i]);          // ← i: reuse allowed
+            path.RemoveAt(path.Count - 1);
+        }
+    }
+}
+
+// Combination sum II: each candidate once, input may contain duplicates.
+// Both tricks at the same time.
+static IList&lt;IList&lt;int&gt;&gt; CombinationSum2(int[] candidates, int target)
+{
+    Array.Sort(candidates);
+    var results = new List&lt;IList&lt;int&gt;&gt;();
+    var path = new List&lt;int&gt;();
+    Go(0, target);
+    return results;
+
+    void Go(int start, int remaining)
+    {
+        if (remaining == 0) { results.Add(new List&lt;int&gt;(path)); return; }
+        for (int i = start; i &lt; candidates.Length; i++)
+        {
+            if (i &gt; start &amp;&amp; candidates[i] == candidates[i - 1]) continue;  // dedupe
+            if (candidates[i] &gt; remaining) break;                           // prune
+            path.Add(candidates[i]);
+            Go(i + 1, remaining - candidates[i]);      // ← i+1: each once
+            path.RemoveAt(path.Count - 1);
+        }
+    }
+}
+
+// Combinations of size k from 1..n, with the strongest prune on this page:
+// stop when too few candidates remain to ever fill the path.
+static IList&lt;IList&lt;int&gt;&gt; Combine(int n, int k)
+{
+    var results = new List&lt;IList&lt;int&gt;&gt;();
+    var path = new List&lt;int&gt;();
+    Go(1);
+    return results;
+
+    void Go(int start)
+    {
+        if (path.Count == k) { results.Add(new List&lt;int&gt;(path)); return; }
+        int need = k - path.Count;
+        for (int i = start; i &lt;= n - need + 1; i++)     // ← the bound IS the prune
+        {
+            path.Add(i);
+            Go(i + 1);
+            path.RemoveAt(path.Count - 1);
+        }
+    }
+}</code></pre><pre data-lang="python" hidden><code>def subsets_with_dup(nums: list[int]) -&gt; list[list[int]]:
+    nums.sort()                                  # duplicates now adjacent
+    results: list[list[int]] = []
+    path: list[int] = []
+
+    def go(start: int) -&gt; None:
+        results.append(path[:])
+        for i in range(start, len(nums)):
+            # i &gt; start: not the first choice at this level, so an equal
+            # value here would repeat a sibling branch.
+            if i &gt; start and nums[i] == nums[i - 1]:
+                continue
+            path.append(nums[i])
+            go(i + 1)
+            path.pop()
+
+    go(0)
+    return results
+
+def combination_sum(candidates: list[int], target: int) -&gt; list[list[int]]:
+    candidates.sort()                            # enables the break below
+    results: list[list[int]] = []
+    path: list[int] = []
+
+    def go(start: int, remaining: int) -&gt; None:
+        if remaining == 0:
+            results.append(path[:])
+            return
+        for i in range(start, len(candidates)):
+            if candidates[i] &gt; remaining:
+                break                            # sorted: all later ones too
+            path.append(candidates[i])
+            go(i, remaining - candidates[i])     # ← i: reuse allowed
+            path.pop()
+
+    go(0, target)
+    return results
+
+def combination_sum2(candidates: list[int], target: int) -&gt; list[list[int]]:
+    candidates.sort()
+    results: list[list[int]] = []
+    path: list[int] = []
+
+    def go(start: int, remaining: int) -&gt; None:
+        if remaining == 0:
+            results.append(path[:])
+            return
+        for i in range(start, len(candidates)):
+            if i &gt; start and candidates[i] == candidates[i - 1]:
+                continue                         # dedupe
+            if candidates[i] &gt; remaining:
+                break                            # prune
+            path.append(candidates[i])
+            go(i + 1, remaining - candidates[i]) # ← i+1: each once
+            path.pop()
+
+    go(0, target)
+    return results
+
+def combine(n: int, k: int) -&gt; list[list[int]]:
+    results: list[list[int]] = []
+    path: list[int] = []
+
+    def go(start: int) -&gt; None:
+        if len(path) == k:
+            results.append(path[:])
+            return
+        need = k - len(path)
+        for i in range(start, n - need + 2):     # ← the bound IS the prune
+            path.append(i)
+            go(i + 1)
+            path.pop()
+
+    go(1)
+    return results</code></pre></div><div class="table-wrap"><table><thead><tr><th>Problem</th><th>Next start</th><th>Dedupe needed?</th><th>Base case</th></tr></thead><tbody><tr><td>Subsets</td><td><code>i + 1</code></td><td>No (distinct input)</td><td>every node is an answer</td></tr><tr><td>Subsets II</td><td><code>i + 1</code></td><td>Yes — sort + skip</td><td>every node is an answer</td></tr><tr><td>Combinations (n, k)</td><td><code>i + 1</code></td><td>No</td><td><code>path.Count == k</code></td></tr><tr><td>Combination sum</td><td><code>i</code> (reuse)</td><td>No (distinct input)</td><td><code>remaining == 0</code></td></tr><tr><td>Combination sum II</td><td><code>i + 1</code></td><td>Yes — sort + skip</td><td><code>remaining == 0</code></td></tr><tr><td>Palindrome partitioning</td><td><code>i + 1</code></td><td>No</td><td>index reached the end</td></tr></tbody></table></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The duplicate-skip is the thing being tested, and the thing to be able to <em>justify</em> rather than recall. Say it
+like this: "sorting puts equal values next to each other; <code>i &gt; start</code> means I already tried this value as the first
+choice at this level, so taking it again here would regenerate a branch I have already explored." If you cannot explain it, an
+interviewer will reasonably assume you memorised it — and the natural probe is "why <code>i &gt; start</code> and not
+<code>i &gt; 0</code>?", which has a precise answer: <code>i &gt; 0</code> would also skip legitimate repeats that appear deeper in
+the <em>same</em> combination, so <code>[1,1,2]</code> would lose the answer <code>[1,1]</code>. Also prefer <code>break</code> over
+<code>continue</code> once the input is sorted, and say why.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Subsets II and combination sum II, then explain the <code>i &gt; start</code> condition from scratch.</li><li>Letter combinations of a phone number — the simplest multi-choice-per-level case.</li><li>Palindrome partitioning (every partition into palindromes), reusing the palindrome precompute from the DP page.</li><li>Generate all valid parentheses for n pairs — the prune is the whole problem, so derive it before coding.</li></ul></div></section>
+
+<section id="permutations"><h2 id="permutations">Permutations, with and without duplicates</h2><p>Permutations differ from combinations in one way: <strong>order matters</strong>, so you cannot use a start index to move
+forward through the input — every unused element is a candidate at every level. That means you need a way to know what is still
+unused, and there are two standard approaches with different trade-offs worth being able to compare.</p>
+<p>The <strong>used-array</strong> version is clearer and extends cleanly to duplicate handling. The <strong>swap-in-place</strong>
+version uses no extra array and is slicker, but it <em>reorders</em> the input as it goes, which breaks the sortedness that
+duplicate-skipping depends on — so for distinct inputs either is fine, and for duplicates use the used-array form.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Used-array form: clear, and the one that extends to duplicates.
+static IList&lt;IList&lt;int&gt;&gt; Permute(int[] nums)
+{
+    var results = new List&lt;IList&lt;int&gt;&gt;();
+    var path = new List&lt;int&gt;();
+    var used = new bool[nums.Length];
+    Go();
+    return results;
+
+    void Go()
+    {
+        if (path.Count == nums.Length) { results.Add(new List&lt;int&gt;(path)); return; }
+        for (int i = 0; i &lt; nums.Length; i++)
+        {
+            if (used[i]) continue;             // every UNUSED element is a choice
+            used[i] = true; path.Add(nums[i]);         // choose (two mutations)
+            Go();
+            path.RemoveAt(path.Count - 1); used[i] = false;   // un-choose BOTH
+        }
+    }
+}
+
+// Swap form: no used[] array, but it permutes nums itself.
+static IList&lt;IList&lt;int&gt;&gt; PermuteSwap(int[] nums)
+{
+    var results = new List&lt;IList&lt;int&gt;&gt;();
+    Go(0);
+    return results;
+
+    void Go(int k)
+    {
+        if (k == nums.Length) { results.Add(new List&lt;int&gt;(nums)); return; }
+        for (int i = k; i &lt; nums.Length; i++)
+        {
+            (nums[k], nums[i]) = (nums[i], nums[k]);   // choose
+            Go(k + 1);
+            (nums[k], nums[i]) = (nums[i], nums[k]);   // un-choose (swap back)
+        }
+    }
+}
+
+// Permutations II — duplicates in the input. Sort, then at each level use a
+// given value at most once. The condition reads: skip nums[i] if it equals
+// its predecessor AND that predecessor is not currently in the path, because
+// then the predecessor already owned this slot in an earlier sibling branch.
+static IList&lt;IList&lt;int&gt;&gt; PermuteUnique(int[] nums)
+{
+    Array.Sort(nums);
+    var results = new List&lt;IList&lt;int&gt;&gt;();
+    var path = new List&lt;int&gt;();
+    var used = new bool[nums.Length];
+    Go();
+    return results;
+
+    void Go()
+    {
+        if (path.Count == nums.Length) { results.Add(new List&lt;int&gt;(path)); return; }
+        for (int i = 0; i &lt; nums.Length; i++)
+        {
+            if (used[i]) continue;
+            if (i &gt; 0 &amp;&amp; nums[i] == nums[i - 1] &amp;&amp; !used[i - 1]) continue;  // dedupe
+            used[i] = true; path.Add(nums[i]);
+            Go();
+            path.RemoveAt(path.Count - 1); used[i] = false;
+        }
+    }
+}
+
+// Next permutation in place — O(n), no recursion. Worth knowing separately:
+// it generates the lexicographic successor rather than the whole set, which
+// is the right answer when you are asked to iterate permutations in O(1) space.
+static void NextPermutation(int[] nums)
+{
+    int i = nums.Length - 2;
+    while (i &gt;= 0 &amp;&amp; nums[i] &gt;= nums[i + 1]) i--;        // find the pivot
+    if (i &gt;= 0)
+    {
+        int j = nums.Length - 1;
+        while (nums[j] &lt;= nums[i]) j--;                  // smallest larger value
+        (nums[i], nums[j]) = (nums[j], nums[i]);
+    }
+    Array.Reverse(nums, i + 1, nums.Length - i - 1);     // the suffix is descending
+}</code></pre><pre data-lang="python" hidden><code>def permute(nums: list[int]) -&gt; list[list[int]]:
+    results: list[list[int]] = []
+    path: list[int] = []
+    used = [False] * len(nums)
+
+    def go() -&gt; None:
+        if len(path) == len(nums):
+            results.append(path[:])
+            return
+        for i in range(len(nums)):
+            if used[i]:
+                continue                       # every UNUSED element is a choice
+            used[i] = True
+            path.append(nums[i])               # choose (two mutations)
+            go()
+            path.pop()
+            used[i] = False                    # un-choose BOTH
+
+    go()
+    return results
+
+def permute_swap(nums: list[int]) -&gt; list[list[int]]:
+    results: list[list[int]] = []
+
+    def go(k: int) -&gt; None:
+        if k == len(nums):
+            results.append(nums[:])
+            return
+        for i in range(k, len(nums)):
+            nums[k], nums[i] = nums[i], nums[k]   # choose
+            go(k + 1)
+            nums[k], nums[i] = nums[i], nums[k]   # un-choose
+
+    go(0)
+    return results
+
+def permute_unique(nums: list[int]) -&gt; list[list[int]]:
+    nums.sort()
+    results: list[list[int]] = []
+    path: list[int] = []
+    used = [False] * len(nums)
+
+    def go() -&gt; None:
+        if len(path) == len(nums):
+            results.append(path[:])
+            return
+        for i in range(len(nums)):
+            if used[i]:
+                continue
+            # skip a value equal to its predecessor when that predecessor is
+            # not in the path: it already owned this slot in a sibling branch.
+            if i &gt; 0 and nums[i] == nums[i - 1] and not used[i - 1]:
+                continue
+            used[i] = True
+            path.append(nums[i])
+            go()
+            path.pop()
+            used[i] = False
+
+    go()
+    return results
+
+def next_permutation(nums: list[int]) -&gt; None:
+    i = len(nums) - 2
+    while i &gt;= 0 and nums[i] &gt;= nums[i + 1]:
+        i -= 1                                  # find the pivot
+    if i &gt;= 0:
+        j = len(nums) - 1
+        while nums[j] &lt;= nums[i]:
+            j -= 1                              # smallest larger value
+        nums[i], nums[j] = nums[j], nums[i]
+    nums[i + 1 :] = reversed(nums[i + 1 :])     # the suffix was descending</code></pre></div><div class="callout callout-note"><span class="callout-title">Why the permutation dedupe looks different</span><p>For combinations the skip is
+<code>i &gt; start &amp;&amp; nums[i] == nums[i-1]</code>; for permutations it is
+<code>i &gt; 0 &amp;&amp; nums[i] == nums[i-1] &amp;&amp; !used[i-1]</code>. They are the same idea — "use each distinct value at
+most once per level" — expressed against different bookkeeping. Combinations advance a start index, so "first at this level" is
+<code>i == start</code>. Permutations scan the whole array every level, so "first at this level" has to be read off the
+<code>used</code> array instead: if the identical predecessor is <em>not</em> used, it was available and therefore already took this
+slot in an earlier sibling. Deriving one from the other is a good way to confirm you understand both.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Offer the used-array version first and <em>mention</em> that the swap version exists with O(1) extra space — knowing
+both and being able to say when each is appropriate is a stronger signal than producing the clever one. The complexity question is
+worth rehearsing because people get it wrong: there are <code>n!</code> permutations and each costs <code>O(n)</code> to copy, so
+<code>O(n · n!)</code>, and the recursion tree has <code>O(n!)</code> leaves but more nodes than that in total. The other likely
+follow-up is "what if you only need the <em>k</em>th permutation?" — do not generate them all; divide by factorials to pick each
+digit directly, which is <code>O(n²)</code> and a genuinely different technique.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Permutations both ways, then permutations II, then derive the dedupe condition without looking.</li><li>Next permutation in place — then use it to iterate every permutation with no recursion at all.</li><li>The <em>k</em>th permutation sequence, computed directly with factorials.</li><li>Letter case permutation of a string ("a1b2" → every combination of cases) — note the choice set is per-character, not global.</li></ul></div></section>
+
+<section id="grid-search"><h2 id="grid-search">Backtracking on a grid: word search and path counting</h2><p>On a grid the "path" is the set of cells you are currently standing on, and the choices are the four neighbours. The new idea is
+that you must mark a cell as <strong>visited on the way in and unmark it on the way out</strong> — that unmark is what makes this
+backtracking rather than flood fill, and forgetting it is the defining bug of the family.</p>
+<p>The idiomatic trick is to mark <strong>in the grid itself</strong> rather than allocate a separate visited array: overwrite the
+cell with a sentinel, recurse, and restore the original character. It is O(1) extra space and it reads as experience — but say out
+loud that you are mutating the caller's input and restoring it, because an interviewer may consider that a problem.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Word search: does the word exist as a path of adjacent cells?
+// Marks in place with a sentinel, then restores.
+static bool Exist(char[][] board, string word)
+{
+    int rows = board.Length, cols = board[0].Length;
+    for (int r = 0; r &lt; rows; r++)
+        for (int c = 0; c &lt; cols; c++)
+            if (Go(r, c, 0)) return true;
+    return false;
+
+    bool Go(int r, int c, int k)
+    {
+        if (k == word.Length) return true;                     // whole word matched
+        if (r &lt; 0 || r &gt;= rows || c &lt; 0 || c &gt;= cols) return false;
+        if (board[r][c] != word[k]) return false;              // includes the sentinel
+
+        char saved = board[r][c];
+        board[r][c] = &#x27;#&#x27;;                                     // mark: choose
+        bool found = Go(r + 1, c, k + 1) || Go(r - 1, c, k + 1)
+                  || Go(r, c + 1, k + 1) || Go(r, c - 1, k + 1);
+        board[r][c] = saved;                                   // un-mark: un-choose
+        return found;
+    }
+}
+
+// Count paths through every non-obstacle cell exactly once (unique paths III).
+// Here the unmark genuinely matters: two different paths reuse the same cells.
+static int UniquePathsIII(int[][] grid)
+{
+    int rows = grid.Length, cols = grid[0].Length;
+    int empty = 0, sr = 0, sc = 0;
+    for (int r = 0; r &lt; rows; r++)
+        for (int c = 0; c &lt; cols; c++)
+        {
+            if (grid[r][c] == 0) empty++;
+            else if (grid[r][c] == 1) { sr = r; sc = c; }
+        }
+    return Go(sr, sc, empty + 1);      // squares to cover: the 0s plus the start
+
+    // remaining = squares still to step on, counting this one.
+    int Go(int r, int c, int remaining)
+    {
+        if (r &lt; 0 || r &gt;= rows || c &lt; 0 || c &gt;= cols || grid[r][c] == -1) return 0;
+        if (grid[r][c] == 2)                                   // the goal
+            return remaining == 0 ? 1 : 0;                      // all squares covered?
+
+        int saved = grid[r][c];
+        grid[r][c] = -1;                                       // mark
+        int total = Go(r + 1, c, remaining - 1) + Go(r - 1, c, remaining - 1)
+                  + Go(r, c + 1, remaining - 1) + Go(r, c - 1, remaining - 1);
+        grid[r][c] = saved;                                    // un-mark
+        return total;
+    }
+}
+
+// Direction arrays keep the four recursive calls to one loop — worth doing
+// once the body grows, and it generalises to eight directions or a knight.
+static readonly int[][] Dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];</code></pre><pre data-lang="python" hidden><code>def exist(board: list[list[str]], word: str) -&gt; bool:
+    rows, cols = len(board), len(board[0])
+
+    def go(r: int, c: int, k: int) -&gt; bool:
+        if k == len(word):
+            return True                               # whole word matched
+        if not (0 &lt;= r &lt; rows and 0 &lt;= c &lt; cols):
+            return False
+        if board[r][c] != word[k]:
+            return False                              # includes the sentinel
+
+        saved, board[r][c] = board[r][c], &quot;#&quot;         # mark: choose
+        found = (go(r + 1, c, k + 1) or go(r - 1, c, k + 1)
+                 or go(r, c + 1, k + 1) or go(r, c - 1, k + 1))
+        board[r][c] = saved                           # un-mark: un-choose
+        return found
+
+    return any(go(r, c, 0) for r in range(rows) for c in range(cols))
+
+def unique_paths_iii(grid: list[list[int]]) -&gt; int:
+    rows, cols = len(grid), len(grid[0])
+    empty = sr = sc = 0
+    for r in range(rows):
+        for c in range(cols):
+            if grid[r][c] == 0:
+                empty += 1
+            elif grid[r][c] == 1:
+                sr, sc = r, c
+
+    # remaining = squares still to step on, counting this one.
+    def go(r: int, c: int, remaining: int) -&gt; int:
+        if not (0 &lt;= r &lt; rows and 0 &lt;= c &lt; cols) or grid[r][c] == -1:
+            return 0
+        if grid[r][c] == 2:                           # the goal
+            return 1 if remaining == 0 else 0         # all squares covered?
+
+        saved, grid[r][c] = grid[r][c], -1            # mark
+        total = (go(r + 1, c, remaining - 1) + go(r - 1, c, remaining - 1)
+                 + go(r, c + 1, remaining - 1) + go(r, c - 1, remaining - 1))
+        grid[r][c] = saved                            # un-mark
+        return total
+
+    return go(sr, sc, empty + 1)                 # the 0s plus the start square
+
+DIRS = ((1, 0), (-1, 0), (0, 1), (0, -1))</code></pre></div><div class="callout callout-warn"><span class="callout-title">Flood fill versus backtracking on a grid</span><p>These look identical and are not. <strong>Counting islands</strong> sinks each
+cell permanently — once visited, never revisited, because no other answer needs it; that is flood fill, it is
+<code>O(rows × cols)</code>, and <em>adding</em> an unmark would make it exponential for no reason. <strong>Word search</strong>
+must unmark, because a cell excluded from one candidate path may be essential to another. Ask yourself "can a cell belong to more
+than one candidate answer?" — yes means backtrack and unmark, no means flood fill and do not. Choosing wrong is not a style
+preference; one of the two answers will be wrong.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>State the complexity carefully, because this is where grid backtracking is graded: word search is
+<code>O(rows × cols × 4^L)</code> for a word of length <code>L</code> — every cell is a possible start, and from each you branch
+four ways to depth <code>L</code> (really <code>3^L</code> after the first step, since you never go straight back, and saying that
+is a nice touch). The standard follow-up is <strong>word search II</strong>, many words at once, and the expected answer is a
+<strong>trie</strong>: walk the grid once while descending the trie, so shared prefixes are explored once instead of once per word.
+Recognising that is the whole point of the follow-up, and it connects this page to the trie section on the trees page.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Word search, then word search II with a trie — and measure the difference on a large dictionary.</li><li>Unique paths III, and explain why the unmark is required here but harmful in "number of islands".</li><li>Rat in a maze / all paths from corner to corner, returning the paths themselves.</li><li>The knight's tour on a small board — then add the heuristic of visiting the most-constrained square first and watch the runtime collapse.</li></ul></div></section>
+
+<section id="constraints"><h2 id="constraints">Constraint puzzles: N-Queens and Sudoku</h2><p>These are the problems backtracking was invented for, and they share a structure: a fixed number of slots, a set of values per
+slot, and <strong>constraints that let you reject a partial assignment long before it is complete</strong>. The algorithm is the
+same skeleton; all the engineering is in making the validity check O(1) so the pruning is cheap.</p>
+<p>For N-Queens the insight is that one queen per row is forced, so the state is just "which column in each row", and the three
+conflict tests collapse to set membership: the column, the diagonal <code>row − col</code>, and the anti-diagonal
+<code>row + col</code>. Each of those is constant along its line, which is the whole trick.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// N-Queens. One queen per row, so the decision at depth r is its column.
+// Conflicts are O(1): a column, a diagonal (r-c) and an anti-diagonal (r+c).
+static IList&lt;IList&lt;string&gt;&gt; SolveNQueens(int n)
+{
+    var results = new List&lt;IList&lt;string&gt;&gt;();
+    var queenCol = new int[n];
+    var cols = new HashSet&lt;int&gt;();
+    var diag = new HashSet&lt;int&gt;();      // r - c is constant down a diagonal
+    var anti = new HashSet&lt;int&gt;();      // r + c is constant down an anti-diagonal
+    Go(0);
+    return results;
+
+    void Go(int r)
+    {
+        if (r == n) { results.Add(Render()); return; }
+        for (int c = 0; c &lt; n; c++)
+        {
+            if (cols.Contains(c) || diag.Contains(r - c) || anti.Contains(r + c))
+                continue;                                     // prune: O(1)
+            cols.Add(c); diag.Add(r - c); anti.Add(r + c);     // choose (3 marks)
+            queenCol[r] = c;
+            Go(r + 1);
+            cols.Remove(c); diag.Remove(r - c); anti.Remove(r + c);  // un-choose all 3
+        }
+    }
+
+    List&lt;string&gt; Render() =&gt; queenCol
+        .Select(c =&gt; new string(&#x27;.&#x27;, c) + &quot;Q&quot; + new string(&#x27;.&#x27;, n - c - 1))
+        .ToList();
+}
+
+// Just the count (n-queens II) — same search, no rendering.
+static int TotalNQueens(int n)
+{
+    var cols = new HashSet&lt;int&gt;(); var diag = new HashSet&lt;int&gt;(); var anti = new HashSet&lt;int&gt;();
+    return Go(0);
+
+    int Go(int r)
+    {
+        if (r == n) return 1;
+        int found = 0;
+        for (int c = 0; c &lt; n; c++)
+        {
+            if (cols.Contains(c) || diag.Contains(r - c) || anti.Contains(r + c)) continue;
+            cols.Add(c); diag.Add(r - c); anti.Add(r + c);
+            found += Go(r + 1);
+            cols.Remove(c); diag.Remove(r - c); anti.Remove(r + c);
+        }
+        return found;
+    }
+}
+
+// Sudoku. Fill the first empty cell; try 1-9; recurse; undo on failure.
+// Returning bool rather than void is what lets the first solution stop the
+// whole search instead of exploring the rest of the tree.
+static void SolveSudoku(char[][] board)
+{
+    Go();
+
+    bool Go()
+    {
+        for (int r = 0; r &lt; 9; r++)
+            for (int c = 0; c &lt; 9; c++)
+            {
+                if (board[r][c] != &#x27;.&#x27;) continue;
+                for (char v = &#x27;1&#x27;; v &lt;= &#x27;9&#x27;; v++)
+                {
+                    if (!IsValid(r, c, v)) continue;
+                    board[r][c] = v;                 // choose
+                    if (Go()) return true;           // ← stop at the first solution
+                    board[r][c] = &#x27;.&#x27;;               // un-choose
+                }
+                return false;                        // no value fits: dead end
+            }
+        return true;                                 // no empty cell left: solved
+    }
+
+    bool IsValid(int r, int c, char v)
+    {
+        int boxR = r / 3 * 3, boxC = c / 3 * 3;
+        for (int i = 0; i &lt; 9; i++)
+        {
+            if (board[r][i] == v || board[i][c] == v) return false;
+            if (board[boxR + i / 3][boxC + i % 3] == v) return false;   // the 3x3 box
+        }
+        return true;
+    }
+}</code></pre><pre data-lang="python" hidden><code>def solve_n_queens(n: int) -&gt; list[list[str]]:
+    results: list[list[str]] = []
+    queen_col = [0] * n
+    cols: set[int] = set()
+    diag: set[int] = set()        # r - c is constant down a diagonal
+    anti: set[int] = set()        # r + c is constant down an anti-diagonal
+
+    def go(r: int) -&gt; None:
+        if r == n:
+            results.append([&quot;.&quot; * c + &quot;Q&quot; + &quot;.&quot; * (n - c - 1) for c in queen_col])
+            return
+        for c in range(n):
+            if c in cols or (r - c) in diag or (r + c) in anti:
+                continue                                  # prune: O(1)
+            cols.add(c); diag.add(r - c); anti.add(r + c)  # choose (3 marks)
+            queen_col[r] = c
+            go(r + 1)
+            cols.discard(c); diag.discard(r - c); anti.discard(r + c)  # undo all 3
+
+    go(0)
+    return results
+
+def total_n_queens(n: int) -&gt; int:
+    cols: set[int] = set()
+    diag: set[int] = set()
+    anti: set[int] = set()
+
+    def go(r: int) -&gt; int:
+        if r == n:
+            return 1
+        found = 0
+        for c in range(n):
+            if c in cols or (r - c) in diag or (r + c) in anti:
+                continue
+            cols.add(c); diag.add(r - c); anti.add(r + c)
+            found += go(r + 1)
+            cols.discard(c); diag.discard(r - c); anti.discard(r + c)
+        return found
+
+    return go(0)
+
+def solve_sudoku(board: list[list[str]]) -&gt; None:
+    def is_valid(r: int, c: int, v: str) -&gt; bool:
+        box_r, box_c = r // 3 * 3, c // 3 * 3
+        for i in range(9):
+            if board[r][i] == v or board[i][c] == v:
+                return False
+            if board[box_r + i // 3][box_c + i % 3] == v:   # the 3x3 box
+                return False
+        return True
+
+    def go() -&gt; bool:
+        for r in range(9):
+            for c in range(9):
+                if board[r][c] != &quot;.&quot;:
+                    continue
+                for v in &quot;123456789&quot;:
+                    if not is_valid(r, c, v):
+                        continue
+                    board[r][c] = v                  # choose
+                    if go():
+                        return True                  # ← stop at first solution
+                    board[r][c] = &quot;.&quot;                # un-choose
+                return False                         # no value fits: dead end
+        return True                                  # no empty cell: solved
+
+    go()</code></pre></div><div class="callout callout-note"><span class="callout-title">Return bool when one answer is enough</span><p>Notice the difference between the two shapes on this page. When you want
+<em>every</em> answer, the recursion returns <code>void</code> and appends to a results list; the search must run to completion.
+When one answer suffices — Sudoku, "is there a path", "can the board be solved" — the recursion returns <code>bool</code> and the
+caller does <code>if (Go()) return true;</code>, which unwinds the entire stack the moment a solution is found. Getting this wrong
+is a real performance bug, not a style choice: a <code>void</code> Sudoku solver explores the whole tree and then has to be stopped
+with a flag.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>N-Queens is a near-certain ask if the interviewer wants to see backtracking specifically, and the discriminator is the
+<code>r − c</code> / <code>r + c</code> diagonal encoding. If you scan the board to check conflicts you still get a correct answer,
+but you have shown you did not see the structure — so say "the difference and the sum are each constant along a diagonal, so three
+hash sets give me O(1) conflict checks." The follow-up is usually the bitmask version, where the three sets become three integers
+and <code>mask &amp; -mask</code> picks the next free column; mentioning it is worth as much as writing it. For Sudoku the expected
+improvement is <strong>most-constrained-variable ordering</strong>: fill the empty cell with the fewest legal values first, rather
+than the first empty cell in scan order. That is a general constraint-satisfaction heuristic and it is the right thing to name.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>N-Queens, then N-Queens II (count only), then the bitmask version.</li><li>Sudoku, then add most-constrained-variable ordering and compare the node counts.</li><li>Word break II and "restore IP addresses" — the same skeleton over string splits instead of board cells.</li><li>Graph colouring with k colours — and notice it is N-Queens with a different conflict test.</li></ul></div></section>
+
+<section id="pruning"><h2 id="pruning">Pruning: the difference between hopeless and fast</h2><p>Every problem on this page is exponential in the worst case. What makes backtracking <em>usable</em> is that good pruning cuts
+branches near the root, and a branch cut at depth 2 removes everything beneath it. Pruning is not an optimisation you add at the
+end — in an interview it is often the answer itself, and it is the thing that distinguishes a candidate who has internalised the
+technique.</p>
+<p>Four prunes cover nearly everything:</p>
+<ol>
+<li><strong>Infeasibility</strong> — this choice already violates a constraint. (N-Queens' conflict sets.)</li>
+<li><strong>Bound</strong> — even the best completion from here cannot beat the answer I already have. (Branch and bound.)</li>
+<li><strong>Counting</strong> — too few candidates remain to fill the remaining slots. (<code>n − need + 1</code> in
+<code>Combine</code>.)</li>
+<li><strong>Symmetry</strong> — this branch is a relabelling of one already explored. (The duplicate skip; the first-row-half
+restriction in N-Queens.)</li>
+</ol>
+<p>Ordering helps too, and costs nothing: <strong>sort so that the most constraining choice comes first</strong>, because failures
+you can reach quickly are failures you pay for once.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Branch-and-bound in miniature: partition nums into k equal-sum subsets.
+// Four prunes, in the order they pay off most.
+static bool CanPartitionKSubsets(int[] nums, int k)
+{
+    int total = nums.Sum();
+    if (total % k != 0) return false;                 // prune 0: arithmetic
+    int target = total / k;
+
+    Array.Sort(nums);
+    Array.Reverse(nums);                              // prune 1: biggest first
+    if (nums[0] &gt; target) return false;               // one item overflows a bucket
+
+    var buckets = new int[k];
+    return Go(0);
+
+    bool Go(int i)
+    {
+        if (i == nums.Length) return true;            // every item placed
+        for (int b = 0; b &lt; k; b++)
+        {
+            if (buckets[b] + nums[i] &gt; target) continue;        // prune 2: infeasible
+
+            // prune 3 (symmetry): two empty buckets are interchangeable, so
+            // trying the second one can only regenerate the first one&#x27;s subtree.
+            if (b &gt; 0 &amp;&amp; buckets[b] == buckets[b - 1]) continue;
+
+            buckets[b] += nums[i];                    // choose
+            if (Go(i + 1)) return true;
+            buckets[b] -= nums[i];                    // un-choose
+        }
+        return false;
+    }
+}
+
+// Bound pruning: the best score reachable from here cannot beat &#x27;best&#x27;,
+// so stop. The &#x27;optimistic&#x27; estimate must never UNDER-estimate, or you
+// will prune a branch that actually held the optimum.
+static int MaxScore(int[] items, int capacity)
+{
+    int best = 0;
+    var sorted = items.OrderByDescending(x =&gt; x).ToArray();
+    Go(0, 0, capacity);
+    return best;
+
+    void Go(int i, int score, int left)
+    {
+        if (left &lt; 0) return;
+        best = Math.Max(best, score);
+        if (i == sorted.Length) return;
+
+        // Optimistic bound: assume every remaining item fits for free.
+        int optimistic = score + sorted.Skip(i).Sum();
+        if (optimistic &lt;= best) return;               // ← the bound prune
+
+        Go(i + 1, score + sorted[i], left - sorted[i]);   // take
+        Go(i + 1, score, left);                            // skip
+    }
+}</code></pre><pre data-lang="python" hidden><code>def can_partition_k_subsets(nums: list[int], k: int) -&gt; bool:
+    total = sum(nums)
+    if total % k:
+        return False                                  # prune 0: arithmetic
+    target = total // k
+
+    nums.sort(reverse=True)                           # prune 1: biggest first
+    if nums[0] &gt; target:
+        return False                                  # one item overflows a bucket
+
+    buckets = [0] * k
+
+    def go(i: int) -&gt; bool:
+        if i == len(nums):
+            return True                               # every item placed
+        for b in range(k):
+            if buckets[b] + nums[i] &gt; target:
+                continue                              # prune 2: infeasible
+            # prune 3 (symmetry): equal buckets are interchangeable, so the
+            # second one can only regenerate the first one&#x27;s subtree.
+            if b &gt; 0 and buckets[b] == buckets[b - 1]:
+                continue
+            buckets[b] += nums[i]                     # choose
+            if go(i + 1):
+                return True
+            buckets[b] -= nums[i]                     # un-choose
+        return False
+
+    return go(0)
+
+def max_score(items: list[int], capacity: int) -&gt; int:
+    best = 0
+    sorted_items = sorted(items, reverse=True)
+    suffix = [0] * (len(sorted_items) + 1)
+    for i in range(len(sorted_items) - 1, -1, -1):
+        suffix[i] = suffix[i + 1] + sorted_items[i]
+
+    def go(i: int, score: int, left: int) -&gt; None:
+        nonlocal best
+        if left &lt; 0:
+            return
+        best = max(best, score)
+        if i == len(sorted_items):
+            return
+        # Optimistic bound: assume every remaining item fits for free.
+        if score + suffix[i] &lt;= best:
+            return                                    # ← the bound prune
+        go(i + 1, score + sorted_items[i], left - sorted_items[i])   # take
+        go(i + 1, score, left)                                        # skip
+
+    go(0, 0, capacity)
+    return best</code></pre></div><div class="table-wrap"><table><thead><tr><th>Prune</th><th>Test</th><th>Example</th></tr></thead><tbody><tr><td>Infeasibility</td><td>This choice breaks a constraint now</td><td>N-Queens conflict sets; bucket overflow</td></tr><tr><td>Bound</td><td>Best possible completion ≤ best so far</td><td>Branch and bound; knapsack suffix sums</td></tr><tr><td>Counting</td><td>Too few candidates left to fill the slots</td><td><code>i &lt;= n - need + 1</code> in combinations</td></tr><tr><td>Symmetry</td><td>This branch relabels an explored one</td><td>Duplicate skip; interchangeable empty buckets</td></tr><tr><td>Ordering</td><td><em>(not a prune — it makes prunes fire sooner)</em></td><td>Largest item first; most-constrained cell first</td></tr></tbody></table></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Say the word "prune" and name which of the four you are applying — it is vocabulary that marks you as having done this
+before. The one correctness trap to be careful about is the <strong>bound</strong> prune: your optimistic estimate must be a genuine
+upper bound on what is still achievable, because if it ever under-estimates you will cut the branch containing the real optimum and
+return a wrong answer confidently. State that property when you write it ("this assumes every remaining item fits, so it can only
+over-estimate"). The symmetry prune is the one interviewers find most impressive and candidates find hardest to spot; the general
+form is "if two slots are currently indistinguishable, only try the first."</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Partition to k equal subsets, adding the four prunes one at a time and counting recursive calls after each.</li><li>N-Queens restricted to half the first row, doubling the count by symmetry — and work out when the doubling is wrong (odd n).</li><li>Take any backtracking solution you have written and instrument it with a node counter; then add one prune and compare.</li></ul></div></section>
+
+<section id="memo-or-not"><h2 id="memo-or-not">When to memoise a backtrack — and when you cannot</h2><p>Backtracking and DP are the same search; the difference is whether you can <strong>cache by state</strong>. Caching works when
+two different partial paths that arrive at the same state have the same future — and fails when they do not.</p>
+<p>The test is mechanical: <strong>does the answer from here depend only on a small summary of the path, or on the path itself?</strong></p>
+<ul>
+<li><strong>Word break</strong> — "can <code>s[i..]</code> be segmented?" depends only on <code>i</code>. Cacheable: the
+exponential backtrack becomes <code>O(n²)</code> DP.</li>
+<li><strong>Word break II</strong> — return every segmentation. The <em>output</em> is exponential, so no cache makes it
+polynomial; you can still memoise the list of suffix segmentations, which helps in practice but not asymptotically.</li>
+<li><strong>Word search</strong> — the future depends on <em>which</em> cells the path has already consumed, and that set is part of
+the state. There are <code>2^(rows·cols)</code> such sets, so memoising is useless. Not cacheable.</li>
+</ul>
+<p>So: if you need to <strong>enumerate</strong> answers, it stays backtracking. If you need to <strong>count or optimise</strong>
+and the state is small, memoise it and you have a DP.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Enumerating: backtracking. Output is exponential, so this is as good
+// as it gets asymptotically.
+static IList&lt;string&gt; WordBreakAll(string s, IList&lt;string&gt; dict)
+{
+    var words = new HashSet&lt;string&gt;(dict);
+    var memo = new Dictionary&lt;int, List&lt;string&gt;&gt;();   // suffix index -&gt; sentences
+    return Go(0);
+
+    List&lt;string&gt; Go(int start)
+    {
+        if (start == s.Length) return [&quot;&quot;];           // one empty completion
+        if (memo.TryGetValue(start, out var hit)) return hit;
+
+        var result = new List&lt;string&gt;();
+        for (int end = start + 1; end &lt;= s.Length; end++)
+        {
+            var word = s[start..end];
+            if (!words.Contains(word)) continue;
+            foreach (var rest in Go(end))
+                result.Add(rest.Length == 0 ? word : word + &quot; &quot; + rest);
+        }
+        return memo[start] = result;
+    }
+}
+
+// Counting: the same search, memoised on the only thing that matters.
+// Now polynomial, and the exponential output problem is gone because we
+// never materialise the answers.
+static int CountSegmentations(string s, IList&lt;string&gt; dict)
+{
+    var words = new HashSet&lt;string&gt;(dict);
+    var memo = new Dictionary&lt;int, int&gt;();
+    return Go(0);
+
+    int Go(int start)
+    {
+        if (start == s.Length) return 1;
+        if (memo.TryGetValue(start, out var hit)) return hit;
+
+        int total = 0;
+        for (int end = start + 1; end &lt;= s.Length; end++)
+            if (words.Contains(s[start..end])) total += Go(end);
+        return memo[start] = total;
+    }
+}</code></pre><pre data-lang="python" hidden><code>from functools import lru_cache
+
+def word_break_all(s: str, word_dict: list[str]) -&gt; list[str]:
+    words = set(word_dict)
+    memo: dict[int, list[str]] = {}
+
+    def go(start: int) -&gt; list[str]:
+        if start == len(s):
+            return [&quot;&quot;]                       # one empty completion
+        if start in memo:
+            return memo[start]
+        result: list[str] = []
+        for end in range(start + 1, len(s) + 1):
+            word = s[start:end]
+            if word not in words:
+                continue
+            for rest in go(end):
+                result.append(word if not rest else word + &quot; &quot; + rest)
+        memo[start] = result
+        return result
+
+    return go(0)
+
+def count_segmentations(s: str, word_dict: list[str]) -&gt; int:
+    words = set(word_dict)
+
+    @lru_cache(maxsize=None)
+    def go(start: int) -&gt; int:
+        if start == len(s):
+            return 1
+        return sum(go(end) for end in range(start + 1, len(s) + 1)
+                   if s[start:end] in words)
+
+    return go(0)</code></pre></div><div class="table-wrap"><table><thead><tr><th>The question asks for…</th><th>Technique</th><th>Why</th></tr></thead><tbody><tr><td>Every answer, listed</td><td><strong>Backtracking</strong></td><td>Output is exponential; no cache changes that</td></tr><tr><td>How many answers</td><td><strong>DP / memoised search</strong></td><td>Count collapses into the state</td></tr><tr><td>The best answer</td><td><strong>DP</strong>, or backtracking + bound</td><td>Optimum collapses into the state</td></tr><tr><td>Does one exist</td><td><strong>Memoised search</strong></td><td>Boolean collapses into the state</td></tr><tr><td>A path that consumes cells</td><td><strong>Backtracking only</strong></td><td>The visited set is part of the state: too large</td></tr></tbody></table></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The sentence that earns this is: <em>"the state here is the index plus the set of used cells, and that set is too big
+to memoise, so this stays exponential."</em> It tells the interviewer you know <em>why</em> you are not optimising, which is a much
+stronger position than either optimising blindly or failing to mention it. The reverse case matters as much — if you write an
+exponential backtrack for a problem whose state is just an index, expect "can you do better?", and the answer is to add a
+dictionary. So the habit worth building is: after any backtracking solution, say out loud what the state would be, and whether it is
+small. One sentence, every time, and you will never be caught on the wrong side of this question.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Word break, word break II and count-segmentations back to back; state the complexity of each and why they differ.</li><li>Take word search and write down exactly what the memo key would have to be, then count how many keys that is.</li><li>Combination sum (enumerate) versus combination sum IV (count) — the same input, two different techniques, and be able to say why.</li><li>Partition to k equal subsets: start from the backtrack on this page, then write the bitmask DP, and compare.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://neetcode.io/roadmap" target="_blank" rel="noopener">NeetCode roadmap</a> — the backtracking track, in a sensible order</li><li><a href="https://leetcode.com/tag/backtracking/" target="_blank" rel="noopener">LeetCode: backtracking</a> — the tag, sorted by frequency</li><li><a href="https://en.wikipedia.org/wiki/Eight_queens_puzzle" target="_blank" rel="noopener">Eight queens puzzle</a> — the symmetry arguments and the solution counts</li><li><a href="https://en.wikipedia.org/wiki/Branch_and_bound" target="_blank" rel="noopener">Branch and bound</a> — the bound prune stated properly</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

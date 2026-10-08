@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage Engines: B-Trees, LSM Trees and the Write Path — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="fundamentals-storage-engines">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Distributed Fundamentals › Fundamentals 4 of 4</div>
+  <h1>Storage Engines: B-Trees, LSM Trees and the Write Path</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#durability-first-the-write-ahead-log">Durability first: the write-ahead log</a></li><li><a href="#b-trees">B-trees</a></li><li><a href="#lsm-trees">LSM trees</a></li><li><a href="#choosing-between-them">Choosing between them</a></li><li><a href="#the-patterns-these-engines-explain">The patterns these engines explain</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>&quot;Which database would you use?&quot; is a question about storage engines as much as about products. Almost every store in these notes is built on one of two structures, and the choice determines whether the system is good at writes or good at reads, how much disk it wastes, and how its latency behaves under load.</p>
+<p><strong>The one-sentence version:</strong> B-trees update data in place and give predictable reads; LSM trees only ever append and give much faster writes, paying for it with background compaction and variable read latency — and nearly every &quot;SQL vs NoSQL&quot; conversation is really this difference wearing a costume.</p>
+<p>This is the machinery underneath <a href="06-key-value-store.html">Chapter 6</a>, and it is where &quot;why Cassandra rather than Postgres?&quot; should actually be answered.</p>
+</section>
+<section id="durability-first-the-write-ahead-log">
+<h2 id="durability-first-the-write-ahead-log">Durability first: the write-ahead log</h2>
+<h3 id="explanation">Explanation</h3>
+<p>Both families share one mechanism, and it is the foundation of durability everywhere. Before any change is applied to the main data structure, it is appended to a <strong>write-ahead log</strong> and flushed to disk. Only then is the write acknowledged.</p>
+<p>The reasoning: updating a tree or a table means several non-atomic page writes, and a crash halfway through leaves the structure corrupt. The log is a single sequential append — hard to corrupt, and cheap, because sequential writes are dramatically faster than random ones on both spinning disks and SSDs. On restart, replay the log from the last checkpoint and the structure is rebuilt.</p>
+<div class="callout callout-note">
+<span class="callout-title">Where the durability guarantee actually lives</span>
+<p>a write is durable when <code>fsync</code> returns, not when <code>write</code> does — the data sits in the OS page cache until then. Systems that acknowledge before <code>fsync</code> are trading durability for latency, usually deliberately and usually configurably (<code>innodb_flush_log_at_trx_commit</code>, Postgres <code>synchronous_commit</code>, Kafka <code>acks</code> plus flush settings). Group commit recovers much of the cost by batching many transactions into one <code>fsync</code>. Being able to say &quot;acknowledged means fsynced, and here is the knob that changes that&quot; is a strong signal in any durability discussion.</p>
+</div>
+</section>
+<section id="b-trees">
+<h2 id="b-trees">B-trees</h2>
+<h3 id="explanation-1">Explanation</h3>
+<p>A B-tree keeps keys sorted in fixed-size pages, typically 4–16 KB, with a shallow, wide structure — a tree of depth 3 or 4 can index billions of keys. A lookup walks from the root to a leaf, reading one page per level.</p>
+<p>Writes <strong>update in place</strong>: find the leaf, modify the page, write it back. If the page is full it splits, which may cascade upward.</p>
+<p><strong>Strengths.</strong> Reads are predictable — a bounded number of page reads, with upper levels almost always cached. Range scans and ordered iteration are natural because the leaves are in key order. Point reads have low, stable latency.</p>
+<p><strong>Weaknesses.</strong> Every write is a random write to a page somewhere on disk, plus the log write — so the same logical change is written at least twice (<strong>write amplification</strong>). Page splits fragment the file over time. Concurrency needs careful latching of pages.</p>
+<p>This is what PostgreSQL, MySQL/InnoDB, SQL Server and most traditional stores use, and it is why they are excellent at mixed read-write workloads with range queries and comparatively poor at sustained very high write rates.</p>
+</section>
+<section id="lsm-trees">
+<h2 id="lsm-trees">LSM trees</h2>
+<h3 id="explanation-2">Explanation</h3>
+<p>A log-structured merge tree never updates anything in place. The write path is:</p>
+<ol>
+<li>Append to the write-ahead log (durability).</li>
+<li>Insert into an in-memory sorted structure, the <strong>memtable</strong> — usually a skip list or balanced tree.</li>
+<li>When the memtable is full, flush it to disk as an immutable sorted file, an <strong>SSTable</strong>, in one sequential write.</li>
+<li>In the background, <strong>compact</strong>: merge SSTables together, discarding superseded values and tombstones.</li>
+</ol>
+<p>Every disk write is sequential, which is why LSM trees absorb writes so much faster than B-trees.</p>
+<p>Reads pay for it. A key might be in the memtable, or in any SSTable, so a read checks the memtable, then files newest-first, until found. Two mechanisms keep that affordable:</p>
+<ul>
+<li><strong>Bloom filters.</strong> A small probabilistic structure per SSTable answering &quot;is this key definitely absent?&quot; False positives are possible, false negatives are not — so a bloom filter can skip a file entirely but never wrongly skip one. This is what stops a read from touching every file.</li>
+<li><strong>Sparse indexes.</strong> One index entry per block rather than per key, so the index stays in memory and a read seeks to a block and scans it.</li>
+</ul>
+<p><strong>Deletes are writes.</strong> Removing a key appends a <strong>tombstone</strong> marking it deleted; the space is not reclaimed until compaction. A workload with heavy deletes can therefore <em>grow</em> on disk, and a range scan over a heavily-deleted range may read many tombstones to return nothing — the classic Cassandra operational trap.</p>
+<p>This is what Cassandra, RocksDB, LevelDB, HBase and ScyllaDB use.</p>
+<h3 id="the-two-compaction-strategies">The two compaction strategies</h3>
+<p>Compaction is where the trade-off is tuned, and the two strategies pull in opposite directions:</p>
+<ul>
+<li><strong>Size-tiered.</strong> Merge SSTables of similar size together. Cheap on writes, but several files can hold the same key, so reads touch more files and the same data may exist in several copies at once — high <strong>space amplification</strong>, with transient spikes during a merge.</li>
+<li><strong>Levelled.</strong> Keep each level's files non-overlapping in key range, so a key appears at most once per level. Reads touch far fewer files and space overhead is small, but a write is rewritten repeatedly as it migrates down the levels — high <strong>write amplification</strong>.</li>
+</ul>
+<div class="callout callout-note">
+<span class="callout-title">The three amplifications</span>
+<p><strong>write amplification</strong> is bytes written to disk per byte of data; <strong>read amplification</strong> is disk reads per logical read; <strong>space amplification</strong> is bytes stored per byte of live data. You cannot minimise all three — it is a genuine trilemma, and the compaction strategy is where you pick your corner. Size-tiered trades space for write cost; levelled trades write cost for space and reads; B-trees sit at moderate write amplification with low read and space amplification. Naming these three is far more precise than &quot;LSM is better for writes&quot; and it is what the question is really probing.</p>
+</div>
+</section>
+<section id="choosing-between-them">
+<h2 id="choosing-between-them">Choosing between them</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th></th>
+<th>B-tree</th>
+<th>LSM tree</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Write path</td>
+<td>Random, in place</td>
+<td>Sequential, append only</td>
+</tr>
+<tr>
+<td>Write throughput</td>
+<td>Moderate</td>
+<td><strong>High</strong></td>
+</tr>
+<tr>
+<td>Point read latency</td>
+<td><strong>Low, predictable</strong></td>
+<td>Higher, variable</td>
+</tr>
+<tr>
+<td>Range scans</td>
+<td><strong>Natural, fast</strong></td>
+<td>Good, but merges across files</td>
+</tr>
+<tr>
+<td>Space amplification</td>
+<td>Low (some fragmentation)</td>
+<td>Higher, and spikes during compaction</td>
+</tr>
+<tr>
+<td>Write amplification</td>
+<td>Moderate (log + page)</td>
+<td>Strategy-dependent, can be high</td>
+</tr>
+<tr>
+<td>Latency outliers</td>
+<td>Few</td>
+<td><strong>Compaction causes them</strong></td>
+</tr>
+<tr>
+<td>Deletes</td>
+<td>Immediate</td>
+<td>Tombstones, reclaimed later</td>
+</tr>
+<tr>
+<td>Typical home</td>
+<td>Postgres, MySQL, SQL Server</td>
+<td>Cassandra, RocksDB, HBase</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>translate the question into the workload rather than naming a product. &quot;Write-heavy, mostly point lookups by a known key, and I can tolerate occasional latency spikes&quot; is an LSM argument. &quot;Mixed read-write, range queries over secondary attributes, and I need predictable tail latency&quot; is a B-tree argument. The detail that distinguishes a strong answer is <strong>tail latency</strong>: LSM compaction competes for disk and CPU with foreground requests, so p99 is noticeably worse and spikier than p50 even when average throughput is excellent. If the requirement is a tight p99 — a trading system, an ad server with a hard budget — that is a real argument against LSM, and almost nobody raises it.</p>
+</div>
+</section>
+<section id="the-patterns-these-engines-explain">
+<h2 id="the-patterns-these-engines-explain">The patterns these engines explain</h2>
+<h3 id="explanation-3">Explanation</h3>
+<p>Several things that look like separate design decisions elsewhere are consequences of the engine underneath:</p>
+<ul>
+<li><strong>Why Cassandra wants you to design the table around the query.</strong> Reads are cheap only along the partition and clustering key order the SSTables are sorted by. Querying another way means scanning, so you denormalise and write the data again in a second table.</li>
+<li><strong>Why append-only logs are everywhere.</strong> Kafka is an LSM write path with the compaction made optional and the log exposed as the product. The same insight — sequential writes are fast, and an immutable log is easy to replicate — drives event sourcing and the materialised-view patterns in <a href="patterns.html">Patterns §2</a>.</li>
+<li><strong>Why &quot;just add an index&quot; is not free.</strong> Every secondary index is another structure to maintain on every write, with its own write amplification. On an LSM store it is worse, because the index must be kept consistent with data that is only reconciled at compaction time — which is why some stores offer only eventually-consistent secondary indexes, or none at all.</li>
+<li><strong>Why time-series stores are their own category.</strong> The workload is append-mostly with timestamp-ordered keys and bulk expiry, which suits an LSM engine with time-windowed compaction so whole SSTables can be dropped when they age out, with no tombstones at all.</li>
+</ul>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>the move that lands is reaching past the product name to the mechanism. &quot;I would use Cassandra&quot; is a weaker answer than &quot;the write rate is the binding constraint and the access pattern is a point lookup on a known partition key, so I want an LSM engine — Cassandra or Scylla — and I will accept that secondary access paths mean writing the data twice.&quot; The second version survives the follow-up, because it has already stated the cost. It also makes the design portable: if the interviewer says &quot;assume you cannot use Cassandra&quot;, you have said what you actually need and can name a substitute.</p>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="06-key-value-store.html">Chapter 6: Key-Value Store</a> — an LSM store built up from first principles.</li>
+<li><a href="fundamentals-replication.html">Replication and consensus</a> — how these engines are kept in sync across machines.</li>
+<li><a href="patterns.html">Patterns</a> — the immutable-log-plus-derived-view pattern this engine makes cheap.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

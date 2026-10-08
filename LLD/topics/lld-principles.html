@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Principles &amp; Patterns Under Pressure — Low-Level Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="lld-principles">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Foundations › Topic 2 of 7</div>
+  <h1>Principles &amp; Patterns Under Pressure</h1>
+  <p class="lede">Six patterns cover almost every LLD prompt, and picking one is a response to a force in the design rather than a name you drop. Strategy and State do most of the work; constructor injection is what makes the result testable — and "how would you test this?" is asked in nearly every round.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#which-patterns">The patterns that actually come up — and the ones that do not</a></li><li><a href="#strategy">Strategy: the workhorse</a></li><li><a href="#state">State machines: the second most useful shape</a></li><li><a href="#seams">Dependency injection and testability</a></li></ol>
+  </div>
+
+<section id="which-patterns"><h2 id="which-patterns">The patterns that actually come up — and the ones that do not</h2><p>There are twenty-three Gang of Four patterns. In an LLD interview you will use about six, and recognising <em>which</em> from the
+wording is most of the value. The others are worth knowing for a vocabulary question but are rarely the answer to
+"design a vending machine".</p>
+<p>The <a href="../../DotNet/topics/design-patterns.html">C# &amp; .NET patterns page</a> covers the catalogue properly, with
+before/after code for each. This page is about <strong>selection under time pressure</strong>: which one the prompt is asking for,
+and how to apply it without over-engineering.</p><div class="table-wrap"><table><thead><tr><th>Pattern</th><th>The wording that signals it</th><th>Shows up in</th></tr></thead><tbody><tr><td><strong>Strategy</strong></td><td>"pricing varies", "different allocation rules", "pluggable"</td><td>Nearly every design on this site</td></tr><tr><td><strong>State</strong></td><td>"can only X when it is in Y", transitions, a mode</td><td>Vending machine, elevator, order flow</td></tr><tr><td><strong>Observer</strong></td><td>"notify", "subscribe", "when X happens, also Y"</td><td>Notifications, logging, event buses</td></tr><tr><td><strong>Factory</strong></td><td>"create the right kind of", an open set of types</td><td>Vehicle, piece, parser, channel</td></tr><tr><td><strong>Builder</strong></td><td>many optional parameters, stepwise construction</td><td>Pizza/order builders, query builders</td></tr><tr><td><strong>Chain of responsibility</strong></td><td>"try this, else that", escalation, middleware</td><td>Logger levels, approvals, vending coin returns</td></tr><tr><td><strong>Decorator</strong></td><td>"add on top of", toppings, wrapping behaviour</td><td>Coffee/pizza add-ons, stream wrappers</td></tr><tr><td><strong>Command</strong></td><td>"undo", "queue the request", "schedule"</td><td>Text editors, remote controls, job queues</td></tr><tr><td><strong>Singleton</strong></td><td><em>almost never the right answer</em></td><td>Say "one instance, injected" instead</td></tr></tbody></table></div><p>Two of those deserve a warning.</p><div class="callout callout-warn"><span class="callout-title">Singleton, and pattern-dropping</span><p><strong>Singleton</strong> is the pattern candidates reach for most and interviewers
+like least. It is global mutable state: it makes testing hard, hides dependencies, and in a threaded design needs careful
+initialisation for no benefit. If there genuinely is one parking lot, say "the application constructs one
+<code>ParkingLot</code> and injects it" — same outcome, no global, and it is testable. Naming this trade-off unprompted is itself a
+good signal.</p>
+<p><strong>Pattern-dropping</strong> is the other failure: announcing "I'll use an abstract factory with a decorator" before there
+is a problem to solve. Patterns are a <em>response</em> to a force in the design. Describe the force first — "pricing varies
+independently of the rest, so I'll put it behind an interface" — and only then, optionally, name it. An interviewer who hears the
+force knows you understand the pattern; one who hears only the name does not.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The highest-value sentence in this round is <strong>"this varies independently, so it goes behind an
+interface"</strong>, because it is the justification for Strategy, and Strategy is the answer to a large majority of LLD follow-ups.
+Get comfortable saying it and you will handle "now add X" calmly. Conversely, if you cannot articulate what force a pattern is
+relieving, do not use it — an unjustified pattern reads as cargo cult and costs you more than the plain code would have. The honest
+position "a conditional is fine here, there is only one axis of change" is a <em>strong</em> answer when it is true.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>For each of the six core patterns, write the one sentence of wording that signals it. Then check yourself against the prompts in the worked designs on this site.</li><li>Find a Singleton in code you have written and rewrite it as an injected instance. Note what became testable.</li></ul></div></section>
+
+<section id="strategy"><h2 id="strategy">Strategy: the workhorse</h2><p>If you learn one pattern for this round, learn this one. A strategy turns a policy that varies into an object you can swap, and
+nearly every LLD follow-up question — "now pricing is hourly", "now pick the nearest spot", "now evict by frequency" — becomes
+"I add one small class" instead of "I edit the core".</p>
+<p>The shape is trivial: an interface with one method, implementations that hold no state they do not need, and a holder that takes
+it through the constructor. The judgement is in <strong>choosing the right method signature</strong> — it should take exactly what
+every implementation needs and nothing more, because a strategy that needs the whole world back is a sign the split is in the wrong
+place.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The seam. One method; the parameters are what EVERY implementation needs.
+public interface IPricingStrategy
+{
+    Money Price(Ticket ticket, DateTime now);
+}
+
+// Implementation 1: flat hourly, part hours rounded up.
+public sealed class FlatHourlyPricing(decimal perHour) : IPricingStrategy
+{
+    public Money Price(Ticket ticket, DateTime now)
+    {
+        var hours = Math.Ceiling(ticket.Duration(now).TotalHours);
+        return new Money(perHour * (decimal)Math.Max(1, hours));
+    }
+}
+
+// Implementation 2: per vehicle type. The follow-up question, answered by
+// ADDING this class — nothing else in the system changes.
+public sealed class PerVehicleTypePricing(IReadOnlyDictionary&lt;SpotSize, decimal&gt; rates)
+    : IPricingStrategy
+{
+    public Money Price(Ticket ticket, DateTime now)
+    {
+        var rate = rates[ticket.Spot.Size];
+        var hours = Math.Ceiling(ticket.Duration(now).TotalHours);
+        return new Money(rate * (decimal)Math.Max(1, hours));
+    }
+}
+
+// Implementation 3: free for the first 15 minutes, then delegate. Strategies
+// compose — this is Decorator applied to a Strategy, and it is a strong answer
+// to &quot;can you add a grace period?&quot; because nothing else is touched.
+public sealed class WithGracePeriod(IPricingStrategy inner, TimeSpan grace) : IPricingStrategy
+{
+    public Money Price(Ticket ticket, DateTime now) =&gt;
+        ticket.Duration(now) &lt;= grace ? Money.Zero() : inner.Price(ticket, now);
+}
+
+// The holder depends on the INTERFACE and is constructed with an implementation.
+public sealed class ParkingLot(IPricingStrategy pricing /* , ... */)
+{
+    public Money Leave(string ticketId, DateTime now)
+    {
+        var ticket = Find(ticketId);
+        var fee = pricing.Price(ticket, now);     // no conditional, ever
+        ticket.Close(now, fee);
+        ticket.Spot.Release();
+        return fee;
+    }
+}
+
+// Wiring, at the composition root:
+//   var lot = new ParkingLot(new WithGracePeriod(
+//       new PerVehicleTypePricing(rates), TimeSpan.FromMinutes(15)));</code></pre><pre data-lang="python" hidden><code>from abc import ABC, abstractmethod
+from datetime import datetime, timedelta
+import math
+
+class PricingStrategy(ABC):
+    @abstractmethod
+    def price(self, ticket: &quot;Ticket&quot;, now: datetime) -&gt; &quot;Money&quot;: ...
+
+class FlatHourlyPricing(PricingStrategy):
+    def __init__(self, per_hour: float) -&gt; None:
+        self._per_hour = per_hour
+
+    def price(self, ticket: &quot;Ticket&quot;, now: datetime) -&gt; &quot;Money&quot;:
+        hours = max(1, math.ceil(ticket.duration(now).total_seconds() / 3600))
+        return Money(self._per_hour * hours)
+
+class PerVehicleTypePricing(PricingStrategy):
+    &quot;&quot;&quot;The follow-up question, answered by ADDING a class.&quot;&quot;&quot;
+    def __init__(self, rates: dict[&quot;SpotSize&quot;, float]) -&gt; None:
+        self._rates = rates
+
+    def price(self, ticket: &quot;Ticket&quot;, now: datetime) -&gt; &quot;Money&quot;:
+        hours = max(1, math.ceil(ticket.duration(now).total_seconds() / 3600))
+        return Money(self._rates[ticket.spot.size] * hours)
+
+class WithGracePeriod(PricingStrategy):
+    &quot;&quot;&quot;Decorator over a Strategy: strategies compose.&quot;&quot;&quot;
+    def __init__(self, inner: PricingStrategy, grace: timedelta) -&gt; None:
+        self._inner, self._grace = inner, grace
+
+    def price(self, ticket: &quot;Ticket&quot;, now: datetime) -&gt; &quot;Money&quot;:
+        if ticket.duration(now) &lt;= self._grace:
+            return Money(0.0)
+        return self._inner.price(ticket, now)
+
+class ParkingLot:
+    def __init__(self, pricing: PricingStrategy) -&gt; None:
+        self._pricing = pricing               # depends on the INTERFACE
+
+    def leave(self, ticket_id: str, now: datetime) -&gt; &quot;Money&quot;:
+        ticket = self._find(ticket_id)
+        fee = self._pricing.price(ticket, now)   # no conditional, ever
+        ticket.close(now, fee)
+        ticket.spot.release()
+        return fee
+
+# Wiring, at the composition root:
+#   lot = ParkingLot(WithGracePeriod(PerVehicleTypePricing(rates),
+#                                    timedelta(minutes=15)))</code></pre></div><div class="callout callout-note"><span class="callout-title">Strategy versus a plain function</span><p>In both C# and Python a strategy with a single method can be a delegate
+(<code>Func&lt;Ticket, DateTime, Money&gt;</code>) or a plain callable. That is often the better engineering choice, and saying so
+shows range. Prefer the named interface when the strategy needs several related methods, when implementations carry configuration
+worth naming, or when you want the type name to document intent in the constructor signature — all three are usually true in an
+interview, which is why the interface is the default here. Prefer the function when it is genuinely one-off.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Expect to be asked <strong>where the strategy is chosen</strong>. The answer you want is "at the composition root —
+whoever builds the <code>ParkingLot</code> decides", because it keeps the lot ignorant of the catalogue of policies. If selection
+must happen at runtime (different pricing per floor, per customer tier), do not put a <code>switch</code> back into the lot: inject
+a small resolver, or key a dictionary of strategies. The anti-pattern to avoid out loud is a strategy interface whose implementations
+are chosen by a conditional inside the class that was supposed to be decoupled from them — it is a surprisingly common way to get
+all the ceremony and none of the benefit.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Add a "first 15 minutes free" rule to a design two ways: inside the pricing class, and as a decorator. Say which you would defend and why.</li><li>Write a strategy whose method signature is wrong — it needs the whole <code>ParkingLot</code> back — and work out what that tells you about the split.</li></ul></div></section>
+
+<section id="state"><h2 id="state">State machines: the second most useful shape</h2><p>Whenever a prompt says an object "can only do X when it is in Y", you have a state machine, and modelling it explicitly is worth
+a lot of credit. Vending machines, elevators, orders, parking tickets and document workflows are all this shape.</p>
+<p>There are two legitimate implementations and you should be able to pick between them. A <strong>transition table</strong> is
+compact, easy to validate and easy to print — good when the states have little behaviour of their own. The <strong>State pattern</strong>
+— one class per state, each knowing which events it accepts — is better when each state behaves differently, and it is what
+interviewers usually mean when they ask about a vending machine.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// --- Option A: an explicit transition table. ---------------------------
+// Compact, trivially testable, and the whole machine is visible at a glance.
+public enum OrderState { Created, Paid, Shipped, Delivered, Cancelled }
+public enum OrderEvent { Pay, Ship, Deliver, Cancel }
+
+public sealed class Order
+{
+    private static readonly Dictionary&lt;(OrderState, OrderEvent), OrderState&gt; Transitions = new()
+    {
+        [(OrderState.Created,  OrderEvent.Pay)]     = OrderState.Paid,
+        [(OrderState.Created,  OrderEvent.Cancel)]  = OrderState.Cancelled,
+        [(OrderState.Paid,     OrderEvent.Ship)]    = OrderState.Shipped,
+        [(OrderState.Paid,     OrderEvent.Cancel)]  = OrderState.Cancelled,
+        [(OrderState.Shipped,  OrderEvent.Deliver)] = OrderState.Delivered,
+        // Anything absent is illegal — the table IS the specification.
+    };
+
+    public OrderState State { get; private set; } = OrderState.Created;
+
+    public void Handle(OrderEvent e)
+    {
+        if (!Transitions.TryGetValue((State, e), out var next))
+            throw new InvalidOperationException($&quot;Cannot {e} an order that is {State}.&quot;);
+        State = next;
+    }
+}
+
+// --- Option B: the State pattern. --------------------------------------
+// One class per state. Prefer this when states have DIFFERENT behaviour,
+// not just different legal transitions.
+public interface IVendingState
+{
+    IVendingState InsertCoin(VendingMachine m, Money coin);
+    IVendingState SelectItem(VendingMachine m, string code);
+    IVendingState Dispense(VendingMachine m);
+}
+
+public sealed class IdleState : IVendingState
+{
+    public IVendingState InsertCoin(VendingMachine m, Money coin)
+    {
+        m.AddCredit(coin);
+        return new HasCreditState();                 // transition
+    }
+    // Illegal here, and the compiler cannot help — so throw loudly.
+    public IVendingState SelectItem(VendingMachine m, string code) =&gt;
+        throw new InvalidOperationException(&quot;Insert a coin first.&quot;);
+    public IVendingState Dispense(VendingMachine m) =&gt;
+        throw new InvalidOperationException(&quot;Nothing selected.&quot;);
+}
+
+public sealed class HasCreditState : IVendingState
+{
+    public IVendingState InsertCoin(VendingMachine m, Money coin)
+    {
+        m.AddCredit(coin);
+        return this;                                 // self-transition
+    }
+    public IVendingState SelectItem(VendingMachine m, string code)
+    {
+        var item = m.Inventory.Require(code);
+        if (m.Credit.Amount &lt; item.Price.Amount)
+            return this;                             // not enough: stay put
+        m.Select(item);
+        return new DispensingState();
+    }
+    public IVendingState Dispense(VendingMachine m) =&gt;
+        throw new InvalidOperationException(&quot;Select an item first.&quot;);
+}
+
+// The machine just delegates and stores whatever comes back.
+public sealed class VendingMachine
+{
+    private IVendingState _state = new IdleState();
+    public void InsertCoin(Money c) =&gt; _state = _state.InsertCoin(this, c);
+    public void SelectItem(string code) =&gt; _state = _state.SelectItem(this, code);
+    public void Dispense() =&gt; _state = _state.Dispense(this);
+}</code></pre><pre data-lang="python" hidden><code>from enum import Enum, auto
+from abc import ABC, abstractmethod
+
+# --- Option A: an explicit transition table. ---------------------------
+class OrderState(Enum):
+    CREATED = auto(); PAID = auto(); SHIPPED = auto()
+    DELIVERED = auto(); CANCELLED = auto()
+
+class OrderEvent(Enum):
+    PAY = auto(); SHIP = auto(); DELIVER = auto(); CANCEL = auto()
+
+TRANSITIONS = {
+    (OrderState.CREATED, OrderEvent.PAY):     OrderState.PAID,
+    (OrderState.CREATED, OrderEvent.CANCEL):  OrderState.CANCELLED,
+    (OrderState.PAID,    OrderEvent.SHIP):    OrderState.SHIPPED,
+    (OrderState.PAID,    OrderEvent.CANCEL):  OrderState.CANCELLED,
+    (OrderState.SHIPPED, OrderEvent.DELIVER): OrderState.DELIVERED,
+    # Anything absent is illegal — the table IS the specification.
+}
+
+class Order:
+    def __init__(self) -&gt; None:
+        self.state = OrderState.CREATED
+
+    def handle(self, event: OrderEvent) -&gt; None:
+        nxt = TRANSITIONS.get((self.state, event))
+        if nxt is None:
+            raise RuntimeError(f&quot;Cannot {event.name} an order that is {self.state.name}.&quot;)
+        self.state = nxt
+
+# --- Option B: the State pattern. --------------------------------------
+class VendingState(ABC):
+    @abstractmethod
+    def insert_coin(self, m: &quot;VendingMachine&quot;, coin) -&gt; &quot;VendingState&quot;: ...
+    @abstractmethod
+    def select_item(self, m: &quot;VendingMachine&quot;, code: str) -&gt; &quot;VendingState&quot;: ...
+    @abstractmethod
+    def dispense(self, m: &quot;VendingMachine&quot;) -&gt; &quot;VendingState&quot;: ...
+
+class IdleState(VendingState):
+    def insert_coin(self, m, coin):
+        m.add_credit(coin)
+        return HasCreditState()                      # transition
+    def select_item(self, m, code):
+        raise RuntimeError(&quot;Insert a coin first.&quot;)
+    def dispense(self, m):
+        raise RuntimeError(&quot;Nothing selected.&quot;)
+
+class HasCreditState(VendingState):
+    def insert_coin(self, m, coin):
+        m.add_credit(coin)
+        return self                                  # self-transition
+    def select_item(self, m, code):
+        item = m.inventory.require(code)
+        if m.credit &lt; item.price:
+            return self                              # not enough: stay put
+        m.select(item)
+        return DispensingState()
+    def dispense(self, m):
+        raise RuntimeError(&quot;Select an item first.&quot;)
+
+class VendingMachine:
+    def __init__(self) -&gt; None:
+        self._state: VendingState = IdleState()
+    def insert_coin(self, coin): self._state = self._state.insert_coin(self, coin)
+    def select_item(self, code): self._state = self._state.select_item(self, code)
+    def dispense(self):          self._state = self._state.dispense(self)</code></pre></div><div class="table-wrap"><table><thead><tr><th></th><th>Transition table</th><th>State pattern</th></tr></thead><tbody><tr><td>Best when</td><td>States differ only in what is legal</td><td>States differ in <em>behaviour</em></td></tr><tr><td>Adding a state</td><td>A few table rows</td><td>One new class</td></tr><tr><td>Reading the whole machine</td><td>One place — easy</td><td>Spread across classes — harder</td></tr><tr><td>Per-state data</td><td>Awkward</td><td>Natural: fields on the state object</td></tr><tr><td>Entry/exit actions</td><td>Needs extra plumbing</td><td>Natural</td></tr><tr><td>Interview default</td><td>Orders, tickets, simple flows</td><td><strong>Vending machine, elevator</strong></td></tr></tbody></table></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Say the words "this is a state machine" as soon as you spot it — it is a recognition signal interviewers listen for.
+Then <strong>enumerate the illegal transitions explicitly</strong>, because that is where the thinking shows: "you cannot dispense
+before selecting, and you cannot select with no credit, so both throw." A design that silently ignores illegal events looks
+identical to one that handles them, right up until the interviewer asks what happens if you press dispense twice. Have an answer for
+whether illegal events throw, return false, or are no-ops — any of the three is defensible, but you should have chosen on
+purpose.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Draw the vending machine states and every legal transition, then list the illegal ones and say what each does.</li><li>Implement an order flow as a transition table, then convert it to the State pattern, and say which you prefer for that problem.</li><li>Add a "refunding" state to the vending machine both ways and compare how much code changed.</li></ul></div></section>
+
+<section id="seams"><h2 id="seams">Dependency injection and testability</h2><p>"How would you test this?" is asked in most LLD rounds and answered badly in most of them. The answer is not a testing
+framework — it is that your design already has the seams, because every collaborator came in through the constructor rather than
+being constructed inside.</p>
+<p>Two dependencies make code untestable more often than anything else, and both have the same cure: <strong>the clock</strong> and
+<strong>randomness</strong>. A method that calls <code>DateTime.Now</code> inside cannot be tested for "what happens after two
+hours" without actually waiting. Pass time in, or inject a clock.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// UNTESTABLE — three hidden dependencies: the clock, the id generator, and
+// a concrete pricing policy constructed on the spot.
+public class BadParkingLot
+{
+    public Ticket Park(Vehicle v)
+    {
+        var spot = FindSpot(v);
+        return new Ticket(Guid.NewGuid().ToString(),     // hidden: randomness
+                          spot,
+                          DateTime.Now);                  // hidden: the clock
+    }
+    public Money Leave(string id, DateTime now) =&gt;
+        new FlatHourlyPricing(10m).Price(Find(id), now);  // hidden: policy
+}
+
+// TESTABLE — every dependency is visible in the constructor signature,
+// which doubles as documentation of what this class actually needs.
+public interface IClock { DateTime Now { get; } }
+public sealed class SystemClock : IClock { public DateTime Now =&gt; DateTime.UtcNow; }
+
+public sealed class ParkingLot(
+    IReadOnlyList&lt;Floor&gt; floors,
+    ISpotAllocationStrategy allocation,
+    IPricingStrategy pricing,
+    IClock clock,
+    Func&lt;string&gt; newTicketId)
+{
+    public Ticket Park(Vehicle vehicle)
+    {
+        var spot = allocation.Find(floors, vehicle)
+                   ?? throw new InvalidOperationException(&quot;Lot full.&quot;);
+        if (!spot.TryOccupy(vehicle))
+            throw new InvalidOperationException(&quot;Spot taken concurrently.&quot;);
+        return new Ticket(newTicketId(), spot, clock.Now);
+    }
+}
+
+// The test writes itself, and runs in microseconds.
+public sealed class FakeClock(DateTime start) : IClock
+{
+    public DateTime Now { get; private set; } = start;
+    public void Advance(TimeSpan by) =&gt; Now += by;
+}
+
+// [Fact]
+// public void Charges_two_hours_for_a_two_hour_stay()
+// {
+//     var clock = new FakeClock(new DateTime(2026, 1, 1, 9, 0, 0));
+//     var lot = new ParkingLot(floors, new FirstAvailable(),
+//                              new FlatHourlyPricing(10m), clock, () =&gt; &quot;T1&quot;);
+//     var ticket = lot.Park(new Car(&quot;KA-01&quot;));
+//     clock.Advance(TimeSpan.FromHours(2));
+//     Assert.Equal(new Money(20m), lot.Leave(ticket.Id, clock.Now));
+// }</code></pre><pre data-lang="python" hidden><code>from datetime import datetime, timedelta
+from typing import Callable, Protocol
+import uuid
+
+# UNTESTABLE — the clock, the id source and the policy are all hidden.
+class BadParkingLot:
+    def park(self, vehicle):
+        spot = self._find_spot(vehicle)
+        return Ticket(str(uuid.uuid4()),      # hidden: randomness
+                      spot,
+                      datetime.now())          # hidden: the clock
+
+# TESTABLE — every dependency is visible in __init__.
+class Clock(Protocol):
+    def now(self) -&gt; datetime: ...
+
+class SystemClock:
+    def now(self) -&gt; datetime:
+        return datetime.utcnow()
+
+class FakeClock:
+    def __init__(self, start: datetime) -&gt; None:
+        self._now = start
+    def now(self) -&gt; datetime:
+        return self._now
+    def advance(self, by: timedelta) -&gt; None:
+        self._now += by
+
+class ParkingLot:
+    def __init__(self, floors, allocation, pricing,
+                 clock: Clock, new_ticket_id: Callable[[], str]) -&gt; None:
+        self._floors = floors
+        self._allocation = allocation
+        self._pricing = pricing
+        self._clock = clock
+        self._new_ticket_id = new_ticket_id
+
+    def park(self, vehicle) -&gt; &quot;Ticket&quot;:
+        spot = self._allocation.find(self._floors, vehicle)
+        if spot is None:
+            raise RuntimeError(&quot;Lot full.&quot;)
+        if not spot.try_occupy(vehicle):
+            raise RuntimeError(&quot;Spot taken concurrently.&quot;)
+        return Ticket(self._new_ticket_id(), spot, self._clock.now())
+
+# def test_charges_two_hours_for_a_two_hour_stay():
+#     clock = FakeClock(datetime(2026, 1, 1, 9, 0, 0))
+#     lot = ParkingLot(floors, FirstAvailable(), FlatHourlyPricing(10.0),
+#                      clock, lambda: &quot;T1&quot;)
+#     ticket = lot.park(Car(&quot;KA-01&quot;))
+#     clock.advance(timedelta(hours=2))
+#     assert lot.leave(ticket.id, clock.now()) == Money(20.0)</code></pre></div><div class="callout callout-note"><span class="callout-title">What to say when asked &quot;how would you test this?&quot;</span><p>Name three layers, briefly:</p><ol>
+<li><strong>Unit</strong> — the invariants, directly. "A ticket cannot be closed twice." "A spot cannot be occupied by two vehicles."
+These are the tests that justify your rich domain objects.</li>
+<li><strong>Policy</strong> — each strategy in isolation, with a fake clock. Pricing is pure arithmetic once time is injected, so it
+is the easiest thing in the system to test exhaustively.</li>
+<li><strong>Flow</strong> — one end-to-end test per use case: park, wait, leave, pay. These catch wiring mistakes that unit tests
+cannot.</li>
+</ol><p>Then add the concurrency sentence: "and I would have a test that spawns N threads all trying to take the last spot, and
+asserts exactly one wins." That one is memorable because almost nobody mentions it.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Constructor injection is the point, not a DI container — if you start talking about container registration you have
+drifted out of the round. The signal is simply that <strong>a reader can see every dependency a class has by looking at its
+constructor</strong>, and that a test can therefore substitute any of them. When an interviewer pushes with "that is a lot of
+constructor parameters", that is a real critique and there is a real answer: too many parameters usually means the class has too many
+responsibilities, so either it should be split, or several parameters are really one concept that deserves its own type.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take any class you have written that calls <code>DateTime.Now</code> and inject a clock. Write the test that was impossible before.</li><li>Count the constructor parameters in your parking lot. If it is more than five, find the two that belong together as one type.</li><li>Write the "N threads race for the last spot" test and run it a thousand times.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="../../DotNet/topics/design-patterns.html" target="_blank" rel="noopener">C# & .NET: Design Patterns & SOLID</a> — the full catalogue with before/after code</li><li><a href="../../DotNet/topics/testing.html" target="_blank" rel="noopener">C# & .NET: Testing</a> — test doubles, and testing time and async properly</li><li><a href="https://refactoring.guru/design-patterns/strategy" target="_blank" rel="noopener">Refactoring Guru: Strategy</a> — the force it relieves, stated first</li><li><a href="https://refactoring.guru/design-patterns/state" target="_blank" rel="noopener">Refactoring Guru: State</a> — and how it differs from Strategy</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parking Lot — Low-Level Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="lld-parking-lot">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Worked designs › Topic 3 of 7</div>
+  <h1>Design a Parking Lot</h1>
+  <p class="lede">The canonical LLD warm-up, worked end to end: the clarifying questions that close the scope, a model where every invariant lives next to its data, two seams that absorb the follow-ups, and the three concurrency races that "multiple entrances" is really asking about.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#scope">Requirements: what to ask and what to rule out</a></li><li><a href="#model">The model</a></li><li><a href="#code">The implementation</a></li><li><a href="#concurrency">Concurrency: where the races actually are</a></li><li><a href="#followups">The follow-ups, and how each one lands</a></li></ol>
+  </div>
+
+<section id="scope"><h2 id="scope">Requirements: what to ask and what to rule out</h2><p>The canonical warm-up, and the one most likely to open an LLD round. It is deceptively open-ended, so the first five minutes are
+about <em>closing</em> it. Here is a realistic clarifying exchange and the scope it produces.</p><div class="table-wrap"><table><thead><tr><th>You ask</th><th>Typical answer</th><th>What it decides</th></tr></thead><tbody><tr><td>How many vehicle types, and will more be added?</td><td>Motorcycle, car, truck — assume more later</td><td>Vehicle is polymorphic, not an enum <code>switch</code></td></tr><tr><td>Does a vehicle fit only its own size spot?</td><td>A small vehicle may use a larger spot</td><td>Allocation searches upwards through sizes</td></tr><tr><td>How is the fee computed?</td><td>Hourly for now — "could it vary?"</td><td><code>IPricingStrategy</code>, injected</td></tr><tr><td>Which spot do we assign?</td><td>Any free one — "could it be nearest?"</td><td><code>ISpotAllocationStrategy</code>, injected</td></tr><tr><td>One entrance or many?</td><td>Several, used at the same time</td><td>Concurrency is in scope; allocation must be atomic</td></tr><tr><td>Do we handle payment?</td><td>Assume it succeeds</td><td>One interface, one method, no implementation</td></tr><tr><td>Persistence?</td><td>In memory</td><td>No repositories, no SQL</td></tr></tbody></table></div><p>Which gives the scope you write down and get agreement on:</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// IN SCOPE
+//   park(vehicle)        -&gt; ticket, with a spot it fits in
+//   leave(ticketId, now) -&gt; fee, spot released
+//   availability()       -&gt; free spots by size
+//   several entrances and exits operating concurrently
+//
+// OUT OF SCOPE (agreed out loud)
+//   payment provider internals, persistence, reservations,
+//   number-plate recognition, multi-lot / multi-tenant
+//
+// INVARIANTS
+//   I1  a spot holds at most one vehicle at a time
+//   I2  a ticket is closed at most once
+//   I3  a vehicle never occupies a spot smaller than it needs
+//
+// VARIES  -&gt; therefore an interface each
+//   pricing, spot allocation</code></pre><pre data-lang="python" hidden><code># IN SCOPE
+#   park(vehicle)         -&gt; ticket, with a spot it fits in
+#   leave(ticket_id, now) -&gt; fee, spot released
+#   availability()        -&gt; free spots by size
+#   several entrances and exits operating concurrently
+#
+# OUT OF SCOPE (agreed out loud)
+#   payment provider internals, persistence, reservations,
+#   number-plate recognition, multi-lot / multi-tenant
+#
+# INVARIANTS
+#   I1  a spot holds at most one vehicle at a time
+#   I2  a ticket is closed at most once
+#   I3  a vehicle never occupies a spot smaller than it needs
+#
+# VARIES  -&gt; therefore a protocol each
+#   pricing, spot allocation</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The question that separates candidates here is <strong>"can a small vehicle use a large spot?"</strong> Almost nobody
+asks it, and it changes the allocation algorithm from a dictionary lookup to an ordered search — which then makes the follow-up
+"should a motorcycle be allowed to take the last truck spot?" a design conversation rather than a bug. Ask it. The second-best
+question is "one entrance or several?", because it is how concurrency legitimately enters the design, and a concurrency discussion
+you introduced yourself scores better than one you were forced into.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write the scope block above from memory in under three minutes.</li><li>Name the two things you would cut first if the interviewer said you had 25 minutes, not 45.</li></ul></div></section>
+
+<section id="model"><h2 id="model">The model</h2><p>Nouns: lot, floor, spot, vehicle, ticket, fee. Verbs: park, leave, compute fee, find spot, occupy, release. Assigning each verb
+to the class that owns the data gives the model almost immediately — the only interesting decision is where
+<strong>occupancy</strong> lives, and the answer is on the spot itself, because that is the only place invariant I1 can be enforced
+atomically.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>ParkingLot                 (entry point; owns the floors, holds the policies)
+ ├── Floor*                  composition — spots do not outlive their floor
+ │     └── ParkingSpot*      composition — OWNS the occupancy invariant (I1)
+ ├── ISpotAllocationStrategy aggregation — injected, swappable
+ ├── IPricingStrategy        aggregation — injected, swappable
+ └── Ticket*                 by id, for open stays
+
+Vehicle (abstract)   -&gt;  Car | Motorcycle | Truck      (RequiredSize)
+SpotSize (enum)      -&gt;  Small &lt; Medium &lt; Large         (ordered: I3)
+Money (value object) -&gt;  immutable, value equality
+
+Responsibilities, one verb-first sentence each:
+  ParkingLot    orchestrates a stay: allocate, issue, price, release.
+  Floor         holds spots and answers &quot;what is free here?&quot;.
+  ParkingSpot   guarantees it is occupied by at most one vehicle.
+  Ticket        records a stay and guarantees it is closed at most once.
+  Vehicle       knows the smallest spot size it can use.</code></pre><pre data-lang="python" hidden><code>ParkingLot                 (entry point; owns the floors, holds the policies)
+ ├── Floor*                  composition — spots do not outlive their floor
+ │     └── ParkingSpot*      composition — OWNS the occupancy invariant (I1)
+ ├── SpotAllocationStrategy  aggregation — injected, swappable
+ ├── PricingStrategy         aggregation — injected, swappable
+ └── Ticket*                 by id, for open stays
+
+Vehicle (ABC)        -&gt;  Car | Motorcycle | Truck      (required_size)
+SpotSize (IntEnum)   -&gt;  SMALL &lt; MEDIUM &lt; LARGE         (ordered: I3)
+Money (frozen)       -&gt;  immutable, value equality
+
+Responsibilities, one verb-first sentence each:
+  ParkingLot    orchestrates a stay: allocate, issue, price, release.
+  Floor         holds spots and answers &quot;what is free here?&quot;.
+  ParkingSpot   guarantees it is occupied by at most one vehicle.
+  Ticket        records a stay and guarantees it is closed at most once.
+  Vehicle       knows the smallest spot size it can use.</code></pre></div><div class="callout callout-note"><span class="callout-title">Why SpotSize is ordered</span><p>Making <code>SpotSize</code> an ordered enum (<code>Small = 1, Medium = 2, Large = 3</code>)
+rather than an unordered tag is a small decision that pays for itself twice. It makes invariant I3 a single comparison
+(<code>spot.Size &gt;= vehicle.RequiredSize</code>), and it makes "search upwards from the smallest spot that fits" the natural
+allocation, which is also the one that wastes the least space. When the interviewer asks "why not just a dictionary keyed by
+size?", the answer is that a dictionary cannot express <em>fits in</em>, only <em>equals</em>.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Be ready to defend putting occupancy on <code>ParkingSpot</code> rather than keeping a
+<code>Dictionary&lt;Spot, Vehicle&gt;</code> on the lot. The argument is the invariant: if occupancy lives on the spot, then
+"a spot holds at most one vehicle" is enforced by one compare-and-set in one place, and no caller can get it wrong. If it lives in a
+dictionary on the lot, every code path that touches the dictionary has to remember the rule, and under concurrency you need a lock
+around the whole map rather than per-spot atomics. That is the general principle this round is testing —
+<strong>put the invariant where the data is</strong> — and the parking lot is a clean place to demonstrate it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>List every place invariant I1 could be violated if occupancy lived on the lot instead of the spot.</li><li>Add "electric vehicles need a charging spot". Decide whether that is a new <code>SpotSize</code>, a flag on the spot, or a new concept — and justify it.</li></ul></div></section>
+
+<section id="code"><h2 id="code">The implementation</h2><p>Written in the order you would write it in the room: the value objects and entities first, because they are quick and they fix
+the vocabulary, then the policies, then the lot that orchestrates them. This is complete and runnable.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>using System.Collections.Concurrent;
+
+public enum SpotSize { Small = 1, Medium = 2, Large = 3 }
+
+public readonly record struct Money(decimal Amount)
+{
+    public static readonly Money Zero = new(0m);
+    public override string ToString() =&gt; $&quot;{Amount:0.00}&quot;;
+}
+
+public abstract class Vehicle(string plate)
+{
+    public string Plate { get; } = plate;
+    public abstract SpotSize RequiredSize { get; }
+}
+public sealed class Motorcycle(string p) : Vehicle(p) { public override SpotSize RequiredSize =&gt; SpotSize.Small; }
+public sealed class Car(string p)        : Vehicle(p) { public override SpotSize RequiredSize =&gt; SpotSize.Medium; }
+public sealed class Truck(string p)      : Vehicle(p) { public override SpotSize RequiredSize =&gt; SpotSize.Large; }
+
+// I1 lives here. TryOccupy is the ONLY way to take a spot, and it is atomic.
+public sealed class ParkingSpot(string id, SpotSize size, int floorNumber)
+{
+    private readonly object _gate = new();
+    public string Id { get; } = id;
+    public SpotSize Size { get; } = size;
+    public int FloorNumber { get; } = floorNumber;
+    public Vehicle? OccupiedBy { get; private set; }
+
+    public bool IsFree { get { lock (_gate) return OccupiedBy is null; } }
+
+    public bool Fits(Vehicle v) =&gt; Size &gt;= v.RequiredSize;          // I3
+
+    public bool TryOccupy(Vehicle v)
+    {
+        if (!Fits(v)) return false;
+        lock (_gate)
+        {
+            if (OccupiedBy is not null) return false;               // lost the race
+            OccupiedBy = v;
+            return true;
+        }
+    }
+
+    public void Release()
+    {
+        lock (_gate) OccupiedBy = null;
+    }
+}
+
+public sealed class Floor(int number, IReadOnlyList&lt;ParkingSpot&gt; spots)
+{
+    public int Number { get; } = number;
+    public IReadOnlyList&lt;ParkingSpot&gt; Spots { get; } = spots;
+
+    public IEnumerable&lt;ParkingSpot&gt; FreeSpotsFor(Vehicle v) =&gt;
+        Spots.Where(s =&gt; s.Fits(v) &amp;&amp; s.IsFree)
+             .OrderBy(s =&gt; s.Size);        // smallest that fits: least waste
+}
+
+// I2 lives here.
+public sealed class Ticket(string id, ParkingSpot spot, Vehicle vehicle, DateTime entryTime)
+{
+    public string Id { get; } = id;
+    public ParkingSpot Spot { get; } = spot;
+    public Vehicle Vehicle { get; } = vehicle;
+    public DateTime EntryTime { get; } = entryTime;
+    public DateTime? ExitTime { get; private set; }
+    public Money? Fee { get; private set; }
+
+    public bool IsClosed =&gt; ExitTime is not null;
+    public TimeSpan Duration(DateTime now) =&gt; (ExitTime ?? now) - EntryTime;
+
+    public void Close(DateTime exitTime, Money fee)
+    {
+        if (IsClosed) throw new InvalidOperationException($&quot;Ticket {Id} already closed.&quot;);
+        if (exitTime &lt; EntryTime) throw new ArgumentException(&quot;Exit precedes entry.&quot;);
+        ExitTime = exitTime;
+        Fee = fee;
+    }
+}
+
+// ---- the two seams -----------------------------------------------------
+public interface ISpotAllocationStrategy
+{
+    ParkingSpot? Find(IReadOnlyList&lt;Floor&gt; floors, Vehicle vehicle);
+}
+
+public sealed class FirstAvailable : ISpotAllocationStrategy
+{
+    public ParkingSpot? Find(IReadOnlyList&lt;Floor&gt; floors, Vehicle v) =&gt;
+        floors.SelectMany(f =&gt; f.FreeSpotsFor(v)).FirstOrDefault();
+}
+
+public sealed class NearestToEntrance : ISpotAllocationStrategy
+{
+    public ParkingSpot? Find(IReadOnlyList&lt;Floor&gt; floors, Vehicle v) =&gt;
+        floors.SelectMany(f =&gt; f.FreeSpotsFor(v))
+              .OrderBy(s =&gt; s.FloorNumber).ThenBy(s =&gt; s.Id)
+              .FirstOrDefault();
+}
+
+public interface IPricingStrategy { Money Price(Ticket ticket, DateTime now); }
+
+public sealed class FlatHourlyPricing(decimal perHour) : IPricingStrategy
+{
+    public Money Price(Ticket t, DateTime now)
+    {
+        var hours = Math.Max(1, (int)Math.Ceiling(t.Duration(now).TotalHours));
+        return new Money(perHour * hours);
+    }
+}
+
+public sealed class PerSizePricing(IReadOnlyDictionary&lt;SpotSize, decimal&gt; rates) : IPricingStrategy
+{
+    public Money Price(Ticket t, DateTime now)
+    {
+        var hours = Math.Max(1, (int)Math.Ceiling(t.Duration(now).TotalHours));
+        return new Money(rates[t.Vehicle.RequiredSize] * hours);
+    }
+}
+
+public interface IClock { DateTime Now { get; } }
+public sealed class SystemClock : IClock { public DateTime Now =&gt; DateTime.UtcNow; }
+
+// ---- the orchestrator --------------------------------------------------
+public sealed class ParkingLot(
+    IReadOnlyList&lt;Floor&gt; floors,
+    ISpotAllocationStrategy allocation,
+    IPricingStrategy pricing,
+    IClock clock)
+{
+    private readonly ConcurrentDictionary&lt;string, Ticket&gt; _open = new();
+    private int _nextTicket;
+
+    public Ticket Park(Vehicle vehicle)
+    {
+        // Retry: between Find and TryOccupy another entrance may have taken it.
+        for (int attempt = 0; attempt &lt; 10; attempt++)
+        {
+            var spot = allocation.Find(floors, vehicle);
+            if (spot is null) throw new InvalidOperationException(&quot;Lot full.&quot;);
+            if (!spot.TryOccupy(vehicle)) continue;                 // lost: try again
+
+            var id = $&quot;T{Interlocked.Increment(ref _nextTicket)}&quot;;
+            var ticket = new Ticket(id, spot, vehicle, clock.Now);
+            _open[id] = ticket;
+            return ticket;
+        }
+        throw new InvalidOperationException(&quot;Could not allocate a spot; too much contention.&quot;);
+    }
+
+    public Money Leave(string ticketId, DateTime now)
+    {
+        if (!_open.TryRemove(ticketId, out var ticket))             // I2, atomically
+            throw new InvalidOperationException($&quot;Unknown or already-closed ticket {ticketId}.&quot;);
+
+        var fee = pricing.Price(ticket, now);
+        ticket.Close(now, fee);
+        ticket.Spot.Release();
+        return fee;
+    }
+
+    public IReadOnlyDictionary&lt;SpotSize, int&gt; Availability() =&gt;
+        floors.SelectMany(f =&gt; f.Spots)
+              .Where(s =&gt; s.IsFree)
+              .GroupBy(s =&gt; s.Size)
+              .ToDictionary(g =&gt; g.Key, g =&gt; g.Count());
+}</code></pre><pre data-lang="python" hidden><code>from __future__ import annotations
+import threading
+from abc import ABC, abstractmethod
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import IntEnum
+from math import ceil
+from typing import Iterable, Protocol
+
+class SpotSize(IntEnum):                 # ordered, so &quot;fits in&quot; is a comparison
+    SMALL = 1
+    MEDIUM = 2
+    LARGE = 3
+
+@dataclass(frozen=True)
+class Money:
+    amount: float
+    def __str__(self) -&gt; str: return f&quot;{self.amount:.2f}&quot;
+
+ZERO = Money(0.0)
+
+class Vehicle(ABC):
+    def __init__(self, plate: str) -&gt; None:
+        self.plate = plate
+    @property
+    @abstractmethod
+    def required_size(self) -&gt; SpotSize: ...
+
+class Motorcycle(Vehicle):
+    @property
+    def required_size(self) -&gt; SpotSize: return SpotSize.SMALL
+class Car(Vehicle):
+    @property
+    def required_size(self) -&gt; SpotSize: return SpotSize.MEDIUM
+class Truck(Vehicle):
+    @property
+    def required_size(self) -&gt; SpotSize: return SpotSize.LARGE
+
+class ParkingSpot:
+    &quot;&quot;&quot;I1 lives here: try_occupy is the only way in, and it is atomic.&quot;&quot;&quot;
+    def __init__(self, id: str, size: SpotSize, floor_number: int) -&gt; None:
+        self.id = id
+        self.size = size
+        self.floor_number = floor_number
+        self._occupied_by: Vehicle | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def is_free(self) -&gt; bool:
+        with self._lock:
+            return self._occupied_by is None
+
+    @property
+    def occupied_by(self) -&gt; Vehicle | None:
+        with self._lock:
+            return self._occupied_by
+
+    def fits(self, v: Vehicle) -&gt; bool:
+        return self.size &gt;= v.required_size              # I3
+
+    def try_occupy(self, v: Vehicle) -&gt; bool:
+        if not self.fits(v):
+            return False
+        with self._lock:
+            if self._occupied_by is not None:
+                return False                             # lost the race
+            self._occupied_by = v
+            return True
+
+    def release(self) -&gt; None:
+        with self._lock:
+            self._occupied_by = None
+
+class Floor:
+    def __init__(self, number: int, spots: list[ParkingSpot]) -&gt; None:
+        self.number = number
+        self.spots = spots
+
+    def free_spots_for(self, v: Vehicle) -&gt; Iterable[ParkingSpot]:
+        return sorted((s for s in self.spots if s.fits(v) and s.is_free),
+                      key=lambda s: s.size)              # smallest that fits
+
+class Ticket:
+    &quot;&quot;&quot;I2 lives here.&quot;&quot;&quot;
+    def __init__(self, id: str, spot: ParkingSpot, vehicle: Vehicle,
+                 entry_time: datetime) -&gt; None:
+        self.id = id
+        self.spot = spot
+        self.vehicle = vehicle
+        self.entry_time = entry_time
+        self.exit_time: datetime | None = None
+        self.fee: Money | None = None
+
+    @property
+    def is_closed(self) -&gt; bool:
+        return self.exit_time is not None
+
+    def duration(self, now: datetime) -&gt; timedelta:
+        return (self.exit_time or now) - self.entry_time
+
+    def close(self, exit_time: datetime, fee: Money) -&gt; None:
+        if self.is_closed:
+            raise RuntimeError(f&quot;Ticket {self.id} already closed.&quot;)
+        if exit_time &lt; self.entry_time:
+            raise ValueError(&quot;Exit precedes entry.&quot;)
+        self.exit_time = exit_time
+        self.fee = fee
+
+# ---- the two seams -----------------------------------------------------
+class SpotAllocationStrategy(Protocol):
+    def find(self, floors: list[Floor], vehicle: Vehicle) -&gt; ParkingSpot | None: ...
+
+class FirstAvailable:
+    def find(self, floors: list[Floor], v: Vehicle) -&gt; ParkingSpot | None:
+        return next((s for f in floors for s in f.free_spots_for(v)), None)
+
+class NearestToEntrance:
+    def find(self, floors: list[Floor], v: Vehicle) -&gt; ParkingSpot | None:
+        candidates = [s for f in floors for s in f.free_spots_for(v)]
+        return min(candidates, key=lambda s: (s.floor_number, s.id), default=None)
+
+class PricingStrategy(Protocol):
+    def price(self, ticket: Ticket, now: datetime) -&gt; Money: ...
+
+def _hours(t: Ticket, now: datetime) -&gt; int:
+    return max(1, ceil(t.duration(now).total_seconds() / 3600))
+
+class FlatHourlyPricing:
+    def __init__(self, per_hour: float) -&gt; None:
+        self._per_hour = per_hour
+    def price(self, t: Ticket, now: datetime) -&gt; Money:
+        return Money(self._per_hour * _hours(t, now))
+
+class PerSizePricing:
+    def __init__(self, rates: dict[SpotSize, float]) -&gt; None:
+        self._rates = rates
+    def price(self, t: Ticket, now: datetime) -&gt; Money:
+        return Money(self._rates[t.vehicle.required_size] * _hours(t, now))
+
+class Clock(Protocol):
+    def now(self) -&gt; datetime: ...
+
+class SystemClock:
+    def now(self) -&gt; datetime: return datetime.utcnow()
+
+# ---- the orchestrator --------------------------------------------------
+class ParkingLot:
+    def __init__(self, floors: list[Floor], allocation: SpotAllocationStrategy,
+                 pricing: PricingStrategy, clock: Clock) -&gt; None:
+        self._floors = floors
+        self._allocation = allocation
+        self._pricing = pricing
+        self._clock = clock
+        self._open: dict[str, Ticket] = {}
+        self._next = 0
+        self._lock = threading.Lock()
+
+    def park(self, vehicle: Vehicle) -&gt; Ticket:
+        # Retry: between find and try_occupy another entrance may have taken it.
+        for _ in range(10):
+            spot = self._allocation.find(self._floors, vehicle)
+            if spot is None:
+                raise RuntimeError(&quot;Lot full.&quot;)
+            if not spot.try_occupy(vehicle):
+                continue                                  # lost: try again
+            with self._lock:
+                self._next += 1
+                ticket = Ticket(f&quot;T{self._next}&quot;, spot, vehicle, self._clock.now())
+                self._open[ticket.id] = ticket
+            return ticket
+        raise RuntimeError(&quot;Could not allocate a spot; too much contention.&quot;)
+
+    def leave(self, ticket_id: str, now: datetime) -&gt; Money:
+        with self._lock:
+            ticket = self._open.pop(ticket_id, None)      # I2, atomically
+        if ticket is None:
+            raise RuntimeError(f&quot;Unknown or already-closed ticket {ticket_id}.&quot;)
+        fee = self._pricing.price(ticket, now)
+        ticket.close(now, fee)
+        ticket.spot.release()
+        return fee
+
+    def availability(self) -&gt; dict[SpotSize, int]:
+        return dict(Counter(s.size for f in self._floors
+                            for s in f.spots if s.is_free))</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Two details in that code are worth pointing at explicitly, because they are the difference between a design that
+<em>looks</em> thread-safe and one that is. First, <strong>the retry loop in <code>Park</code></strong>: finding a free spot and
+taking it are two steps, so between them another entrance can win, and <code>TryOccupy</code> returning <code>false</code> is a
+normal outcome rather than an error. Candidates who lock the whole lot around both steps are correct but have serialised every
+entrance; candidates who ignore the gap have a double-booking bug. Second, <strong><code>TryRemove</code> in <code>Leave</code></strong>
+makes "close this ticket" atomic — the ticket is removed from the open map by exactly one caller, so a double exit fails cleanly
+without needing a lock. Say both of these out loud; they are cheap and they are exactly what the round rewards.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write the park/leave flow and then the three invariant tests (I1, I2, I3) before adding any feature.</li><li>Replace the retry loop with a lock around the whole lot. Measure how many concurrent entrances it supports, and say when you would still prefer it.</li></ul></div></section>
+
+<section id="concurrency"><h2 id="concurrency">Concurrency: where the races actually are</h2><p>"Multiple entrances" is the prompt's invitation to talk about threading, and there are exactly three races worth naming. Being
+able to list them and say how each is handled is the single strongest thing you can do in the last ten minutes.</p><div class="table-wrap"><table><thead><tr><th>Race</th><th>What goes wrong</th><th>Handled by</th></tr></thead><tbody><tr><td><strong>Two vehicles, one spot</strong></td><td>Both see it free and both park</td><td><code>TryOccupy</code> compare-and-set per spot, plus the retry loop</td></tr><tr><td><strong>Double exit</strong></td><td>A ticket is paid twice, or a spot is released twice</td><td>Atomic remove from the open-ticket map; <code>Close</code> also throws</td></tr><tr><td><strong>Availability is stale</strong></td><td>The count is out of date the moment it is returned</td><td>Accepted deliberately — say so</td></tr><tr><td><strong>Release then re-park</strong></td><td>A spot is handed out before the leaver finished</td><td>Release happens last, after the ticket is closed</td></tr></tbody></table></div><p>The third row is the interesting one. <code>Availability()</code> walks the spots without a global lock, so it can return a
+number that was never simultaneously true. That is almost always the right trade — a parking display does not need linearisability —
+but you should <strong>say that you chose it</strong> rather than leave the interviewer wondering whether you noticed.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// The test that proves I1 holds under contention. Worth writing in the
+// room if there is time, and worth describing if there is not.
+[Fact]
+public void Only_one_vehicle_wins_the_last_spot()
+{
+    var spot  = new ParkingSpot(&quot;S1&quot;, SpotSize.Medium, 0);
+    var floor = new Floor(0, [spot]);
+    var lot   = new ParkingLot([floor], new FirstAvailable(),
+                               new FlatHourlyPricing(10m), new SystemClock());
+
+    int parked = 0, rejected = 0;
+    Parallel.For(0, 64, i =&gt;
+    {
+        try { lot.Park(new Car($&quot;KA-{i}&quot;)); Interlocked.Increment(ref parked); }
+        catch (InvalidOperationException) { Interlocked.Increment(ref rejected); }
+    });
+
+    Assert.Equal(1, parked);          // exactly one winner
+    Assert.Equal(63, rejected);
+    Assert.False(spot.IsFree);
+}
+
+// ---- Granularity: three options, worth comparing out loud --------------
+//
+// A. One lock on the whole lot.
+//    + trivially correct, easy to reason about
+//    - every entrance serialises; a 10-floor lot behaves like a 1-car gate
+//
+// B. One lock per spot  (what the code above does)
+//    + entrances contend only when they pick the SAME spot
+//    - find-then-take is not atomic, so you need the retry loop
+//
+// C. A lock-free free-list per (floor, size)
+//    + no scan at all: pop a spot in O(1)
+//    - more state to keep consistent on release; harder to get right
+//
+// B is the right default for an interview: it is correct, it is genuinely
+// concurrent, and the retry loop is three lines you can defend.</code></pre><pre data-lang="python" hidden><code>import threading
+
+def test_only_one_vehicle_wins_the_last_spot():
+    &quot;&quot;&quot;Proves I1 under contention.&quot;&quot;&quot;
+    spot = ParkingSpot(&quot;S1&quot;, SpotSize.MEDIUM, 0)
+    lot = ParkingLot([Floor(0, [spot])], FirstAvailable(),
+                     FlatHourlyPricing(10.0), SystemClock())
+
+    parked, rejected = [], []
+    barrier = threading.Barrier(64)          # make them start together
+
+    def attempt(i: int) -&gt; None:
+        barrier.wait()
+        try:
+            lot.park(Car(f&quot;KA-{i}&quot;))
+            parked.append(i)
+        except RuntimeError:
+            rejected.append(i)
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(64)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    assert len(parked) == 1                  # exactly one winner
+    assert len(rejected) == 63
+    assert not spot.is_free
+
+# ---- Granularity: three options, worth comparing out loud --------------
+#
+# A. One lock on the whole lot.
+#    + trivially correct, easy to reason about
+#    - every entrance serialises; a 10-floor lot behaves like a 1-car gate
+#
+# B. One lock per spot  (what the code above does)
+#    + entrances contend only when they pick the SAME spot
+#    - find-then-take is not atomic, so you need the retry loop
+#
+# C. A lock-free free-list per (floor, size)
+#    + no scan at all: pop a spot in O(1)
+#    - more state to keep consistent on release; harder to get right
+#
+# B is the right default for an interview.</code></pre></div><div class="callout callout-warn"><span class="callout-title">The GIL does not make Python code thread-safe</span><p>A common wrong answer: "Python has a GIL so I do not need locks." The GIL
+serialises bytecode execution, not <em>logical</em> operations. <code>if self._occupied_by is None: self._occupied_by = v</code> is
+two bytecode sequences with a switch point between them, so two threads can both pass the check. The lock in
+<code>try_occupy</code> is genuinely required. The GIL means you will not corrupt the interpreter's own structures; it says nothing
+about your invariants. If the interviewer is a Python person, knowing this distinction is a real differentiator — and the same
+reasoning applies to <code>asyncio</code>, where an <code>await</code> inside a check-then-act is exactly the same bug.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>If you only have time for one concurrency sentence, make it: <strong>"find-a-spot and take-a-spot are two operations,
+so I made taking it a compare-and-set and retry when I lose."</strong> That names the check-then-act race, gives the fix, and shows
+you understand why the naive version is wrong — all in one line. If you have longer, compare the three lock granularities above;
+interviewers like the comparison more than the implementation because it shows you chose rather than defaulted. The follow-up to be
+ready for is "what if this is distributed across processes?", and the answer is that the per-spot CAS becomes a conditional write in
+a shared store — the structure of the design does not change, only the mechanism.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Run the contention test a thousand times. If it ever passes with two winners, your CAS is wrong.</li><li>Remove the lock from <code>try_occupy</code> and get the test to fail — it may take many runs, which is itself the lesson about race bugs.</li><li>Design option C (free-lists) and work out what must happen on release to keep it consistent.</li></ul></div></section>
+
+<section id="followups"><h2 id="followups">The follow-ups, and how each one lands</h2><p>These are the extensions interviewers actually ask, in rough order of likelihood. For each, the test is whether your answer is
+"I add a class" or "I rewrite something".</p><div class="table-wrap"><table><thead><tr><th>Follow-up</th><th>The answer</th><th>Cost</th></tr></thead><tbody><tr><td>"Motorcycles are half price"</td><td>Add <code>PerSizePricing</code>, inject it</td><td><strong>One new class</strong></td></tr><tr><td>"First 15 minutes are free"</td><td>Add a <code>WithGracePeriod</code> decorator around any pricing</td><td><strong>One new class</strong></td></tr><tr><td>"Assign the spot nearest the lift"</td><td>Add an allocation strategy</td><td><strong>One new class</strong></td></tr><tr><td>"Add electric vehicles that need charging"</td><td>New <code>Vehicle</code> subclass; charging is a spot <em>capability</em>, not a size</td><td>A field + a predicate in <code>Fits</code></td></tr><tr><td>"Support reservations"</td><td>A spot gains a reserved-until field; allocation skips reserved spots</td><td>Touches <code>ParkingSpot</code> and allocation</td></tr><tr><td>"Several lots in a city"</td><td>A <code>ParkingLotGroup</code> over lots; the lot itself is unchanged</td><td>A new layer above</td></tr><tr><td>"Make it survive a restart"</td><td>An <code>ITicketRepository</code> seam; the domain is unchanged</td><td>A new interface + an adapter</td></tr><tr><td>"A million spots"</td><td>Free-lists per (floor, size) replace the scan</td><td>Allocation internals only</td></tr></tbody></table></div><p>Notice that the first three cost one class each — that is the dividend from building the "varies" list in minute eight. The
+electric-vehicle one is the most interesting, and the one candidates most often get wrong.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// WRONG — adding Electric as a SpotSize. Size and capability are different
+// axes, so this conflates them and now &quot;is an electric spot bigger than a
+// medium spot?&quot; has no sensible answer.
+public enum SpotSize { Small, Medium, Large, Electric }   // ✗
+
+// RIGHT — capability is orthogonal to size, so it is a separate concept.
+public sealed class ParkingSpot(string id, SpotSize size, int floorNumber, bool hasCharger = false)
+{
+    public bool HasCharger { get; } = hasCharger;
+
+    public bool Fits(Vehicle v) =&gt;
+        Size &gt;= v.RequiredSize &amp;&amp; (!v.NeedsCharging || HasCharger);
+}
+
+public abstract class Vehicle(string plate)
+{
+    public string Plate { get; } = plate;
+    public abstract SpotSize RequiredSize { get; }
+    public virtual bool NeedsCharging =&gt; false;           // default: no
+}
+
+public sealed class ElectricCar(string p) : Vehicle(p)
+{
+    public override SpotSize RequiredSize =&gt; SpotSize.Medium;
+    public override bool NeedsCharging =&gt; true;
+}
+
+// And when a THIRD requirement arrives (disabled bays, valet-only, oversize),
+// the predicate is the thing that is now varying — so it becomes the seam:
+public interface ISpotRequirement { bool IsSatisfiedBy(ParkingSpot spot); }
+// ParkingSpot.Fits(v) =&gt; v.Requirements.All(r =&gt; r.IsSatisfiedBy(this));</code></pre><pre data-lang="python" hidden><code># WRONG — size and capability are different axes.
+class SpotSize(IntEnum):
+    SMALL = 1; MEDIUM = 2; LARGE = 3; ELECTRIC = 4          # ✗
+
+# RIGHT — capability is orthogonal to size.
+class ParkingSpot:
+    def __init__(self, id: str, size: SpotSize, floor_number: int,
+                 has_charger: bool = False) -&gt; None:
+        self.id = id
+        self.size = size
+        self.floor_number = floor_number
+        self.has_charger = has_charger
+        ...
+
+    def fits(self, v: &quot;Vehicle&quot;) -&gt; bool:
+        return self.size &gt;= v.required_size and (not v.needs_charging or self.has_charger)
+
+class Vehicle(ABC):
+    @property
+    @abstractmethod
+    def required_size(self) -&gt; SpotSize: ...
+    @property
+    def needs_charging(self) -&gt; bool:
+        return False                                        # default: no
+
+class ElectricCar(Vehicle):
+    @property
+    def required_size(self) -&gt; SpotSize: return SpotSize.MEDIUM
+    @property
+    def needs_charging(self) -&gt; bool: return True
+
+# When a THIRD requirement arrives (disabled bays, valet-only, oversize),
+# the predicate itself is what varies — so it becomes the seam:
+class SpotRequirement(Protocol):
+    def is_satisfied_by(self, spot: ParkingSpot) -&gt; bool: ...
+# ParkingSpot.fits(v) -&gt; all(r.is_satisfied_by(self) for r in v.requirements)</code></pre></div><div class="callout callout-note"><span class="callout-title">The rule of three</span><p>Notice the progression in that last example. <strong>One</strong> requirement (size) is a comparison.
+<strong>Two</strong> (size and charging) is a boolean field and a compound predicate — still fine, and over-abstracting here would be
+a mistake. <strong>Three</strong> is when the predicate itself is clearly the thing varying, and extracting
+<code>ISpotRequirement</code> pays for itself. Saying this out loud — "I would keep it a field for now and extract an interface when
+a third one arrives" — is a better answer than either extreme, because it shows you can tell premature abstraction from necessary
+abstraction. Interviewers are testing for that judgement as much as for the abstraction itself.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>When a follow-up arrives, <strong>say where it lands before you write anything</strong>: "that is a pricing change, so
+it is a new strategy and nothing else moves." Thirty seconds of placement is worth more than two minutes of code, and if your
+placement is wrong the interviewer will correct you before you have wasted the time. The one follow-up that should make you pause is
+reservations — it genuinely does not fit cleanly into the model above, because a reserved spot is neither free nor occupied, and the
+honest answer is that <code>ParkingSpot</code> gains a small state machine (Free → Reserved → Occupied). Recognising that a
+requirement <em>does not</em> fit your abstraction is a better signal than forcing it in.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement the electric-vehicle extension and time yourself. It should take under five minutes if the model is right.</li><li>Take reservations seriously: draw the spot state machine and work out what happens when a reservation expires while a car is arriving.</li><li>Add "the lot has an operator dashboard showing live occupancy per floor". Decide whether that is a query on the lot or an observer.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="../../DotNet/topics/threading.html" target="_blank" rel="noopener">C# & .NET: Threading & Async</a> — lock, Interlocked and the concurrent collections used here</li><li><a href="../../DotNet/topics/design-patterns.html" target="_blank" rel="noopener">C# & .NET: Design Patterns & SOLID</a> — Strategy and Decorator in full</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard — LLD</title>
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body data-root="">
+<div class="layout">
+<main class="main">
+
+  <h1>LLD</h1>
+  <p class="lede">A self-paced study site for the <strong>low-level design round</strong> — machine coding, object-oriented
+  design, "design a parking lot". Two foundation pages on how the round is scored and run, then five prompts worked end to end in
+  <strong>C#</strong> with the equivalent <strong>Python</strong> alongside. Seven pages, 31 sections. The sidebar has two menus —
+  <em>Foundations</em> and <em>Worked designs</em>; pages you have opened turn <span class="badge badge-visited">✓ visited</span>.</p>
+
+  <div class="storage-banner"></div>
+
+  <div class="stats-row">
+    <div class="progress">
+      <span>Visited</span>
+      <span class="progress-bar"><span class="progress-fill" data-progress-fill></span></span>
+      <span class="progress-num" data-progress-num>0 / 0</span>
+    </div>
+    <button type="button" class="btn btn-danger btn-sm" data-reset-visited>Reset visited topics</button>
+  </div>
+
+  <div class="callout callout-note">
+    <span class="callout-title">How to use this site</span>
+    <ul>
+      <li><strong>Start with The LLD Round.</strong> This interview is scored differently from system design, and most candidates who fail it fail on the clock or the requirements rather than on the design. That page is the rubric and the timetable.</li>
+      <li><strong>Then Principles &amp; Patterns.</strong> Six patterns answer almost every prompt; the page is about picking one under time pressure, not about the catalogue. The catalogue lives on the <a href="../DotNet/topics/design-patterns.html">C# patterns page</a>.</li>
+      <li><strong>Then the worked designs, in order.</strong> Each one is a full round: clarifying questions, the model, complete code, the concurrency story, and the follow-ups that prompt attracts.</li>
+      <li>Every code sample has a <strong>C# | Python</strong> tab bar. <strong>Copy</strong> grabs whatever tab is showing.</li>
+      <li><strong>Interview angle</strong> boxes say what is actually being graded in that section, and the sentence to say out loud.</li>
+      <li>Visited state lives in your browser only, separate from the C#, System Design and DSA sites.</li>
+    </ul>
+  </div>
+
+  <div class="callout callout-warn">
+    <span class="callout-title">Work the problem before you read it</span>
+    <p>These pages give away the answer in the first screen. Reading a worked design is close to worthless compared with attempting
+    it — set a 45-minute timer, build it, and <em>then</em> read. The gap between what you produced and what is here is the only
+    part of this site that will change your score.</p>
+  </div>
+
+  <h2 id="topics">Topics</h2>
+  <div data-topic-groups></div>
+
+  <h2 id="order">Suggested order</h2>
+  <p>Go in sidebar order. The two <strong>foundations</strong> pages (1–2) are short and everything after assumes them.
+  <strong>Parking lot</strong> (3) is the fullest treatment and establishes the vocabulary — invariants, seams, check-then-act —
+  that the rest refer back to, so do not skip it even if the prompt looks beneath you. After that the four designs are independent
+  and you can take them in any order.</p>
+
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Phase</th><th>Pages</th><th>You should be able to…</th></tr></thead>
+    <tbody>
+      <tr><td>Framing</td><td>The LLD Round · Principles &amp; Patterns</td><td>Run 45 minutes to a budget you state out loud; ask the questions that change the model; give every class a one-sentence verb-first responsibility; name what varies and put an interface there before the follow-up arrives.</td></tr>
+      <tr><td>Modelling</td><td>Parking Lot · Splitwise</td><td>Put each invariant next to the data it constrains, tell entities from value objects, and keep money in integer cents with splits that sum exactly.</td></tr>
+      <tr><td>State machines</td><td>Elevator Bank · Vending Machine</td><td>Spot a state machine from the wording, enumerate the <em>illegal</em> transitions and decide what each does, and keep time a parameter so the thing is deterministic enough to demonstrate.</td></tr>
+      <tr><td>Concurrency</td><td>Parking Lot · Cache &amp; Rate Limiter</td><td>Name the check-then-act race, fix it with a compare-and-set and a retry, choose a lock granularity on purpose, and say why a reader-writer lock buys nothing when every read is a write.</td></tr>
+      <tr><td>Algorithms inside designs</td><td>Vending Machine · Splitwise · Cache &amp; Rate Limiter</td><td>Recognise when a design round has an algorithm hiding in it, and be honest about bounds: greedy change-making, NP-hard settle-up, approximate rate limiting.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="more">Other prompts worth practising</h2>
+  <p>Not worked here, but they come up and they reuse the same moves. For each, predict the seam before you start:</p>
+  <ul>
+    <li><strong>Notification dispatcher</strong> — Observer plus a channel Strategy; the follow-up is retries and ordering.</li>
+    <li><strong>Logger</strong> — Chain of responsibility over levels, with appenders behind an interface.</li>
+    <li><strong>Tic-tac-toe, then chess</strong> — the real question is whether adding a new piece is a new class or an edit.</li>
+    <li><strong>Library / inventory system</strong> — entity modelling plus a reservation state machine, like parking with reservations.</li>
+    <li><strong>Text editor with undo</strong> — the Command pattern, and the one prompt where it is genuinely the answer.</li>
+    <li><strong>Snake and ladders, deck of cards, ATM</strong> — short warm-ups; useful for drilling the first ten minutes.</li>
+  </ul>
+
+  <p class="footer-note">Personal study site · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="assets/js/curriculum.js"></script>
+<script src="assets/js/visited.js"></script>
+<script src="assets/js/nav.js"></script>
+<script src="assets/js/code-tabs.js"></script>
+<script>
+/* Dashboard: topic cards + progress, kept in sync with visited state */
+(function () {
+  'use strict';
+  var C = window.CURRICULUM, V = window.VISITED;
+  if (!C || !V) return;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
+    });
+  }
+
+  function cardHtml(t) {
+    var i = C.topics.indexOf(t);
+    var visited = V.isVisited(t.id);
+    return '<div class="card' + (visited ? ' visited' : '') + '">' +
+      '<h3><span class="card-num">' + (visited ? '✓' : (i + 1)) + '</span><a href="' + t.href + '">' + esc(t.label) + '</a></h3>' +
+      '<p>' + esc(t.blurb) + '</p>' +
+      '<div class="card-foot"><span>' + t.sections.length + ' sections</span>' +
+      (visited ? '<span class="badge badge-visited">Visited</span>' : (i === 0 ? '<span class="badge badge-start">Start here</span>' : '')) +
+      '</div></div>';
+  }
+
+  function render() {
+    var host = document.querySelector('[data-topic-groups]');
+    if (host) {
+      host.innerHTML = C.groups.map(function (g) {
+        var done = g.topics.filter(function (t) { return V.isVisited(t.id); }).length;
+        return '<div class="group-head" id="group-' + esc(g.id) + '"><h3>' + esc(g.label) + '</h3>' +
+          '<span class="group-count">' + done + ' / ' + g.topics.length + ' visited</span></div>' +
+          '<p class="group-blurb">' + esc(g.blurb) + '</p>' +
+          '<div class="cards">' + g.topics.map(cardHtml).join('') + '</div>';
+      }).join('');
+    }
+    var n = V.count(), total = C.topics.length;
+    var fill = document.querySelector('[data-progress-fill]');
+    var num = document.querySelector('[data-progress-num]');
+    if (fill) fill.style.width = (total ? Math.round(n / total * 100) : 0) + '%';
+    if (num) num.textContent = n + ' / ' + total;
+  }
+
+  document.addEventListener('DOMContentLoaded', render);
+  document.addEventListener('visited:change', render);
+})();
+</script>
+</body>
+</html>

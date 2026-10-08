@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Loop — Interview Playbook</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="playbook-loop">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › The process › Topic 2 of 5</div>
+  <h1>The Loop</h1>
+  <p class="lede">Five round types, mixed in different proportions by level: coding, low-level design, system design, the project deep-dive and the behavioural round. What each one scores, how the weighting shifts as you go up, and why the two rounds people prepare least for are the ones that decide senior outcomes.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#rounds">The five rounds a loop is built from</a></li><li><a href="#coding">The coding round, as a round</a></li><li><a href="#deep-dive">The project deep-dive</a></li><li><a href="#behavioural">The behavioural round</a></li></ol>
+  </div>
+
+<section id="rounds"><h2 id="rounds">The five rounds a loop is built from</h2><p>Onsite loops differ between companies in their proportions, not usually in their ingredients. Almost every big-tech loop is
+assembled from the same five round types, and knowing which you are getting tells you what to prepare.</p><div class="table-wrap"><table><thead><tr><th>Round</th><th>What happens</th><th>Where it is covered here</th></tr></thead><tbody><tr><td><strong>Coding</strong></td><td>One or two algorithmic problems in 45 minutes, usually shared-editor</td><td><a href="../../DSA/index.html">DSA</a> — all nine pages</td></tr><tr><td><strong>Low-level design</strong></td><td>Turn a small real-world system into classes and working code</td><td><a href="../../LLD/index.html">LLD</a> — all seven pages</td></tr><tr><td><strong>System design</strong></td><td>Architect a large system end to end on a whiteboard</td><td><a href="../../SystemDesign/index.html">System Design</a> — 33 pages</td></tr><tr><td><strong>Project deep-dive</strong></td><td>Forty minutes on something you actually built</td><td><a href="#deep-dive">Below</a></td></tr><tr><td><strong>Behavioural</strong></td><td>Structured questions about how you work with people</td><td><a href="#behavioural">Below</a></td></tr></tbody></table></div><p>Roughly how they are weighted by seniority — and this is the pattern that matters most for planning your time:</p><div class="table-wrap"><table><thead><tr><th>Target level</th><th>Coding</th><th>LLD</th><th>System design</th><th>Deep-dive + behavioural</th></tr></thead><tbody><tr><td>New grad / entry</td><td><strong>Dominant</strong></td><td>Sometimes</td><td>Rare or light</td><td>Light</td></tr><tr><td>Mid (2–5 yrs)</td><td><strong>Heavy</strong></td><td>Common</td><td>One round</td><td>One round</td></tr><tr><td>Senior (5–10 yrs)</td><td>Still required</td><td>Common</td><td><strong>One or two rounds</strong></td><td><strong>Heavily weighted</strong></td></tr><tr><td>Staff+</td><td>Table stakes</td><td>Sometimes</td><td><strong>Dominant</strong></td><td><strong>Dominant</strong></td></tr></tbody></table></div><div class="callout callout-warn"><span class="callout-title">Confirm the actual structure with your recruiter</span><p>Loop composition varies by company, by org inside a company, by level
+and over time, and it changes more often than public write-ups keep up with. The table above is a planning heuristic, not a
+schedule. Your recruiter will tell you the real one if you ask — see
+<a href="playbook-pipeline.html#screen">the four questions</a> — and that beats any generalisation on this page.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The planning implication is the useful part. A mid-level candidate who spends 80% of their preparation on system
+design has misallocated badly, because coding is still where most mid-level rejections happen. A senior candidate who spends 80% on
+LeetCode has misallocated just as badly in the other direction — at senior level the coding round is usually a filter you need to
+not fail, while system design and the deep-dive are where the <em>level</em> is decided. Work out which side of that line you are
+on before you plan, and the <a href="playbook-plan.html">twelve-week plan</a> sets the ratios accordingly.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write down the level you are targeting, then allocate your preparation hours across the five round types in proportion. Check it against the table.</li></ul></div></section>
+
+<section id="coding"><h2 id="coding">The coding round, as a round</h2><p>The algorithms themselves are the <a href="../../DSA/index.html">DSA site</a>. What belongs here is how the <em>round</em> is
+scored, because the same solution earns very different marks depending on how it arrives.</p>
+<p>Interviewers almost universally score on four axes, written down on a form:</p><div class="table-wrap"><table><thead><tr><th>Axis</th><th>What earns it</th></tr></thead><tbody><tr><td><strong>Problem solving</strong></td><td>You worked towards the solution with a method rather than recalling or guessing. Brute force stated, then improved, with the reason for each improvement said out loud.</td></tr><tr><td><strong>Coding</strong></td><td>It is clean, it compiles, names mean something, and it would survive code review. Not just correct — <em>readable</em>.</td></tr><tr><td><strong>Verification</strong></td><td>You tested it yourself, out loud, on a small example and the edge cases — before being asked whether it works.</td></tr><tr><td><strong>Communication</strong></td><td>They could follow your thinking throughout, and you responded to hints rather than talking over them.</td></tr></tbody></table></div><p>Two of those four have nothing to do with algorithms, which is why candidates who grind problems in silence plateau.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>THE 45 MINUTES
+
+ 0-5    CLARIFY      Restate the problem. Ask about input size, types,
+                     duplicates, empty input, whether it is sorted, what
+                     to return on no answer. Write an example and agree it.
+
+ 5-10   BRUTE FORCE  Say the obvious solution and its complexity out loud.
+                     Do NOT write it. &quot;That&#x27;s O(n^2) because for each
+                     element I rescan the rest — can I avoid the rescan?&quot;
+
+10-15   IMPROVE      Name the technique and WHY it applies. &quot;The array is
+                     sorted, so two pointers get this to O(n).&quot; Get a nod
+                     before you commit to typing.
+
+15-35   CODE         Talk while writing. Helper functions for anything
+                     fiddly. If you get stuck, say what you are stuck on —
+                     that is when hints arrive, and taking a hint well is
+                     scored positively, not negatively.
+
+35-42   TEST         Walk a small example through the code by hand, out
+                     loud. Then the edge cases you listed at minute 3.
+                     Find your own bug before they do.
+
+42-45   WRAP         State final complexity, time and space. Name one
+                     thing you would change with more time.</code></pre><pre data-lang="python" hidden><code>THE 45 MINUTES
+
+ 0-5    CLARIFY      Restate the problem. Ask about input size, types,
+                     duplicates, empty input, whether it is sorted, what
+                     to return on no answer. Write an example and agree it.
+
+ 5-10   BRUTE FORCE  Say the obvious solution and its complexity out loud.
+                     Do NOT write it. &quot;That&#x27;s O(n^2) because for each
+                     element I rescan the rest - can I avoid the rescan?&quot;
+
+10-15   IMPROVE      Name the technique and WHY it applies. &quot;The array is
+                     sorted, so two pointers get this to O(n).&quot; Get a nod
+                     before you commit to typing.
+
+15-35   CODE         Talk while writing. Helper functions for anything
+                     fiddly. If you get stuck, say what you are stuck on -
+                     that is when hints arrive, and taking a hint well is
+                     scored positively, not negatively.
+
+35-42   TEST         Walk a small example through the code by hand, out
+                     loud. Then the edge cases you listed at minute 3.
+                     Find your own bug before they do.
+
+42-45   WRAP         State final complexity, time and space. Name one
+                     thing you would change with more time.</code></pre></div><div class="callout callout-note"><span class="callout-title">Hints are not a penalty</span><p>Candidates often believe that needing a hint is a failure, and so they go quiet and push rather
+than engage. The scoring usually works the other way: interviewers are instructed to give hints, and <em>how you take one</em> is
+information they want. Picking up a hint quickly, saying what it unlocked, and running with it reads as collaborative and coachable.
+Ignoring a hint, or visibly not hearing it because you are talking, reads badly — and is one of the more common reasons a technically
+adequate candidate gets a weak score.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The highest-leverage habit is <strong>narrating before coding</strong>: never start typing until you have said what
+you are about to write and why. It sounds slow and it is faster, because it gives the interviewer the chance to stop you before you
+spend fifteen minutes on the wrong approach — which is the single most common way a 45-minute round ends with nothing working. The
+second habit is <strong>testing before being asked</strong>. "Let me run through this with <code>[2,1]</code>" catches your own
+off-by-one and converts a bug the interviewer found into a bug you found, which is scored completely differently.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Solve ten problems out loud, on a timer, with nobody in the room. The talking is the skill, and it is unpleasant to practise, which is why most people skip it and then do it for the first time in the interview.</li><li>Record one and watch it. Count how long you went silent, and how long before you wrote your first line.</li></ul></div></section>
+
+<section id="deep-dive"><h2 id="deep-dive">The project deep-dive</h2><p>Forty minutes on something you actually built. It appears under many names — technical deep-dive, past experience, architecture
+review — and it is <strong>not</strong> the behavioural round, though the two are often scheduled together and conflated by
+candidates. The behavioural round is about how you work with people. This one is about whether your technical claims survive
+pressure.</p>
+<p>What is being probed:</p>
+<ul>
+<li><strong>Did you actually do it?</strong> Depth of recall is the tell. People who built a thing remember the awkward details.</li>
+<li><strong>Did you understand the alternatives?</strong> "Why this and not that?" — several times, going further each time.</li>
+<li><strong>Do you know what was wrong with it?</strong> A candidate who thinks their design was perfect either did not operate it
+or is not being straight.</li>
+<li><strong>Can you scope?</strong> Can you explain it in three minutes to someone who has never seen it, then go six levels deep
+when asked.</li>
+</ul><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>PREPARE TWO OR THREE PROJECTS. For each, write out:
+
+  CONTEXT        What was the problem, who had it, why did it matter?
+                 Two sentences. No acronyms the interviewer cannot know.
+
+  YOUR PART      What did YOU do, as distinct from the team? Be precise
+                 and honest — &quot;I owned the ingestion path; two others
+                 built the API&quot; is stronger than a vague collective &quot;we&quot;.
+
+  THE DIAGRAM    The whole thing in five boxes, drawable in 90 seconds.
+                 Practise drawing it. You will be asked to.
+
+  DECISIONS      Three real ones, each with: the alternatives you
+                 considered, why you chose, and what it cost you.
+                 This is the core of the round.
+
+  NUMBERS        Scale, latency, throughput, cost, team size, timeline.
+                 Be ready to say how you measured each one.
+
+  THE INCIDENT   Something that broke. What you saw, how you diagnosed
+                 it, what you changed, what you changed PERMANENTLY so
+                 it could not recur.
+
+  REGRETS        Two things you would do differently and why. Have these
+                 ready — the question is near-certain and improvising
+                 it produces either arrogance or waffle.</code></pre><pre data-lang="python" hidden><code>PREPARE TWO OR THREE PROJECTS. For each, write out:
+
+  CONTEXT        What was the problem, who had it, why did it matter?
+                 Two sentences. No acronyms the interviewer cannot know.
+
+  YOUR PART      What did YOU do, as distinct from the team? Be precise
+                 and honest - &quot;I owned the ingestion path; two others
+                 built the API&quot; is stronger than a vague collective &quot;we&quot;.
+
+  THE DIAGRAM    The whole thing in five boxes, drawable in 90 seconds.
+                 Practise drawing it. You will be asked to.
+
+  DECISIONS      Three real ones, each with: the alternatives you
+                 considered, why you chose, and what it cost you.
+                 This is the core of the round.
+
+  NUMBERS        Scale, latency, throughput, cost, team size, timeline.
+                 Be ready to say how you measured each one.
+
+  THE INCIDENT   Something that broke. What you saw, how you diagnosed
+                 it, what you changed, what you changed PERMANENTLY so
+                 it could not recur.
+
+  REGRETS        Two things you would do differently and why. Have these
+                 ready - the question is near-certain and improvising
+                 it produces either arrogance or waffle.</code></pre></div><div class="callout callout-note"><span class="callout-title">Pick the project you can go deepest on, not the most impressive one</span><p>Candidates reliably choose the project with the
+biggest name attached and then run out of depth four questions in. The round rewards depth, not scale. A well-understood internal
+tool you built alone and can discuss to the bottom scores better than a flagship system where your part was one service and you
+cannot answer why the queue was chosen. If the interviewer has to go looking for the edge of your knowledge and finds it quickly,
+that is the result they record — regardless of the logo on the slide.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Two moves. First, <strong>have the three-minute version rehearsed</strong>, because you will be asked to summarise
+before you are asked to go deep, and a rambling ten-minute opener burns a quarter of the round and sets a poor tone. Second,
+<strong>volunteer a limitation early</strong> — "this worked well for our write volume, but it would not have survived another order
+of magnitude, and here is where it would break first." That single sentence demonstrates you understood the system rather than
+operating it, pre-empts the probe, and makes everything else you say more credible. Defensiveness is the failure mode here, and it
+is very visible.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write the full template above for two projects. It takes an hour each and it is the highest-return hour in the whole process at senior level.</li><li>Draw each architecture in 90 seconds, from memory, five times.</li><li>Have someone ask "why not X?" four times in a row about one decision. Notice where you run out of answer; go and find out.</li></ul></div></section>
+
+<section id="behavioural"><h2 id="behavioural">The behavioural round</h2><p>Structured questions about how you work: conflict, failure, influence, ambiguity, priorities. It is a real, separately-scored
+round at every major company, it is where a surprising share of technically strong candidates are rejected, and it is the one
+people prepare for least.</p>
+<p>Companies dress it differently — a published set of leadership principles, a general cognitive-ability-and-culture round, a
+career-history conversation — but the mechanics are the same everywhere: <strong>specific past situations, probed for detail</strong>.
+The probing is the point. Generic answers collapse under one follow-up.</p>
+<p><strong>STAR</strong> is the standard structure and it is worth using because it is what the interviewer is taking notes
+against:</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>S  SITUATION   Context in two sentences. Where, when, what was at stake.
+T  TASK        What specifically was YOUR responsibility in it.
+A  ACTION      What YOU did. The longest part, and it must be &quot;I&quot;, not
+               &quot;we&quot; — the round is assessing you, not your team.
+R  RESULT      What happened, with a number where one exists, plus what
+               you learned or changed afterwards.
+
+BUILD A STORY BANK. Eight to twelve real situations, each written out
+once, each usable for several questions. The point is not to memorise
+answers — it is so you are never searching your memory under pressure.
+
+Cover at minimum:
+  · a conflict with a colleague, and how it resolved
+  · a disagreement with your manager or a senior decision
+  · a failure that was genuinely your fault
+  · a time you missed a deadline, and what you did about it
+  · a hard technical call made with incomplete information
+  · something you shipped that had real measurable impact
+  · a time you changed your mind given new evidence
+  · a time you influenced something without authority
+  · a time you had to say no, or push back on scope
+  · the most difficult thing you have debugged
+
+For each: the facts, the numbers, YOUR part, and the follow-up
+&quot;what would you do differently?&quot; — which is asked almost every time.</code></pre><pre data-lang="python" hidden><code>S  SITUATION   Context in two sentences. Where, when, what was at stake.
+T  TASK        What specifically was YOUR responsibility in it.
+A  ACTION      What YOU did. The longest part, and it must be &quot;I&quot;, not
+               &quot;we&quot; - the round is assessing you, not your team.
+R  RESULT      What happened, with a number where one exists, plus what
+               you learned or changed afterwards.
+
+BUILD A STORY BANK. Eight to twelve real situations, each written out
+once, each usable for several questions. The point is not to memorise
+answers - it is so you are never searching your memory under pressure.
+
+Cover at minimum:
+  · a conflict with a colleague, and how it resolved
+  · a disagreement with your manager or a senior decision
+  · a failure that was genuinely your fault
+  · a time you missed a deadline, and what you did about it
+  · a hard technical call made with incomplete information
+  · something you shipped that had real measurable impact
+  · a time you changed your mind given new evidence
+  · a time you influenced something without authority
+  · a time you had to say no, or push back on scope
+  · the most difficult thing you have debugged
+
+For each: the facts, the numbers, YOUR part, and the follow-up
+&quot;what would you do differently?&quot; - which is asked almost every time.</code></pre></div><div class="callout callout-warn"><span class="callout-title">The failure story is the one that decides it</span><p>"Tell me about a time you failed" is asked almost universally, and the
+common answers both fail. A disguised humblebrag ("I care too much about quality") reads as evasive. A story where the failure was
+someone else's reads worse. What is wanted is a real failure that was genuinely yours, told without flinching, with what you
+understood afterwards and what you <em>changed</em> as a result — and ideally evidence the change stuck. The round is testing
+whether you can look at your own work honestly, because someone who cannot is expensive to work with. Pick a real one and practise
+telling it until it is comfortable.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Three mechanics that matter more than the content. <strong>Use "I" not "we"</strong> — the single most common
+scoring complaint is that the interviewer could not tell what the candidate personally did. <strong>Keep each answer to about two
+minutes</strong> and then stop; they will probe where they want more, and probing is good, but a five-minute monologue gets one
+story into a slot that could have held three. <strong>Have numbers.</strong> "It got much faster" is a story; "p99 went from 800ms
+to 120ms and the on-call pages for that service went to zero" is evidence. Finally, be aware that this site does not yet have a
+section devoted to this round — if you are short on preparation time and you have never written a story bank, writing one is almost
+certainly a better use of two hours than another ten algorithm problems.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write the full story bank. Ten stories, STAR structure, numbers included. This is the single most neglected and highest-return preparation task in the whole process.</li><li>For each story, write the "what would you do differently?" answer. It is asked nearly every time.</li><li>Say three of them out loud on a timer. Cut each to two minutes.</li></ul></div></section>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Loop structures and processes change — confirm specifics with your recruiter.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

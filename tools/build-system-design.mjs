@@ -45,7 +45,7 @@ const NO_MERMAID = ARGS.has('--no-mermaid');
 const QUIET = ARGS.has('--quiet');
 
 const SITE_TITLE = 'System Design';
-const SITE_SUBTITLE = 'Alex Xu Vol 1 & 2 · 28 chapters';
+const SITE_SUBTITLE = 'Alex Xu Vol 1 & 2 · 28 chapters + fundamentals';
 
 /* Relative path from SystemDesign/chapters/*.html back to the notes folder,
    used for images. Spaces are percent-encoded so file:// is happy. */
@@ -88,6 +88,27 @@ function makeSlugger() {
 /* ==========================================================================
    2. Chapter discovery
    ========================================================================== */
+/* Standalone pages that live at the notes root rather than in a numbered
+   chapter folder. Each names the group it belongs to and the breadcrumb
+   position to show; order within a group follows this array. Add a file here
+   and it is picked up — nothing else in the build needs to change. */
+const ROOT_PAGES = [
+  { file: 'Patterns.md', slug: 'patterns', group: 'foundations', position: 'Patterns index' },
+  { file: 'Fundamentals-Consistency.md', slug: 'fundamentals-consistency', group: 'fundamentals', position: 'Fundamentals 1 of 4' },
+  { file: 'Fundamentals-Replication.md', slug: 'fundamentals-replication', group: 'fundamentals', position: 'Fundamentals 2 of 4' },
+  { file: 'Fundamentals-Time-And-Order.md', slug: 'fundamentals-time-and-order', group: 'fundamentals', position: 'Fundamentals 3 of 4' },
+  { file: 'Fundamentals-Storage-Engines.md', slug: 'fundamentals-storage-engines', group: 'fundamentals', position: 'Fundamentals 4 of 4' },
+];
+
+/* Which group a numbered chapter belongs to. Kept here so the sidebar, the
+   breadcrumb and the dashboard can never disagree about it. */
+function chapterGroup(num) {
+  if (num <= 3) return 'foundations';
+  if (num <= 7) return 'building-blocks';
+  if (num <= 15) return 'volume-1';
+  return 'volume-2';
+}
+
 function discover() {
   const dirs = fs.readdirSync(NOTES, { withFileTypes: true })
     .filter((d) => d.isDirectory() && /^\d+\./.test(d.name))
@@ -109,19 +130,28 @@ function discover() {
       mdPath: path.join(NOTES, dir, mdName),
       slug,
       out: `${slug}.html`,
+      group: chapterGroup(num),
+      position: null,            // filled in once the chapter count is known
     };
   });
 
-  const patterns = {
-    kind: 'page',
-    num: 0,
-    dir: null,
-    mdPath: path.join(NOTES, 'Patterns.md'),
-    slug: 'patterns',
-    out: 'patterns.html',
-  };
+  const extras = ROOT_PAGES
+    .filter((e) => fs.existsSync(path.join(NOTES, e.file)))
+    .map((e) => ({
+      kind: 'page',
+      num: 0,
+      dir: null,
+      mdPath: path.join(NOTES, e.file),
+      slug: e.slug,
+      out: `${e.slug}.html`,
+      group: e.group,
+      position: e.position,
+    }));
 
-  return { chapters, patterns };
+  const missing = ROOT_PAGES.filter((e) => !fs.existsSync(path.join(NOTES, e.file)));
+  for (const m of missing) warn(`  ! root page not found, skipping: ${m.file}`);
+
+  return { chapters, extras };
 }
 
 /* ==========================================================================
@@ -321,7 +351,7 @@ function escapeHtml(s) {
      ../05. Consistent Hashing/              -> 05-consistent-hashing.html
      ../05. Consistent Hashing/#anchor       -> 05-consistent-hashing.html#anchor
      ./28. Stock Exchange/                   -> 28-stock-exchange.html   (root Readme)
-     ./Patterns.md                           -> patterns.html
+     ./Patterns.md, ./Fundamentals-*.md       -> <slug>.html  (ROOT_PAGES)
      #anchor                                 -> unchanged
      https://…                               -> unchanged, opened in a new tab
    ========================================================================== */
@@ -340,7 +370,9 @@ function rewriteHref(raw, ctx) {
 
   const bare = target.replace(/^\.\.?\//, '').replace(/\/+$/, '');
 
-  if (/^patterns\.md$/i.test(bare)) return { href: `patterns.html${anchor}`, internal: true };
+  // Any root-level page from the ROOT_PAGES registry, matched on its filename.
+  const rootPage = ROOT_PAGES.find((e) => e.file.toLowerCase() === bare.toLowerCase());
+  if (rootPage) return { href: `${rootPage.slug}.html${anchor}`, internal: true };
 
   // "05. Consistent Hashing" or "05. Consistent Hashing/Readme.md"
   const dirPart = bare.replace(/\/?(readme\.md)$/i, '');
@@ -642,25 +674,26 @@ const GROUP_DEFS = [
     id: 'foundations',
     label: 'Foundations',
     blurb: 'The scaling story, the estimation maths and the interview process itself. Read these first — every chapter after them assumes this vocabulary.',
-    match: (e) => e.slug === 'patterns' || (e.num >= 1 && e.num <= 3),
+  },
+  {
+    id: 'fundamentals',
+    label: 'Distributed Fundamentals',
+    blurb: 'The theory the designs assume: what a consistency guarantee actually promises, how replicas agree, why ordering needs clocks you cannot trust, and what a storage engine trades away. Not in the book — these are the follow-up questions the designs attract.',
   },
   {
     id: 'building-blocks',
     label: 'Building Blocks',
     blurb: 'Four mechanisms that reappear inside almost every system later in the book. Technique chapters rather than design chapters.',
-    match: (e) => e.num >= 4 && e.num <= 7,
   },
   {
     id: 'volume-1',
     label: 'Volume 1 Systems',
     blurb: 'The classic end-to-end designs: shorteners, crawlers, feeds, chat, video and file sync.',
-    match: (e) => e.num >= 8 && e.num <= 15,
   },
   {
     id: 'volume-2',
     label: 'Volume 2 Systems',
     blurb: 'The harder half — geospatial search, streaming aggregation, money, storage and exchanges, where correctness under failure is the whole problem.',
-    match: (e) => e.num >= 16 && e.num <= 28,
   },
 ];
 
@@ -670,7 +703,7 @@ function writeCurriculum(entries) {
     label: g.label,
     blurb: g.blurb,
     topics: entries
-      .filter(g.match)
+      .filter((e) => e.group === g.id)
       .map((e) => ({
         id: e.slug,
         label: e.label,
@@ -801,9 +834,10 @@ function writeDashboard(curriculum, counts) {
 
   <h1>${escapeHtml(SITE_TITLE)}</h1>
   <p class="lede">A self-paced study site built from the <strong>System Design Interview — An Insider's Guide (Vol 1 &amp; 2)</strong>
-  notes in this repository. ${counts.chapters} chapters plus a patterns index, ${counts.sections} sections,
-  ${counts.images} diagrams and ${counts.mermaidInlined} rendered flow diagrams — all generated straight from the
-  markdown, so the notes stay the single source of truth. Pages you have opened turn
+  notes in this repository, plus a <strong>Distributed Fundamentals</strong> group covering the theory the designs assume —
+  consistency models, replication and consensus, time and ordering, and storage engines. ${counts.chapters} chapters plus
+  ${counts.extras} standalone pages, ${counts.sections} sections, ${counts.images} diagrams and ${counts.mermaidInlined} rendered
+  flow diagrams — all generated straight from the markdown, so the notes stay the single source of truth. Pages you have opened turn
   <span class="badge badge-visited">✓ visited</span>.</p>
 
   <div class="storage-banner"></div>
@@ -896,6 +930,20 @@ function writeDashboard(curriculum, counts) {
 /* The DotNet site is hand-authored, but its topic count is advertised on the
    root landing page. Read it from that site's own curriculum rather than
    hardcoding a number here that goes stale the moment a topic is added. */
+/* Read any sibling site's curriculum.js the way the browser does, so the root
+   landing's counts can never drift from the sites themselves. */
+function siteCounts(siteDir) {
+  const file = path.join(ROOT, siteDir, 'assets', 'js', 'curriculum.js');
+  if (!fs.existsSync(file)) return null;
+  const w = {};
+  new Function('window', fs.readFileSync(file, 'utf8'))(w);   // only assigns window.CURRICULUM
+  const topics = w.CURRICULUM.topics;
+  return {
+    topics: topics.length,
+    sections: topics.reduce((n, t) => n + (t.sections?.length ?? 0), 0),
+  };
+}
+
 function dotnetTopicCount() {
   const src = fs.readFileSync(path.join(DOTNET_ASSETS, 'js', 'curriculum.js'), 'utf8');
   const w = {};
@@ -904,7 +952,43 @@ function dotnetTopicCount() {
 }
 
 function writeRootLanding(counts) {
-  const dotnetTopics = dotnetTopicCount();
+  /* Every card below is only emitted if that site actually exists, so adding
+     or removing a study site needs no edit here. */
+  const dotnet = siteCounts('DotNet');
+  const dsa = siteCounts('DSA');
+  const lld = siteCounts('LLD');
+  const playbook = siteCounts('Playbook');
+
+  const cards = [
+    dotnet && {
+      cls: '', href: 'DotNet/index.html', title: 'C# &amp; .NET',
+      blurb: 'The language core through threading, Web API, security, data access and patterns, then the Azure platform and the DevOps practice that ships it. Every sample paired with Python.',
+      meta: `${dotnet.topics} topics · C# | Python tabs`,
+    },
+    {
+      cls: ' sd', href: 'SystemDesign/index.html', title: 'System Design',
+      blurb: "Alex Xu's Insider's Guide, Volumes 1 and 2 — the scaling story, the recurring building blocks, and 28 end-to-end designs from URL shorteners to stock exchanges, plus the distributed-systems theory they assume.",
+      meta: `${counts.chapters} chapters · ${counts.sections} sections · ${counts.animations} interactive explainers`,
+    },
+    dsa && {
+      cls: ' dsa', href: 'DSA/index.html', title: 'DSA',
+      blurb: 'The coding round: how to run the 45 minutes and read Big-O out loud, then one page per pattern — windows, hashing, monotonic stacks, binary search, trees, graphs, dynamic programming and backtracking — each with its canonical problems.',
+      meta: `${dsa.topics} topics · ${dsa.sections} sections · C# | Python tabs`,
+    },
+    lld && {
+      cls: ' lld', href: 'LLD/index.html', title: 'LLD',
+      blurb: 'The low-level design round: how it is scored and how to run its clock, the patterns that answer almost every prompt, then five designs worked end to end with their concurrency stories and follow-ups.',
+      meta: `${lld.topics} topics · ${lld.sections} sections · C# | Python tabs`,
+    },
+    playbook && {
+      cls: ' pb', href: 'Playbook/index.html', title: 'Interview Playbook',
+      blurb: 'The process layer: what each company\u2019s loop actually contains and how each round is scored, levels and what they expect, a twelve-week plan across all four tracks, and the offer stage.',
+      meta: `${playbook.topics} topics · ${playbook.sections} sections`,
+    },
+  ].filter(Boolean);
+
+  const siteWord = ['', 'One', 'Two', 'Three', 'Four', 'Five', 'Six'][cards.length] ?? String(cards.length);
+
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -920,6 +1004,9 @@ function writeRootLanding(counts) {
     border-radius: var(--radius); padding: 1.25rem; background: var(--surface); text-decoration: none; color: inherit; }
   .path-card:hover { border-color: var(--border-strong); box-shadow: 0 2px 10px rgba(22,28,36,.07); }
   .path-card.sd { border-top-color: var(--accent); }
+  .path-card.dsa { border-top-color: var(--success); }
+  .path-card.lld { border-top-color: var(--warning, #b7791f); }
+  .path-card.pb { border-top-color: var(--danger, #c53030); }
   .path-card h2 { margin: 0 0 .4rem; font-size: 1.15rem; }
   .path-card p { margin: 0 0 .9rem; font-size: .9rem; color: var(--text-muted); }
   .path-card .meta { margin-top: auto; font-size: .78rem; color: var(--text-faint); }
@@ -929,23 +1016,21 @@ function writeRootLanding(counts) {
 <div class="layout">
 <main class="main">
   <h1>Learning Path</h1>
-  <p class="lede">Two self-paced study sites, both offline-first and both storing their progress separately in this browser.</p>
+  <p class="lede">${siteWord} self-paced study sites, all offline-first and each storing its progress separately in this browser.
+  Between them they cover the four rounds a big-tech loop is made of — coding, low-level design, system design and the process
+  around them.</p>
 
   <div class="path-cards">
-    <a class="path-card" href="DotNet/index.html">
-      <h2>C# &amp; .NET →</h2>
-      <p>The language core through threading, Web API, security, data access and patterns, then the Azure platform and the DevOps practice that ships it. Every sample paired with Python.</p>
-      <span class="meta">${dotnetTopics} topics · C# | Python tabs</span>
-    </a>
-    <a class="path-card sd" href="SystemDesign/index.html">
-      <h2>System Design →</h2>
-      <p>Alex Xu's Insider's Guide, Volumes 1 and 2 — the scaling story, the recurring building blocks, and 28 end-to-end designs from URL shorteners to stock exchanges.</p>
-      <span class="meta">${counts.chapters} chapters · ${counts.sections} sections · ${counts.animations} interactive explainers</span>
-    </a>
+${cards.map((c) => `    <a class="path-card${c.cls}" href="${c.href}">
+      <h2>${c.title} →</h2>
+      <p>${c.blurb}</p>
+      <span class="meta">${c.meta}</span>
+    </a>`).join('\n')}
   </div>
 
-  <p class="footer-note">Both sites are static and work offline over <code>file://</code>. The System Design site is generated from
-  <code>system-design-notes/</code> by <code>tools/build-system-design.mjs</code>; the markdown stays the source of truth.</p>
+  <p class="footer-note">All of these are static and work offline over <code>file://</code>. The System Design site is generated from
+  <code>system-design-notes/</code> by <code>tools/build-system-design.mjs</code>; the markdown stays the source of truth, and this
+  landing page is generated by the same script.</p>
 </main>
 </div>
 </body>
@@ -965,9 +1050,16 @@ async function main() {
     fs.mkdirSync(path.join(OUT, d), { recursive: true });
   }
 
-  const { chapters, patterns } = discover();
-  const entries = [patterns, ...chapters];
-  log(`  discovered ${chapters.length} chapters + Patterns.md`);
+  const { chapters, extras } = discover();
+  for (const c of chapters) c.position = `Chapter ${c.num} of ${chapters.length}`;
+
+  /* Build order follows GROUP_DEFS, so prev/next in the pager walks the
+     sidebar in the order it is displayed. */
+  const entries = GROUP_DEFS.flatMap((g) => [
+    ...extras.filter((e) => e.group === g.id),
+    ...chapters.filter((c) => c.group === g.id),
+  ]);
+  log(`  discovered ${chapters.length} chapters + ${extras.length} root pages`);
 
   // folder name -> output slug, for cross-chapter link rewriting
   const dirToSlug = new Map();
@@ -999,14 +1091,8 @@ async function main() {
   // pass 2: build each page
   const built = [];
   for (const entry of entries) {
-    const isPatterns = entry.slug === 'patterns';
-    const groupLabel = isPatterns ? 'Foundations'
-      : entry.num <= 3 ? 'Foundations'
-      : entry.num <= 7 ? 'Building Blocks'
-      : entry.num <= 15 ? 'Volume 1 Systems'
-      : 'Volume 2 Systems';
-
-    const position = isPatterns ? 'Patterns index' : `Chapter ${entry.num} of ${chapters.length}`;
+    const groupLabel = GROUP_DEFS.find((g) => g.id === entry.group)?.label ?? '';
+    const position = entry.position ?? '';
     const meta = {
       label: entry.slug,
       breadcrumb: `<a href="../index.html">Dashboard</a> › ${escapeHtml(groupLabel)} › ${escapeHtml(position)}`,
@@ -1028,6 +1114,7 @@ async function main() {
   const curriculum = writeCurriculum(built);
   const counts = {
     chapters: chapters.length,
+    extras: extras.length,
     sections: stats.sections,
     images: stats.images,
     mermaidInlined: stats.mermaidInlined,
@@ -1040,7 +1127,7 @@ async function main() {
   const problems = checkLinks(shared);
 
   log('\n--- report -------------------------------------------------');
-  log(`  pages            ${built.length} (${chapters.length} chapters + patterns + dashboard + root landing)`);
+  log(`  pages            ${built.length} (${chapters.length} chapters + ${extras.length} root pages + dashboard + root landing)`);
   log(`  sections         ${stats.sections}`);
   log(`  images rewritten ${stats.images}${stats.missingImages.length ? `  (${stats.missingImages.length} MISSING)` : ''}`);
   log(`  mermaid          ${stats.mermaidInlined}/${stats.mermaidSeen} inlined  (${fresh} rendered, ${cached} from cache)`);

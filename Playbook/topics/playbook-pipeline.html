@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Before the Loop — Interview Playbook</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="playbook-pipeline">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › The process › Topic 1 of 5</div>
+  <h1>Before the Loop</h1>
+  <p class="lede">The filters that come before the onsite — application, referral, recruiter screen, online assessment — each of which rejects people for reasons unrelated to how they would do in the loop. What each one is really checking, and the four questions that make the recruiter screen pay for itself.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#shape">The shape of the pipeline</a></li><li><a href="#resume">The résumé and the referral</a></li><li><a href="#screen">The recruiter screen</a></li><li><a href="#oa">Online assessments</a></li></ol>
+  </div>
+
+<section id="shape"><h2 id="shape">The shape of the pipeline</h2><p>Before the onsite there are three or four filters, and each one fails candidates for reasons that have nothing to do with how
+well they would do in the loop. They are worth understanding because they are cheap to pass once you know what they are checking.</p><div class="table-wrap"><table><thead><tr><th>Stage</th><th>Who decides</th><th>What it is actually filtering for</th><th>Typical duration</th></tr></thead><tbody><tr><td><strong>Application / referral</strong></td><td>Recruiter or a sourcing tool</td><td>Does the résumé match the req on keywords and level</td><td>Days to weeks</td></tr><tr><td><strong>Recruiter screen</strong></td><td>Recruiter</td><td>Are you real, available, roughly the right level, and not wildly off on comp</td><td>20–30 min</td></tr><tr><td><strong>Online assessment</strong></td><td>Automated</td><td>Can you code at all, under a timer, unaided</td><td>60–120 min</td></tr><tr><td><strong>Phone / technical screen</strong></td><td>An engineer</td><td>Would a full loop be worth five engineers' time</td><td>45–60 min</td></tr><tr><td><strong>Onsite loop</strong></td><td>4–6 engineers</td><td>Everything — see <a href="playbook-loop.html">the next page</a></td><td>4–6 hours</td></tr></tbody></table></div><p>Not every company runs all of these, and the order varies. The two generalisations that hold almost everywhere: the
+<strong>recruiter screen is not a technical filter</strong> and you should stop treating it as one, and the
+<strong>phone screen is scored on the same rubric as an onsite coding round</strong>, just with a lower bar for how much you finish.</p><div class="callout callout-warn"><span class="callout-title">Everything on this page is a moving target</span><p>Loop structures, assessment formats and even round counts change — companies
+reorganise, teams run variants, and what was true for a friend last year may not be true for your req. Treat this page as the
+<em>shape</em> to expect, and then <strong>ask your recruiter for the specifics</strong>. That question is completely normal, they
+answer it routinely, and the answer is the single highest-value piece of information you will get in the whole process. Ask it in
+the screen, and ask again before the onsite is scheduled.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The thing most candidates get wrong at this stage is <strong>treating the recruiter as an obstacle rather than the
+best-informed ally they have</strong>. Recruiters are measured on candidates who get offers; they want you to pass. They will tell
+you the loop structure, which rounds are weighted heaviest, what level the req is open at, often what language is expected, and
+sometimes who is interviewing you. Ask all of it, politely and directly, in one message. Candidates who go in blind are competing
+against candidates who did not.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write the four questions you will ask your recruiter before any onsite. Keep them in a file so you never have to think of them under pressure.</li></ul></div></section>
+
+<section id="resume"><h2 id="resume">The résumé and the referral</h2><p>The résumé's only job at this stage is to not get filtered. It is read in well under a minute, by someone who is not an
+engineer, against a requisition. Optimise for that reader.</p>
+<ul>
+<li><strong>One page</strong> unless you have a decade-plus of relevant work, and then two. Nobody reads the third.</li>
+<li><strong>Bullets are outcomes, not duties.</strong> "Responsible for the payments service" says nothing. "Cut payment
+authorisation p99 from 1.2s to 310ms by replacing a synchronous fraud check with an async pipeline, unblocking a 40% traffic
+increase" says what you did, how, and what it was worth.</li>
+<li><strong>Numbers everywhere you can honestly put them.</strong> Latency, throughput, cost, error rate, team size, revenue.
+Unquantified bullets read as unverifiable.</li>
+<li><strong>Technology names matter at this stage</strong>, because the first pass is keyword-shaped. If the req says Kubernetes and
+you have run Kubernetes, the word should be on the page.</li>
+<li><strong>No skills bar charts, no photo, no "references available".</strong> They cost space and signal inexperience.</li>
+</ul><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>BEFORE
+  • Worked on the notifications team.
+  • Responsible for improving system performance.
+  • Used C#, .NET, Azure, SQL Server.
+
+AFTER
+  • Rebuilt notification fan-out as a queue-backed worker pool, cutting
+    p99 delivery from 45s to 2.1s and absorbing a 6x Black Friday peak
+    with no added capacity.
+  • Found and fixed an N+1 in the subscription query that accounted for
+    38% of database CPU; cut monthly Azure SQL spend by ~$7k.
+  • Led the migration of 14 services from .NET Framework to .NET 8,
+    writing the shared migration guide the other three teams used.
+
+The pattern:  &lt;what you did&gt; + &lt;how&gt; + &lt;the number it moved&gt;.
+If you cannot name the number, it is usually not a résumé bullet.</code></pre><pre data-lang="python" hidden><code>BEFORE
+  • Worked on the notifications team.
+  • Responsible for improving system performance.
+  • Used Python, Django, AWS, Postgres.
+
+AFTER
+  • Rebuilt notification fan-out as a queue-backed worker pool, cutting
+    p99 delivery from 45s to 2.1s and absorbing a 6x Black Friday peak
+    with no added capacity.
+  • Found and fixed an N+1 in the subscription query that accounted for
+    38% of database CPU; cut monthly RDS spend by ~$7k.
+  • Led the migration of 14 services off Python 2, writing the shared
+    migration guide the other three teams used.
+
+The pattern:  &lt;what you did&gt; + &lt;how&gt; + &lt;the number it moved&gt;.
+If you cannot name the number, it is usually not a résumé bullet.</code></pre></div><div class="callout callout-note"><span class="callout-title">Referrals are worth more than the résumé</span><p>A referral does not get you hired, but it reliably gets you <em>read</em> — and
+at the application stage, being read is most of the battle. Ask people you have actually worked with; a referral from someone who
+can write two honest sentences about you is worth more than one from an acquaintance clicking a button. If you do not know anyone,
+a short, specific message to someone on the team ("I saw your talk on X, I have been working on Y, would you be open to referring
+me?") works more often than people expect — referral bonuses mean you are asking them to do something they are paid for.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Every bullet on your résumé is a potential forty-minute conversation in the
+<a href="playbook-loop.html#deep-dive">project deep-dive round</a>, so <strong>do not write anything you cannot defend in
+depth</strong>. If a bullet says you designed something, expect "what were the alternatives, and why did you reject them?" If it
+claims a number, expect "how did you measure that?" The strongest résumés are slightly <em>under</em>-claimed, because the
+interviewer's job is to probe until they find the edge of what you actually did, and finding that edge early and honestly is much
+better than being caught overstating.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Rewrite your three weakest bullets with a number in each. If you cannot find one, go and measure it, or cut the bullet.</li><li>For every bullet, write the follow-up question you would ask if you were the interviewer. Answer it out loud.</li></ul></div></section>
+
+<section id="screen"><h2 id="screen">The recruiter screen</h2><p>Twenty minutes, non-technical, and it filters more people than it should. What is actually being checked is mundane: that you
+are genuinely interested, that you are available on a timeline that fits the req, that your level expectation is roughly
+realistic, and that you will not be a problem to schedule.</p>
+<p>It is also the only stage where <strong>you</strong> get to gather information cheaply. The four questions worth asking, every
+time:</p>
+<ol>
+<li><strong>"What does the loop look like — how many rounds, and what is each one?"</strong> You will be told. This is the single
+most useful thing you can learn.</li>
+<li><strong>"What level is this req open at, and is there flexibility?"</strong> Determines everything about how you should prepare
+and what the bar will be. See <a href="playbook-levels.html">levels</a>.</li>
+<li><strong>"Is there a language requirement, or can I use whichever I am strongest in?"</strong> Most companies are
+language-agnostic for coding rounds; a few are not. Worth knowing before you practise in the wrong one.</li>
+<li><strong>"What is the timeline, and is there anything I should prepare specifically?"</strong> Sometimes produces genuinely
+useful guidance.</li>
+</ol><div class="callout callout-warn"><span class="callout-title">The compensation question</span><p>You will probably be asked what you are currently paid or what you are looking for. In several
+US states and some other jurisdictions asking for salary history is restricted, and you are never obliged to volunteer it anywhere.
+The standard, friendly deflection is to redirect to the <em>range for the role</em>: "I would rather understand the band for this
+level first — what range is budgeted?" If pressed for a number, give a researched range for the level and market rather than your
+current figure, and say it is based on the level. Anchoring on your current salary is how underpaid people stay underpaid; the
+detail and the reasoning belong on the <a href="playbook-offer.html">offer page</a>, but the moment that decides it is
+<em>here</em>.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The mistake to avoid is treating this as a formality and showing up vague. "I'm just exploring" and "I'd be open to
+anything" read as uncommitted, and recruiters are triaging. Have one honest sentence about why <em>this</em> company and
+<em>this</em> team — it does not need to be profound, it needs to be specific — and a clear answer on timeline. Then spend the rest
+of the call asking your four questions. A screen where you learned the loop structure, the level and the timeline is a screen that
+paid for itself.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write your one-sentence "why this company" for your top three targets.</li><li>Rehearse the compensation deflection out loud until it sounds relaxed rather than evasive. It is a scripted moment; script it.</li></ul></div></section>
+
+<section id="oa"><h2 id="oa">Online assessments</h2><p>An automated, timed coding test taken unsupervised or lightly supervised, typically one to three problems in 60–120 minutes,
+auto-graded on hidden tests. Some companies attach extra components — a work-style or situational-judgement questionnaire, or a
+short work-simulation exercise — which are not auto-graded on correctness in the same way but do get looked at.</p>
+<p>The OA is a different skill from the interview and should be practised differently:</p>
+<ul>
+<li><strong>It is graded on passing tests, not on explanation.</strong> Nobody hears your reasoning. A working brute force that
+passes is worth more than an elegant solution that does not compile.</li>
+<li><strong>Edge cases are the whole game.</strong> Hidden tests are where people lose. Empty input, a single element, duplicates,
+the maximum constraint, integer overflow. Write those checks before you optimise.</li>
+<li><strong>Read all the problems first</strong>, then do the easiest. Time spent stuck on problem one while problem three was
+twenty minutes of work is the most common way to fail.</li>
+<li><strong>Know your language's I/O.</strong> Some platforms require you to parse stdin yourself, and burning ten minutes on
+input parsing is a miserable way to lose.</li>
+<li><strong>Watch the constraints.</strong> They tell you the intended complexity — the table on the
+<a href="../../DSA/topics/dsa-recursion-dp.html#bitmask-trees">DP page</a> maps constraint sizes to expected solutions, and it is
+directly applicable here.</li>
+</ul><div class="callout callout-note"><span class="callout-title">On integrity</span><p>Many assessments are proctored, recorded, or paired with a later interview where you are asked to explain
+the code you submitted. Beyond that, the practical argument is simple: an OA score that does not reflect what you can do under
+observation buys you a loop you will then fail, having spent your one shot at that company and usually triggering a cooldown period
+before you can reapply. The assessment is not the prize.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The structural advice that helps most: <strong>spend the first five minutes not coding</strong>. Read every problem,
+rank them by how quickly you can get something passing, and start with the cheapest. Then for each one, write the brute force
+first, run it against the examples, and only then optimise — because a submitted brute force that passes some tests scores, and an
+unfinished optimal solution does not. This is the opposite of the advice for a live interview, where your reasoning is the product.
+Knowing that the two formats reward different behaviour is itself the insight.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take three timed mock assessments under real conditions — no pausing, no lookups. The time pressure is the thing being trained.</li><li>Write your language's competitive-programming I/O boilerplate once and memorise it.</li><li>For your last five practice problems, list the edge cases you missed. That list is your personal pre-submit checklist.</li></ul></div></section>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Loop structures and processes change — confirm specifics with your recruiter.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

@@ -27,6 +27,16 @@ Every chapter has been expanded beyond a plain summary of the book, using a few 
 - [Chapter 3 – A Framework For System Design Interviews](./03.%20System%20Design%20Framework/) — the process, and a one-page cheat sheet.
 - [Chapter 2 – Back-of-the-envelope Estimation](./02.%20Back%20Of%20the%20Envelope%20Estimation/) — powers of two, latency numbers, and the estimation recipe.
 
+## Distributed Fundamentals
+
+Not from the book. These four pages cover the theory the designs above assume but rarely state — the material the
+"what happens when a region goes down?" follow-up actually lands in.
+
+- [Consistency Models, CAP and PACELC](Fundamentals-Consistency.md) — what each guarantee promises, CAP stated correctly, and the half of the trade-off CAP leaves out.
+- [Replication, Quorums and Consensus](Fundamentals-Replication.md) — leader-based replication and failover, what `R + W > N` does and does not buy, Raft, and leases.
+- [Time, Ordering and Idempotency](Fundamentals-Time-And-Order.md) — why wall clocks are not an ordering mechanism, Lamport and vector clocks, exactly-once as at-least-once plus idempotency, and event time versus processing time.
+- [Storage Engines](Fundamentals-Storage-Engines.md) — write-ahead logs, B-trees versus LSM trees, compaction strategies, and the three amplifications.
+
 ## Chapters
 
  * [Chapter 1 - Scale From Zero To Millions Of Users](./01.%20Scaling/)

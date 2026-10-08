@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The LLD Round — Low-Level Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="lld-round">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Foundations › Topic 1 of 7</div>
+  <h1>The LLD Round</h1>
+  <p class="lede">Machine coding, object-oriented design, "design a parking lot" — a separate interview from system design, with its own rubric and its own clock. How to run the 45 minutes, which questions change the design, how nouns become classes with real invariants, and the failure modes that actually sink candidates.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#what-is-graded">What the round actually is, and what it grades</a></li><li><a href="#the-clock">Running the 45 minutes</a></li><li><a href="#requirements">Clarifying: the questions that change the design</a></li><li><a href="#nouns-to-classes">From nouns to classes: responsibilities and invariants</a></li><li><a href="#diagram">The diagram: what to draw, and how little is enough</a></li><li><a href="#common-mistakes">The failure modes, and what to do instead</a></li></ol>
+  </div>
+
+<section id="what-is-graded"><h2 id="what-is-graded">What the round actually is, and what it grades</h2><p>The low-level design round — also called machine coding, object-oriented design, or just "design a parking lot" — gives you a
+small, familiar real-world system and 45 to 60 minutes to turn it into classes. It is a separate interview from system design, and
+confusing the two is the fastest way to fail it.</p>
+<p><strong>System design asks how the system survives scale and failure</strong>: how many machines, which datastore, what happens
+when a region goes down. <strong>LLD asks how the code is shaped</strong>: what the types are, who owns what, which interface absorbs
+the change the interviewer is about to ask for. Nobody wants to hear about sharding in an LLD round, and nobody wants a class
+diagram in a system design round.</p>
+<p>What is being graded, in roughly descending order of weight:</p><div class="table-wrap"><table><thead><tr><th>Signal</th><th>What it looks like when present</th><th>What it looks like when absent</th></tr></thead><tbody><tr><td><strong>Requirements discipline</strong></td><td>You ask what is in and out of scope, and write the list down before coding</td><td>You start typing at minute one and build the wrong thing</td></tr><tr><td><strong>Modelling</strong></td><td>Nouns become classes, each with one clear responsibility and real invariants</td><td>One god class, or anaemic data bags with all the logic outside them</td></tr><tr><td><strong>Interfaces at the seams</strong></td><td>The parts the interviewer will want to vary are behind abstractions</td><td>Every policy hard-coded in an <code>if</code>/<code>switch</code></td></tr><tr><td><strong>Working code</strong></td><td>It compiles, it runs the happy path, names read like the domain</td><td>Pseudocode, or a diagram with no implementation</td></tr><tr><td><strong>Extensibility under fire</strong></td><td>A new requirement is a new class, not an edit to five existing ones</td><td>Every follow-up requires surgery across the design</td></tr><tr><td><strong>Concurrency and edge cases</strong></td><td>You name the races and say how you handle them</td><td>Silent assumption of a single thread</td></tr></tbody></table></div><p>The last row is where mid-level and senior candidates separate. Two people submit a working design; one of them said "two
+threads can take the last spot, so the allocation has to be atomic" and the other did not.</p><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The most common failure in this round is not a bad design — it is <strong>running out of time</strong>. Candidates
+spend twenty minutes on a beautiful class diagram and have fifteen lines of code when the hour ends. Budget explicitly and say the
+budget out loud: "I will spend five minutes on requirements, ten on the model, then write code and keep talking." An interviewer who
+hears that knows you have done this before, and it also gives them a natural place to redirect you if your priorities are wrong for
+their rubric. Ask early which they want more of — a complete model or running code — because companies genuinely differ, and the
+question is free.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write down, from memory, the six things above that are being graded. If you cannot produce them in a room, you cannot aim at them.</li><li>Take any design you have previously written at work and ask: which <code>if</code> statements would become new classes if the requirement varied?</li></ul></div></section>
+
+<section id="the-clock"><h2 id="the-clock">Running the 45 minutes</h2><p>A timetable you can actually hold in your head. The exact minutes do not matter; the ordering does, and so does never letting
+any phase run long.</p><div class="table-wrap"><table><thead><tr><th>Minutes</th><th>Phase</th><th>What you produce</th></tr></thead><tbody><tr><td>0–5</td><td><strong>Clarify</strong></td><td>A written, agreed list of in-scope use cases and explicit non-goals</td></tr><tr><td>5–10</td><td><strong>Model</strong></td><td>Entities, their responsibilities, and the relationships between them</td></tr><tr><td>10–15</td><td><strong>Interfaces</strong></td><td>The two or three seams where behaviour will vary, named</td></tr><tr><td>15–40</td><td><strong>Code</strong></td><td>The core classes, the main flow, compiling and talking as you go</td></tr><tr><td>40–45</td><td><strong>Harden</strong></td><td>Concurrency, edge cases, how you would test it, what you left out</td></tr></tbody></table></div><h3>0–5 · Clarify</h3>
+<p>Ask the questions whose answers change the design, and skip the ones that do not. For a parking lot: how many vehicle types,
+does pricing vary by type or duration, is there one entrance or many, do we assign a specific spot or just a spot. Not: what colour
+is the sign. Write the answers somewhere visible and <strong>state the non-goals explicitly</strong> — "I am not going to model
+payments beyond an interface" is a legitimate, time-saving move as long as you say it.</p>
+<h3>5–10 · Model</h3>
+<p>Underline the nouns in the requirements; they are your candidate classes. Underline the verbs; they are your methods, and they
+tell you which class each belongs on. Then do one pass asking <strong>"what must always be true?"</strong> — those are the invariants,
+and an invariant is what justifies a class existing rather than being a struct of public fields.</p>
+<h3>10–15 · Interfaces</h3>
+<p>Ask yourself what the interviewer will change in twenty minutes. Pricing. Allocation strategy. Notification channel. Each of those
+becomes an interface <em>now</em>, with one implementation. This is the single highest-return five minutes in the round, because the
+follow-up question is coming and you will either add a class or rewrite the core.</p>
+<h3>15–40 · Code</h3>
+<p>Write top-down: the entry-point class first, so the shape of the whole thing is visible early, then fill in the collaborators.
+Keep narrating. If you are stuck on a detail, stub it with a comment and move on — a complete skeleton beats one perfect class.</p>
+<h3>40–45 · Harden</h3>
+<p>Volunteer the weaknesses before you are asked: where the races are, what happens on invalid input, what you would test first,
+what you deliberately left out. Finishing by naming your own design's limits reads as judgement, not as doubt.</p><div class="callout callout-warn"><span class="callout-title">The three clock-killers</span><ol>
+<li><strong>Perfecting the diagram.</strong> It is a thinking aid, not a deliverable. Ten minutes, maximum.</li>
+<li><strong>Writing getters and setters.</strong> Nobody is grading boilerplate. Say "assume properties" and move on.</li>
+<li><strong>Designing the database.</strong> Unless asked, persistence is an interface with one method. Do not write SQL.</li>
+</ol></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Say your plan in the first minute and then visibly follow it — it converts a vague hour into something the interviewer
+can follow and score. When you hit the coding phase, start with the class that represents the <em>whole system</em>
+(<code>ParkingLot</code>, <code>ElevatorController</code>, <code>VendingMachine</code>) and write its public methods first, even as
+stubs. That single move tells the interviewer what the system <em>does</em> before you get lost in what it is made of, and it gives
+them an early chance to say "actually I care more about X" while there is still time to turn.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take parking lot and do only the first ten minutes — requirements and model — in ten real minutes, timed. Then stop. Do it three times.</li><li>Practice stating three non-goals out loud for any system. It is a learned reflex and it buys you the time you need.</li></ul></div></section>
+
+<section id="requirements"><h2 id="requirements">Clarifying: the questions that change the design</h2><p>There is a small set of questions that pay off across nearly every LLD prompt, because each one has an answer that forks the
+model. Learn the set, not the individual answers.</p><div class="table-wrap"><table><thead><tr><th>Question</th><th>Why it changes the design</th></tr></thead><tbody><tr><td>Who are the actors?</td><td>Each actor is usually a separate entry point and a separate permission surface</td></tr><tr><td>What are the entity types, and will more be added?</td><td>Two fixed types is an enum; an open set is polymorphism or a registry</td></tr><tr><td>Is there a policy that varies?</td><td>Pricing, allocation, eviction, routing — every one is a strategy interface</td></tr><tr><td>Is anything stateful with rules about transitions?</td><td>If yes, that is a state machine, and you should say the words</td></tr><tr><td>Single instance or many? Single thread or many?</td><td>Decides whether you need locking, and how coarse it can be</td></tr><tr><td>What must never happen?</td><td>Double-booking, negative balance, lost money — these become invariants and tests</td></tr><tr><td>What is explicitly out of scope?</td><td>Buys back time and shows you are managing the hour</td></tr></tbody></table></div><p>Write the answers as a short list of use cases in the candidate's own words. Not UML, not prose — a list:</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Agreed scope — parking lot (written on the board in minute 4)
+//
+// IN
+//   1. Vehicle arrives, is issued a ticket and assigned a spot it fits in.
+//   2. Vehicle leaves, fee is computed from duration and vehicle type, paid.
+//   3. Operator can query free spots per floor and per type.
+//   4. Multiple entrances and exits, used concurrently.
+//
+// OUT (said out loud, agreed)
+//   - Payment provider internals: IPaymentProcessor with one method.
+//   - Persistence: everything in memory.
+//   - Reservations, season tickets, number-plate recognition.
+//
+// INVARIANTS (the things that must never happen)
+//   - A spot is occupied by at most one vehicle.
+//   - A ticket is paid at most once.
+//   - A vehicle never occupies a spot its type does not fit.
+//
+// VARIES (therefore: an interface each)
+//   - Pricing       -&gt; IPricingStrategy
+//   - Spot choice   -&gt; ISpotAllocationStrategy</code></pre><pre data-lang="python" hidden><code># Agreed scope — parking lot (written on the board in minute 4)
+#
+# IN
+#   1. Vehicle arrives, is issued a ticket and assigned a spot it fits in.
+#   2. Vehicle leaves, fee is computed from duration and vehicle type, paid.
+#   3. Operator can query free spots per floor and per type.
+#   4. Multiple entrances and exits, used concurrently.
+#
+# OUT (said out loud, agreed)
+#   - Payment provider internals: PaymentProcessor protocol, one method.
+#   - Persistence: everything in memory.
+#   - Reservations, season tickets, number-plate recognition.
+#
+# INVARIANTS (the things that must never happen)
+#   - A spot is occupied by at most one vehicle.
+#   - A ticket is paid at most once.
+#   - A vehicle never occupies a spot its type does not fit.
+#
+# VARIES (therefore: a protocol each)
+#   - Pricing      -&gt; PricingStrategy
+#   - Spot choice  -&gt; SpotAllocationStrategy</code></pre></div><div class="callout callout-note"><span class="callout-title">The &quot;varies&quot; list is the design</span><p>Of everything you write in the first ten minutes, the <em>varies</em> list is the part
+that determines your score. Every follow-up question an interviewer asks in this round is a variation —
+"now motorcycles are half price", "now assign the spot nearest the lift", "now also send an SMS". If the varying thing is already
+behind an interface, your answer is "I add a class", which takes thirty seconds and demonstrates the open/closed principle without
+you having to name it. If it is not, your answer is a rewrite you do not have time for.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Interviewers plant the variation deliberately: a prompt that mentions two vehicle types is nearly always followed by a
+third, and a prompt with a flat fee is nearly always followed by hourly pricing. So treat every concrete detail in the prompt as a
+<em>hint about what will change</em>, and say so: "you have mentioned two vehicle types, so I will assume more are coming and keep
+the type open rather than hard-coding a pair." That sentence is often worth more than the next twenty minutes of code — and it
+costs one line.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>For each of parking lot, vending machine and elevator, write the "varies" list in under two minutes.</li><li>Take a prompt and predict the three follow-up questions. Check your prediction against the real follow-ups in this site's worked designs.</li></ul></div></section>
+
+<section id="nouns-to-classes"><h2 id="nouns-to-classes">From nouns to classes: responsibilities and invariants</h2><p>The noun-underlining trick gets you candidate classes, but it over-generates: not every noun is a class, and the
+discrimination is what interviewers watch. Three questions sort it out.</p>
+<ol>
+<li><strong>Does it have identity?</strong> Two tickets with the same contents are still different tickets — that is an
+<em>entity</em>, and it needs an id. Two <code>Money(5, "USD")</code> are interchangeable — that is a <em>value object</em>, and it
+should be immutable with value equality.</li>
+<li><strong>Does it have rules?</strong> If there is something that must always be true about it, it is a class that enforces that
+rule in its constructor and methods. If there is not, it may just be a field.</li>
+<li><strong>Does it have behaviour, or only data?</strong> A class with no methods but getters and setters is a warning sign — the
+behaviour that belongs to it has leaked into a service somewhere.</li>
+</ol>
+<p>Then assign each verb to exactly one class, using the rule that <strong>the object that owns the data owns the operation</strong>.
+<code>Ticket.MarkPaid()</code>, not <code>PaymentService.MarkTicketPaid(ticket)</code>, because only <code>Ticket</code> can
+guarantee a ticket is not paid twice.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// ANAEMIC — the usual first draft. Ticket is a data bag; the rule about
+// paying twice lives outside it, so every caller has to remember it.
+public class Ticket
+{
+    public string Id { get; set; }
+    public DateTime EntryTime { get; set; }
+    public DateTime? ExitTime { get; set; }
+    public bool IsPaid { get; set; }          // anyone can set this to anything
+}
+
+// RICH — the invariant is enforced where the data lives, so it cannot be
+// broken by a caller who forgot. Note what is NOT settable from outside.
+public class Ticket
+{
+    public string Id { get; }
+    public ParkingSpot Spot { get; }
+    public DateTime EntryTime { get; }
+    public DateTime? ExitTime { get; private set; }
+    public Money? AmountPaid { get; private set; }
+
+    public bool IsClosed =&gt; ExitTime is not null;
+
+    public Ticket(string id, ParkingSpot spot, DateTime entryTime)
+    {
+        Id = id ?? throw new ArgumentNullException(nameof(id));
+        Spot = spot ?? throw new ArgumentNullException(nameof(spot));
+        EntryTime = entryTime;
+    }
+
+    // The invariant &quot;a ticket is paid at most once&quot; is now unbreakable.
+    public void Close(DateTime exitTime, Money amount)
+    {
+        if (IsClosed)
+            throw new InvalidOperationException($&quot;Ticket {Id} is already closed.&quot;);
+        if (exitTime &lt; EntryTime)
+            throw new ArgumentException(&quot;Exit cannot precede entry.&quot;, nameof(exitTime));
+
+        ExitTime = exitTime;
+        AmountPaid = amount;
+    }
+
+    public TimeSpan Duration(DateTime now) =&gt; (ExitTime ?? now) - EntryTime;
+}
+
+// VALUE OBJECT — no identity, immutable, value equality for free via record.
+// Currency mismatch is a bug, so it throws rather than silently adding.
+public readonly record struct Money(decimal Amount, string Currency = &quot;USD&quot;)
+{
+    public static Money Zero(string currency = &quot;USD&quot;) =&gt; new(0m, currency);
+
+    public Money Add(Money other) =&gt; Currency == other.Currency
+        ? this with { Amount = Amount + other.Amount }
+        : throw new InvalidOperationException($&quot;Cannot add {other.Currency} to {Currency}.&quot;);
+
+    public override string ToString() =&gt; $&quot;{Amount:0.00} {Currency}&quot;;
+}</code></pre><pre data-lang="python" hidden><code>from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+
+# ANAEMIC — a data bag; the &quot;pay once&quot; rule lives in whoever calls it.
+@dataclass
+class TicketAnaemic:
+    id: str
+    entry_time: datetime
+    exit_time: datetime | None = None
+    is_paid: bool = False          # anyone can set this to anything
+
+# RICH — the invariant is enforced where the data lives.
+class Ticket:
+    def __init__(self, id: str, spot: &quot;ParkingSpot&quot;, entry_time: datetime):
+        if not id:
+            raise ValueError(&quot;id is required&quot;)
+        self._id = id
+        self._spot = spot
+        self._entry_time = entry_time
+        self._exit_time: datetime | None = None
+        self._amount_paid: &quot;Money | None&quot; = None
+
+    @property
+    def id(self) -&gt; str: return self._id
+    @property
+    def spot(self) -&gt; &quot;ParkingSpot&quot;: return self._spot
+    @property
+    def is_closed(self) -&gt; bool: return self._exit_time is not None
+
+    def close(self, exit_time: datetime, amount: &quot;Money&quot;) -&gt; None:
+        if self.is_closed:
+            raise RuntimeError(f&quot;Ticket {self._id} is already closed.&quot;)
+        if exit_time &lt; self._entry_time:
+            raise ValueError(&quot;Exit cannot precede entry.&quot;)
+        self._exit_time = exit_time
+        self._amount_paid = amount
+
+    def duration(self, now: datetime) -&gt; timedelta:
+        return (self._exit_time or now) - self._entry_time
+
+# VALUE OBJECT — frozen dataclass gives immutability and value equality.
+@dataclass(frozen=True)
+class Money:
+    amount: float
+    currency: str = &quot;USD&quot;
+
+    def add(self, other: &quot;Money&quot;) -&gt; &quot;Money&quot;:
+        if self.currency != other.currency:
+            raise ValueError(f&quot;Cannot add {other.currency} to {self.currency}.&quot;)
+        return Money(self.amount + other.amount, self.currency)
+
+    def __str__(self) -&gt; str:
+        return f&quot;{self.amount:.2f} {self.currency}&quot;</code></pre></div><div class="table-wrap"><table><thead><tr><th>Smell</th><th>What it means</th><th>The fix</th></tr></thead><tbody><tr><td>A class named <code>…Manager</code> or <code>…Helper</code></td><td>You could not say what it is responsible for</td><td>Name the responsibility; if you cannot, it should not exist</td></tr><tr><td>All getters and setters, no methods</td><td>Behaviour leaked into a service</td><td>Move the operation to the data</td></tr><tr><td>One class with every method</td><td>God object</td><td>Split along the axes of change</td></tr><tr><td>A <code>switch</code> on a type field</td><td>Polymorphism written out by hand</td><td>Subclass, or a strategy keyed by type</td></tr><tr><td>A boolean parameter on a public method</td><td>Two operations wearing one name</td><td>Two methods</td></tr><tr><td>Deep inheritance to share code</td><td>Reuse mistaken for subtyping</td><td>Compose: inject the shared part</td></tr></tbody></table></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>When you present the model, say each class's responsibility <strong>in one sentence beginning with a verb</strong> —
+"<code>Ticket</code> records a vehicle's stay and guarantees it is only closed once." If the sentence needs an "and", you probably
+have two classes. This is single-responsibility applied as a sentence test rather than recited as a principle, and interviewers
+respond far better to the former. The other reliable win is to <strong>volunteer one invariant and show the line of code that
+enforces it</strong>; it demonstrates in five seconds that you think about correctness rather than just structure.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take the anaemic <code>Ticket</code> above and list every rule a caller would have to remember. That list is what the rich version deletes.</li><li>Write <code>Money</code> as a value object in your language of choice, with equality, addition and a currency guard.</li><li>For a vending machine, sort the nouns into entities and value objects, and justify each one.</li></ul></div></section>
+
+<section id="diagram"><h2 id="diagram">The diagram: what to draw, and how little is enough</h2><p>Draw the class diagram, but treat it as a sketch you will abandon. Its only job is to let you and the interviewer agree on the
+model before you commit twenty minutes of typing to it. Boxes with class names, a line of key fields, a line of key methods, and
+arrows for the relationships that matter. No UML stereotypes, no multiplicities unless they are interesting, no getters.</p>
+<p>The arrows worth distinguishing — and the ones you should be able to defend:</p><div class="table-wrap"><table><thead><tr><th>Relationship</th><th>Meaning</th><th>Test to apply</th></tr></thead><tbody><tr><td><strong>Composition</strong> (filled diamond)</td><td>Owner creates it and it dies with the owner</td><td>A <code>Floor</code>'s spots do not outlive the floor</td></tr><tr><td><strong>Aggregation</strong> (open diamond)</td><td>Holds a reference, independent lifetime</td><td>A <code>Ticket</code> refers to a <code>Vehicle</code> that exists anyway</td></tr><tr><td><strong>Inheritance</strong> (hollow triangle)</td><td>"is substitutable for"</td><td>Can a caller use the child wherever it expects the parent?</td></tr><tr><td><strong>Implements</strong> (dashed triangle)</td><td>Fulfils a contract</td><td>This is the one you want most of the time</td></tr><tr><td><strong>Depends on</strong> (plain arrow)</td><td>Uses it transiently, as a parameter or local</td><td>Keep these pointing at interfaces</td></tr></tbody></table></div><p>A worked example for the parking lot, drawn in text because that is how it will look on a shared editor anyway:</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>ParkingLot
+  - floors : List&lt;Floor&gt;                 (composition)
+  - allocation : ISpotAllocationStrategy (aggregation, injected)
+  - pricing : IPricingStrategy           (aggregation, injected)
+  + Park(Vehicle) : Ticket
+  + Leave(ticketId, now) : Money
+  + Availability() : IReadOnlyDictionary&lt;SpotSize,int&gt;
+        |
+        | composition (1..*)
+        v
+     Floor
+       - spots : List&lt;ParkingSpot&gt;       (composition)
+       + FreeSpots(SpotSize) : IEnumerable&lt;ParkingSpot&gt;
+            |
+            | composition (1..*)
+            v
+       ParkingSpot
+         - size : SpotSize
+         - occupiedBy : Vehicle?
+         + TryOccupy(Vehicle) : bool     &lt;- the invariant lives here
+         + Release() : void
+
+  Vehicle (abstract)  &lt;|-- Car, Motorcycle, Truck
+    + Size : SpotSize
+
+  &lt;&lt;interface&gt;&gt; IPricingStrategy          &lt;|.. FlatHourlyPricing
+    + Price(Ticket, DateTime) : Money     &lt;|.. PerVehicleTypePricing
+
+  &lt;&lt;interface&gt;&gt; ISpotAllocationStrategy   &lt;|.. FirstAvailable
+    + Find(IEnumerable&lt;Floor&gt;, Vehicle)   &lt;|.. NearestToExit
+          : ParkingSpot?</code></pre><pre data-lang="python" hidden><code>ParkingLot
+  - floors : list[Floor]                  (composition)
+  - allocation : SpotAllocationStrategy   (aggregation, injected)
+  - pricing : PricingStrategy             (aggregation, injected)
+  + park(vehicle) -&gt; Ticket
+  + leave(ticket_id, now) -&gt; Money
+  + availability() -&gt; dict[SpotSize, int]
+        |
+        | composition (1..*)
+        v
+     Floor
+       - spots : list[ParkingSpot]        (composition)
+       + free_spots(size) -&gt; Iterator[ParkingSpot]
+            |
+            | composition (1..*)
+            v
+       ParkingSpot
+         - size : SpotSize
+         - occupied_by : Vehicle | None
+         + try_occupy(vehicle) -&gt; bool    &lt;- the invariant lives here
+         + release() -&gt; None
+
+  Vehicle (ABC)  &lt;|-- Car, Motorcycle, Truck
+    + size : SpotSize
+
+  &lt;&lt;Protocol&gt;&gt; PricingStrategy            &lt;|.. FlatHourlyPricing
+    + price(ticket, now) -&gt; Money         &lt;|.. PerVehicleTypePricing
+
+  &lt;&lt;Protocol&gt;&gt; SpotAllocationStrategy     &lt;|.. FirstAvailable
+    + find(floors, vehicle)               &lt;|.. NearestToExit
+          -&gt; ParkingSpot | None</code></pre></div><div class="callout callout-warn"><span class="callout-title">Do not gold-plate the diagram</span><p>Three mistakes cost real minutes. <strong>Drawing every field</strong> — show the two or
+three that carry meaning. <strong>Agonising over composition versus aggregation</strong> — say which you mean in words and move on;
+no interviewer has ever failed a candidate over a diamond. <strong>Drawing before agreeing the requirements</strong> — a beautiful
+diagram of the wrong system is worse than no diagram, because now you are emotionally invested in it.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Narrate the diagram as a <em>walk through one use case</em> rather than reading the boxes out: "a car arrives at an
+entrance, <code>ParkingLot.Park</code> asks the allocation strategy for a spot, the spot atomically marks itself occupied, and we
+hand back a ticket." That single sentence proves the model actually works end to end, which a static diagram does not, and it
+surfaces missing pieces immediately — if you cannot narrate a use case, something is missing. Do this before you write any code and
+you will almost never have to restructure halfway through.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Draw the parking lot model in five minutes, then narrate the park and leave flows through it. Note where you stumble; that is the gap.</li><li>Take the diagram above and add "electric vehicles need a charging spot". How many boxes change?</li></ul></div></section>
+
+<section id="common-mistakes"><h2 id="common-mistakes">The failure modes, and what to do instead</h2><p>A short list of the things that actually sink this round, each with the counter-move. Most candidates who fail LLD fail on one
+of these rather than on any deep design question.</p><div class="table-wrap"><table><thead><tr><th>Failure</th><th>Why it happens</th><th>Counter-move</th></tr></thead><tbody><tr><td>No code by the end</td><td>Over-investment in diagrams and discussion</td><td>Start coding at minute 15 no matter what state the model is in</td></tr><tr><td>Built the wrong thing</td><td>Skipped or rushed the clarify phase</td><td>Write the scope list down and get an explicit "yes"</td></tr><tr><td>God class</td><td>Modelling the system as one object with everything in it</td><td>Give every class a one-sentence, verb-first responsibility</td></tr><tr><td>Hard-coded policy</td><td>Did not predict the variation</td><td>Build the "varies" list in minute 8; one interface per entry</td></tr><tr><td>Cannot absorb the follow-up</td><td>Policies live in <code>switch</code> statements</td><td>New behaviour should be a new class, not an edited one</td></tr><tr><td>Silent on threading</td><td>Assumed a single caller without saying so</td><td>State the concurrency model explicitly, even if it is "single-threaded for now"</td></tr><tr><td>Enum explosion</td><td>Used a type tag where polymorphism belonged</td><td>If you <code>switch</code> on it more than once, it should be a type</td></tr><tr><td>Nothing is testable</td><td>Everything constructs its own dependencies</td><td>Inject collaborators through the constructor</td></tr><tr><td>Silence</td><td>Thinking without narrating</td><td>Say what you are about to do before you do it</td></tr></tbody></table></div><p>The last one is worth dwelling on. In this round the interviewer is building a model of how you think, and silence gives them
+nothing to score. Even "I am going to stub pricing for now and come back to it" keeps them with you — and lets them stop you if
+pricing is the thing they actually care about.</p><div class="callout callout-note"><span class="callout-title">Two safe defaults when you are unsure</span><ul>
+<li><strong>Prefer composition to inheritance.</strong> Inheritance for "is substitutable for" only; if you are reaching for a base
+class to share code, inject a collaborator instead. Deep hierarchies are the single most common structural criticism in this round.</li>
+<li><strong>Prefer an interface with one implementation over a conditional.</strong> It costs three lines now and makes the follow-up
+question free. The reverse — refactoring a conditional into an interface under time pressure — is where candidates lose the plot.</li>
+</ul></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>If you realise mid-round that your model is wrong, <strong>say so and adjust</strong> rather than defending it. "I have
+realised pricing should not live on <code>Ticket</code> — it varies independently, so I will pull it into a strategy" is a
+<em>positive</em> signal: it is what a good engineer does in code review, and interviewers are explicitly looking for whether you can
+take and act on feedback. Candidates who defend an obviously strained design because they are already committed to it score worse
+than candidates who had the same flaw and fixed it. The round is a collaboration simulation as much as a design test.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Record yourself doing a 45-minute design. Watch it back and count the seconds of silence; that is your biggest cheap win.</li><li>Take a design you have done and have someone add a requirement at minute 35. Notice whether you add a class or edit five.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://refactoring.guru/design-patterns" target="_blank" rel="noopener">Refactoring Guru: design patterns</a> — the catalogue, with the problem each pattern solves stated first</li><li><a href="https://martinfowler.com/bliki/AnemicDomainModel.html" target="_blank" rel="noopener">Fowler: anaemic domain model</a> — why the data bag is an anti-pattern</li><li><a href="https://martinfowler.com/bliki/ValueObject.html" target="_blank" rel="noopener">Fowler: value object</a> — identity versus value, stated precisely</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

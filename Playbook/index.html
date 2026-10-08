@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard — Interview Playbook</title>
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body data-root="">
+<div class="layout">
+<main class="main">
+
+  <h1>Interview Playbook</h1>
+  <p class="lede">The <strong>process</strong> around the four technical tracks — what a loop actually contains and how each round
+  is scored, what the levels mean and how to target one, a twelve-week plan across all four sites, and what to do when an offer or
+  a rejection arrives. Five pages, 17 sections. The sidebar has three menus — <em>The process</em>, <em>Preparing</em> and
+  <em>After the loop</em>; pages you have opened turn <span class="badge badge-visited">✓ visited</span>.</p>
+
+  <div class="storage-banner"></div>
+
+  <div class="stats-row">
+    <div class="progress">
+      <span>Visited</span>
+      <span class="progress-bar"><span class="progress-fill" data-progress-fill></span></span>
+      <span class="progress-num" data-progress-num>0 / 0</span>
+    </div>
+    <button type="button" class="btn btn-danger btn-sm" data-reset-visited>Reset visited topics</button>
+  </div>
+
+  <div class="callout callout-warn">
+    <span class="callout-title">Read this first: these are moving targets</span>
+    <p>Loop structures, assessment formats, level ladders, cooldown periods and compensation bands all differ between companies and
+    change over time — sometimes between two teams at the same company in the same year. Everything here is the <em>shape</em> to
+    expect and the <em>method</em> for handling it, not a current specification. <strong>Your recruiter is the authoritative source
+    for your own process, and they will tell you if you ask.</strong> The pay figures on the offer page are illustrative arithmetic,
+    not benchmarks; get real ranges from levels.fyi and from people at that company and level.</p>
+  </div>
+
+  <div class="callout callout-note">
+    <span class="callout-title">How to use this site</span>
+    <ul>
+      <li><strong>Read The Loop first</strong> if you are already preparing — it tells you which of the four technical tracks your level is actually graded on, which is the thing most likely to be misallocating your time right now.</li>
+      <li><strong>Read Levels early</strong> if you have not yet applied. Targeting the wrong rung is expensive in both directions and it is largely under your control.</li>
+      <li><strong>The Twelve-Week Plan</strong> is the scheduling layer over the other four sites. Take its ratios and adjust them to your level.</li>
+      <li><strong>Interview angle</strong> boxes here say what the stage is really assessing, and the thing to do about it.</li>
+      <li>Visited state lives in your browser only, separate from the C#, System Design, DSA and LLD sites.</li>
+    </ul>
+  </div>
+
+  <h2 id="topics">Topics</h2>
+  <div data-topic-groups></div>
+
+  <h2 id="tracks">The four technical tracks</h2>
+  <p>This site covers the process. The rounds themselves are the other four:</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Round</th><th>Site</th><th>Start at</th></tr></thead>
+    <tbody>
+      <tr><td>Coding</td><td><a href="../DSA/index.html">DSA</a></td><td><a href="../DSA/topics/dsa.html">Foundations &amp; Complexity</a></td></tr>
+      <tr><td>Low-level design</td><td><a href="../LLD/index.html">LLD</a></td><td><a href="../LLD/topics/lld-round.html">The LLD Round</a></td></tr>
+      <tr><td>System design</td><td><a href="../SystemDesign/index.html">System Design</a></td><td><a href="../SystemDesign/chapters/03-system-design-framework.html">A Framework for System Design Interviews</a></td></tr>
+      <tr><td>Language &amp; platform depth</td><td><a href="../DotNet/index.html">C# &amp; .NET</a></td><td><a href="../DotNet/topics/core-concepts.html">Core Concepts</a></td></tr>
+      <tr><td>Project deep-dive · Behavioural</td><td><em>This site</em></td><td><a href="topics/playbook-loop.html#deep-dive">The Loop</a></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="gaps">What this site does not cover yet</h2>
+  <p>Honest about its own scope. The largest remaining gap is a <strong>dedicated behavioural section</strong> — the
+  <a href="topics/playbook-loop.html#behavioural">behavioural round</a> here gives you the STAR structure and the story-bank
+  checklist, which is enough to prepare against, but a full treatment would work each competency separately with examples and
+  follow-up chains. Given how heavily that round is weighted at senior level, it is the next thing worth building.</p>
+
+  <p class="footer-note">Personal study site · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="assets/js/curriculum.js"></script>
+<script src="assets/js/visited.js"></script>
+<script src="assets/js/nav.js"></script>
+<script src="assets/js/code-tabs.js"></script>
+<script>
+/* Dashboard: topic cards + progress, kept in sync with visited state */
+(function () {
+  'use strict';
+  var C = window.CURRICULUM, V = window.VISITED;
+  if (!C || !V) return;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
+    });
+  }
+
+  function cardHtml(t) {
+    var i = C.topics.indexOf(t);
+    var visited = V.isVisited(t.id);
+    return '<div class="card' + (visited ? ' visited' : '') + '">' +
+      '<h3><span class="card-num">' + (visited ? '✓' : (i + 1)) + '</span><a href="' + t.href + '">' + esc(t.label) + '</a></h3>' +
+      '<p>' + esc(t.blurb) + '</p>' +
+      '<div class="card-foot"><span>' + t.sections.length + ' sections</span>' +
+      (visited ? '<span class="badge badge-visited">Visited</span>' : (i === 0 ? '<span class="badge badge-start">Start here</span>' : '')) +
+      '</div></div>';
+  }
+
+  function render() {
+    var host = document.querySelector('[data-topic-groups]');
+    if (host) {
+      host.innerHTML = C.groups.map(function (g) {
+        var done = g.topics.filter(function (t) { return V.isVisited(t.id); }).length;
+        return '<div class="group-head" id="group-' + esc(g.id) + '"><h3>' + esc(g.label) + '</h3>' +
+          '<span class="group-count">' + done + ' / ' + g.topics.length + ' visited</span></div>' +
+          '<p class="group-blurb">' + esc(g.blurb) + '</p>' +
+          '<div class="cards">' + g.topics.map(cardHtml).join('') + '</div>';
+      }).join('');
+    }
+    var n = V.count(), total = C.topics.length;
+    var fill = document.querySelector('[data-progress-fill]');
+    var num = document.querySelector('[data-progress-num]');
+    if (fill) fill.style.width = (total ? Math.round(n / total * 100) : 0) + '%';
+    if (num) num.textContent = n + ' / ' + total;
+  }
+
+  document.addEventListener('DOMContentLoaded', render);
+  document.addEventListener('visited:change', render);
+})();
+</script>
+</body>
+</html>

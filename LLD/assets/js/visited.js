@@ -5,7 +5,7 @@
    localStorage on file:// pages, so we probe once and fall back to an
    in-memory store (the page still works, state just does not persist).
 
-   Any page with <body data-topic="core-concepts"> is marked visited on load.
+   Any page with <body data-topic="lld-parking-lot"> is marked visited on load.
    Exposes window.VISITED = { all, isVisited, mark, reset, count, storageOk }
    and fires a "visited:change" event on document whenever state changes.
    ========================================================================== */
@@ -13,12 +13,12 @@
 (function () {
   'use strict';
 
-  var KEY = 'systemDesign.v1.visited';
+  var KEY = 'lld.v1.visited';
   var memory = null;
 
   var storageOk = (function () {
     try {
-      var t = '__sd_test__';
+      var t = '__lp_test__';
       window.localStorage.setItem(t, '1');
       window.localStorage.removeItem(t);
       return true;
@@ -40,21 +40,12 @@
     try { document.dispatchEvent(new CustomEvent('visited:change')); } catch (e) { /* old browsers */ }
   }
 
+
   var api = {
     storageOk: storageOk,
     all: function () { return load(); },
     isVisited: function (id) { return Object.prototype.hasOwnProperty.call(load(), id); },
-    count: function () {
-      var s = load();
-      var C = window.CURRICULUM;
-      if (!C || !C.topics) return Object.keys(s).length;
-      /* Only count ids this site still has a page for. The DSA topics moved to
-         their own site and their old marks are left in place for it to import,
-         so counting raw keys here would report more visited than there are. */
-      return C.topics.filter(function (t) {
-        return Object.prototype.hasOwnProperty.call(s, t.id);
-      }).length;
-    },
+    count: function () { return Object.keys(load()).length; },
     mark: function (id) {
       if (!id) return;
       var s = load();

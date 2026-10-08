@@ -1,0 +1,664 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cache &amp; Rate Limiter — Low-Level Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="lld-cache-rate-limiter">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Worked designs › Topic 7 of 7</div>
+  <h1>Design a Cache and a Rate Limiter</h1>
+  <p class="lede">The two concurrency-flavoured LLD prompts. An O(1) LRU derived rather than recalled, why a reader-writer lock buys nothing when every read is a write, eviction and expiry behind interfaces, and four rate-limiting algorithms with what each one gets wrong.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#lru">The LRU cache: O(1) in both directions</a></li><li><a href="#threadsafe">Making it thread-safe — and why one lock is usually the right answer</a></li><li><a href="#policies">TTL and pluggable eviction</a></li><li><a href="#rate-limiter">Rate limiters: the same design muscle, a different policy</a></li></ol>
+  </div>
+
+<section id="lru"><h2 id="lru">The LRU cache: O(1) in both directions</h2><p>"Design an LRU cache" is the most-asked LLD warm-up at Microsoft and Amazon, and it is deceptively specific: the interviewer
+wants <strong>O(1) get and O(1) put</strong>, which rules out anything that scans. The
+<a href="../../DSA/topics/dsa-hashing.html#lru">DSA page covers it as an algorithm</a>; this page treats it as a design round, where
+the policy, the expiry and the threading are all separate concerns that will each become a follow-up.</p>
+<p>The structure is forced by the requirement. A hash map gives O(1) lookup but no order. A doubly-linked list gives O(1) move-to-front
+and O(1) eviction from the tail, but no lookup. <strong>Combine them</strong>: the map's values are list <em>nodes</em>, so a lookup
+hands you the node and you can unlink it in O(1) without searching. A singly-linked list does not work — unlinking needs the
+predecessor — and saying that out loud is the detail that shows you derived the structure rather than recalled it.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>/// LRU: hash map -&gt; intrusive doubly-linked list node.
+/// Sentinel head/tail nodes remove every null check from the link code.
+public sealed class LruCache&lt;TKey, TValue&gt; where TKey : notnull
+{
+    private sealed class Node
+    {
+        public TKey Key = default!;
+        public TValue Value = default!;
+        public Node? Prev, Next;
+    }
+
+    private readonly int _capacity;
+    private readonly Dictionary&lt;TKey, Node&gt; _map;
+    private readonly Node _head = new();    // sentinel: most recent is _head.Next
+    private readonly Node _tail = new();    // sentinel: least recent is _tail.Prev
+
+    public LruCache(int capacity)
+    {
+        if (capacity &lt;= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
+        _capacity = capacity;
+        _map = new Dictionary&lt;TKey, Node&gt;(capacity);
+        _head.Next = _tail;
+        _tail.Prev = _head;
+    }
+
+    public int Count =&gt; _map.Count;
+
+    public bool TryGet(TKey key, out TValue value)
+    {
+        if (!_map.TryGetValue(key, out var node)) { value = default!; return false; }
+        MoveToFront(node);                                   // the &quot;used&quot; in LRU
+        value = node.Value;
+        return true;
+    }
+
+    public void Put(TKey key, TValue value)
+    {
+        if (_map.TryGetValue(key, out var existing))
+        {
+            existing.Value = value;
+            MoveToFront(existing);
+            return;
+        }
+
+        if (_map.Count == _capacity) EvictLeastRecent();
+
+        var node = new Node { Key = key, Value = value };
+        _map[key] = node;
+        LinkAfterHead(node);
+    }
+
+    public bool Remove(TKey key)
+    {
+        if (!_map.Remove(key, out var node)) return false;
+        Unlink(node);
+        return true;
+    }
+
+    // ---- the four list primitives; every one is O(1) ----
+    private void Unlink(Node n)
+    {
+        n.Prev!.Next = n.Next;
+        n.Next!.Prev = n.Prev;
+        n.Prev = n.Next = null;
+    }
+
+    private void LinkAfterHead(Node n)
+    {
+        n.Next = _head.Next;
+        n.Prev = _head;
+        _head.Next!.Prev = n;
+        _head.Next = n;
+    }
+
+    private void MoveToFront(Node n)
+    {
+        if (_head.Next == n) return;                          // already there
+        Unlink(n);
+        LinkAfterHead(n);
+    }
+
+    private void EvictLeastRecent()
+    {
+        var victim = _tail.Prev!;
+        if (victim == _head) return;                          // empty
+        _map.Remove(victim.Key);
+        Unlink(victim);
+    }
+}</code></pre><pre data-lang="python" hidden><code>from __future__ import annotations
+from typing import Generic, TypeVar
+
+K = TypeVar(&quot;K&quot;)
+V = TypeVar(&quot;V&quot;)
+
+class _Node(Generic[K, V]):
+    __slots__ = (&quot;key&quot;, &quot;value&quot;, &quot;prev&quot;, &quot;next&quot;)
+    def __init__(self, key=None, value=None):
+        self.key = key
+        self.value = value
+        self.prev: _Node | None = None
+        self.next: _Node | None = None
+
+class LruCache(Generic[K, V]):
+    &quot;&quot;&quot;Hash map -&gt; intrusive doubly-linked list node.
+    Sentinel head/tail remove every None check from the link code.&quot;&quot;&quot;
+
+    def __init__(self, capacity: int) -&gt; None:
+        if capacity &lt;= 0:
+            raise ValueError(&quot;capacity must be positive&quot;)
+        self._capacity = capacity
+        self._map: dict[K, _Node[K, V]] = {}
+        self._head = _Node()      # most recent is _head.next
+        self._tail = _Node()      # least recent is _tail.prev
+        self._head.next = self._tail
+        self._tail.prev = self._head
+
+    def __len__(self) -&gt; int:
+        return len(self._map)
+
+    _MISSING = object()
+
+    def get(self, key: K, default=None):
+        node = self._map.get(key)
+        if node is None:
+            return default
+        self._move_to_front(node)                    # the &quot;used&quot; in LRU
+        return node.value
+
+    def put(self, key: K, value: V) -&gt; None:
+        existing = self._map.get(key)
+        if existing is not None:
+            existing.value = value
+            self._move_to_front(existing)
+            return
+
+        if len(self._map) == self._capacity:
+            self._evict_least_recent()
+
+        node = _Node(key, value)
+        self._map[key] = node
+        self._link_after_head(node)
+
+    def remove(self, key: K) -&gt; bool:
+        node = self._map.pop(key, None)
+        if node is None:
+            return False
+        self._unlink(node)
+        return True
+
+    # ---- the four list primitives; every one is O(1) ----
+    def _unlink(self, n: _Node) -&gt; None:
+        n.prev.next = n.next
+        n.next.prev = n.prev
+        n.prev = n.next = None
+
+    def _link_after_head(self, n: _Node) -&gt; None:
+        n.next = self._head.next
+        n.prev = self._head
+        self._head.next.prev = n
+        self._head.next = n
+
+    def _move_to_front(self, n: _Node) -&gt; None:
+        if self._head.next is n:
+            return                                   # already there
+        self._unlink(n)
+        self._link_after_head(n)
+
+    def _evict_least_recent(self) -&gt; None:
+        victim = self._tail.prev
+        if victim is self._head:
+            return                                   # empty
+        del self._map[victim.key]
+        self._unlink(victim)</code></pre></div><div class="callout callout-note"><span class="callout-title">The library answer, and why you still write it by hand</span><p>C# has no built-in LRU, but
+<code>OrderedDictionary</code> (.NET 9+) and Python's <code>collections.OrderedDictionary</code> with
+<code>move_to_end</code> both give you one in about six lines — and Python's <code>functools.lru_cache</code> is this exact
+structure in C. Mention that you know, then write it by hand anyway, because the question is testing whether you can derive
+"map plus doubly-linked list" from "O(1) both ways". Offering the library version <em>first</em> and the hand-rolled one second is
+the ideal order: it shows judgement and then shows mechanics.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Derive the structure out loud rather than announcing it: "I need O(1) lookup, so a hash map. I need O(1) eviction of
+the oldest, so I need ordering with O(1) removal from the middle — that is a doubly-linked list, and singly-linked will not do
+because unlinking needs the predecessor. So the map's values are the list nodes." That is thirty seconds and it is the whole
+question. The two bug-magnets to be careful with are <strong>sentinels</strong> (use them; they delete every null check) and
+<strong>updating an existing key</strong>, which must refresh recency rather than insert a duplicate — interviewers test that case
+almost every time, usually by putting the same key twice and then checking what got evicted.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write it with sentinels and without, and count the null checks you saved.</li><li>Put the same key twice at capacity and verify nothing was evicted and recency moved.</li><li>Implement LFU (evict least <em>frequently</em> used) in O(1) — it needs a second level of lists keyed by frequency.</li></ul></div></section>
+
+<section id="threadsafe"><h2 id="threadsafe">Making it thread-safe — and why one lock is usually the right answer</h2><p>"Now make it thread-safe" follows within a minute. The honest answer is that <strong>a single lock around the whole cache is
+correct and usually the right engineering choice</strong>, and being able to say <em>why</em> the clever alternatives do not work is
+worth more than attempting one.</p>
+<p>The reason finer-grained locking is hard here: every <code>get</code> <strong>mutates</strong> the linked list. A read is a
+write. So a reader-writer lock buys you nothing — there are no pure readers — and striping the map by key does not help, because the
+list is one shared structure that every operation touches at its head.</p><div class="table-wrap"><table><thead><tr><th>Approach</th><th>Works?</th><th>Why</th></tr></thead><tbody><tr><td>One lock around every operation</td><td><strong>Yes</strong></td><td>Simple, correct; the critical section is a few pointer writes</td></tr><tr><td>Reader-writer lock</td><td>No benefit</td><td><code>get</code> mutates recency, so every caller is a writer</td></tr><tr><td>Striped locks by key hash</td><td>No</td><td>The recency list is global; striping does not partition it</td></tr><tr><td>Lock-free list</td><td>In principle</td><td>Very hard to get right; not an interview answer</td></tr><tr><td>Sharded caches (N independent LRUs)</td><td><strong>Yes</strong></td><td>The real scaling answer: partition by key, each shard its own lock</td></tr><tr><td>Approximate LRU (CLOCK / sampling)</td><td><strong>Yes</strong></td><td>What Redis actually does: drop exactness to drop contention</td></tr></tbody></table></div><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>/// Correct, simple, and the right default. The critical section is a
+/// dictionary lookup plus four pointer writes — microseconds, not milliseconds.
+public sealed class ThreadSafeLruCache&lt;TKey, TValue&gt;(int capacity) where TKey : notnull
+{
+    private readonly LruCache&lt;TKey, TValue&gt; _inner = new(capacity);
+    private readonly object _gate = new();
+
+    public bool TryGet(TKey key, out TValue value)
+    {
+        lock (_gate) return _inner.TryGet(key, out value);
+    }
+
+    public void Put(TKey key, TValue value)
+    {
+        lock (_gate) _inner.Put(key, value);
+    }
+
+    /// Get-or-add WITHOUT holding the lock across the factory call. Calling a
+    /// user-supplied delegate inside a lock is how caches deadlock in production.
+    public TValue GetOrAdd(TKey key, Func&lt;TKey, TValue&gt; factory)
+    {
+        lock (_gate) { if (_inner.TryGet(key, out var hit)) return hit; }
+
+        var created = factory(key);               // outside the lock
+
+        lock (_gate)
+        {
+            // Someone may have inserted while we were computing. Prefer theirs
+            // so every caller observes the same instance.
+            if (_inner.TryGet(key, out var raced)) return raced;
+            _inner.Put(key, created);
+            return created;
+        }
+    }
+}
+
+/// The scaling answer: N independent caches, each with its own lock.
+/// Contention drops by roughly N; eviction becomes per-shard, which means
+/// LRU is now approximate across the whole cache — say that out loud.
+public sealed class ShardedLruCache&lt;TKey, TValue&gt; where TKey : notnull
+{
+    private readonly ThreadSafeLruCache&lt;TKey, TValue&gt;[] _shards;
+
+    public ShardedLruCache(int capacity, int shards = 16)
+    {
+        _shards = Enumerable.Range(0, shards)
+            .Select(_ =&gt; new ThreadSafeLruCache&lt;TKey, TValue&gt;(Math.Max(1, capacity / shards)))
+            .ToArray();
+    }
+
+    private ThreadSafeLruCache&lt;TKey, TValue&gt; ShardFor(TKey key) =&gt;
+        _shards[(uint)key.GetHashCode() % (uint)_shards.Length];
+
+    public bool TryGet(TKey key, out TValue value) =&gt; ShardFor(key).TryGet(key, out value);
+    public void Put(TKey key, TValue value) =&gt; ShardFor(key).Put(key, value);
+}</code></pre><pre data-lang="python" hidden><code>from __future__ import annotations
+import threading
+from typing import Callable, Generic, TypeVar
+
+K = TypeVar(&quot;K&quot;)
+V = TypeVar(&quot;V&quot;)
+
+class ThreadSafeLruCache(Generic[K, V]):
+    &quot;&quot;&quot;Correct, simple, and the right default. The critical section is a dict
+    lookup plus four pointer writes.&quot;&quot;&quot;
+
+    def __init__(self, capacity: int) -&gt; None:
+        self._inner: LruCache[K, V] = LruCache(capacity)
+        self._lock = threading.Lock()
+
+    def get(self, key: K, default=None):
+        with self._lock:
+            return self._inner.get(key, default)
+
+    def put(self, key: K, value: V) -&gt; None:
+        with self._lock:
+            self._inner.put(key, value)
+
+    _MISSING = object()
+
+    def get_or_add(self, key: K, factory: Callable[[K], V]) -&gt; V:
+        &quot;&quot;&quot;Never hold the lock across the factory call — that is how caches
+        deadlock in production.&quot;&quot;&quot;
+        with self._lock:
+            hit = self._inner.get(key, self._MISSING)
+        if hit is not self._MISSING:
+            return hit
+
+        created = factory(key)                  # outside the lock
+
+        with self._lock:
+            # Someone may have inserted while we computed. Prefer theirs, so
+            # every caller observes the same instance.
+            raced = self._inner.get(key, self._MISSING)
+            if raced is not self._MISSING:
+                return raced
+            self._inner.put(key, created)
+            return created
+
+class ShardedLruCache(Generic[K, V]):
+    &quot;&quot;&quot;N independent caches, each with its own lock. Contention drops by ~N;
+    eviction is per-shard, so LRU is now APPROXIMATE globally — say so.&quot;&quot;&quot;
+
+    def __init__(self, capacity: int, shards: int = 16) -&gt; None:
+        self._shards = [ThreadSafeLruCache(max(1, capacity // shards))
+                        for _ in range(shards)]
+
+    def _shard_for(self, key: K) -&gt; ThreadSafeLruCache[K, V]:
+        return self._shards[hash(key) % len(self._shards)]
+
+    def get(self, key: K, default=None):
+        return self._shard_for(key).get(key, default)
+
+    def put(self, key: K, value: V) -&gt; None:
+        self._shard_for(key).put(key, value)</code></pre></div><div class="callout callout-warn"><span class="callout-title">Never call a user-supplied delegate while holding a lock</span><p><code>GetOrAdd</code> is where real caches deadlock. If the
+factory is slow you have serialised every caller; if the factory re-enters the cache you deadlock outright; if it throws you must
+not leave the cache inconsistent. The pattern above — check, compute <em>outside</em>, re-check, insert — is the standard fix, and
+it accepts that two threads may compute the same value concurrently. That duplicate work is almost always cheaper than the
+alternatives, but if it is not (the factory is an expensive network call), the answer is a <strong>per-key in-flight map</strong>
+of promises so the second caller awaits the first's result instead of recomputing. Naming that upgrade is a strong senior
+signal.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The move here is to <em>not</em> reach for cleverness and to justify it: <strong>"a single lock is correct and the
+critical section is a few pointer writes, so I would ship that and measure before optimising. If it became a bottleneck I would
+shard, and I would accept that LRU then becomes approximate per shard."</strong> That answer demonstrates you know the alternatives
+and chose. If you are asked why a <code>ReaderWriterLock</code> would not help, the answer is one sentence and it is the best thing
+you can say in this whole section: <em>in an LRU, a read is a write</em>. Candidates who propose a reader-writer lock without
+noticing that <code>get</code> reorders the list have missed the central property of the data structure.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a test that hammers the cache from 16 threads and asserts the map and list stay consistent (count matches, no cycles).</li><li>Implement the in-flight promise map so concurrent misses on one key compute it once.</li><li>Measure single-lock versus 16-shard throughput under contention. Check whether the complexity was worth it.</li></ul></div></section>
+
+<section id="policies"><h2 id="policies">TTL and pluggable eviction</h2><p>The next follow-ups are always "add expiry" and "what if we wanted LFU instead?". Both are the same move: the thing that varies
+goes behind an interface. Expiry is slightly subtler because there are two valid strategies and the right answer is usually
+<em>both</em>.</p>
+<ul>
+<li><strong>Lazy expiry</strong> — check the timestamp on read, treat an expired entry as a miss. Zero background cost, but expired
+entries keep occupying capacity until someone asks for them.</li>
+<li><strong>Active expiry</strong> — a sweeper, or a min-heap by expiry time, reclaiming space proactively. Costs a thread or a
+periodic tick.</li>
+</ul>
+<p>Real caches do lazy for correctness and active for memory. Say that.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public interface IEvictionPolicy&lt;TKey&gt;
+{
+    void RecordAccess(TKey key);
+    void RecordInsert(TKey key);
+    void Remove(TKey key);
+    TKey? SelectVictim();            // null when there is nothing to evict
+}
+
+public sealed class CacheEntry&lt;TValue&gt;(TValue value, DateTime? expiresAt)
+{
+    public TValue Value { get; } = value;
+    public DateTime? ExpiresAt { get; } = expiresAt;
+    public bool IsExpired(DateTime now) =&gt; ExpiresAt is { } e &amp;&amp; now &gt;= e;
+}
+
+public sealed class Cache&lt;TKey, TValue&gt;(
+    int capacity, IEvictionPolicy&lt;TKey&gt; policy, IClock clock) where TKey : notnull
+{
+    private readonly Dictionary&lt;TKey, CacheEntry&lt;TValue&gt;&gt; _entries = new(capacity);
+    private readonly object _gate = new();
+
+    public bool TryGet(TKey key, out TValue value)
+    {
+        lock (_gate)
+        {
+            value = default!;
+            if (!_entries.TryGetValue(key, out var entry)) return false;
+
+            if (entry.IsExpired(clock.Now))          // LAZY expiry: a miss
+            {
+                _entries.Remove(key);
+                policy.Remove(key);
+                return false;
+            }
+
+            policy.RecordAccess(key);
+            value = entry.Value;
+            return true;
+        }
+    }
+
+    public void Put(TKey key, TValue value, TimeSpan? ttl = null)
+    {
+        lock (_gate)
+        {
+            var expiresAt = ttl is { } t ? clock.Now + t : (DateTime?)null;
+
+            if (_entries.ContainsKey(key))
+            {
+                _entries[key] = new CacheEntry&lt;TValue&gt;(value, expiresAt);
+                policy.RecordAccess(key);
+                return;
+            }
+
+            if (_entries.Count &gt;= capacity)
+            {
+                SweepExpired();                       // ACTIVE expiry: free space first
+                if (_entries.Count &gt;= capacity &amp;&amp; policy.SelectVictim() is { } victim)
+                {
+                    _entries.Remove(victim);
+                    policy.Remove(victim);
+                }
+            }
+
+            _entries[key] = new CacheEntry&lt;TValue&gt;(value, expiresAt);
+            policy.RecordInsert(key);
+        }
+    }
+
+    /// Prefer evicting something already dead over something merely old.
+    private void SweepExpired()
+    {
+        var now = clock.Now;
+        foreach (var key in _entries.Where(kv =&gt; kv.Value.IsExpired(now))
+                                    .Select(kv =&gt; kv.Key).ToList())
+        {
+            _entries.Remove(key);
+            policy.Remove(key);
+        }
+    }
+}</code></pre><pre data-lang="python" hidden><code>from __future__ import annotations
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Generic, Protocol, TypeVar
+
+K = TypeVar(&quot;K&quot;)
+V = TypeVar(&quot;V&quot;)
+
+class EvictionPolicy(Protocol[K]):
+    def record_access(self, key: K) -&gt; None: ...
+    def record_insert(self, key: K) -&gt; None: ...
+    def remove(self, key: K) -&gt; None: ...
+    def select_victim(self) -&gt; K | None: ...
+
+@dataclass
+class CacheEntry(Generic[V]):
+    value: V
+    expires_at: datetime | None
+    def is_expired(self, now: datetime) -&gt; bool:
+        return self.expires_at is not None and now &gt;= self.expires_at
+
+class Cache(Generic[K, V]):
+    _MISSING = object()
+
+    def __init__(self, capacity: int, policy: EvictionPolicy[K], clock) -&gt; None:
+        self._capacity = capacity
+        self._policy = policy
+        self._clock = clock
+        self._entries: dict[K, CacheEntry[V]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: K, default=None):
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return default
+
+            if entry.is_expired(self._clock.now()):      # LAZY expiry: a miss
+                del self._entries[key]
+                self._policy.remove(key)
+                return default
+
+            self._policy.record_access(key)
+            return entry.value
+
+    def put(self, key: K, value: V, ttl: timedelta | None = None) -&gt; None:
+        with self._lock:
+            now = self._clock.now()
+            expires_at = now + ttl if ttl is not None else None
+
+            if key in self._entries:
+                self._entries[key] = CacheEntry(value, expires_at)
+                self._policy.record_access(key)
+                return
+
+            if len(self._entries) &gt;= self._capacity:
+                self._sweep_expired(now)                 # ACTIVE: free space first
+                if len(self._entries) &gt;= self._capacity:
+                    victim = self._policy.select_victim()
+                    if victim is not None:
+                        self._entries.pop(victim, None)
+                        self._policy.remove(victim)
+
+            self._entries[key] = CacheEntry(value, expires_at)
+            self._policy.record_insert(key)
+
+    def _sweep_expired(self, now: datetime) -&gt; None:
+        &quot;&quot;&quot;Prefer evicting something already dead over something merely old.&quot;&quot;&quot;
+        for key in [k for k, e in self._entries.items() if e.is_expired(now)]:
+            del self._entries[key]
+            self._policy.remove(key)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The separation to point at is that <strong><code>Cache</code> no longer knows what LRU means</strong> — it knows there
+is a policy that records accesses and names victims. LRU, LFU, FIFO and random all become implementations, and "what if we wanted
+LFU?" becomes a thirty-second answer. Expect the probe "isn't that over-engineering for a cache?" and have the honest answer ready:
+in production, yes, you would use a library; in this round the interviewer asked for a second policy, and the interface is the thing
+that makes the second policy cheap. Also volunteer that <strong>sweeping expired entries before evicting live ones</strong> is a
+deliberate ordering — it is free hit-rate, and it is the kind of detail that distinguishes someone who has operated a cache from
+someone who has only read about one.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement LFU behind <code>IEvictionPolicy</code> and swap it in without touching <code>Cache</code>.</li><li>Add a min-heap of expiry times for active sweeping, and work out what happens when a TTL is extended.</li><li>Write the test where an entry expires between <code>Put</code> and <code>TryGet</code>, using a fake clock.</li></ul></div></section>
+
+<section id="rate-limiter"><h2 id="rate-limiter">Rate limiters: the same design muscle, a different policy</h2><p>Rate limiting is the other near-universal LLD prompt in this family, and it is the same shape: a small amount of per-key state,
+a policy that varies, and a concurrency story. Four algorithms come up; know what each gets wrong.</p><div class="table-wrap"><table><thead><tr><th>Algorithm</th><th>State per key</th><th>Gets wrong</th></tr></thead><tbody><tr><td><strong>Fixed window</strong></td><td>A counter and a window start</td><td>Allows 2× the limit across a boundary</td></tr><tr><td><strong>Sliding window log</strong></td><td>Every request timestamp</td><td>Exact, but memory grows with the limit</td></tr><tr><td><strong>Sliding window counter</strong></td><td>Two counters</td><td>Approximate, but cheap — the usual production choice</td></tr><tr><td><strong>Token bucket</strong></td><td>Token count and a refill timestamp</td><td>Allows a burst up to the bucket size — often desirable</td></tr><tr><td><strong>Leaky bucket</strong></td><td>A queue</td><td>Smooths output; adds latency rather than rejecting</td></tr></tbody></table></div><p>Token bucket is the best default answer: it is O(1) in time and space, it handles bursts gracefully, and it is what most API
+gateways implement. Compute refill <em>lazily</em> from elapsed time rather than running a timer — that is the trick that makes it
+O(1) and testable.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public interface IRateLimiter
+{
+    bool TryAcquire(string key, int permits = 1);
+}
+
+/// Token bucket. Tokens refill lazily from elapsed time, so there is no timer
+/// and the whole thing is deterministic under a fake clock.
+public sealed class TokenBucketRateLimiter(
+    double capacity, double refillPerSecond, IClock clock) : IRateLimiter
+{
+    private sealed class Bucket { public double Tokens; public DateTime LastRefill; }
+
+    private readonly Dictionary&lt;string, Bucket&gt; _buckets = [];
+    private readonly object _gate = new();
+
+    public bool TryAcquire(string key, int permits = 1)
+    {
+        lock (_gate)
+        {
+            var now = clock.Now;
+            if (!_buckets.TryGetValue(key, out var b))
+                _buckets[key] = b = new Bucket { Tokens = capacity, LastRefill = now };
+
+            // Lazy refill: add whatever accrued since we last looked.
+            var elapsed = (now - b.LastRefill).TotalSeconds;
+            if (elapsed &gt; 0)
+            {
+                b.Tokens = Math.Min(capacity, b.Tokens + elapsed * refillPerSecond);
+                b.LastRefill = now;
+            }
+
+            if (b.Tokens &lt; permits) return false;
+            b.Tokens -= permits;
+            return true;
+        }
+    }
+}
+
+/// Sliding window log: exact, at the cost of storing timestamps.
+/// Good to show you know the trade-off even if you would not ship it.
+public sealed class SlidingWindowLogRateLimiter(
+    int limit, TimeSpan window, IClock clock) : IRateLimiter
+{
+    private readonly Dictionary&lt;string, Queue&lt;DateTime&gt;&gt; _hits = [];
+    private readonly object _gate = new();
+
+    public bool TryAcquire(string key, int permits = 1)
+    {
+        lock (_gate)
+        {
+            var now = clock.Now;
+            if (!_hits.TryGetValue(key, out var q)) _hits[key] = q = new Queue&lt;DateTime&gt;();
+
+            var cutoff = now - window;
+            while (q.Count &gt; 0 &amp;&amp; q.Peek() &lt;= cutoff) q.Dequeue();   // drop stale
+
+            if (q.Count + permits &gt; limit) return false;
+            for (int i = 0; i &lt; permits; i++) q.Enqueue(now);
+            return true;
+        }
+    }
+}</code></pre><pre data-lang="python" hidden><code>from __future__ import annotations
+import threading
+from collections import deque
+from datetime import datetime, timedelta
+from typing import Protocol
+
+class RateLimiter(Protocol):
+    def try_acquire(self, key: str, permits: int = 1) -&gt; bool: ...
+
+class TokenBucketRateLimiter:
+    &quot;&quot;&quot;Tokens refill lazily from elapsed time: no timer, O(1), and fully
+    deterministic under a fake clock.&quot;&quot;&quot;
+
+    def __init__(self, capacity: float, refill_per_second: float, clock) -&gt; None:
+        self._capacity = capacity
+        self._refill = refill_per_second
+        self._clock = clock
+        self._buckets: dict[str, list] = {}       # key -&gt; [tokens, last_refill]
+        self._lock = threading.Lock()
+
+    def try_acquire(self, key: str, permits: int = 1) -&gt; bool:
+        with self._lock:
+            now = self._clock.now()
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                bucket = self._buckets[key] = [self._capacity, now]
+
+            elapsed = (now - bucket[1]).total_seconds()
+            if elapsed &gt; 0:                        # lazy refill
+                bucket[0] = min(self._capacity, bucket[0] + elapsed * self._refill)
+                bucket[1] = now
+
+            if bucket[0] &lt; permits:
+                return False
+            bucket[0] -= permits
+            return True
+
+class SlidingWindowLogRateLimiter:
+    &quot;&quot;&quot;Exact, at the cost of storing timestamps.&quot;&quot;&quot;
+
+    def __init__(self, limit: int, window: timedelta, clock) -&gt; None:
+        self._limit = limit
+        self._window = window
+        self._clock = clock
+        self._hits: dict[str, deque[datetime]] = {}
+        self._lock = threading.Lock()
+
+    def try_acquire(self, key: str, permits: int = 1) -&gt; bool:
+        with self._lock:
+            now = self._clock.now()
+            q = self._hits.setdefault(key, deque())
+
+            cutoff = now - self._window
+            while q and q[0] &lt;= cutoff:            # drop stale
+                q.popleft()
+
+            if len(q) + permits &gt; self._limit:
+                return False
+            for _ in range(permits):
+                q.append(now)
+            return True</code></pre></div><div class="callout callout-note"><span class="callout-title">The fixed-window boundary bug, in numbers</span><p>A limit of 100 per minute with fixed windows: 100 requests at 11:00:59 and
+100 more at 11:01:01 are both legal, so the client sent <strong>200 requests in two seconds</strong> while never exceeding the
+stated limit. That is the concrete example to give if asked why fixed windows are inadequate — it is far more convincing than
+"it has boundary issues", and it immediately motivates the sliding variants. The sliding window <em>counter</em> fixes it
+approximately by weighting the previous window's count by how much of it still overlaps, which costs two integers instead of a list
+of timestamps.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Lead with token bucket and justify it on <strong>bursts</strong>: "real clients are bursty, and a bucket lets them
+spend saved capacity instead of being rejected for arriving in a clump, which is usually what you want from an API." Then mention
+the lazy refill as the implementation trick, because it is what makes it O(1) with no background thread. The distributed follow-up
+is near-certain — "now it runs on 20 servers" — and the answer is that per-server state no longer works, so the bucket moves into a
+shared store and the check-and-decrement must be atomic there (a Lua script in Redis, or a conditional write). That is the same
+compare-and-set reasoning as the <a href="lld-parking-lot.html#concurrency">parking lot's last spot</a>, which is a nice connection
+to draw explicitly.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement all four with an injected clock and show the fixed-window 2× burst as a test.</li><li>Add the sliding window counter and compare its error against the exact log on a replayed trace.</li><li>Extend token bucket to return <em>when</em> the caller may retry, not just true/false. Clients need that header.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="../../DSA/topics/dsa-hashing.html#lru" target="_blank" rel="noopener">DSA: The LRU cache</a> — the same structure as an algorithms question</li><li><a href="../../SystemDesign/chapters/04-rate-limiter.html" target="_blank" rel="noopener">System Design: Rate Limiter</a> — the same algorithms at system scale</li><li><a href="../../DotNet/topics/threading.html" target="_blank" rel="noopener">C# & .NET: Threading & Async</a> — lock, ReaderWriterLockSlim and the concurrent collections</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

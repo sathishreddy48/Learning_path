@@ -1,0 +1,962 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recursion &amp; Dynamic Programming — DSA</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="dsa-recursion-dp">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Patterns › Topic 8 of 9</div>
+  <h1>Recursion &amp; Dynamic Programming</h1>
+  <p class="lede">The family people skip and then lose an onsite to. DP is recursion with the repeated work deleted — so every problem here is reached by the same three steps: brute force, memoise, tabulate. Nine sections covering the shapes that actually get asked, and how to tell DP from greedy when it matters.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#recursion-to-dp">From recursion to DP: the three-step conversion</a></li><li><a href="#one-dimension">One-dimensional DP: the decision at each index</a></li><li><a href="#two-strings">Two sequences: LCS, edit distance and the grid</a></li><li><a href="#knapsack">Knapsack: the one shape behind half of all DP questions</a></li><li><a href="#lis">Longest increasing subsequence, and the O(n log n) upgrade</a></li><li><a href="#grids">Grid DP: paths, costs and the obstacle cases</a></li><li><a href="#intervals">Interval and partition DP: when the split point is the decision</a></li><li><a href="#bitmask-trees">Bitmask DP and DP on trees</a></li><li><a href="#recognising">Recognising DP — and telling it from greedy</a></li></ol>
+  </div>
+
+<section id="recursion-to-dp"><h2 id="recursion-to-dp">From recursion to DP: the three-step conversion</h2><p>Dynamic programming is not a separate skill from recursion — it is recursion with the repeated work deleted. Almost every DP
+problem in an interview can be reached by the same three steps, in order, out loud:</p>
+<ol>
+<li><strong>Write the brute-force recursion.</strong> Define what the function <em>means</em> in one sentence, then write it. Do not
+think about efficiency yet. If you cannot state the meaning of <code>F(i)</code> in English, you do not have a recurrence, and no
+amount of table-filling will rescue that.</li>
+<li><strong>Add a memo.</strong> Cache on the arguments that vary. This alone takes exponential to polynomial and is usually enough
+to pass. It is also the step you should write first in an interview, because it is the one least likely to contain a bug.</li>
+<li><strong>Turn it into a table</strong> (only if asked, or if recursion depth is a risk). Iterate the states in an order where
+every dependency is already computed, then collapse the table to the one or two rows you actually read.</li>
+</ol>
+<p>The whole method hangs on naming the <strong>state</strong>: the smallest set of values that fully determines the answer from
+here on. Get the state right and the recurrence usually writes itself; get it wrong and nothing works. "Fibonacci" is the
+degenerate example, but it shows the mechanics exactly.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Step 1 — brute force. Meaning: Fib(n) is the nth Fibonacci number.
+// O(2^n): Fib(n-2) is recomputed by both branches, all the way down.
+static long FibSlow(int n) =&gt; n &lt; 2 ? n : FibSlow(n - 1) + FibSlow(n - 2);
+
+// Step 2 — memoise. One cache entry per distinct argument, so each state is
+// computed once: O(n) time, O(n) space. This is the step to write first.
+static long FibMemo(int n, Dictionary&lt;int, long&gt;? memo = null)
+{
+    memo ??= new Dictionary&lt;int, long&gt;();
+    if (n &lt; 2) return n;                                  // base case
+    if (memo.TryGetValue(n, out var hit)) return hit;      // already solved
+    return memo[n] = FibMemo(n - 1, memo) + FibMemo(n - 2, memo);
+}
+
+// Step 3 — tabulate. Same recurrence, computed bottom-up so no call stack.
+static long FibTable(int n)
+{
+    if (n &lt; 2) return n;
+    var dp = new long[n + 1];
+    dp[1] = 1;
+    for (int i = 2; i &lt;= n; i++) dp[i] = dp[i - 1] + dp[i - 2];
+    return dp[n];
+}
+
+// Step 3b — collapse. The loop only ever reads the last two cells, so the
+// array is not needed at all: O(1) space.
+static long Fib(int n)
+{
+    long prev = 0, cur = 1;
+    if (n &lt; 2) return n;
+    for (int i = 2; i &lt;= n; i++) (prev, cur) = (cur, prev + cur);
+    return cur;
+}</code></pre><pre data-lang="python" hidden><code>from functools import lru_cache
+
+# Step 1 — brute force. O(2^n).
+def fib_slow(n: int) -&gt; int:
+    return n if n &lt; 2 else fib_slow(n - 1) + fib_slow(n - 2)
+
+# Step 2 — memoise. In Python the decorator does it for you, which is worth
+# knowing but worth writing by hand at least once so you can explain it.
+@lru_cache(maxsize=None)
+def fib_memo(n: int) -&gt; int:
+    return n if n &lt; 2 else fib_memo(n - 1) + fib_memo(n - 2)
+
+def fib_memo_manual(n: int, memo: dict[int, int] | None = None) -&gt; int:
+    if memo is None:
+        memo = {}
+    if n &lt; 2:
+        return n
+    if n in memo:
+        return memo[n]
+    memo[n] = fib_memo_manual(n - 1, memo) + fib_memo_manual(n - 2, memo)
+    return memo[n]
+
+# Step 3 — tabulate.
+def fib_table(n: int) -&gt; int:
+    if n &lt; 2:
+        return n
+    dp = [0] * (n + 1)
+    dp[1] = 1
+    for i in range(2, n + 1):
+        dp[i] = dp[i - 1] + dp[i - 2]
+    return dp[n]
+
+# Step 3b — collapse to O(1) space.
+def fib(n: int) -&gt; int:
+    prev, cur = 0, 1
+    if n &lt; 2:
+        return n
+    for _ in range(2, n + 1):
+        prev, cur = cur, prev + cur
+    return cur</code></pre></div><div class="callout callout-note"><span class="callout-title">The four questions that define a DP</span><ul>
+<li><strong>State</strong> — what do the parameters mean? Write the sentence: "<code>dp[i][j]</code> is the minimum cost to …".</li>
+<li><strong>Transition</strong> — how does a state depend on smaller ones? This is the recurrence.</li>
+<li><strong>Base case</strong> — the smallest states, answered without recursion. Most DP bugs live here.</li>
+<li><strong>Answer</strong> — which cell is the result? Not always <code>dp[n]</code>; sometimes it is the max over a whole row.</li>
+</ul></div><div class="table-wrap"><table><thead><tr><th></th><th>Memoisation (top-down)</th><th>Tabulation (bottom-up)</th></tr></thead><tbody><tr><td>Direction</td><td>From the answer down to base cases</td><td>From base cases up to the answer</td></tr><tr><td>Writing it</td><td>Mechanical once you have the recursion</td><td>Needs you to pick a correct fill order</td></tr><tr><td>Computes</td><td>Only the states actually reachable</td><td>Every state in the table</td></tr><tr><td>Risk</td><td>Stack overflow on deep recursion</td><td>Off-by-one in loop bounds</td></tr><tr><td>Space</td><td>Cache plus call stack</td><td>Collapsible to O(width)</td></tr><tr><td>Reach for it when</td><td>Default. Write this first.</td><td>Depth is a risk, or you need the O(1)-space version</td></tr></tbody></table></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Say the three steps out loud as you do them — "brute force first, then I will memoise, then collapse the space if you
+want it" — because the interviewer is grading your <em>method</em>, and the method is the thing that transfers to the problem they
+ask next. The single highest-value sentence you can produce is the state definition; if you say "<code>dp[i]</code> is the best I
+can do considering only the first <code>i</code> items" and it is correct, a strong interviewer will often help you with the rest.
+Also be ready for "what is the complexity?" — the answer is always <em>number of states × work per state</em>, and saying it in that
+form shows you understand why memoisation helped rather than that you memorised a bound.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write Fibonacci all four ways from memory, then state the complexity of each in states × work-per-state form.</li><li>Climbing stairs with steps of 1 or 2, then generalise to a given set of step sizes.</li><li>Explain why memoisation is correct — what property must the subproblems have? (Name both overlapping subproblems and optimal substructure.)</li></ul></div></section>
+
+<section id="one-dimension"><h2 id="one-dimension">One-dimensional DP: the decision at each index</h2><p>The first real family. You walk an array once; at each index you make a small decision, and the state is "the best answer
+considering the prefix that ends here". Everything below is the same shape with a different transition.</p>
+<p><strong>House robber</strong> is the archetype: you cannot take two adjacent elements. At index <code>i</code> you either take
+<code>i</code> (and add the best from <code>i-2</code>) or skip it (and keep the best from <code>i-1</code>). That one sentence is
+the recurrence.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// dp[i] = max loot considering houses 0..i-1.
+// Collapsed: only dp[i-1] and dp[i-2] are ever read.
+static int Rob(int[] nums)
+{
+    int take = 0, skip = 0;                    // best ending here / before here
+    foreach (var n in nums)
+        (take, skip) = (skip + n, Math.Max(skip, take));
+    return Math.Max(take, skip);
+}
+
+// dp[i] = number of ways to decode s[0..i-1]. Base: dp[0] = 1, the empty
+// string has exactly one decoding. The &quot;1&quot; here is the classic trap.
+static int NumDecodings(string s)
+{
+    int prev2 = 1, prev1 = s[0] == &#x27;0&#x27; ? 0 : 1;
+    for (int i = 1; i &lt; s.Length; i++)
+    {
+        int cur = 0;
+        if (s[i] != &#x27;0&#x27;) cur += prev1;                       // one-digit step
+        int two = (s[i - 1] - &#x27;0&#x27;) * 10 + (s[i] - &#x27;0&#x27;);
+        if (two &gt;= 10 &amp;&amp; two &lt;= 26) cur += prev2;            // two-digit step
+        (prev2, prev1) = (prev1, cur);
+    }
+    return prev1;
+}
+
+// Maximum subarray sum (Kadane). dp[i] = best sum of a subarray ENDING at i,
+// which is why it is DP and not a sliding window: the window may not shrink.
+static int MaxSubArray(int[] nums)
+{
+    int best = nums[0], endingHere = nums[0];
+    for (int i = 1; i &lt; nums.Length; i++)
+    {
+        endingHere = Math.Max(nums[i], endingHere + nums[i]);   // extend or restart
+        best = Math.Max(best, endingHere);
+    }
+    return best;
+}
+
+// Word break: dp[i] = can s[0..i-1] be segmented?
+static bool WordBreak(string s, IList&lt;string&gt; dict)
+{
+    var words = new HashSet&lt;string&gt;(dict);
+    var dp = new bool[s.Length + 1];
+    dp[0] = true;
+    for (int i = 1; i &lt;= s.Length; i++)
+        for (int j = 0; j &lt; i; j++)
+            if (dp[j] &amp;&amp; words.Contains(s[j..i])) { dp[i] = true; break; }
+    return dp[s.Length];
+}</code></pre><pre data-lang="python" hidden><code>def rob(nums: list[int]) -&gt; int:
+    take = skip = 0                      # best ending here / before here
+    for n in nums:
+        take, skip = skip + n, max(skip, take)
+    return max(take, skip)
+
+def num_decodings(s: str) -&gt; int:
+    prev2, prev1 = 1, 0 if s[0] == &quot;0&quot; else 1
+    for i in range(1, len(s)):
+        cur = 0
+        if s[i] != &quot;0&quot;:
+            cur += prev1                                  # one-digit step
+        if 10 &lt;= int(s[i - 1 : i + 1]) &lt;= 26:
+            cur += prev2                                  # two-digit step
+        prev2, prev1 = prev1, cur
+    return prev1
+
+def max_sub_array(nums: list[int]) -&gt; int:
+    best = ending_here = nums[0]
+    for n in nums[1:]:
+        ending_here = max(n, ending_here + n)             # extend or restart
+        best = max(best, ending_here)
+    return best
+
+def word_break(s: str, word_dict: list[str]) -&gt; bool:
+    words = set(word_dict)
+    dp = [False] * (len(s) + 1)
+    dp[0] = True
+    for i in range(1, len(s) + 1):
+        for j in range(i):
+            if dp[j] and s[j:i] in words:
+                dp[i] = True
+                break
+    return dp[len(s)]</code></pre></div><div class="callout callout-warn"><span class="callout-title">The circular variant</span><p>"House robber II" puts the houses in a circle, so the first and last are now adjacent. Do not
+try to patch the recurrence — run the linear solver twice, once on <code>nums[0..n-2]</code> and once on <code>nums[1..n-1]</code>,
+and take the better. Reducing a variant to the solved case is a stronger answer than a new recurrence, and it generalises: a lot of
+"circular" problems are two linear problems.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Kadane's algorithm is the one to be careful with, because it <em>looks</em> like a sliding window and is not — a window
+assumes shrinking from the left is valid, and here it is not, since dropping a prefix can only be decided by comparing sums. Say
+"<code>dp[i]</code> is the best subarray <em>ending</em> at <code>i</code>" and the confusion disappears. Expect two follow-ups:
+return the indices rather than the sum (keep a start pointer that resets whenever you restart), and handle an all-negative array
+(initialising <code>best</code> to <code>0</code> instead of <code>nums[0]</code> is the standard bug, and it is the case they will
+test). For decode-ways, be ready to explain why <code>dp[0] = 1</code>.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>House robber, then the circular variant, then the binary-tree variant (which is DP on a tree — see the last section).</li><li>Maximum subarray, returning the indices; then maximum <em>product</em> subarray, where you must track the minimum too and say why.</li><li>Decode ways, getting every zero case right: leading zero, "<code>30</code>", "<code>100</code>", "<code>101</code>".</li><li>Word break, then word break II which returns every segmentation — note where it stops being DP and becomes backtracking.</li></ul></div></section>
+
+<section id="two-strings"><h2 id="two-strings">Two sequences: LCS, edit distance and the grid</h2><p>When the input is <em>two</em> sequences, the state is almost always a pair of prefix lengths: <code>dp[i][j]</code> is the
+answer for the first <code>i</code> of one and the first <code>j</code> of the other. That gives an <code>(m+1) × (n+1)</code> grid,
+the extra row and column being the empty-prefix base cases — which is the whole reason this family is written as a table rather
+than fought index-by-index.</p>
+<p>Every problem in the family differs only in what happens at a cell. Learn the grid once and you get LCS, edit distance, longest
+common substring, shortest common supersequence and string interleaving for free.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Longest common SUBSEQUENCE (not substring: gaps allowed).
+// dp[i,j] = LCS length of a[0..i-1] and b[0..j-1].
+static int Lcs(string a, string b)
+{
+    var dp = new int[a.Length + 1, b.Length + 1];      // row/col 0 = empty prefix = 0
+    for (int i = 1; i &lt;= a.Length; i++)
+        for (int j = 1; j &lt;= b.Length; j++)
+            dp[i, j] = a[i - 1] == b[j - 1]
+                ? dp[i - 1, j - 1] + 1                  // match: consume both
+                : Math.Max(dp[i - 1, j], dp[i, j - 1]); // else: drop one, best of two
+    return dp[a.Length, b.Length];
+}
+
+// Edit distance (Levenshtein): insert, delete or replace, cost 1 each.
+static int EditDistance(string a, string b)
+{
+    var dp = new int[a.Length + 1, b.Length + 1];
+    for (int i = 0; i &lt;= a.Length; i++) dp[i, 0] = i;   // delete i chars
+    for (int j = 0; j &lt;= b.Length; j++) dp[0, j] = j;   // insert j chars
+    for (int i = 1; i &lt;= a.Length; i++)
+        for (int j = 1; j &lt;= b.Length; j++)
+            dp[i, j] = a[i - 1] == b[j - 1]
+                ? dp[i - 1, j - 1]                      // free match
+                : 1 + Math.Min(dp[i - 1, j - 1],        // replace
+                      Math.Min(dp[i - 1, j],            // delete from a
+                               dp[i, j - 1]));          // insert into a
+    return dp[a.Length, b.Length];
+}
+
+// Longest common SUBSTRING — contiguous, so a mismatch resets to 0 and the
+// answer is the max anywhere in the table, not the corner.
+static int LongestCommonSubstring(string a, string b)
+{
+    var dp = new int[a.Length + 1, b.Length + 1];
+    int best = 0;
+    for (int i = 1; i &lt;= a.Length; i++)
+        for (int j = 1; j &lt;= b.Length; j++)
+            if (a[i - 1] == b[j - 1])
+                best = Math.Max(best, dp[i, j] = dp[i - 1, j - 1] + 1);
+    return best;
+}
+
+// Space collapse: each row reads only the row above, so two rows suffice.
+static int LcsTwoRows(string a, string b)
+{
+    var prev = new int[b.Length + 1];
+    var cur = new int[b.Length + 1];
+    for (int i = 1; i &lt;= a.Length; i++)
+    {
+        for (int j = 1; j &lt;= b.Length; j++)
+            cur[j] = a[i - 1] == b[j - 1] ? prev[j - 1] + 1 : Math.Max(prev[j], cur[j - 1]);
+        (prev, cur) = (cur, prev);
+        Array.Clear(cur);                               // stale row must be wiped
+    }
+    return prev[b.Length];
+}</code></pre><pre data-lang="python" hidden><code>def lcs(a: str, b: str) -&gt; int:
+    dp = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1          # match: consume both
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+    return dp[len(a)][len(b)]
+
+def edit_distance(a: str, b: str) -&gt; int:
+    dp = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for i in range(len(a) + 1):
+        dp[i][0] = i                                     # delete i chars
+    for j in range(len(b) + 1):
+        dp[0][j] = j                                     # insert j chars
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]              # free match
+            else:
+                dp[i][j] = 1 + min(dp[i - 1][j - 1],     # replace
+                                   dp[i - 1][j],         # delete
+                                   dp[i][j - 1])         # insert
+    return dp[len(a)][len(b)]
+
+def longest_common_substring(a: str, b: str) -&gt; int:
+    dp = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    best = 0
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:                     # mismatch resets to 0
+                dp[i][j] = dp[i - 1][j - 1] + 1
+                best = max(best, dp[i][j])
+    return best
+
+def lcs_two_rows(a: str, b: str) -&gt; int:
+    prev = [0] * (len(b) + 1)
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        for j in range(1, len(b) + 1):
+            cur[j] = prev[j - 1] + 1 if a[i - 1] == b[j - 1] else max(prev[j], cur[j - 1])
+        prev = cur
+    return prev[len(b)]</code></pre></div><div class="table-wrap"><table><thead><tr><th>Problem</th><th>On a match</th><th>On a mismatch</th><th>Answer is</th></tr></thead><tbody><tr><td>Longest common subsequence</td><td><code>dp[i-1][j-1] + 1</code></td><td><code>max(dp[i-1][j], dp[i][j-1])</code></td><td>the corner</td></tr><tr><td>Longest common substring</td><td><code>dp[i-1][j-1] + 1</code></td><td><code>0</code> — contiguity broken</td><td>the max anywhere</td></tr><tr><td>Edit distance</td><td><code>dp[i-1][j-1]</code> (free)</td><td><code>1 + min</code> of the three neighbours</td><td>the corner</td></tr><tr><td>Delete-only distance</td><td><code>dp[i-1][j-1]</code></td><td><code>1 + min(dp[i-1][j], dp[i][j-1])</code></td><td>the corner</td></tr><tr><td>Distinct subsequences</td><td><code>dp[i-1][j-1] + dp[i-1][j]</code></td><td><code>dp[i-1][j]</code></td><td>the corner</td></tr></tbody></table></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>This is the family most likely to appear in a Google or Meta loop, and the discriminator is whether you can
+<em>derive</em> the cell rule rather than recall it. Narrate one cell: "I am looking at <code>a[i-1]</code> and <code>b[j-1]</code>;
+if they match I have nothing to decide, so I take the diagonal; if not, my options are …". Then expect the two standard follow-ups.
+<strong>Reconstruct the answer</strong>, not just its length — walk backwards from the corner, moving diagonally on a match and
+otherwise towards the larger neighbour, and note that this needs the full table, so it is incompatible with the two-row collapse.
+<strong>Reduce the space</strong> — two rows, which you should offer before being asked. If they push to O(min(m,n)) space
+<em>and</em> reconstruction, that is Hirschberg's algorithm; naming it is enough, nobody expects you to code it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Edit distance, then reconstruct the actual edit script from the table.</li><li>Longest palindromic subsequence — solve it by calling LCS on the string and its reverse, and explain why that works.</li><li>Distinct subsequences (how many times does <code>t</code> appear as a subsequence of <code>s</code>) — derive the cell rule yourself.</li><li>Interleaving string: given <code>a</code>, <code>b</code>, <code>c</code>, is <code>c</code> an interleaving? Same grid, different meaning.</li></ul></div></section>
+
+<section id="knapsack"><h2 id="knapsack">Knapsack: the one shape behind half of all DP questions</h2><p>If a problem gives you a collection of items and a budget — weight, capacity, a target sum, an amount of money — it is a
+knapsack, and the only real question is <strong>how many times may you use each item</strong>. That single distinction decides the
+direction of one loop, and getting it backwards is the most common DP bug there is.</p>
+<ul>
+<li><strong>0/1 knapsack</strong> — each item at most once. Iterate capacity <em>downwards</em>, so a cell never sees this item's own
+update.</li>
+<li><strong>Unbounded knapsack</strong> — each item any number of times. Iterate capacity <em>upwards</em>, so a cell deliberately
+reuses this item.</li>
+</ul>
+<p>Subset-sum, partition-equal-subset and "target sum" are 0/1 knapsack with boolean or counting cells. Coin change (fewest coins)
+and coin change II (number of ways) are unbounded.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// --- 0/1: each item once. Note the DOWNWARD capacity loop. --------------
+static int Knapsack01(int[] weights, int[] values, int capacity)
+{
+    var dp = new int[capacity + 1];              // dp[c] = best value at capacity c
+    for (int i = 0; i &lt; weights.Length; i++)
+        for (int c = capacity; c &gt;= weights[i]; c--)       // ← downwards
+            dp[c] = Math.Max(dp[c], dp[c - weights[i]] + values[i]);
+    return dp[capacity];
+}
+
+// Partition into two equal-sum halves = subset-sum for total/2, 0/1 shaped.
+static bool CanPartition(int[] nums)
+{
+    int total = nums.Sum();
+    if (total % 2 != 0) return false;                       // odd total: impossible
+    int target = total / 2;
+    var dp = new bool[target + 1];
+    dp[0] = true;                                           // empty subset
+    foreach (var n in nums)
+        for (int c = target; c &gt;= n; c--)                   // ← downwards
+            dp[c] |= dp[c - n];
+    return dp[target];
+}
+
+// --- Unbounded: reuse allowed. Note the UPWARD capacity loop. -----------
+// Fewest coins to make the amount, or -1.
+static int CoinChange(int[] coins, int amount)
+{
+    var dp = new int[amount + 1];
+    Array.Fill(dp, int.MaxValue);
+    dp[0] = 0;                                              // zero coins for zero
+    foreach (var coin in coins)
+        for (int c = coin; c &lt;= amount; c++)                // ← upwards
+            if (dp[c - coin] != int.MaxValue)
+                dp[c] = Math.Min(dp[c], dp[c - coin] + 1);
+    return dp[amount] == int.MaxValue ? -1 : dp[amount];
+}
+
+// Number of WAYS to make the amount as a combination (order irrelevant).
+// Coins outside, amount inside — swap the loops and you count permutations.
+static int CoinChangeWays(int[] coins, int amount)
+{
+    var dp = new long[amount + 1];
+    dp[0] = 1;
+    foreach (var coin in coins)                             // ← coins outermost
+        for (int c = coin; c &lt;= amount; c++)
+            dp[c] += dp[c - coin];
+    return (int)dp[amount];
+}
+
+// Same cells, loops swapped: now ORDER MATTERS, so this counts permutations
+// (&quot;combination sum IV&quot;). The nesting is the entire difference.
+static int CountPermutations(int[] nums, int target)
+{
+    var dp = new long[target + 1];
+    dp[0] = 1;
+    for (int c = 1; c &lt;= target; c++)                       // ← target outermost
+        foreach (var n in nums)
+            if (c &gt;= n) dp[c] += dp[c - n];
+    return (int)dp[target];
+}</code></pre><pre data-lang="python" hidden><code># --- 0/1: each item once. DOWNWARD capacity loop. -----------------------
+def knapsack_01(weights: list[int], values: list[int], capacity: int) -&gt; int:
+    dp = [0] * (capacity + 1)
+    for w, v in zip(weights, values):
+        for c in range(capacity, w - 1, -1):          # ← downwards
+            dp[c] = max(dp[c], dp[c - w] + v)
+    return dp[capacity]
+
+def can_partition(nums: list[int]) -&gt; bool:
+    total = sum(nums)
+    if total % 2:
+        return False
+    target = total // 2
+    dp = [False] * (target + 1)
+    dp[0] = True                                      # empty subset
+    for n in nums:
+        for c in range(target, n - 1, -1):            # ← downwards
+            dp[c] = dp[c] or dp[c - n]
+    return dp[target]
+
+# --- Unbounded: reuse allowed. UPWARD capacity loop. --------------------
+def coin_change(coins: list[int], amount: int) -&gt; int:
+    INF = float(&quot;inf&quot;)
+    dp = [INF] * (amount + 1)
+    dp[0] = 0
+    for coin in coins:
+        for c in range(coin, amount + 1):             # ← upwards
+            dp[c] = min(dp[c], dp[c - coin] + 1)
+    return -1 if dp[amount] == INF else dp[amount]
+
+def coin_change_ways(coins: list[int], amount: int) -&gt; int:
+    dp = [0] * (amount + 1)
+    dp[0] = 1
+    for coin in coins:                                # ← coins outermost
+        for c in range(coin, amount + 1):
+            dp[c] += dp[c - coin]
+    return dp[amount]
+
+# Loops swapped: order now matters, so this counts permutations.
+def count_permutations(nums: list[int], target: int) -&gt; int:
+    dp = [0] * (target + 1)
+    dp[0] = 1
+    for c in range(1, target + 1):                    # ← target outermost
+        for n in nums:
+            if c &gt;= n:
+                dp[c] += dp[c - n]
+    return dp[target]</code></pre></div><div class="callout callout-warn"><span class="callout-title">The two loop rules, and why they are the rules</span><p>In the collapsed one-array form, <code>dp[c - w]</code> is either
+"before this item was considered" or "after", and the loop direction is what decides which.</p><ul>
+<li><strong>Capacity downwards → 0/1.</strong> <code>dp[c - w]</code> is still from the previous item's row, so the item is used at
+most once.</li>
+<li><strong>Capacity upwards → unbounded.</strong> <code>dp[c - w]</code> may already include this item, so it is reused freely.</li>
+<li><strong>Items outer, capacity inner → combinations</strong> (order irrelevant: <code>1+2</code> and <code>2+1</code> are one
+answer).</li>
+<li><strong>Capacity outer, items inner → permutations</strong> (order matters: they are two answers).</li>
+</ul><p>Four lines, and between them they cover coin change, coin change II, combination sum IV, partition and target sum. Memorise
+the two axes rather than the five problems.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The strongest thing you can do here is <em>name the reduction</em> before you write anything: "this is 0/1 knapsack
+with the values equal to the weights, so it is subset-sum for half the total." That one sentence usually earns the problem. Then
+state the complexity honestly as <strong>O(n × capacity)</strong> and say the word <em>pseudo-polynomial</em> — it is polynomial in
+the capacity's <em>value</em>, not in its number of bits, which is why subset-sum is NP-complete and this table is not a
+contradiction. Interviewers at Google and Amazon do ask that, and it separates people who understand the bound from people who
+recite it. If asked for the chosen items rather than the optimum, you need the full 2-D table to walk back through.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Partition equal subset sum, then "target sum" (assign ± to each number) — show it is the same problem after one algebraic step.</li><li>Coin change and coin change II back to back, and say out loud why the loop nesting differs.</li><li>Combination sum IV, and explain why it is <em>not</em> coin change II.</li><li>0/1 knapsack returning the selected items, which forces the 2-D table back.</li></ul></div></section>
+
+<section id="lis"><h2 id="lis">Longest increasing subsequence, and the O(n log n) upgrade</h2><p>LIS earns its own section because it is asked constantly, it has a quadratic solution everybody knows and an
+<code>O(n log n)</code> solution that is a genuine discriminator, and a surprising number of problems reduce to it once you sort the
+input the right way.</p>
+<p>The <code>O(n²)</code> version is plain 1-D DP: <code>dp[i]</code> is the length of the longest increasing subsequence
+<em>ending at</em> <code>i</code>. The <code>O(n log n)</code> version keeps a different thing entirely —
+<code>tails[k]</code> is the <strong>smallest possible tail</strong> of an increasing subsequence of length <code>k+1</code> — and
+that array is sorted, so binary search applies. Be clear that <code>tails</code> is not itself the answer subsequence; it only has
+the right <em>length</em>.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// O(n^2): dp[i] = LIS length ending at i. Easy to explain, easy to extend.
+static int LisQuadratic(int[] nums)
+{
+    var dp = new int[nums.Length];
+    Array.Fill(dp, 1);
+    int best = nums.Length == 0 ? 0 : 1;
+    for (int i = 1; i &lt; nums.Length; i++)
+    {
+        for (int j = 0; j &lt; i; j++)
+            if (nums[j] &lt; nums[i]) dp[i] = Math.Max(dp[i], dp[j] + 1);
+        best = Math.Max(best, dp[i]);
+    }
+    return best;
+}
+
+// O(n log n): tails[k] = smallest tail of an increasing subsequence of
+// length k+1. Kept sorted by construction, so binary search for the slot.
+static int Lis(int[] nums)
+{
+    var tails = new List&lt;int&gt;();
+    foreach (var n in nums)
+    {
+        int lo = 0, hi = tails.Count;
+        while (lo &lt; hi)                      // lower_bound: first tail &gt;= n
+        {
+            int mid = lo + (hi - lo) / 2;
+            if (tails[mid] &lt; n) lo = mid + 1; else hi = mid;
+        }
+        if (lo == tails.Count) tails.Add(n); // extends the longest run
+        else tails[lo] = n;                  // a smaller tail for that length
+    }
+    return tails.Count;
+}
+// For a NON-DECREASING subsequence, make the probe &#x27;tails[mid] &lt;= n&#x27;
+// (upper_bound) — a one-character change that is easy to get wrong.
+
+// Reduction: Russian-doll envelopes. Sort by width ascending, and by height
+// DESCENDING within equal widths so same-width pairs can never nest; then the
+// answer is just LIS over the heights.
+static int MaxEnvelopes(int[][] envelopes)
+{
+    Array.Sort(envelopes, (a, b) =&gt; a[0] == b[0] ? b[1] - a[1] : a[0] - b[0]);
+    return Lis(envelopes.Select(e =&gt; e[1]).ToArray());
+}</code></pre><pre data-lang="python" hidden><code>def lis_quadratic(nums: list[int]) -&gt; int:
+    if not nums:
+        return 0
+    dp = [1] * len(nums)
+    for i in range(1, len(nums)):
+        for j in range(i):
+            if nums[j] &lt; nums[i]:
+                dp[i] = max(dp[i], dp[j] + 1)
+    return max(dp)
+
+from bisect import bisect_left, bisect_right
+
+def lis(nums: list[int]) -&gt; int:
+    tails: list[int] = []            # tails[k] = smallest tail of length k+1
+    for n in nums:
+        i = bisect_left(tails, n)    # bisect_right for non-decreasing
+        if i == len(tails):
+            tails.append(n)          # extends the longest run
+        else:
+            tails[i] = n             # a smaller tail for that length
+    return len(tails)
+
+def max_envelopes(envelopes: list[list[int]]) -&gt; int:
+    # width ascending, height DESCENDING within a width so equal widths
+    # cannot nest; then LIS on the heights.
+    envelopes.sort(key=lambda e: (e[0], -e[1]))
+    return lis([e[1] for e in envelopes])</code></pre></div><div class="callout callout-note"><span class="callout-title">Problems that are LIS after one sort</span><ul>
+<li><strong>Russian doll envelopes</strong> / <strong>maximum height by stacking cuboids</strong> — sort one dimension, LIS the other.</li>
+<li><strong>Minimum number of arrows / non-overlapping intervals</strong> — the greedy complement of the same structure.</li>
+<li><strong>Longest chain of pairs</strong> — sort by second element, then greedily extend; the greedy is provably optimal here, which is worth knowing because it is <em>faster</em> than LIS.</li>
+<li><strong>Minimum deletions to sort</strong> — <code>n − LIS(n)</code>, a one-line reduction that often surprises people.</li>
+</ul></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Write the <code>O(n²)</code> version first and say "that is quadratic, and there is an <code>O(n log n)</code> method
+if you want it" — offering the upgrade without being asked reads much better than being pushed to it. If you do write the fast
+version, the thing being graded is whether you can state what <code>tails</code> holds; "it is the smallest tail for each length, so
+it stays sorted" is the sentence. Be honest about its limitation: it gives the length but not the subsequence, and recovering the
+actual subsequence needs a parent-index array alongside it. The follow-up to expect is <strong>count</strong> the number of longest
+increasing subsequences, which the fast version cannot do at all — you go back to the quadratic DP and carry a count per index.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write both versions, then extend the quadratic one to <em>return</em> the subsequence.</li><li>Number of longest increasing subsequences — and explain why you had to abandon the O(n log n) form.</li><li>Russian doll envelopes, and justify the descending tiebreak on height.</li><li>Longest bitonic subsequence (increases then decreases) — run LIS forwards and backwards and combine.</li></ul></div></section>
+
+<section id="grids"><h2 id="grids">Grid DP: paths, costs and the obstacle cases</h2><p>A grid is already a table, so these are the easiest DP problems to set up and the easiest to get wrong at the edges. The state
+is the cell; the transition looks only at the neighbours you are allowed to arrive from, which for "right and down only" means the
+cell above and the cell to the left. The whole difficulty is the first row and first column.</p>
+<p>Note that these are DP precisely <em>because</em> movement is restricted to one direction per axis, which makes the dependency
+graph acyclic. The moment a problem lets you move in all four directions with weights, there is no fill order and it stops being DP
+— that is Dijkstra, and reaching for a table there is a real mistake.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Unique paths, moving only right and down. dp[c] = ways to reach this cell.
+// One row suffices: dp[c] += dp[c-1] IS the &quot;from above + from the left&quot; rule.
+static int UniquePaths(int m, int n)
+{
+    var dp = new int[n];
+    Array.Fill(dp, 1);                       // first row: exactly one way each
+    for (int r = 1; r &lt; m; r++)
+        for (int c = 1; c &lt; n; c++)
+            dp[c] += dp[c - 1];              // old dp[c] = above, dp[c-1] = left
+    return dp[n - 1];
+}
+
+// With obstacles: a blocked cell contributes zero ways.
+static int UniquePathsWithObstacles(int[][] grid)
+{
+    int n = grid[0].Length;
+    var dp = new int[n];
+    dp[0] = grid[0][0] == 1 ? 0 : 1;
+    for (int r = 0; r &lt; grid.Length; r++)
+        for (int c = 0; c &lt; n; c++)
+            if (grid[r][c] == 1) dp[c] = 0;             // wall: unreachable
+            else if (c &gt; 0) dp[c] += dp[c - 1];
+    return dp[n - 1];
+}
+
+// Minimum path sum. Same shape, min instead of sum, and the edges are
+// cumulative rather than 1 — this is where the off-by-ones live.
+static int MinPathSum(int[][] grid)
+{
+    int rows = grid.Length, cols = grid[0].Length;
+    var dp = new int[cols];
+    dp[0] = grid[0][0];
+    for (int c = 1; c &lt; cols; c++) dp[c] = dp[c - 1] + grid[0][c];   // first row
+    for (int r = 1; r &lt; rows; r++)
+    {
+        dp[0] += grid[r][0];                                          // first col
+        for (int c = 1; c &lt; cols; c++)
+            dp[c] = Math.Min(dp[c], dp[c - 1]) + grid[r][c];
+    }
+    return dp[cols - 1];
+}
+
+// Largest square of 1s: dp[r,c] = side of the largest square whose
+// BOTTOM-RIGHT corner is (r,c). Three neighbours, limited by the smallest.
+static int MaximalSquare(char[][] m)
+{
+    int rows = m.Length, cols = m[0].Length, best = 0;
+    var dp = new int[rows + 1, cols + 1];
+    for (int r = 1; r &lt;= rows; r++)
+        for (int c = 1; c &lt;= cols; c++)
+            if (m[r - 1][c - 1] == &#x27;1&#x27;)
+                best = Math.Max(best, dp[r, c] =
+                    1 + Math.Min(dp[r - 1, c - 1], Math.Min(dp[r - 1, c], dp[r, c - 1])));
+    return best * best;
+}</code></pre><pre data-lang="python" hidden><code>def unique_paths(m: int, n: int) -&gt; int:
+    dp = [1] * n                              # first row: one way each
+    for _ in range(1, m):
+        for c in range(1, n):
+            dp[c] += dp[c - 1]                # above + left
+    return dp[n - 1]
+
+def unique_paths_with_obstacles(grid: list[list[int]]) -&gt; int:
+    n = len(grid[0])
+    dp = [0] * n
+    dp[0] = 0 if grid[0][0] == 1 else 1
+    for row in grid:
+        for c in range(n):
+            if row[c] == 1:
+                dp[c] = 0                     # wall: unreachable
+            elif c &gt; 0:
+                dp[c] += dp[c - 1]
+    return dp[n - 1]
+
+def min_path_sum(grid: list[list[int]]) -&gt; int:
+    rows, cols = len(grid), len(grid[0])
+    dp = [0] * cols
+    dp[0] = grid[0][0]
+    for c in range(1, cols):                  # first row
+        dp[c] = dp[c - 1] + grid[0][c]
+    for r in range(1, rows):
+        dp[0] += grid[r][0]                   # first column
+        for c in range(1, cols):
+            dp[c] = min(dp[c], dp[c - 1]) + grid[r][c]
+    return dp[cols - 1]
+
+def maximal_square(m: list[list[str]]) -&gt; int:
+    rows, cols, best = len(m), len(m[0]), 0
+    dp = [[0] * (cols + 1) for _ in range(rows + 1)]
+    for r in range(1, rows + 1):
+        for c in range(1, cols + 1):
+            if m[r - 1][c - 1] == &quot;1&quot;:
+                dp[r][c] = 1 + min(dp[r - 1][c - 1], dp[r - 1][c], dp[r][c - 1])
+                best = max(best, dp[r][c])
+    return best * best</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Two things get graded. First, the <strong>sentinel trick</strong>: padding the table with an extra zero row and column,
+as the maximal-square code does, deletes every edge case from the loop body, and saying "I will pad so the first row needs no
+special case" is a small, very legible signal of experience. Second, <strong>knowing when it is not DP</strong> — if the question
+lets you move in all four directions, the dependency graph has cycles, there is no valid fill order, and the answer is BFS (unit
+weights) or Dijkstra (weighted). Candidates who force a table onto a four-direction problem lose the question outright, so state the
+direction constraint back to the interviewer before you start filling anything.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Unique paths, then with obstacles, then with the grid padded so there is no special-casing in the loop.</li><li>Minimum path sum, then the variant where you may also move diagonally down-right.</li><li>Maximal square, then maximal <em>rectangle</em> — and notice it stops being grid DP and becomes a monotonic stack per row.</li><li>Triangle minimum path sum, solved bottom-up so no edge handling is needed at all.</li></ul></div></section>
+
+<section id="intervals"><h2 id="intervals">Interval and partition DP: when the split point is the decision</h2><p>The hardest common family, and the one with a recognisable signature: the state is a <strong>range</strong>
+<code>dp[i][j]</code>, and the transition loops over every way to <em>split</em> or every element to handle <em>last</em>. That gives
+<code>O(n²)</code> states with <code>O(n)</code> work each, so <code>O(n³)</code>, and the fill order must go by increasing range
+length — not by <code>i</code> — because a range depends on strictly shorter ranges.</p>
+<p>The trick that unlocks burst-balloons-style problems is counter-intuitive and worth drilling: iterate over which element you deal
+with <strong>last</strong>, not first. Thinking first-to-last leaves the two sides coupled through a changing array; thinking
+last-to-first leaves two independent subranges with fixed boundaries.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// Longest palindromic subsequence: dp[i,j] over the range [i..j].
+// Filled by increasing length so shorter ranges are ready.
+static int LongestPalindromeSubseq(string s)
+{
+    int n = s.Length;
+    var dp = new int[n, n];
+    for (int i = 0; i &lt; n; i++) dp[i, i] = 1;              // length 1
+    for (int len = 2; len &lt;= n; len++)                      // ← length outermost
+        for (int i = 0; i + len - 1 &lt; n; i++)
+        {
+            int j = i + len - 1;
+            dp[i, j] = s[i] == s[j]
+                ? (len == 2 ? 2 : dp[i + 1, j - 1] + 2)
+                : Math.Max(dp[i + 1, j], dp[i, j - 1]);
+        }
+    return dp[0, n - 1];
+}
+
+// Burst balloons. dp[i,j] = best coins from the OPEN range (i, j), and k is
+// the balloon burst LAST, so its neighbours are exactly i and j.
+static int MaxCoins(int[] nums)
+{
+    var a = new int[nums.Length + 2];
+    a[0] = a[^1] = 1;                                       // virtual 1s at the ends
+    nums.CopyTo(a, 1);
+    int n = a.Length;
+    var dp = new int[n, n];
+    for (int len = 2; len &lt; n; len++)                       // open-range width
+        for (int i = 0; i + len &lt; n; i++)
+        {
+            int j = i + len;
+            for (int k = i + 1; k &lt; j; k++)                 // k bursts last
+                dp[i, j] = Math.Max(dp[i, j],
+                    dp[i, k] + a[i] * a[k] * a[j] + dp[k, j]);
+        }
+    return dp[0, n - 1];
+}
+
+// Matrix chain multiplication — the textbook interval DP. dims has n+1 entries
+// for n matrices: matrix i is dims[i] x dims[i+1].
+static int MatrixChain(int[] dims)
+{
+    int n = dims.Length - 1;
+    var dp = new int[n, n];
+    for (int len = 2; len &lt;= n; len++)
+        for (int i = 0; i + len - 1 &lt; n; i++)
+        {
+            int j = i + len - 1;
+            dp[i, j] = int.MaxValue;
+            for (int k = i; k &lt; j; k++)                     // split after k
+                dp[i, j] = Math.Min(dp[i, j],
+                    dp[i, k] + dp[k + 1, j] + dims[i] * dims[k + 1] * dims[j + 1]);
+        }
+    return dp[0, n - 1];
+}
+
+// Palindrome partitioning II: fewest cuts. Precompute palindromicity so the
+// inner check is O(1), which is what makes the whole thing O(n^2).
+static int MinCut(string s)
+{
+    int n = s.Length;
+    var isPal = new bool[n, n];
+    for (int i = n - 1; i &gt;= 0; i--)
+        for (int j = i; j &lt; n; j++)
+            isPal[i, j] = s[i] == s[j] &amp;&amp; (j - i &lt; 2 || isPal[i + 1, j - 1]);
+
+    var cuts = new int[n];
+    for (int j = 0; j &lt; n; j++)
+    {
+        if (isPal[0, j]) { cuts[j] = 0; continue; }          // whole prefix is one
+        cuts[j] = int.MaxValue;
+        for (int i = 1; i &lt;= j; i++)
+            if (isPal[i, j]) cuts[j] = Math.Min(cuts[j], cuts[i - 1] + 1);
+    }
+    return cuts[n - 1];
+}</code></pre><pre data-lang="python" hidden><code>def longest_palindrome_subseq(s: str) -&gt; int:
+    n = len(s)
+    dp = [[0] * n for _ in range(n)]
+    for i in range(n):
+        dp[i][i] = 1
+    for length in range(2, n + 1):                 # ← length outermost
+        for i in range(n - length + 1):
+            j = i + length - 1
+            if s[i] == s[j]:
+                dp[i][j] = 2 if length == 2 else dp[i + 1][j - 1] + 2
+            else:
+                dp[i][j] = max(dp[i + 1][j], dp[i][j - 1])
+    return dp[0][n - 1]
+
+def max_coins(nums: list[int]) -&gt; int:
+    a = [1] + nums + [1]                           # virtual 1s at the ends
+    n = len(a)
+    dp = [[0] * n for _ in range(n)]
+    for length in range(2, n):                     # open-range width
+        for i in range(n - length):
+            j = i + length
+            for k in range(i + 1, j):              # k bursts LAST
+                dp[i][j] = max(dp[i][j],
+                               dp[i][k] + a[i] * a[k] * a[j] + dp[k][j])
+    return dp[0][n - 1]
+
+def matrix_chain(dims: list[int]) -&gt; int:
+    n = len(dims) - 1
+    dp = [[0] * n for _ in range(n)]
+    for length in range(2, n + 1):
+        for i in range(n - length + 1):
+            j = i + length - 1
+            dp[i][j] = min(
+                dp[i][k] + dp[k + 1][j] + dims[i] * dims[k + 1] * dims[j + 1]
+                for k in range(i, j)
+            )
+    return dp[0][n - 1]
+
+def min_cut(s: str) -&gt; int:
+    n = len(s)
+    is_pal = [[False] * n for _ in range(n)]
+    for i in range(n - 1, -1, -1):
+        for j in range(i, n):
+            is_pal[i][j] = s[i] == s[j] and (j - i &lt; 2 or is_pal[i + 1][j - 1])
+
+    cuts = [0] * n
+    for j in range(n):
+        if is_pal[0][j]:
+            cuts[j] = 0
+            continue
+        cuts[j] = min(cuts[i - 1] + 1 for i in range(1, j + 1) if is_pal[i][j])
+    return cuts[n - 1]</code></pre></div><div class="callout callout-warn"><span class="callout-title">The fill order is the bug</span><p>Range DP depends on <em>shorter</em> ranges, so a naive <code>for i { for j }</code> loop
+reads cells that have not been written yet and silently returns a wrong answer. Two orders are correct: iterate
+<strong>by increasing length</strong> (shown above — the clearest to explain), or iterate <strong><code>i</code> descending and
+<code>j</code> ascending from <code>i</code></strong> (shorter to write, as in the <code>isPal</code> precompute). Pick one and use
+it every time. If the recursion is easier to reason about, memoise instead — top-down gets the order right for free, which is a good
+reason to prefer it here specifically.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Interval DP is a senior-level signal; nobody expects burst balloons from a new graduate. The move that matters is
+<strong>saying "what if I decide which one is last?"</strong> out loud — if you reach for that reframing yourself, you have shown the
+insight even if the code does not finish. Be explicit about why first-to-last fails: bursting a balloon changes who is adjacent to
+whom, so the two halves are not independent subproblems, and DP needs them to be. State the complexity as <code>O(n³)</code> with
+<code>O(n²)</code> states, and if asked whether it can be improved, the honest answer is that Knuth's optimisation applies to some
+members of this family and not to burst balloons.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Longest palindromic subsequence, then minimum insertions to make a string a palindrome — one subtraction apart.</li><li>Palindrome partitioning II, and explain why precomputing palindromicity changes the overall complexity.</li><li>Burst balloons. Expect to need two attempts; the point is to internalise the last-not-first reframing.</li><li>Stone game / optimal strategy for a game — interval DP where the two players alternate, so the cell holds a score difference.</li></ul></div></section>
+
+<section id="bitmask-trees"><h2 id="bitmask-trees">Bitmask DP and DP on trees</h2><p>Two shapes worth recognising even if you rarely need to write them, because both are instantly identifiable from the
+constraints and both have a tell.</p>
+<p><strong>Bitmask DP</strong>: the tell is <code>n ≤ 20</code>-ish. A set of up to ~20 items fits in an <code>int</code>, so the
+state can be "which subset have I already used", giving <code>O(2ⁿ · n)</code> — fine at <code>n = 20</code>
+(about 20 million), hopeless at <code>n = 30</code>. Travelling salesman, assignment problems and "partition into k equal subsets"
+all live here.</p>
+<p><strong>DP on trees</strong>: the tell is a tree input and a question about the whole structure. Each node's answer is computed
+from its children's answers, so the recursion <em>is</em> the fill order — a post-order traversal, no table needed. The standard
+shape returns a small tuple per node, typically "best including this node" and "best excluding it".</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>// --- Bitmask: travelling salesman, O(2^n · n^2). -----------------------
+// dp[mask, i] = cheapest route visiting exactly &#x27;&#x27;&#x27;mask&#x27;&#x27;&#x27;, currently at i.
+static int Tsp(int[,] dist)
+{
+    int n = dist.GetLength(0), full = (1 &lt;&lt; n) - 1;
+    var dp = new int[1 &lt;&lt; n, n];
+    for (int m = 0; m &lt; (1 &lt;&lt; n); m++)
+        for (int i = 0; i &lt; n; i++) dp[m, i] = int.MaxValue / 2;
+    dp[1, 0] = 0;                                     // start at city 0
+
+    for (int mask = 1; mask &lt;= full; mask++)
+        for (int i = 0; i &lt; n; i++)
+        {
+            if ((mask &amp; (1 &lt;&lt; i)) == 0) continue;      // i must be visited
+            if (dp[mask, i] &gt;= int.MaxValue / 2) continue;
+            for (int j = 0; j &lt; n; j++)
+            {
+                if ((mask &amp; (1 &lt;&lt; j)) != 0) continue;  // j must NOT be visited
+                int next = mask | (1 &lt;&lt; j);
+                dp[next, j] = Math.Min(dp[next, j], dp[mask, i] + dist[i, j]);
+            }
+        }
+
+    int best = int.MaxValue;
+    for (int i = 1; i &lt; n; i++) best = Math.Min(best, dp[full, i] + dist[i, 0]);
+    return best;
+}
+
+// Useful bit idioms for these loops:
+//   mask &amp; (1 &lt;&lt; i)        is i in the set?
+//   mask | (1 &lt;&lt; i)        add i
+//   mask &amp; (mask - 1)      drop the lowest set bit
+//   BitOperations.PopCount((uint)mask)   how many are set
+//   for (int s = mask; s &gt; 0; s = (s - 1) &amp; mask)   every submask of mask
+
+// --- DP on a tree: house robber III. -----------------------------------
+// Returns (rob this node, skip this node) for the subtree. One pass, O(n).
+static int RobTree(TreeNode? root)
+{
+    var (rob, skip) = Solve(root);
+    return Math.Max(rob, skip);
+
+    static (int rob, int skip) Solve(TreeNode? node)
+    {
+        if (node is null) return (0, 0);
+        var (lr, ls) = Solve(node.left);
+        var (rr, rs) = Solve(node.right);
+        return (node.val + ls + rs,                       // rob: children skipped
+                Math.Max(lr, ls) + Math.Max(rr, rs));     // skip: children free
+    }
+}
+
+// Tree diameter: the answer is a side effect of the depth computation.
+static int Diameter(TreeNode? root)
+{
+    int best = 0;
+    Depth(root);
+    return best;
+
+    int Depth(TreeNode? node)
+    {
+        if (node is null) return 0;
+        int l = Depth(node.left), r = Depth(node.right);
+        best = Math.Max(best, l + r);      // path THROUGH this node
+        return 1 + Math.Max(l, r);         // depth reported UPWARDS
+    }
+}</code></pre><pre data-lang="python" hidden><code># --- Bitmask: travelling salesman, O(2^n · n^2). -----------------------
+def tsp(dist: list[list[int]]) -&gt; int:
+    n = len(dist)
+    full = (1 &lt;&lt; n) - 1
+    INF = float(&quot;inf&quot;)
+    dp = [[INF] * n for _ in range(1 &lt;&lt; n)]
+    dp[1][0] = 0                                   # start at city 0
+
+    for mask in range(1, full + 1):
+        for i in range(n):
+            if not mask &amp; (1 &lt;&lt; i) or dp[mask][i] == INF:
+                continue
+            for j in range(n):
+                if mask &amp; (1 &lt;&lt; j):                # j must not be visited
+                    continue
+                nxt = mask | (1 &lt;&lt; j)
+                dp[nxt][j] = min(dp[nxt][j], dp[mask][i] + dist[i][j])
+
+    return min(dp[full][i] + dist[i][0] for i in range(1, n))
+
+# Bit idioms:
+#   mask &amp; (1 &lt;&lt; i)      is i in the set?
+#   mask | (1 &lt;&lt; i)      add i
+#   mask &amp; (mask - 1)    drop the lowest set bit
+#   bin(mask).count(&quot;1&quot;) / int.bit_count(mask)   population count
+#   submasks: s = mask
+#             while s: ...; s = (s - 1) &amp; mask
+
+# --- DP on a tree: house robber III. -----------------------------------
+def rob_tree(root) -&gt; int:
+    def solve(node) -&gt; tuple[int, int]:           # (rob here, skip here)
+        if node is None:
+            return 0, 0
+        lr, ls = solve(node.left)
+        rr, rs = solve(node.right)
+        return (node.val + ls + rs,               # rob: children skipped
+                max(lr, ls) + max(rr, rs))        # skip: children free
+    return max(solve(root))
+
+def diameter(root) -&gt; int:
+    best = 0
+    def depth(node) -&gt; int:
+        nonlocal best
+        if node is None:
+            return 0
+        l, r = depth(node.left), depth(node.right)
+        best = max(best, l + r)                   # path THROUGH this node
+        return 1 + max(l, r)                      # depth reported UPWARDS
+    depth(root)
+    return best</code></pre></div><div class="table-wrap"><table><thead><tr><th>Constraint on n</th><th>What is expected</th></tr></thead><tbody><tr><td><code>n ≤ 12</code></td><td>Factorial is fine — permutations, brute force</td></tr><tr><td><code>n ≤ 20</code></td><td><strong>Bitmask DP</strong> or plain backtracking: <code>2ⁿ</code></td></tr><tr><td><code>n ≤ 100</code></td><td><code>O(n³)</code> — interval DP, Floyd-Warshall</td></tr><tr><td><code>n ≤ 1,000</code></td><td><code>O(n²)</code> — grid DP, two-string DP</td></tr><tr><td><code>n ≤ 10⁵</code></td><td><code>O(n log n)</code> — sort, heap, LIS with binary search</td></tr><tr><td><code>n ≤ 10⁷</code></td><td><code>O(n)</code> — one pass, 1-D DP, no sorting</td></tr></tbody></table></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Nobody will fault you for not producing a bitmask TSP, but they <em>will</em> notice if you miss what
+<code>n ≤ 20</code> is telling you. Reading the constraint aloud and concluding "that is small enough for exponential, so I will
+think in subsets" is the entire signal — it is the same reasoning as the table above, and it is worth more than the code. For tree
+DP the thing to get right is the <strong>return-versus-record distinction</strong>, which the diameter code shows: you record the
+best path <em>through</em> the node into a running maximum, and you return the depth <em>upwards</em>. Those are two different
+quantities and conflating them is the classic bug. Say "I will return X and record Y" before writing the body.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Partition to k equal-sum subsets with <code>n ≤ 16</code> — recognise the bitmask from the constraint.</li><li>House robber III, then binary tree maximum path sum — same return-versus-record shape.</li><li>Diameter of a tree, then diameter of an <em>n</em>-ary tree (track the best two child depths).</li><li>Count the number of ways to assign n tasks to n workers with a cost matrix — the assignment problem as bitmask DP.</li></ul></div></section>
+
+<section id="recognising"><h2 id="recognising">Recognising DP — and telling it from greedy</h2><p>By the time you have worked the families above, the recognition rules are short. A problem is DP when it asks for an
+<strong>optimum or a count</strong> over a space of choices, the choices <strong>interact</strong> (an early decision constrains a
+later one), and the same subproblem is reachable by more than one route. The wording gives it away: <em>minimum cost to</em>,
+<em>maximum value of</em>, <em>how many ways</em>, <em>is it possible to</em>, <em>longest/shortest … such that</em>.</p>
+<p>It is <strong>not</strong> DP when a locally best choice is provably globally best — that is greedy, and it is faster. It is not
+DP when you need to enumerate <em>all</em> the solutions rather than count or optimise over them — that is backtracking. And it is
+not DP when the dependency graph has cycles, because then no fill order exists — that is a shortest-path problem.</p><div class="table-wrap"><table><thead><tr><th>Signal</th><th>Reach for</th><th>Why</th></tr></thead><tbody><tr><td>"minimum / maximum cost", choices interact</td><td><strong>DP</strong></td><td>Overlapping subproblems; the optimum needs lookahead</td></tr><tr><td>"how many ways", "count the"</td><td><strong>DP</strong> (sum the transitions)</td><td>Same structure, addition instead of min/max</td></tr><tr><td>"list every / print all"</td><td><strong>Backtracking</strong></td><td>Output size is exponential; no table can hold it</td></tr><tr><td>Locally best is provably globally best</td><td><strong>Greedy</strong></td><td>An exchange argument exists — and it is faster</td></tr><tr><td>Four-direction movement with weights</td><td><strong>Dijkstra</strong></td><td>Cyclic dependencies, so no DP fill order</td></tr><tr><td><code>n ≤ 20</code> and subsets matter</td><td><strong>Bitmask DP</strong></td><td>The state fits in an int</td></tr><tr><td>Range, and the split point is the decision</td><td><strong>Interval DP</strong></td><td><code>O(n²)</code> states, fill by length</td></tr></tbody></table></div><p>The greedy-versus-DP line is the one interviewers probe, because candidates reach for greedy when it is wrong and for DP when it
+is unnecessary. Coin change is the standard illustration: with coins <code>{1, 5, 10, 25}</code> the greedy "take the largest that
+fits" is optimal, so you may be tempted to generalise it. With <code>{1, 3, 4}</code> and amount <code>6</code> greedy gives
+<code>4 + 1 + 1 = 3</code> coins and the optimum is <code>3 + 3 = 2</code>. The lesson is procedural rather than factual:
+<strong>if you propose greedy, you owe an exchange argument; if you cannot produce one in a sentence, use DP.</strong></p><div class="callout callout-note"><span class="callout-title">A checklist for the room</span><ol>
+<li>Say what the brute force is and what it costs. Always. Even if it is obviously terrible.</li>
+<li>Name the state in one English sentence, and write that sentence as a comment above the function.</li>
+<li>Write the recurrence, then the base cases — and sanity-check the base cases against <code>n = 0</code> and <code>n = 1</code>.</li>
+<li>Memoise. Say "number of states times work per state" and give the complexity.</li>
+<li><em>Offer</em> tabulation and the space collapse before being asked; implement whichever they want.</li>
+<li>Trace one small input by hand, out loud. This catches base-case bugs that staring at the code will not.</li>
+</ol></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>The single most common failure in a DP interview is not a wrong recurrence — it is silence. Candidates recognise "this
+is DP", then spend eight minutes trying to produce the final table in one shot and have nothing to show. Write the exponential
+recursion <em>immediately</em>; it is always short, it proves you understood the problem, and it is the thing you then improve in
+front of them. A memoised solution with a clearly stated state beats a half-finished optimal table every time. If you blank
+completely, fall back to the mechanical route: what is the last decision I make, and what do I need to know to make it? That
+question has produced the state for every problem on this page.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Take ten mixed problems and, without solving any of them, classify each as DP / greedy / backtracking / shortest-path and justify it in one sentence. Recognition is the bottleneck, not implementation.</li><li>Find a problem where greedy looks right and is not, and write the counterexample down — you will be asked for one.</li><li>Re-derive three solutions from this page a week from now from the state sentence alone, without rereading the code.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://neetcode.io/roadmap" target="_blank" rel="noopener">NeetCode roadmap</a> — the 1-D and 2-D DP tracks, in a sensible order</li><li><a href="https://leetcode.com/tag/dynamic-programming/" target="_blank" rel="noopener">LeetCode: dynamic programming</a> — the tag, sorted by frequency</li><li><a href="https://cp-algorithms.com/dynamic_programming/knapsack.html" target="_blank" rel="noopener">cp-algorithms: knapsack</a> — the loop-direction rules derived properly</li><li><a href="https://learn.microsoft.com/dotnet/api/system.numerics.bitoperations" target="_blank" rel="noopener">BitOperations</a> — PopCount, TrailingZeroCount and friends for bitmask DP</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

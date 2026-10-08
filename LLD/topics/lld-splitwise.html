@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Splitwise — Low-Level Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="lld-splitwise">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Worked designs › Topic 6 of 7</div>
+  <h1>Design Splitwise</h1>
+  <p class="lede">An expense splitter, where the obvious model is instructively wrong: keep an append-only history and a derived pairwise balance, never use floats for money, make every split sum exactly — and when asked to settle up, say "NP-hard" before you say "greedy".</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#scope">Requirements, and the modelling decision that defines the design</a></li><li><a href="#model">The model: expenses in, balances out</a></li><li><a href="#code">The implementation</a></li><li><a href="#settle">Settle up: minimising the number of transactions</a></li></ol>
+  </div>
+
+<section id="scope"><h2 id="scope">Requirements, and the modelling decision that defines the design</h2><p>Splitwise is asked because the obvious model is wrong in an instructive way. The naive design keeps a list of expenses and
+recomputes who owes whom on demand; the good design keeps a <strong>net balance between every pair</strong> and updates it as
+expenses arrive. Both are defensible, and knowing the trade-off is the point.</p><div class="table-wrap"><table><thead><tr><th>You ask</th><th>Typical answer</th><th>What it decides</th></tr></thead><tbody><tr><td>How can an expense be split?</td><td>Equally, exact amounts, percentages, shares</td><td>A <code>SplitStrategy</code> — the main seam</td></tr><tr><td>Groups, or just people?</td><td>Both — but groups can be a filter</td><td>Keep balances pairwise; groups are a view</td></tr><tr><td>Do we need the full history?</td><td>Usually yes for audit</td><td>Keep expenses <em>and</em> balances — they answer different questions</td></tr><tr><td>Multiple currencies?</td><td>Usually "assume one"</td><td>Take the simplification, mention it</td></tr><tr><td>"Settle up" — minimise transactions?</td><td>Yes, the classic follow-up</td><td>A separate algorithm; see the last section</td></tr><tr><td>Floating point money?</td><td>"Use cents"</td><td>Say this unprompted — it is a real correctness point</td></tr></tbody></table></div><div class="callout callout-warn"><span class="callout-title">Never use floating point for money</span><p>Say this in the first two minutes. <code>0.1 + 0.2 != 0.3</code> in IEEE 754, and
+over thousands of splits the error is visible and unexplainable to users. Use integer <strong>cents</strong> (or C#'s
+<code>decimal</code>, which is base-10 and exact for this range). It also makes the remainder problem explicit:
+splitting 100 cents three ways is 34/33/33, not 33.33 each, and <em>someone</em> has to get the extra cent. Deciding who —
+deterministically, usually the payer or the first participant in a stable order — is a small detail interviewers notice because it
+means you thought about the sum having to come out exactly right.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Lead with the balance-versus-history distinction, because it reframes the whole problem: <strong>"I will keep an
+append-only list of expenses for history, and a derived pairwise net balance for queries, because 'what do I owe Alice?' should not
+be a scan over every expense ever."</strong> That is a materialised view over an event log, which is a genuinely transferable idea
+and connects this round to the system design one. The second thing to volunteer is cents-not-floats, with the remainder rule. Those
+two sentences front-load most of the credit available in this problem.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write out the two models — recompute-from-history and maintained-balances — and list what each makes fast and slow.</li><li>Decide your remainder rule and state it in one sentence.</li></ul></div></section>
+
+<section id="model"><h2 id="model">The model: expenses in, balances out</h2><p>The key structural choice is that <strong>a balance is directional and antisymmetric</strong>: if Alice owes Bob 500, then Bob
+owes Alice −500. Storing both directions invites them to disagree, so store one canonical direction and negate on read. That one
+decision removes an entire class of bug.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>ExpenseBook                      (entry point)
+ ├── expenses : List&lt;Expense&gt;       append-only history (audit, undo)
+ └── balances : Dictionary&lt;(string,string), long&gt;
+                                    canonical pair -&gt; cents, ANTISYMMETRIC
+                                    key is always (min(a,b), max(a,b))
+
+Expense                            immutable record of one event
+  - id, description, paidBy, amountCents, shares
+
+Split  = (participant, amountCents)    what each person&#x27;s portion is
+
+&lt;&lt;interface&gt;&gt; ISplitStrategy       the seam
+  + Split(payer, amountCents, participants, args) -&gt; IReadOnlyList&lt;Split&gt;
+     &lt;|.. EqualSplit        divide, remainder to the first participants
+     &lt;|.. ExactSplit        caller supplies the amounts; must sum exactly
+     &lt;|.. PercentageSplit   caller supplies percentages; must sum to 100
+     &lt;|.. ShareSplit        caller supplies weights (2 shares : 1 share)
+
+Responsibilities:
+  ExpenseBook   records expenses and maintains the derived balances.
+  ISplitStrategy turns one amount into per-person portions that SUM EXACTLY.
+  Expense       is an immutable fact; it is never edited, only reversed.</code></pre><pre data-lang="python" hidden><code>ExpenseBook                      (entry point)
+ ├── expenses : list[Expense]       append-only history (audit, undo)
+ └── balances : dict[tuple[str,str], int]
+                                    canonical pair -&gt; cents, ANTISYMMETRIC
+                                    key is always (min(a,b), max(a,b))
+
+Expense                            immutable record of one event
+  - id, description, paid_by, amount_cents, shares
+
+Split  = (participant, amount_cents)   what each person&#x27;s portion is
+
+&lt;&lt;Protocol&gt;&gt; SplitStrategy        the seam
+  + split(payer, amount_cents, participants, args) -&gt; list[Split]
+     &lt;|.. EqualSplit        divide, remainder to the first participants
+     &lt;|.. ExactSplit        caller supplies the amounts; must sum exactly
+     &lt;|.. PercentageSplit   caller supplies percentages; must sum to 100
+     &lt;|.. ShareSplit        caller supplies weights (2 shares : 1 share)
+
+Responsibilities:
+  ExpenseBook    records expenses and maintains the derived balances.
+  SplitStrategy  turns one amount into portions that SUM EXACTLY.
+  Expense        is an immutable fact; never edited, only reversed.</code></pre></div><div class="callout callout-note"><span class="callout-title">The invariant that catches every bug in this problem</span><p><strong>The sum of all balances is always zero, and every split
+sums exactly to the expense.</strong> Both are cheap to assert and between them they catch rounding errors, double-counting, and
+asymmetric updates. Say you would assert them after every mutation in debug builds — it is the kind of answer that shows you have
+debugged money code before, and it gives you an obvious thing to test.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Convince yourself that storing both <code>(a,b)</code> and <code>(b,a)</code> is a bug waiting to happen. Name two ways they diverge.</li><li>Write the two invariants as assertions.</li></ul></div></section>
+
+<section id="code"><h2 id="code">The implementation</h2><p>The split strategies first — they carry the remainder logic, which is where the subtlety is — then the book.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public readonly record struct Split(string Participant, long AmountCents);
+
+public sealed record Expense(
+    string Id, string Description, string PaidBy,
+    long AmountCents, IReadOnlyList&lt;Split&gt; Shares);
+
+public interface ISplitStrategy
+{
+    IReadOnlyList&lt;Split&gt; Split(long amountCents, IReadOnlyList&lt;string&gt; participants,
+                               IReadOnlyList&lt;long&gt;? args = null);
+}
+
+/// Equal split. The remainder goes to the first participants, one cent each,
+/// so the portions ALWAYS sum exactly to the amount.
+public sealed class EqualSplit : ISplitStrategy
+{
+    public IReadOnlyList&lt;Split&gt; Split(long amount, IReadOnlyList&lt;string&gt; people,
+                                      IReadOnlyList&lt;long&gt;? _ = null)
+    {
+        if (people.Count == 0) throw new ArgumentException(&quot;No participants.&quot;);
+        long each = amount / people.Count;
+        long remainder = amount - each * people.Count;   // 0 .. people.Count-1
+        return people.Select((p, i) =&gt;
+            new Split(p, each + (i &lt; remainder ? 1 : 0))).ToList();
+    }
+}
+
+/// Exact amounts supplied by the caller. Rejected unless they sum exactly.
+public sealed class ExactSplit : ISplitStrategy
+{
+    public IReadOnlyList&lt;Split&gt; Split(long amount, IReadOnlyList&lt;string&gt; people,
+                                      IReadOnlyList&lt;long&gt;? amounts = null)
+    {
+        ArgumentNullException.ThrowIfNull(amounts);
+        if (amounts.Count != people.Count) throw new ArgumentException(&quot;Length mismatch.&quot;);
+        if (amounts.Sum() != amount)
+            throw new ArgumentException($&quot;Shares sum to {amounts.Sum()}, expected {amount}.&quot;);
+        return people.Zip(amounts, (p, a) =&gt; new Split(p, a)).ToList();
+    }
+}
+
+/// Weights: [2,1,1] splits 4:1:1... no — 2 parts, 1 part, 1 part of the total.
+/// Largest-remainder apportionment, so the parts still sum exactly.
+public sealed class ShareSplit : ISplitStrategy
+{
+    public IReadOnlyList&lt;Split&gt; Split(long amount, IReadOnlyList&lt;string&gt; people,
+                                      IReadOnlyList&lt;long&gt;? weights = null)
+    {
+        ArgumentNullException.ThrowIfNull(weights);
+        if (weights.Count != people.Count) throw new ArgumentException(&quot;Length mismatch.&quot;);
+        long total = weights.Sum();
+        if (total &lt;= 0) throw new ArgumentException(&quot;Weights must be positive.&quot;);
+
+        var floors = weights.Select(w =&gt; amount * w / total).ToArray();
+        long distributed = floors.Sum();
+        long remainder = amount - distributed;
+
+        // Give the leftover cents to the largest fractional parts first.
+        var order = Enumerable.Range(0, people.Count)
+            .OrderByDescending(i =&gt; amount * weights[i] % total)
+            .ThenBy(i =&gt; i)                             // deterministic tie-break
+            .ToArray();
+        for (int k = 0; k &lt; remainder; k++) floors[order[k]]++;
+
+        return people.Select((p, i) =&gt; new Split(p, floors[i])).ToList();
+    }
+}
+
+public sealed class ExpenseBook
+{
+    private readonly List&lt;Expense&gt; _expenses = [];
+    private readonly Dictionary&lt;(string, string), long&gt; _balances = [];
+    private int _nextId;
+
+    public IReadOnlyList&lt;Expense&gt; Expenses =&gt; _expenses;
+
+    private static (string, string) Key(string a, string b) =&gt;
+        string.CompareOrdinal(a, b) &lt;= 0 ? (a, b) : (b, a);
+
+    /// Positive result: &#x27;debtor&#x27; owes &#x27;creditor&#x27; that many cents.
+    public long Owes(string debtor, string creditor)
+    {
+        var key = Key(debtor, creditor);
+        long v = _balances.GetValueOrDefault(key);
+        return key.Item1 == debtor ? v : -v;            // antisymmetric on read
+    }
+
+    public Expense Add(string description, string paidBy, long amountCents,
+                       IReadOnlyList&lt;string&gt; participants,
+                       ISplitStrategy strategy, IReadOnlyList&lt;long&gt;? args = null)
+    {
+        if (amountCents &lt;= 0) throw new ArgumentException(&quot;Amount must be positive.&quot;);
+        var shares = strategy.Split(amountCents, participants, args);
+        if (shares.Sum(s =&gt; s.AmountCents) != amountCents)
+            throw new InvalidOperationException(&quot;Split does not sum to the amount.&quot;);
+
+        var expense = new Expense($&quot;E{++_nextId}&quot;, description, paidBy, amountCents, shares);
+        _expenses.Add(expense);
+        Apply(expense, +1);
+        return expense;
+    }
+
+    /// Reverse an expense. History is append-only, so we do not delete —
+    /// we apply the inverse, which keeps the audit trail intact.
+    public void Reverse(string expenseId)
+    {
+        var expense = _expenses.SingleOrDefault(e =&gt; e.Id == expenseId)
+                      ?? throw new ArgumentException($&quot;No expense {expenseId}.&quot;);
+        Apply(expense, -1);
+    }
+
+    private void Apply(Expense e, int sign)
+    {
+        foreach (var (participant, share) in e.Shares)
+        {
+            if (participant == e.PaidBy) continue;      // nobody owes themselves
+            Adjust(participant, e.PaidBy, sign * share);
+        }
+    }
+
+    private void Adjust(string debtor, string creditor, long cents)
+    {
+        var key = Key(debtor, creditor);
+        long delta = key.Item1 == debtor ? cents : -cents;
+        long next = _balances.GetValueOrDefault(key) + delta;
+        if (next == 0) _balances.Remove(key);           // keep the map sparse
+        else _balances[key] = next;
+    }
+
+    /// What one person owes (negative) or is owed (positive), net.
+    public long NetBalance(string person) =&gt;
+        _balances.Sum(kv =&gt; kv.Key.Item1 == person ? -kv.Value
+                          : kv.Key.Item2 == person ? kv.Value : 0);
+
+    public IReadOnlyDictionary&lt;string, long&gt; AllNetBalances()
+    {
+        var net = new Dictionary&lt;string, long&gt;();
+        foreach (var ((a, b), v) in _balances)
+        {
+            net[a] = net.GetValueOrDefault(a) - v;      // a owes v  -&gt; a is down
+            net[b] = net.GetValueOrDefault(b) + v;      // b is owed v
+        }
+        return net;
+    }
+
+    public void Settle(string debtor, string creditor, long cents) =&gt;
+        Adjust(debtor, creditor, -cents);
+}</code></pre><pre data-lang="python" hidden><code>from __future__ import annotations
+from dataclasses import dataclass
+from typing import Protocol, Sequence
+
+@dataclass(frozen=True)
+class Split:
+    participant: str
+    amount_cents: int
+
+@dataclass(frozen=True)
+class Expense:
+    id: str
+    description: str
+    paid_by: str
+    amount_cents: int
+    shares: tuple[Split, ...]
+
+class SplitStrategy(Protocol):
+    def split(self, amount_cents: int, participants: Sequence[str],
+              args: Sequence[int] | None = None) -&gt; list[Split]: ...
+
+class EqualSplit:
+    &quot;&quot;&quot;Remainder goes to the first participants, one cent each, so the
+    portions ALWAYS sum exactly to the amount.&quot;&quot;&quot;
+    def split(self, amount: int, people: Sequence[str],
+              args: Sequence[int] | None = None) -&gt; list[Split]:
+        if not people:
+            raise ValueError(&quot;No participants.&quot;)
+        each, remainder = divmod(amount, len(people))
+        return [Split(p, each + (1 if i &lt; remainder else 0))
+                for i, p in enumerate(people)]
+
+class ExactSplit:
+    def split(self, amount: int, people: Sequence[str],
+              args: Sequence[int] | None = None) -&gt; list[Split]:
+        if args is None or len(args) != len(people):
+            raise ValueError(&quot;Length mismatch.&quot;)
+        if sum(args) != amount:
+            raise ValueError(f&quot;Shares sum to {sum(args)}, expected {amount}.&quot;)
+        return [Split(p, a) for p, a in zip(people, args)]
+
+class ShareSplit:
+    &quot;&quot;&quot;Weights, apportioned by largest remainder so parts sum exactly.&quot;&quot;&quot;
+    def split(self, amount: int, people: Sequence[str],
+              args: Sequence[int] | None = None) -&gt; list[Split]:
+        if args is None or len(args) != len(people):
+            raise ValueError(&quot;Length mismatch.&quot;)
+        total = sum(args)
+        if total &lt;= 0:
+            raise ValueError(&quot;Weights must be positive.&quot;)
+
+        floors = [amount * w // total for w in args]
+        remainder = amount - sum(floors)
+
+        # Leftover cents go to the largest fractional parts first.
+        order = sorted(range(len(people)),
+                       key=lambda i: (-(amount * args[i] % total), i))
+        for k in range(remainder):
+            floors[order[k]] += 1
+        return [Split(p, floors[i]) for i, p in enumerate(people)]
+
+class ExpenseBook:
+    def __init__(self) -&gt; None:
+        self.expenses: list[Expense] = []
+        self._balances: dict[tuple[str, str], int] = {}
+        self._next_id = 0
+
+    @staticmethod
+    def _key(a: str, b: str) -&gt; tuple[str, str]:
+        return (a, b) if a &lt;= b else (b, a)
+
+    def owes(self, debtor: str, creditor: str) -&gt; int:
+        &quot;&quot;&quot;Positive: debtor owes creditor that many cents.&quot;&quot;&quot;
+        key = self._key(debtor, creditor)
+        v = self._balances.get(key, 0)
+        return v if key[0] == debtor else -v        # antisymmetric on read
+
+    def add(self, description: str, paid_by: str, amount_cents: int,
+            participants: Sequence[str], strategy: SplitStrategy,
+            args: Sequence[int] | None = None) -&gt; Expense:
+        if amount_cents &lt;= 0:
+            raise ValueError(&quot;Amount must be positive.&quot;)
+        shares = strategy.split(amount_cents, participants, args)
+        if sum(s.amount_cents for s in shares) != amount_cents:
+            raise RuntimeError(&quot;Split does not sum to the amount.&quot;)
+
+        self._next_id += 1
+        expense = Expense(f&quot;E{self._next_id}&quot;, description, paid_by,
+                          amount_cents, tuple(shares))
+        self.expenses.append(expense)
+        self._apply(expense, +1)
+        return expense
+
+    def reverse(self, expense_id: str) -&gt; None:
+        &quot;&quot;&quot;History is append-only: apply the inverse rather than deleting.&quot;&quot;&quot;
+        expense = next((e for e in self.expenses if e.id == expense_id), None)
+        if expense is None:
+            raise ValueError(f&quot;No expense {expense_id}.&quot;)
+        self._apply(expense, -1)
+
+    def _apply(self, e: Expense, sign: int) -&gt; None:
+        for share in e.shares:
+            if share.participant == e.paid_by:
+                continue                            # nobody owes themselves
+            self._adjust(share.participant, e.paid_by, sign * share.amount_cents)
+
+    def _adjust(self, debtor: str, creditor: str, cents: int) -&gt; None:
+        key = self._key(debtor, creditor)
+        delta = cents if key[0] == debtor else -cents
+        nxt = self._balances.get(key, 0) + delta
+        if nxt == 0:
+            self._balances.pop(key, None)           # keep the map sparse
+        else:
+            self._balances[key] = nxt
+
+    def net_balance(self, person: str) -&gt; int:
+        total = 0
+        for (a, b), v in self._balances.items():
+            if a == person: total -= v
+            elif b == person: total += v
+        return total
+
+    def all_net_balances(self) -&gt; dict[str, int]:
+        net: dict[str, int] = {}
+        for (a, b), v in self._balances.items():
+            net[a] = net.get(a, 0) - v              # a owes v -&gt; a is down
+            net[b] = net.get(b, 0) + v              # b is owed v
+        return net
+
+    def settle(self, debtor: str, creditor: str, cents: int) -&gt; None:
+        self._adjust(debtor, creditor, -cents)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Point at <code>EqualSplit</code>'s remainder line deliberately. <code>divmod(amount, n)</code> and then handing the
+leftover cents to the first <code>remainder</code> people is three lines, it is deterministic, and it guarantees the shares sum
+exactly — which is the invariant that keeps balances summing to zero. Candidates who write <code>amount / n</code> and move on have
+introduced money that quietly vanishes. The same reasoning scales up to <code>ShareSplit</code>, where the technique has a name
+(<strong>largest-remainder apportionment</strong>, the same method used to allocate parliamentary seats) and mentioning it is a nice
+flourish. Also note <code>Reverse</code> applies the inverse rather than deleting: an append-only history with compensating entries
+is how real ledgers work, and saying so is a transferable point.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Split 100 cents three ways and check the shares sum to 100, not 99.</li><li>Split 100 cents with weights [1,1,1] and then [2,1,1]; verify both sum exactly and the tie-break is deterministic.</li><li>Add an expense, reverse it, and assert every balance is back to zero and the map is empty.</li></ul></div></section>
+
+<section id="settle"><h2 id="settle">Settle up: minimising the number of transactions</h2><p>The classic follow-up. Given everyone's net balance, produce a set of payments that clears all debts with as few transactions as
+possible. Two things to say immediately:</p>
+<ol>
+<li><strong>The pairwise balances do not matter here, only the net per person.</strong> If Alice owes Bob 10 and Bob owes Carol 10,
+Alice can simply pay Carol 10 — one transaction instead of two. Collapsing to net balances is the whole first insight.</li>
+<li><strong>The exact minimum is NP-hard</strong> — it contains the partition problem, because any subset of people whose balances
+sum to zero can be settled among themselves. So the honest answer is a greedy heuristic that is optimal in the number of
+<em>people</em> (at most <code>n−1</code> transactions) but not always in the true minimum.</li>
+</ol>
+<p>The greedy: repeatedly match the largest creditor with the largest debtor, settle the smaller of the two amounts, repeat. At
+least one person is zeroed per transaction, so it terminates in at most <code>n−1</code> payments.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public readonly record struct Payment(string From, string To, long Cents);
+
+public static class Settlement
+{
+    /// Greedy: match the biggest debtor with the biggest creditor each round.
+    /// At most n-1 payments. Not always the true minimum (that is NP-hard),
+    /// but optimal in n and what every real app ships.
+    public static IReadOnlyList&lt;Payment&gt; MinimalTransfers(
+        IReadOnlyDictionary&lt;string, long&gt; netBalances)
+    {
+        // Positive = is owed; negative = owes. They must sum to zero.
+        if (netBalances.Values.Sum() != 0)
+            throw new ArgumentException(&quot;Balances do not sum to zero.&quot;);
+
+        var debtors = new PriorityQueue&lt;string, long&gt;();    // most negative first
+        var creditors = new PriorityQueue&lt;string, long&gt;();  // most positive first
+        var owed = new Dictionary&lt;string, long&gt;(netBalances);
+
+        foreach (var (person, amount) in netBalances)
+        {
+            if (amount &lt; 0) debtors.Enqueue(person, amount);        // min-heap on amount
+            else if (amount &gt; 0) creditors.Enqueue(person, -amount);
+        }
+
+        var payments = new List&lt;Payment&gt;();
+        while (debtors.Count &gt; 0 &amp;&amp; creditors.Count &gt; 0)
+        {
+            var debtor = debtors.Dequeue();
+            var creditor = creditors.Dequeue();
+
+            long transfer = Math.Min(-owed[debtor], owed[creditor]);
+            payments.Add(new Payment(debtor, creditor, transfer));
+
+            owed[debtor] += transfer;
+            owed[creditor] -= transfer;
+
+            // Whoever is not yet square goes back in. At least one is zeroed.
+            if (owed[debtor] &lt; 0) debtors.Enqueue(debtor, owed[debtor]);
+            if (owed[creditor] &gt; 0) creditors.Enqueue(creditor, -owed[creditor]);
+        }
+        return payments;
+    }
+}</code></pre><pre data-lang="python" hidden><code>from __future__ import annotations
+import heapq
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Payment:
+    frm: str
+    to: str
+    cents: int
+
+def minimal_transfers(net_balances: dict[str, int]) -&gt; list[Payment]:
+    &quot;&quot;&quot;Greedy: match the biggest debtor with the biggest creditor each round.
+    At most n-1 payments. Not always the true minimum (that is NP-hard), but
+    optimal in n and what every real app ships.&quot;&quot;&quot;
+    if sum(net_balances.values()) != 0:
+        raise ValueError(&quot;Balances do not sum to zero.&quot;)
+
+    owed = dict(net_balances)
+    debtors = [(amt, p) for p, amt in net_balances.items() if amt &lt; 0]
+    creditors = [(-amt, p) for p, amt in net_balances.items() if amt &gt; 0]
+    heapq.heapify(debtors)      # most negative first
+    heapq.heapify(creditors)    # most positive first (negated)
+
+    payments: list[Payment] = []
+    while debtors and creditors:
+        _, debtor = heapq.heappop(debtors)
+        _, creditor = heapq.heappop(creditors)
+
+        transfer = min(-owed[debtor], owed[creditor])
+        payments.append(Payment(debtor, creditor, transfer))
+
+        owed[debtor] += transfer
+        owed[creditor] -= transfer
+
+        # Whoever is not yet square goes back. At least one is zeroed.
+        if owed[debtor] &lt; 0:
+            heapq.heappush(debtors, (owed[debtor], debtor))
+        if owed[creditor] &gt; 0:
+            heapq.heappush(creditors, (-owed[creditor], creditor))
+
+    return payments</code></pre></div><div class="callout callout-note"><span class="callout-title">Why greedy is not optimal, with the smallest counterexample</span><p>Take net balances
+<code>A: −10, B: −10, C: +10, D: +10</code>. The true minimum is <strong>two</strong> payments (A→C 10, B→D 10). The largest-first
+greedy also finds two here, but add <code>A: −15, B: −5, C: +10, D: +10</code>: greedy pairs A with C (10), leaving A −5, then A
+with D (5), then B with D (5) — <strong>three</strong> payments, where A→C 10, A→D 5, B→D 5 is also three but
+<code>A: −15, B: −5</code> against <code>C: +10, D: +10</code> genuinely needs three. The real wins come from spotting
+<em>subsets that sum to zero</em> and settling them internally, and finding those subsets is exactly subset-sum. State that,
+say the exponential solution is <code>O(2ⁿ)</code> bitmask DP over subsets, and note that <code>n</code> in a friend group is small
+enough that it is actually tractable if anyone cared.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Say <strong>"NP-hard, so I will use a greedy that is optimal in <em>n</em>"</strong> — that is the sentence the
+follow-up is fishing for. Then prove termination out loud: each transaction zeroes at least one person, so it cannot exceed
+<code>n−1</code>. Interviewers are checking whether you will claim optimality you cannot deliver; candidates who confidently assert
+the greedy is minimal are marked down, and candidates who say "this is a heuristic, here is its bound, here is why exact is
+exponential" are marked up — even though the code is identical. This is the same honesty-about-bounds move as the greedy-coin
+discussion on the <a href="lld-vending-machine.html#change">vending machine page</a>, and it comes up constantly.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Implement it and assert: every balance is zero afterwards, and the count is at most n−1.</li><li>Build a case where a zero-sum subset exists and show greedy misses the saving.</li><li>Write the exponential exact version with bitmask DP over subsets and compare on six people.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://en.wikipedia.org/wiki/Largest_remainder_method" target="_blank" rel="noopener">Largest remainder method</a> — the apportionment rule ShareSplit uses</li><li><a href="../../DSA/topics/dsa-recursion-dp.html#bitmask-trees" target="_blank" rel="noopener">DSA: Bitmask DP</a> — the exact settle-up solution over subsets</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

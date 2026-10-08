@@ -284,6 +284,86 @@ window.CURRICULUM = {
               "label": "Bellman-Ford, Floyd-Warshall and MSTs"
             }
           ]
+        },
+        {
+          "id": "dsa-recursion-dp",
+          "label": "Recursion & Dynamic Programming",
+          "href": "topics/dsa-recursion-dp.html",
+          "blurb": "Brute force, memoise, tabulate — then the shapes that get asked: 1-D decisions, two-sequence grids, knapsack, LIS, intervals, bitmask and tree DP, and how to tell DP from greedy.",
+          "sections": [
+            {
+              "hash": "#recursion-to-dp",
+              "label": "From recursion to DP: the three-step conversion"
+            },
+            {
+              "hash": "#one-dimension",
+              "label": "One-dimensional DP: the decision at each index"
+            },
+            {
+              "hash": "#two-strings",
+              "label": "Two sequences: LCS, edit distance and the grid"
+            },
+            {
+              "hash": "#knapsack",
+              "label": "Knapsack: the one shape behind half of all DP questions"
+            },
+            {
+              "hash": "#lis",
+              "label": "Longest increasing subsequence, and the O(n log n) upgrade"
+            },
+            {
+              "hash": "#grids",
+              "label": "Grid DP: paths, costs and the obstacle cases"
+            },
+            {
+              "hash": "#intervals",
+              "label": "Interval and partition DP: when the split point is the decision"
+            },
+            {
+              "hash": "#bitmask-trees",
+              "label": "Bitmask DP and DP on trees"
+            },
+            {
+              "hash": "#recognising",
+              "label": "Recognising DP — and telling it from greedy"
+            }
+          ]
+        },
+        {
+          "id": "dsa-backtracking",
+          "label": "Backtracking",
+          "href": "topics/dsa-backtracking.html",
+          "blurb": "Choose, explore, un-choose. Subsets and permutations with duplicates, grid paths, N-Queens and Sudoku, the four prunes, and when a backtrack can be memoised into a DP.",
+          "sections": [
+            {
+              "hash": "#the-template",
+              "label": "The template: choose, explore, un-choose"
+            },
+            {
+              "hash": "#combinations",
+              "label": "Subsets and combinations, including duplicates"
+            },
+            {
+              "hash": "#permutations",
+              "label": "Permutations, with and without duplicates"
+            },
+            {
+              "hash": "#grid-search",
+              "label": "Backtracking on a grid: word search and path counting"
+            },
+            {
+              "hash": "#constraints",
+              "label": "Constraint puzzles: N-Queens and Sudoku"
+            },
+            {
+              "hash": "#pruning",
+              "label": "Pruning: the difference between hopeless and fast"
+            },
+            {
+              "hash": "#memo-or-not",
+              "label": "When to memoise a backtrack — and when you cannot"
+            }
+          ]
         }
       ]
     }

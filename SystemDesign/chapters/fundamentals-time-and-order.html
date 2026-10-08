@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Time, Ordering and Idempotency — System Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="fundamentals-time-and-order">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Distributed Fundamentals › Fundamentals 3 of 4</div>
+  <h1>Time, Ordering and Idempotency</h1>
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#introduction">Introduction</a></li><li><a href="#why-wall-clocks-fail">Why wall clocks fail</a></li><li><a href="#logical-clocks">Logical clocks</a></li><li><a href="#delivery-semantics-and-idempotency">Delivery semantics and idempotency</a></li><li><a href="#event-time-versus-processing-time">Event time versus processing time</a></li><li><a href="#where-to-go-next">Where to go next</a></li></ol>
+  </div>
+
+<section id="introduction">
+<h2 id="introduction">Introduction</h2>
+<p>Distributed systems have no shared clock and no global &quot;now&quot;. Every ordering question — which write won, did this happen before that, is this message a duplicate — has to be answered without one. This page covers the clocks that work, the one that does not, and the idempotency that makes the whole problem tractable in practice.</p>
+<p><strong>The one-sentence version:</strong> wall-clock timestamps are not an ordering mechanism, logical clocks are, and the practical escape hatch for most systems is to stop caring about order by making operations idempotent.</p>
+<p>This sits underneath the deduplication in <a href="19-distributed-message-queue.html">Chapter 19</a>, the correctness arguments in <a href="26-payment-system.html">Chapter 26</a>, and the windowing in <a href="21-ad-click-event-aggregation.html">Chapter 21</a>.</p>
+</section>
+<section id="why-wall-clocks-fail">
+<h2 id="why-wall-clocks-fail">Why wall clocks fail</h2>
+<h3 id="explanation">Explanation</h3>
+<p>Each machine has its own quartz clock, drifting at its own rate, periodically corrected by NTP. Three consequences make wall-clock timestamps unsafe for ordering:</p>
+<ul>
+<li><strong>Drift.</strong> Typical NTP-synced machines stay within a few milliseconds of each other, but tens or hundreds of milliseconds is routine under load, and worse is possible. Any two events closer together than the drift cannot be ordered by timestamp.</li>
+<li><strong>Jumps.</strong> NTP corrections move the clock, sometimes backwards. A <code>now()</code> call can return a value earlier than a previous one on the same machine. Leap seconds historically caused the same effect, spectacularly.</li>
+<li><strong>No causality.</strong> Even with perfect clocks, equal or near-equal timestamps say nothing about which event <em>caused</em> which.</li>
+</ul>
+<div class="callout callout-note">
+<span class="callout-title">The concrete failure to have ready</span>
+<p>last-write-wins keyed on wall clock means the write from the machine with the fastest clock wins, regardless of when it actually happened. A user updates their profile, then corrects a typo a second later from another device — if the first device's clock is 2 seconds ahead, the correction is silently discarded and never comes back. The data is not corrupted in any way a checksum would catch; it is just wrong, and the system will insist it is right.</p>
+</div>
+<h3 id="what-a-monotonic-clock-is-for">What a monotonic clock is for</h3>
+<p>Most languages expose two clocks. The wall clock (<code>DateTime.UtcNow</code>, <code>time.time()</code>) can jump and is the only one meaningful across machines. The monotonic clock (<code>Stopwatch</code>, <code>time.monotonic()</code>) never goes backwards but has no meaning outside the process.</p>
+<p>The rule: <strong>measure durations with the monotonic clock, express points in time with the wall clock, and order events with neither.</strong> Timeouts and latency measurements taken from the wall clock will occasionally produce negative durations or hour-long stalls, and that bug is miserable to find.</p>
+</section>
+<section id="logical-clocks">
+<h2 id="logical-clocks">Logical clocks</h2>
+<h3 id="explanation-1">Explanation</h3>
+<p>Logical clocks abandon real time and track causality directly.</p>
+<p><strong>Lamport timestamps</strong> are a single counter per node. On any local event, increment. On sending a message, attach the counter. On receiving, set the counter to <code>max(local, received) + 1</code>.</p>
+<p>This guarantees: if <code>a</code> happened-before <code>b</code>, then <code>L(a) &lt; L(b)</code>. The converse does <strong>not</strong> hold — a smaller timestamp does not prove causality, because concurrent events get arbitrary values. Lamport timestamps give you a <em>total order</em> that is consistent with causality, which is enough to break ties deterministically but not enough to detect conflicts.</p>
+<p><strong>Vector clocks</strong> fix the converse. Each node keeps a vector of counters, one per node, incrementing its own entry on an event and taking the element-wise maximum on receipt. Now comparing two vectors tells you exactly one of three things:</p>
+<ul>
+<li><code>V(a) &lt; V(b)</code> on every element → <code>a</code> happened before <code>b</code>.</li>
+<li><code>V(b) &lt; V(a)</code> on every element → <code>b</code> happened before <code>a</code>.</li>
+<li>Neither → <strong>concurrent</strong>, and the system must decide what that means.</li>
+</ul>
+<p>That third outcome is the whole point. Vector clocks let a system <em>detect</em> a conflict rather than silently resolve it the wrong way — which is how Dynamo-style stores know to return multiple versions (&quot;siblings&quot;) to the application instead of picking one.</p>
+<p>The cost is size: a vector grows with the number of nodes that have ever written to a key, and pruning it safely is fiddly. That is why vector clocks appear in systems with a bounded set of writers and are avoided elsewhere.</p>
+<h3 id="hybrid-logical-clocks-and-truetime">Hybrid logical clocks and TrueTime</h3>
+<p>Two practical refinements worth naming:</p>
+<p><strong>Hybrid logical clocks (HLC)</strong> combine a wall-clock component with a logical counter. They stay close to real time, so timestamps remain human-meaningful and comparable across systems, while the logical part guarantees monotonicity and causality even when the wall clock misbehaves. This is the pragmatic modern default — CockroachDB and MongoDB both use them.</p>
+<p><strong>TrueTime</strong> is Spanner's approach: instead of pretending the clock is exact, expose the uncertainty. <code>TT.now()</code> returns an <em>interval</em> <code>[earliest, latest]</code> guaranteed to contain the true time, kept narrow (single-digit milliseconds) by GPS and atomic clocks in every datacentre. To commit a transaction, Spanner simply <em>waits out the uncertainty</em> — it delays until the interval has passed, so no later transaction can get an earlier timestamp.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>the insight to articulate about TrueTime is that it does not solve clock uncertainty, it <em>bounds and then pays for</em> it. Commit latency is deliberately increased by the clock uncertainty window, which buys externally consistent distributed transactions. That is a trade almost nobody else can make, because it requires special hardware in every datacentre — and saying so is the right level of detail. It also makes a nice general point: you can often convert an unbounded uncertainty into a bounded cost, and that is frequently the best available move.</p>
+</div>
+</section>
+<section id="delivery-semantics-and-idempotency">
+<h2 id="delivery-semantics-and-idempotency">Delivery semantics and idempotency</h2>
+<h3 id="explanation-2">Explanation</h3>
+<p>Every messaging and RPC system offers one of three guarantees, and only two of them are real.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Semantics</th>
+<th>Mechanism</th>
+<th>You get</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>At-most-once</strong></td>
+<td>Fire and forget</td>
+<td>Loss on failure</td>
+<td>Cheapest</td>
+</tr>
+<tr>
+<td><strong>At-least-once</strong></td>
+<td>Retry until acknowledged</td>
+<td>Duplicates</td>
+<td>Receiver must cope</td>
+</tr>
+<tr>
+<td><strong>Exactly-once</strong></td>
+<td>Does not exist on the wire</td>
+<td>—</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The third row is the important one. <strong>Exactly-once delivery is impossible</strong> in the presence of network failures: a sender that does not receive an acknowledgement cannot distinguish &quot;the message was lost&quot; from &quot;the message arrived and the acknowledgement was lost&quot;, so it must either retry (risking a duplicate) or not (risking a loss).</p>
+<p>What systems <em>do</em> provide is <strong>exactly-once processing</strong>, which is at-least-once delivery plus an idempotent receiver. The duplicates still arrive; they just stop mattering. Kafka's &quot;exactly-once semantics&quot; is precisely this — producer sequence numbers plus transactional writes — and being able to say so is a reliable way to show you understand the guarantee rather than the marketing.</p>
+<h3 id="making-an-operation-idempotent">Making an operation idempotent</h3>
+<p>Four mechanisms, roughly in order of how often they are the answer:</p>
+<ul>
+<li><strong>Idempotency keys.</strong> The client generates a unique key per logical operation and sends it with every retry. The server records processed keys and returns the stored result for a repeat. This is what Stripe does for payments, and it is the right default answer for any request that moves money or creates a resource.</li>
+<li><strong>Natural idempotence.</strong> Design the operation so repeating it is harmless: <code>SET status = 'paid'</code> rather than <code>INCREMENT attempts</code>. Absolute operations are idempotent, relative ones are not.</li>
+<li><strong>Deduplication windows.</strong> Keep recently-seen message ids in a store with a TTL and drop repeats. Cheap, but only correct if duplicates always arrive within the window — so the window has to exceed the maximum possible retry delay, and you should say what you think that is.</li>
+<li><strong>Conditional writes / compare-and-set.</strong> Attach an expected version; the write fails if the version moved. Also solves lost updates, and it is the same mechanism as the optimistic locking in <a href="22-hotel-reservation-system.html">Chapter 22</a>.</li>
+</ul>
+<div class="callout callout-note">
+<span class="callout-title">The transactional outbox</span>
+<p>the common failure is writing to a database and then publishing an event — if the process dies between them, the event is lost and the two systems diverge forever. The fix is to write the event into an <code>outbox</code> table <em>in the same transaction</em> as the state change, and have a separate relay read the outbox and publish. The relay publishes at-least-once, so consumers must still be idempotent, but the event can no longer be lost. This pattern is the standard answer to &quot;how do you keep your database and your message queue consistent?&quot; and it comes up constantly in microservices discussions.</p>
+</div>
+</section>
+<section id="event-time-versus-processing-time">
+<h2 id="event-time-versus-processing-time">Event time versus processing time</h2>
+<h3 id="explanation-3">Explanation</h3>
+<p>Any system that aggregates a stream has to choose which clock its windows are keyed on.</p>
+<p><strong>Processing time</strong> is when your system saw the event. Simple, always available, and wrong whenever events are delayed — a mobile client that was offline for an hour dumps its backlog into the current window, inflating it and leaving the real window empty.</p>
+<p><strong>Event time</strong> is when the event actually happened, carried in the event itself. Correct, but you can never be sure you have received everything for a window, because a straggler may still be in flight.</p>
+<p>The reconciliation is a <strong>watermark</strong>: an assertion that no event older than time <code>T</code> will arrive from now on. Windows older than the watermark can be closed and emitted; events arriving after it are <em>late</em>, and the system needs a policy — drop them, emit a correction, or hold windows open longer and accept the latency.</p>
+<div class="callout callout-interview">
+<span class="callout-title">Interview angle</span>
+<p>this comes up in any streaming or analytics design, and the discriminating question is &quot;what do you do with late data?&quot; There is no universally right answer, and the interviewer wants to hear you choose a trade: drop it (simplest, slightly wrong counts), emit a retraction (correct, but downstream consumers must handle corrections), or widen the window (correct, costs latency and memory). Naming the three and picking one for a stated reason is the complete answer. The related move is to keep the raw event log so that any window can be recomputed later — which is the reasoning behind the lambda and kappa architectures in <a href="21-ad-click-event-aggregation.html">Chapter 21</a>.</p>
+</div>
+</section>
+<section id="where-to-go-next" data-kind="further">
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li><a href="fundamentals-replication.html">Replication and consensus</a> — versioning, and where leases depend on clocks.</li>
+<li><a href="fundamentals-consistency.html">Consistency models, CAP and PACELC</a> — the guarantees this ordering supports.</li>
+<li><a href="19-distributed-message-queue.html">Chapter 19: Distributed Message Queue</a> — delivery semantics made concrete.</li>
+</ul>
+</section>
+
+
+  <p class="footer-note">Generated from <code>system-design-notes/</code> · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+
+</body>
+</html>

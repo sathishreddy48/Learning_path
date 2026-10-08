@@ -13,7 +13,7 @@
 window.CURRICULUM = {
   "meta": {
     "title": "System Design",
-    "subtitle": "Alex Xu Vol 1 & 2 · 28 chapters"
+    "subtitle": "Alex Xu Vol 1 & 2 · 28 chapters + fundamentals"
   },
   "groups": [
     {
@@ -214,6 +214,145 @@ window.CURRICULUM = {
             {
               "hash": "#one-page-cheat-sheet",
               "label": "One-page cheat sheet"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fundamentals",
+      "label": "Distributed Fundamentals",
+      "blurb": "The theory the designs assume: what a consistency guarantee actually promises, how replicas agree, why ordering needs clocks you cannot trust, and what a storage engine trades away. Not in the book — these are the follow-up questions the designs attract.",
+      "topics": [
+        {
+          "id": "fundamentals-consistency",
+          "label": "Consistency Models, CAP and PACELC",
+          "href": "chapters/fundamentals-consistency.html",
+          "blurb": "a consistency model is a contract about what a read is allowed to return, strong models let you reason about the system as if it were a single machine, weak models give that up in exchange…",
+          "sections": [
+            {
+              "hash": "#introduction",
+              "label": "Introduction"
+            },
+            {
+              "hash": "#the-hierarchy-strongest-to-weakest",
+              "label": "The hierarchy, strongest to weakest"
+            },
+            {
+              "hash": "#cap-stated-correctly",
+              "label": "CAP, stated correctly"
+            },
+            {
+              "hash": "#pacelc-the-half-of-the-trade-off-cap-leaves-out",
+              "label": "PACELC: the half of the trade-off CAP leaves out"
+            },
+            {
+              "hash": "#where-the-guarantee-gets-bought",
+              "label": "Where the guarantee gets bought"
+            },
+            {
+              "hash": "#where-to-go-next",
+              "label": "Where to go next"
+            }
+          ]
+        },
+        {
+          "id": "fundamentals-replication",
+          "label": "Replication, Quorums and Consensus",
+          "href": "chapters/fundamentals-replication.html",
+          "blurb": "replication is easy until two replicas disagree, and the entire field is about who decides which one is right — a designated leader, a majority vote, or the reader at read time.",
+          "sections": [
+            {
+              "hash": "#introduction",
+              "label": "Introduction"
+            },
+            {
+              "hash": "#leader-based-replication",
+              "label": "Leader-based replication"
+            },
+            {
+              "hash": "#quorums",
+              "label": "Quorums"
+            },
+            {
+              "hash": "#consensus",
+              "label": "Consensus"
+            },
+            {
+              "hash": "#choosing-between-them",
+              "label": "Choosing between them"
+            },
+            {
+              "hash": "#where-to-go-next",
+              "label": "Where to go next"
+            }
+          ]
+        },
+        {
+          "id": "fundamentals-time-and-order",
+          "label": "Time, Ordering and Idempotency",
+          "href": "chapters/fundamentals-time-and-order.html",
+          "blurb": "wall-clock timestamps are not an ordering mechanism, logical clocks are, and the practical escape hatch for most systems is to stop caring about order by making operations idempotent.",
+          "sections": [
+            {
+              "hash": "#introduction",
+              "label": "Introduction"
+            },
+            {
+              "hash": "#why-wall-clocks-fail",
+              "label": "Why wall clocks fail"
+            },
+            {
+              "hash": "#logical-clocks",
+              "label": "Logical clocks"
+            },
+            {
+              "hash": "#delivery-semantics-and-idempotency",
+              "label": "Delivery semantics and idempotency"
+            },
+            {
+              "hash": "#event-time-versus-processing-time",
+              "label": "Event time versus processing time"
+            },
+            {
+              "hash": "#where-to-go-next",
+              "label": "Where to go next"
+            }
+          ]
+        },
+        {
+          "id": "fundamentals-storage-engines",
+          "label": "Storage Engines: B-Trees, LSM Trees and the Write Path",
+          "href": "chapters/fundamentals-storage-engines.html",
+          "blurb": "B-trees update data in place and give predictable reads; LSM trees only ever append and give much faster writes, paying for it with background compaction and variable read latency — and…",
+          "sections": [
+            {
+              "hash": "#introduction",
+              "label": "Introduction"
+            },
+            {
+              "hash": "#durability-first-the-write-ahead-log",
+              "label": "Durability first: the write-ahead log"
+            },
+            {
+              "hash": "#b-trees",
+              "label": "B-trees"
+            },
+            {
+              "hash": "#lsm-trees",
+              "label": "LSM trees"
+            },
+            {
+              "hash": "#choosing-between-them",
+              "label": "Choosing between them"
+            },
+            {
+              "hash": "#the-patterns-these-engines-explain",
+              "label": "The patterns these engines explain"
+            },
+            {
+              "hash": "#where-to-go-next",
+              "label": "Where to go next"
             }
           ]
         }

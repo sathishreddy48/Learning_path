@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vending Machine — Low-Level Design</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="lld-vending-machine">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Worked designs › Topic 5 of 7</div>
+  <h1>Design a Vending Machine</h1>
+  <p class="lede">The canonical State-pattern prompt, and secretly two problems: a state machine whose illegal transitions you must choose on purpose, and a change-making algorithm where greedy is wrong in two different ways once the coin float is finite.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#scope">Requirements, and why this one is really two problems</a></li><li><a href="#states">The state machine</a></li><li><a href="#change">Making change: greedy, and when greedy is wrong</a></li><li><a href="#machine">The machine, and the follow-ups</a></li></ol>
+  </div>
+
+<section id="scope"><h2 id="scope">Requirements, and why this one is really two problems</h2><p>A vending machine is asked because it is a <strong>state machine with a real algorithm inside it</strong>. The state machine is
+the obvious half; the change-making is the half candidates forget until the interviewer asks "what if you cannot make exact change?"
+and the design has no answer.</p><div class="table-wrap"><table><thead><tr><th>You ask</th><th>Typical answer</th><th>What it decides</th></tr></thead><tbody><tr><td>Which coins/notes are accepted?</td><td>A fixed denomination set</td><td>Change-making operates over a known list</td></tr><tr><td>Must it give exact change?</td><td>Yes, or refuse the sale</td><td>A dispense can fail <em>after</em> payment — a whole state</td></tr><tr><td>Can the user cancel?</td><td>Yes, full refund</td><td>A cancel transition from most states</td></tr><tr><td>Does the machine track its own coin float?</td><td>Yes</td><td>Change-making is bounded by stock, not infinite</td></tr><tr><td>Multiple items at once?</td><td>No, one per transaction</td><td>Cuts a lot of complexity — take it</td></tr><tr><td>Restocking / operator mode?</td><td>Nice to have</td><td>Mention it; implement only if time</td></tr></tbody></table></div><p>The states fall out immediately. Write them and the legal transitions on the board before any code — this is the one prompt
+where the diagram is genuinely worth the minutes.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>insertCoin                select                 dispense
+  Idle ───────────▶ HasCredit ───────────▶ Dispensing ───────────▶ Idle
+   ▲                 │   │  ▲                                       │
+   │        cancel   │   │  └── insertCoin (self-transition)        │
+   └─────────────────┘   │                                          │
+   │                     └── select, insufficient credit ──▶ stays  │
+   │                     └── select, cannot make change ──▶ refund  │
+   └──────────────────────────────────────────────────────────────┘
+
+ILLEGAL, and each must do something you chose on purpose:
+  Idle       + select     -&gt; error &quot;insert a coin first&quot;
+  Idle       + dispense   -&gt; error &quot;nothing selected&quot;
+  HasCredit  + dispense   -&gt; error &quot;select an item first&quot;
+  Dispensing + insertCoin -&gt; error, or queue for the next sale (pick one)</code></pre><pre data-lang="python" hidden><code>insert_coin               select                 dispense
+  IDLE ───────────▶ HAS_CREDIT ──────────▶ DISPENSING ───────────▶ IDLE
+   ▲                 │   │  ▲                                       │
+   │        cancel   │   │  └── insert_coin (self-transition)       │
+   └─────────────────┘   │                                          │
+   │                     └── select, insufficient credit ──▶ stays  │
+   │                     └── select, cannot make change ──▶ refund  │
+   └──────────────────────────────────────────────────────────────┘
+
+ILLEGAL, and each must do something you chose on purpose:
+  IDLE       + select      -&gt; error &quot;insert a coin first&quot;
+  IDLE       + dispense    -&gt; error &quot;nothing selected&quot;
+  HAS_CREDIT + dispense    -&gt; error &quot;select an item first&quot;
+  DISPENSING + insert_coin -&gt; error, or queue for the next sale (pick one)</code></pre></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Enumerate the <em>illegal</em> transitions out loud, not just the legal ones. Any candidate can draw three boxes and
+three arrows; the discriminating question is what happens when someone presses Dispense twice, and a design that silently no-ops is
+indistinguishable from one that throws until you ask. Decide and say it. The second thing to volunteer early is that
+<strong>a sale can fail after the money is in</strong> — out of stock, or no change available — because that is the requirement that
+forces a refund path through the state machine, and retrofitting it later is painful.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Draw the machine and label every illegal transition with what it does. Three minutes, from memory.</li><li>Decide what happens if the item runs out between select and dispense, and where in your design that is detected.</li></ul></div></section>
+
+<section id="states"><h2 id="states">The state machine</h2><p>One class per state, each returning the next state. The machine holds no transition logic at all — it delegates and stores
+whatever comes back, which is what keeps it from growing a <code>switch</code>.</p>
+<p>The piece worth getting right is that <strong>the state object decides, the machine executes</strong>. A state never mutates the
+machine's state field; it returns a successor. That makes every transition visible at one line in the machine and makes the states
+trivially unit-testable.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public sealed record Item(string Code, string Name, int PriceCents);
+
+public interface IVendingState
+{
+    string Name { get; }
+    IVendingState InsertCoin(VendingMachine m, int cents);
+    IVendingState Select(VendingMachine m, string code);
+    IVendingState Dispense(VendingMachine m);
+    IVendingState Cancel(VendingMachine m);
+}
+
+public sealed class IdleState : IVendingState
+{
+    public string Name =&gt; &quot;Idle&quot;;
+    public IVendingState InsertCoin(VendingMachine m, int cents)
+    {
+        m.AddCredit(cents);
+        return new HasCreditState();
+    }
+    public IVendingState Select(VendingMachine m, string code) =&gt;
+        throw new InvalidOperationException(&quot;Insert a coin first.&quot;);
+    public IVendingState Dispense(VendingMachine m) =&gt;
+        throw new InvalidOperationException(&quot;Nothing selected.&quot;);
+    public IVendingState Cancel(VendingMachine m) =&gt; this;        // no-op
+}
+
+public sealed class HasCreditState : IVendingState
+{
+    public string Name =&gt; &quot;HasCredit&quot;;
+
+    public IVendingState InsertCoin(VendingMachine m, int cents)
+    {
+        m.AddCredit(cents);
+        return this;                                              // self-transition
+    }
+
+    public IVendingState Select(VendingMachine m, string code)
+    {
+        var item = m.Inventory.Find(code);
+        if (item is null) { m.Report($&quot;Unknown code {code}.&quot;); return this; }
+        if (m.Inventory.StockOf(code) == 0) { m.Report($&quot;{item.Name} is sold out.&quot;); return this; }
+        if (m.CreditCents &lt; item.PriceCents)
+        {
+            m.Report($&quot;Need {item.PriceCents - m.CreditCents} more cents.&quot;);
+            return this;                                          // stay, keep credit
+        }
+
+        // Can we actually return the change? Check BEFORE committing the sale.
+        var change = m.Bank.MakeChange(m.CreditCents - item.PriceCents);
+        if (change is null)
+        {
+            m.Report(&quot;Cannot make exact change; refunding.&quot;);
+            m.RefundAll();
+            return new IdleState();
+        }
+
+        m.Hold(item, change);
+        return new DispensingState();
+    }
+
+    public IVendingState Dispense(VendingMachine m) =&gt;
+        throw new InvalidOperationException(&quot;Select an item first.&quot;);
+
+    public IVendingState Cancel(VendingMachine m)
+    {
+        m.RefundAll();
+        return new IdleState();
+    }
+}
+
+public sealed class DispensingState : IVendingState
+{
+    public string Name =&gt; &quot;Dispensing&quot;;
+    public IVendingState InsertCoin(VendingMachine m, int cents) =&gt;
+        throw new InvalidOperationException(&quot;Wait for the current sale to finish.&quot;);
+    public IVendingState Select(VendingMachine m, string code) =&gt;
+        throw new InvalidOperationException(&quot;Already dispensing.&quot;);
+
+    public IVendingState Dispense(VendingMachine m)
+    {
+        m.CompleteSale();          // commits stock, bank and change in one step
+        return new IdleState();
+    }
+
+    // Too late: the sale is committed in Dispense, so cancelling here would
+    // need a compensating action. Simplest defensible rule is to refuse.
+    public IVendingState Cancel(VendingMachine m) =&gt;
+        throw new InvalidOperationException(&quot;Cannot cancel while dispensing.&quot;);
+}</code></pre><pre data-lang="python" hidden><code>from __future__ import annotations
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Item:
+    code: str
+    name: str
+    price_cents: int
+
+class VendingState(ABC):
+    name: str
+    @abstractmethod
+    def insert_coin(self, m: &quot;VendingMachine&quot;, cents: int) -&gt; &quot;VendingState&quot;: ...
+    @abstractmethod
+    def select(self, m: &quot;VendingMachine&quot;, code: str) -&gt; &quot;VendingState&quot;: ...
+    @abstractmethod
+    def dispense(self, m: &quot;VendingMachine&quot;) -&gt; &quot;VendingState&quot;: ...
+    @abstractmethod
+    def cancel(self, m: &quot;VendingMachine&quot;) -&gt; &quot;VendingState&quot;: ...
+
+class IdleState(VendingState):
+    name = &quot;Idle&quot;
+    def insert_coin(self, m, cents):
+        m.add_credit(cents)
+        return HasCreditState()
+    def select(self, m, code):
+        raise RuntimeError(&quot;Insert a coin first.&quot;)
+    def dispense(self, m):
+        raise RuntimeError(&quot;Nothing selected.&quot;)
+    def cancel(self, m):
+        return self                                   # no-op
+
+class HasCreditState(VendingState):
+    name = &quot;HasCredit&quot;
+
+    def insert_coin(self, m, cents):
+        m.add_credit(cents)
+        return self                                   # self-transition
+
+    def select(self, m, code):
+        item = m.inventory.find(code)
+        if item is None:
+            m.report(f&quot;Unknown code {code}.&quot;)
+            return self
+        if m.inventory.stock_of(code) == 0:
+            m.report(f&quot;{item.name} is sold out.&quot;)
+            return self
+        if m.credit_cents &lt; item.price_cents:
+            m.report(f&quot;Need {item.price_cents - m.credit_cents} more cents.&quot;)
+            return self                               # stay, keep credit
+
+        # Can we actually return the change? Check BEFORE committing.
+        change = m.bank.make_change(m.credit_cents - item.price_cents)
+        if change is None:
+            m.report(&quot;Cannot make exact change; refunding.&quot;)
+            m.refund_all()
+            return IdleState()
+
+        m.hold(item, change)
+        return DispensingState()
+
+    def dispense(self, m):
+        raise RuntimeError(&quot;Select an item first.&quot;)
+
+    def cancel(self, m):
+        m.refund_all()
+        return IdleState()
+
+class DispensingState(VendingState):
+    name = &quot;Dispensing&quot;
+    def insert_coin(self, m, cents):
+        raise RuntimeError(&quot;Wait for the current sale to finish.&quot;)
+    def select(self, m, code):
+        raise RuntimeError(&quot;Already dispensing.&quot;)
+    def dispense(self, m):
+        m.complete_sale()        # commits stock, bank and change in one step
+        return IdleState()
+    def cancel(self, m):
+        raise RuntimeError(&quot;Cannot cancel while dispensing.&quot;)</code></pre></div><div class="callout callout-note"><span class="callout-title">Check change before committing, not after</span><p>The ordering in <code>Select</code> is the part interviewers probe. It is
+tempting to deduct the price, dispense, and <em>then</em> try to make change — at which point you may have taken the money and
+have no way to return the remainder. Checking <code>MakeChange</code> first, while the transaction is still abortable, means the
+failure path is a clean full refund. This is the same reasoning as validating before mutating anywhere else, and saying so connects
+the toy problem to real practice.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Write a test for every illegal transition and assert the exact message.</li><li>Add a "exact change only" lamp that lights when the bank cannot make common change amounts. Where does it belong?</li></ul></div></section>
+
+<section id="change"><h2 id="change">Making change: greedy, and when greedy is wrong</h2><p>The algorithmic half. Given a set of denominations with <em>limited stock</em>, return a multiset of coins summing exactly to
+the change due, or fail. Two facts to have ready:</p>
+<ol>
+<li><strong>Greedy (take the largest coin that fits, repeatedly) is not always correct.</strong> With coins
+<code>{1, 3, 4}</code> and 6 due, greedy gives <code>4+1+1</code> = three coins; the optimum is <code>3+3</code> = two. Greedy is
+provably optimal only for <em>canonical</em> systems, which real currencies happen to be — so greedy is fine for
+<code>{1, 5, 10, 25}</code>, and you should say <em>why</em> it is fine rather than assuming.</li>
+<li><strong>Limited stock breaks greedy even on canonical systems.</strong> Suppose the float holds one quarter and three
+dimes, and 30 cents is due. Greedy takes the quarter, then cannot make the remaining 5 and gives up — even though
+<code>10+10+10</code> is sitting right there. That is not a suboptimal answer, it is <em>no</em> answer for an amount that was
+perfectly makeable. With bounded coins you need DP or backtracking to be correct.</li>
+</ol>
+<p>So: implement greedy, <em>say</em> both caveats, and offer the DP as the correct-under-stock version. That sequence is worth far
+more than silently writing either one.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>/// The machine&#x27;s coin float. Denominations in cents, with counts.
+public sealed class CoinBank(IDictionary&lt;int, int&gt; initial)
+{
+    private readonly SortedDictionary&lt;int, int&gt; _counts =
+        new(initial.ToDictionary(kv =&gt; kv.Key, kv =&gt; kv.Value),
+            Comparer&lt;int&gt;.Create((a, b) =&gt; b.CompareTo(a)));   // descending
+
+    public int TotalCents =&gt; _counts.Sum(kv =&gt; kv.Key * kv.Value);
+
+    public void Add(int cents, int n = 1) =&gt;
+        _counts[cents] = _counts.GetValueOrDefault(cents) + n;
+
+    /// Greedy: correct for canonical systems with UNLIMITED stock.
+    /// Returns null when it cannot make the amount exactly.
+    public IReadOnlyDictionary&lt;int, int&gt;? MakeChangeGreedy(int amount)
+    {
+        if (amount == 0) return new Dictionary&lt;int, int&gt;();
+        var take = new Dictionary&lt;int, int&gt;();
+        foreach (var (coin, available) in _counts)
+        {
+            int n = Math.Min(amount / coin, available);
+            if (n == 0) continue;
+            take[coin] = n;
+            amount -= coin * n;
+        }
+        return amount == 0 ? take : null;          // could not finish exactly
+    }
+
+    /// Correct under LIMITED stock: bounded-knapsack DP, one layer per
+    /// denomination so the count of each coin is explicitly bounded.
+    ///   dp[i, a] = fewest coins to make &#x27;a&#x27; using the first i denominations.
+    /// O(denominations x amount x maxCount) — tiny for a vending machine.
+    public IReadOnlyDictionary&lt;int, int&gt;? MakeChange(int amount)
+    {
+        if (amount == 0) return new Dictionary&lt;int, int&gt;();
+
+        var coins = _counts.Keys.ToArray();
+        int n = coins.Length;
+        const int Inf = int.MaxValue / 2;
+
+        var dp = new int[n + 1, amount + 1];
+        var take = new int[n + 1, amount + 1];   // how many of coin i-1 we took
+        for (int i = 0; i &lt;= n; i++)
+            for (int a = 0; a &lt;= amount; a++) dp[i, a] = Inf;
+        dp[0, 0] = 0;
+
+        for (int i = 1; i &lt;= n; i++)
+        {
+            int coin = coins[i - 1], available = _counts[coin];
+            for (int a = 0; a &lt;= amount; a++)
+            {
+                int best = dp[i - 1, a], bestK = 0;
+                for (int k = 1; k &lt;= available &amp;&amp; k * coin &lt;= a; k++)
+                {
+                    int prev = dp[i - 1, a - k * coin];
+                    if (prev + k &lt; best) { best = prev + k; bestK = k; }
+                }
+                dp[i, a] = best;
+                take[i, a] = bestK;
+            }
+        }
+
+        if (dp[n, amount] &gt;= Inf) return null;
+
+        // Walk the layers back: each one says exactly how many it contributed.
+        var result = new Dictionary&lt;int, int&gt;();
+        for (int i = n, a = amount; i &gt; 0; i--)
+        {
+            int k = take[i, a];
+            if (k &gt; 0) { result[coins[i - 1]] = k; a -= k * coins[i - 1]; }
+        }
+        return result;
+    }
+
+    public void Remove(IReadOnlyDictionary&lt;int, int&gt; coins)
+    {
+        foreach (var (coin, n) in coins)
+        {
+            if (_counts.GetValueOrDefault(coin) &lt; n)
+                throw new InvalidOperationException($&quot;Not enough {coin}c coins.&quot;);
+            _counts[coin] -= n;
+        }
+    }
+}</code></pre><pre data-lang="python" hidden><code>from __future__ import annotations
+
+class CoinBank:
+    &quot;&quot;&quot;The machine&#x27;s coin float: denominations in cents, with counts.&quot;&quot;&quot;
+
+    def __init__(self, initial: dict[int, int]) -&gt; None:
+        self._counts = dict(initial)
+
+    @property
+    def total_cents(self) -&gt; int:
+        return sum(c * n for c, n in self._counts.items())
+
+    def add(self, cents: int, n: int = 1) -&gt; None:
+        self._counts[cents] = self._counts.get(cents, 0) + n
+
+    def make_change_greedy(self, amount: int) -&gt; dict[int, int] | None:
+        &quot;&quot;&quot;Correct for canonical systems with UNLIMITED stock. None on failure.&quot;&quot;&quot;
+        if amount == 0:
+            return {}
+        take: dict[int, int] = {}
+        for coin in sorted(self._counts, reverse=True):
+            n = min(amount // coin, self._counts[coin])
+            if n:
+                take[coin] = n
+                amount -= coin * n
+        return take if amount == 0 else None
+
+    def make_change(self, amount: int) -&gt; dict[int, int] | None:
+        &quot;&quot;&quot;Correct under LIMITED stock: bounded-knapsack DP, one layer per
+        denomination so each coin&#x27;s count is explicitly bounded.
+            dp[i][a] = fewest coins to make &#x27;a&#x27; using the first i denominations.
+        O(denominations x amount x max_count) — tiny for a vending machine.
+        &quot;&quot;&quot;
+        if amount == 0:
+            return {}
+
+        coins = list(self._counts)
+        n = len(coins)
+        INF = float(&quot;inf&quot;)
+
+        dp = [[INF] * (amount + 1) for _ in range(n + 1)]
+        take = [[0] * (amount + 1) for _ in range(n + 1)]   # count of coin i-1
+        dp[0][0] = 0
+
+        for i, coin in enumerate(coins, start=1):
+            available = self._counts[coin]
+            for a in range(amount + 1):
+                best, best_k = dp[i - 1][a], 0
+                for k in range(1, available + 1):
+                    if k * coin &gt; a:
+                        break
+                    prev = dp[i - 1][a - k * coin]
+                    if prev + k &lt; best:
+                        best, best_k = prev + k, k
+                dp[i][a], take[i][a] = best, best_k
+
+        if dp[n][amount] == INF:
+            return None
+
+        # Walk the layers back: each says exactly how many it contributed.
+        result: dict[int, int] = {}
+        a = amount
+        for i in range(n, 0, -1):
+            k = take[i][a]
+            if k:
+                result[coins[i - 1]] = k
+                a -= k * coins[i - 1]
+        return result
+
+    def remove(self, coins: dict[int, int]) -&gt; None:
+        for coin, n in coins.items():
+            if self._counts.get(coin, 0) &lt; n:
+                raise RuntimeError(f&quot;Not enough {coin}c coins.&quot;)
+            self._counts[coin] -= n</code></pre></div><div class="callout callout-warn"><span class="callout-title">Greedy fails in two different ways — know which is which</span><ul>
+<li><strong>Non-canonical denominations</strong> (<code>{1,3,4}</code>, amount 6): greedy returns a <em>suboptimal but valid</em>
+answer. You get change, just more coins than necessary.</li>
+<li><strong>Limited stock</strong> (one 25c and three 10c in the float, amount 30c): greedy takes the quarter, strands
+itself on 5c and returns <em>no answer at all</em> — for an amount <code>10+10+10</code> makes exactly. That is a correctness bug,
+not an efficiency one, and it is the one that matters in a vending machine.</li>
+</ul><p>Keeping these two straight is a real discriminator. Many candidates know "greedy coin change can be suboptimal" and stop
+there, missing that the stock constraint is the one their own design just introduced.</p></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>This is where the vending machine stops being a toy. Write greedy first — it is four lines and it is right for US or
+Euro coins — then say: <strong>"this is only optimal because the denominations are canonical, and it can fail outright once stock is
+limited, so the correct version is a bounded-knapsack DP."</strong> That one sentence links an LLD round to the
+<a href="../../DSA/topics/dsa-recursion-dp.html#knapsack">knapsack family</a> and shows you can tell an efficiency bug from a
+correctness bug. If they want the DP, the complexity is <code>O(amount × total coins)</code>, which for a vending machine is
+trivially small — worth saying, because it justifies choosing correctness over cleverness.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Construct a stock level where greedy fails and the DP succeeds. Then write that as a test.</li><li>Work out why a one-array DP with a single parent pointer gets this wrong — the per-coin layer is not ceremony, it is what makes reconstruction respect the stock bound.</li><li>Extend <code>make_change</code> to prefer returning the machine's most plentiful coins, keeping scarce ones in the float.</li></ul></div></section>
+
+<section id="machine"><h2 id="machine">The machine, and the follow-ups</h2><p>The machine itself is small — it holds state, credit, inventory and bank, and delegates every event. The only logic it owns is
+committing a sale atomically.</p><div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="csharp">C#</button><button role="tab" aria-selected="false" data-lang="python">Python</button></div><pre data-lang="csharp"><code>public sealed class Inventory(IDictionary&lt;string, (Item item, int count)&gt; initial)
+{
+    private readonly Dictionary&lt;string, (Item item, int count)&gt; _stock = new(initial);
+    public Item? Find(string code) =&gt; _stock.TryGetValue(code, out var e) ? e.item : null;
+    public int StockOf(string code) =&gt; _stock.TryGetValue(code, out var e) ? e.count : 0;
+    public void Take(string code)
+    {
+        var e = _stock[code];
+        if (e.count == 0) throw new InvalidOperationException(&quot;Sold out.&quot;);
+        _stock[code] = (e.item, e.count - 1);
+    }
+    public void Restock(string code, int n)
+    {
+        var e = _stock[code];
+        _stock[code] = (e.item, e.count + n);
+    }
+}
+
+public sealed class VendingMachine(Inventory inventory, CoinBank bank)
+{
+    private IVendingState _state = new IdleState();
+    private readonly List&lt;int&gt; _inserted = [];
+    private Item? _held;
+    private IReadOnlyDictionary&lt;int, int&gt;? _heldChange;
+
+    public Inventory Inventory { get; } = inventory;
+    public CoinBank Bank { get; } = bank;
+    public string State =&gt; _state.Name;
+    public int CreditCents =&gt; _inserted.Sum();
+    public List&lt;string&gt; Messages { get; } = [];
+
+    // --- events: delegate, store the successor. No logic here. ---
+    public void InsertCoin(int cents) =&gt; _state = _state.InsertCoin(this, cents);
+    public void Select(string code)   =&gt; _state = _state.Select(this, code);
+    public void Dispense()            =&gt; _state = _state.Dispense(this);
+    public void Cancel()              =&gt; _state = _state.Cancel(this);
+
+    // --- operations the states call back into ---
+    internal void AddCredit(int cents) =&gt; _inserted.Add(cents);
+    internal void Report(string msg) =&gt; Messages.Add(msg);
+
+    internal void Hold(Item item, IReadOnlyDictionary&lt;int, int&gt; change)
+    {
+        _held = item;
+        _heldChange = change;
+    }
+
+    internal void RefundAll()
+    {
+        _inserted.Clear();
+        _held = null;
+        _heldChange = null;
+    }
+
+    /// Commit: stock out, coins in, change out — all or nothing.
+    internal void CompleteSale()
+    {
+        var item = _held ?? throw new InvalidOperationException(&quot;Nothing held.&quot;);
+        var change = _heldChange!;
+
+        Inventory.Take(item.Code);
+        foreach (var c in _inserted) Bank.Add(c);     // the user&#x27;s coins join the float
+        Bank.Remove(change);                           // change leaves it
+
+        Report($&quot;Dispensed {item.Name}; change {change.Sum(kv =&gt; kv.Key * kv.Value)}c.&quot;);
+        _inserted.Clear();
+        _held = null;
+        _heldChange = null;
+    }
+}</code></pre><pre data-lang="python" hidden><code>class Inventory:
+    def __init__(self, initial: dict[str, tuple[Item, int]]) -&gt; None:
+        self._stock = dict(initial)
+    def find(self, code: str) -&gt; Item | None:
+        entry = self._stock.get(code)
+        return entry[0] if entry else None
+    def stock_of(self, code: str) -&gt; int:
+        entry = self._stock.get(code)
+        return entry[1] if entry else 0
+    def take(self, code: str) -&gt; None:
+        item, count = self._stock[code]
+        if count == 0:
+            raise RuntimeError(&quot;Sold out.&quot;)
+        self._stock[code] = (item, count - 1)
+    def restock(self, code: str, n: int) -&gt; None:
+        item, count = self._stock[code]
+        self._stock[code] = (item, count + n)
+
+class VendingMachine:
+    def __init__(self, inventory: Inventory, bank: CoinBank) -&gt; None:
+        self.inventory = inventory
+        self.bank = bank
+        self.messages: list[str] = []
+        self._state: VendingState = IdleState()
+        self._inserted: list[int] = []
+        self._held: Item | None = None
+        self._held_change: dict[int, int] | None = None
+
+    @property
+    def state(self) -&gt; str: return self._state.name
+    @property
+    def credit_cents(self) -&gt; int: return sum(self._inserted)
+
+    # --- events: delegate, store the successor. No logic here. ---
+    def insert_coin(self, cents: int) -&gt; None: self._state = self._state.insert_coin(self, cents)
+    def select(self, code: str) -&gt; None:       self._state = self._state.select(self, code)
+    def dispense(self) -&gt; None:                self._state = self._state.dispense(self)
+    def cancel(self) -&gt; None:                  self._state = self._state.cancel(self)
+
+    # --- operations the states call back into ---
+    def add_credit(self, cents: int) -&gt; None: self._inserted.append(cents)
+    def report(self, msg: str) -&gt; None: self.messages.append(msg)
+
+    def hold(self, item: Item, change: dict[int, int]) -&gt; None:
+        self._held, self._held_change = item, change
+
+    def refund_all(self) -&gt; None:
+        self._inserted.clear()
+        self._held = self._held_change = None
+
+    def complete_sale(self) -&gt; None:
+        &quot;&quot;&quot;Commit: stock out, coins in, change out — all or nothing.&quot;&quot;&quot;
+        if self._held is None or self._held_change is None:
+            raise RuntimeError(&quot;Nothing held.&quot;)
+        item, change = self._held, self._held_change
+
+        self.inventory.take(item.code)
+        for c in self._inserted:
+            self.bank.add(c)                      # the user&#x27;s coins join the float
+        self.bank.remove(change)                  # change leaves it
+
+        given = sum(c * n for c, n in change.items())
+        self.report(f&quot;Dispensed {item.name}; change {given}c.&quot;)
+        self._inserted.clear()
+        self._held = self._held_change = None</code></pre></div><div class="table-wrap"><table><thead><tr><th>Follow-up</th><th>The answer</th></tr></thead><tbody><tr><td>"Cannot make exact change"</td><td>Already handled: checked before committing, full refund</td></tr><tr><td>"Add card payment"</td><td>An <code>IPaymentMethod</code> seam; coins become one implementation</td></tr><tr><td>"Operator restocks and empties the float"</td><td>A maintenance state, plus restock/collect operations</td></tr><tr><td>"Two people use it at once"</td><td>Physically impossible for one machine — but say it: a lock around the event methods, or a single-threaded event loop</td></tr><tr><td>"Make it a bank of machines with shared stock"</td><td>Now stock is contended and you need the same CAS reasoning as the parking lot</td></tr><tr><td>"Prices change at runtime"</td><td><code>Item</code> is a value object, so replace it; or a pricing strategy if it varies by time of day</td></tr></tbody></table></div><div class="callout callout-interview"><span class="callout-title">Interview angle</span><p>Two things to volunteer at the end. First, <strong><code>CompleteSale</code> is the transaction boundary</strong> —
+stock, float and change all move together, and if any step could fail you would need them ordered so that the recoverable failure
+happens first. Naming a transaction boundary in a design with no database is exactly the kind of transfer interviewers are looking
+for. Second, <strong>the concurrency answer here is "don't"</strong>: one physical machine has one user, so a lock around the four
+event methods is both sufficient and honest. Candidates sometimes invent elaborate concurrency for this problem; recognising that
+the domain does not need it is the better answer, and it is a different skill from being able to build it.</p></div><div class="callout callout-practice"><span class="callout-title">Practice</span><ul><li>Drive the machine through: insert 100, select a 65c item with the bank holding only 25c coins. Check you get a refund, not a half-sale.</li><li>Add a maintenance mode and work out which transitions it must block.</li><li>Make <code>CompleteSale</code> fail halfway (stock taken, change unavailable) and decide how you would make it safe.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="../../DSA/topics/dsa-recursion-dp.html#knapsack" target="_blank" rel="noopener">DSA: Knapsack</a> — the bounded-knapsack DP the coin float needs</li><li><a href="https://refactoring.guru/design-patterns/state" target="_blank" rel="noopener">Refactoring Guru: State</a> — the pattern, and how it differs from Strategy</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button; use the tabs to switch between C# and Python where both are provided.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>
