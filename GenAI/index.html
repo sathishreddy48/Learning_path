@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard — GenAI</title>
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body data-root="">
+<div class="layout">
+<main class="main">
+
+  <h1>GenAI</h1>
+  <p class="lede">A self-paced study site for the <strong>AI / GenAI interview round</strong> — the one that barely existed three
+  years ago and is now on most loops. Three foundation pages on what the round grades and how a model behaves as a component,
+  three on the systems you will be asked to design, and three on the internals that actually separate candidates. Nine pages,
+  59 sections, <strong>Python</strong> throughout. The sidebar has three menus — <em>Foundations</em>, <em>Building</em> and
+  <em>Internals</em>; pages you have opened turn <span class="badge badge-visited">✓ visited</span>.</p>
+
+  <div class="storage-banner"></div>
+
+  <div class="stats-row">
+    <div class="progress">
+      <span>Visited</span>
+      <span class="progress-bar"><span class="progress-fill" data-progress-fill></span></span>
+      <span class="progress-num" data-progress-num>0 / 0</span>
+    </div>
+    <button type="button" class="btn btn-danger btn-sm" data-reset-visited>Reset visited topics</button>
+  </div>
+
+  <div class="callout callout-note">
+    <span class="callout-title">How to use this site</span>
+    <ul>
+      <li><strong>Start with The GenAI Round.</strong> This round is scored differently from system design and differently again between companies, and the commonest way to fail it is to answer a systems question with a framework name. That page is the rubric.</li>
+      <li><strong>Then the two foundations.</strong> Everything after assumes you can talk about tokens, context and sampling precisely, and that you know what a tool call is on the wire.</li>
+      <li><strong>Then Building, in order.</strong> RAG is the most-asked design question; evals are the follow-up most candidates have no answer to; agents tie both together.</li>
+      <li><strong>Then Internals.</strong> This is where candidates are separated — far more people have built a RAG pipeline than can say what a causal mask does or why generation is memory-bandwidth-bound.</li>
+      <li>Code samples are <strong>Python</strong>. <strong>Copy</strong> grabs the block.</li>
+      <li><strong>Interview angle</strong> boxes say what is actually being graded in that section, and the sentence to say out loud.</li>
+      <li>Visited state lives in your browser only, separate from the C#, System Design, DSA, LLD and Playbook sites.</li>
+    </ul>
+  </div>
+
+  <div class="callout callout-warn">
+    <span class="callout-title">Build something before you read this</span>
+    <p>Of all four rounds, this is the one where reading is least sufficient. Interviewers in AI rounds probe for whether you have
+    actually run the thing — what your chunk size was and why, what your retrieval recall was, what broke when you changed models.
+    Build one RAG pipeline end to end with a real corpus and a real eval set before you rely on any of these pages. The specifics
+    you collect doing that are the answer to half the questions here.</p>
+  </div>
+
+  <h2 id="topics">Topics</h2>
+  <div data-topic-groups></div>
+
+  <h2 id="order">Suggested order</h2>
+  <p>Go in sidebar order. The three <strong>Foundations</strong> pages are short and everything after assumes them —
+  particularly <strong>Tools &amp; Function Calling</strong>, which is the mechanism underneath every agent question.
+  <strong>RAG</strong> is the single highest-value page if you are short of time, and <strong>Evals</strong> is the one that
+  most reliably surprises candidates, because "how do you know it got better?" is asked far more often than people prepare for.</p>
+
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Phase</th><th>Pages</th><th>You should be able to…</th></tr></thead>
+    <tbody>
+      <tr><td>Framing</td><td>The GenAI Round</td><td>Tell which of the four round shapes you are in within two minutes; run a 60-minute AI design to a stated budget; use the vocabulary precisely enough that nobody has to ask what you mean.</td></tr>
+      <tr><td>The model as a component</td><td>LLMs &amp; Prompting</td><td>Reason in tokens rather than words; say what temperature and top-p each do to the distribution; explain why structured output is a correctness mechanism and not a convenience.</td></tr>
+      <tr><td>Making it act</td><td>Tools &amp; Function Calling · Agents</td><td>Describe a tool call on the wire without hand-waving; design a tool schema a model will use correctly; say where the loop terminates and which actions never run unsupervised.</td></tr>
+      <tr><td>Grounding and measuring</td><td>RAG · Evals</td><td>Design a retrieval pipeline and defend the chunk size; explain RRF; evaluate retrieval separately from generation; state what your regression gate blocks on.</td></tr>
+      <tr><td>Internals</td><td>Transformer Internals · Training &amp; Fine-Tuning</td><td>Walk through attention with shapes; explain the causal mask; say why LoRA's low-rank update is sufficient and what QLoRA quantizes; choose between prompting, retrieval and fine-tuning for a stated problem.</td></tr>
+      <tr><td>Running it</td><td>Inference &amp; Serving</td><td>Say why decoding is bandwidth-bound and prefill is not, size VRAM for a model, explain the KV cache and what it costs, and justify a serving stack.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="more">Questions worth rehearsing out loud</h2>
+  <p>Not pages here, but they recur across loops and each one is answered by material on this site. Practise saying each in
+  ninety seconds:</p>
+  <ul>
+    <li><strong>"Design a system that answers questions over our internal documents."</strong> — the default RAG prompt; the follow-up is always evaluation.</li>
+    <li><strong>"Your RAG system returns a wrong answer. Debug it."</strong> — the answer is to separate retrieval failure from generation failure, and say how.</li>
+    <li><strong>"Would you fine-tune for this?"</strong> — usually the correct answer is no, and the credit is in why.</li>
+    <li><strong>"How do you stop it hallucinating?"</strong> — grounding, structured output, and the honest admission that you reduce rather than eliminate.</li>
+    <li><strong>"This agent will send emails. What do you change?"</strong> — the approval-gate question, dressed up.</li>
+    <li><strong>"Estimate the cost of serving this."</strong> — tokens, batching, and total-versus-active parameters.</li>
+  </ul>
+
+  <p class="footer-note">Personal study site · Works offline by opening <code>index.html</code> · Visited state is stored locally in your browser · No data leaves this machine.</p>
+
+</main>
+</div>
+<script src="assets/js/curriculum.js"></script>
+<script src="assets/js/visited.js"></script>
+<script src="assets/js/nav.js"></script>
+<script src="assets/js/code-tabs.js"></script>
+<script>
+/* Dashboard: topic cards + progress, kept in sync with visited state */
+(function () {
+  'use strict';
+  var C = window.CURRICULUM, V = window.VISITED;
+  if (!C || !V) return;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
+    });
+  }
+
+  function cardHtml(t) {
+    var i = C.topics.indexOf(t);
+    var visited = V.isVisited(t.id);
+    return '<div class="card' + (visited ? ' visited' : '') + '">' +
+      '<h3><span class="card-num">' + (visited ? '✓' : (i + 1)) + '</span><a href="' + t.href + '">' + esc(t.label) + '</a></h3>' +
+      '<p>' + esc(t.blurb) + '</p>' +
+      '<div class="card-foot"><span>' + t.sections.length + ' sections</span>' +
+      (visited ? '<span class="badge badge-visited">Visited</span>' : (i === 0 ? '<span class="badge badge-start">Start here</span>' : '')) +
+      '</div></div>';
+  }
+
+  function render() {
+    var host = document.querySelector('[data-topic-groups]');
+    if (host) {
+      host.innerHTML = C.groups.map(function (g) {
+        var done = g.topics.filter(function (t) { return V.isVisited(t.id); }).length;
+        return '<div class="group-head" id="group-' + esc(g.id) + '"><h3>' + esc(g.label) + '</h3>' +
+          '<span class="group-count">' + done + ' / ' + g.topics.length + ' visited</span></div>' +
+          '<p class="group-blurb">' + esc(g.blurb) + '</p>' +
+          '<div class="cards">' + g.topics.map(cardHtml).join('') + '</div>';
+      }).join('');
+    }
+    var n = V.count(), total = C.topics.length;
+    var fill = document.querySelector('[data-progress-fill]');
+    var num = document.querySelector('[data-progress-num]');
+    if (fill) fill.style.width = (total ? Math.round(n / total * 100) : 0) + '%';
+    if (num) num.textContent = n + ' / ' + total;
+  }
+
+  document.addEventListener('DOMContentLoaded', render);
+  document.addEventListener('visited:change', render);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Evals — GenAI</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="evals">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Building › Topic 5 of 9</div>
+  <h1>Evals</h1>
+  <p class="lede">The answer to &quot;how do you know it got better?&quot; — and the thing most candidates have no answer for. Building a golden set worth having, deterministic metrics before semantic ones, where LLM-as-judge works and how it lies, and putting a regression gate in CI.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#why-evals">Why evals, and what they replace</a></li><li><a href="#golden-data">Golden datasets worth having</a></li><li><a href="#metrics">Metrics: deterministic, then semantic</a></li><li><a href="#llm-judge">LLM-as-judge: when it works, how it lies</a></li><li><a href="#rag-evals">Evaluating retrieval separately from generation</a></li><li><a href="#ci">Evals in CI, and regression gates</a></li></ol>
+  </div>
+
+<section id="why-evals"><h2 id="why-evals">Why evals, and what they replace</h2>
+<p>In ordinary software a change is either correct or it is not, and a test asserts the difference. With a model in the loop,
+"correct" is a distribution and every change — a new prompt, a new chunk size, a model upgrade you did not choose — moves it a
+little in several directions at once. Some outputs get better, some get worse, and the aggregate is invisible without
+measurement.</p>
+
+<p><strong>Evals are what replace the unit test.</strong> That framing is the one to lead with, because it tells the interviewer
+you understand what is different about this kind of system rather than that you have heard of a tool.</p>
+
+<p>Three questions you cannot answer without them, all of which come up in real work:</p>
+
+<ul>
+<li><strong>"Did that prompt change help?"</strong> You tried five examples and they looked better. Five examples cannot
+distinguish a 5% improvement from a 5% regression.</li>
+<li><strong>"Can we switch to the cheaper model?"</strong> Possibly — it depends entirely on how much quality you lose, which is
+a number you either have or do not.</li>
+<li><strong>"The provider updated the model. Are we still fine?"</strong> This one happens <em>to</em> you rather than being
+chosen, which is why the gate needs to be automatic.</li>
+</ul>
+
+<p>The cost argument is worth making too. Building a golden set is a day or two of unglamorous work, and teams skip it because
+there is always something more urgent. The result is that every subsequent change is a guess, and the team's velocity degrades
+as the system grows — they become afraid to touch the prompt. A day spent on evals early is the highest-return day in an LLM
+project.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"How do you know it works?" is the most reliably under-prepared question in this round. Have a concrete answer, with numbers:
+<strong>"a golden set of about two hundred cases drawn from real queries, retrieval measured separately from generation,
+deterministic checks where I can have them and an LLM judge where I cannot, run in CI on every prompt change with a gate on
+regression."</strong> Say that unprompted while describing the architecture and the follow-up never comes.</p></div></section>
+
+<section id="golden-data"><h2 id="golden-data">Golden datasets worth having</h2>
+<p>A golden set is a collection of inputs with known-good outputs, or at least known-good <em>properties</em> of outputs. It is
+the asset the whole eval story rests on, and the common mistake is to generate it synthetically because that is faster.</p>
+
+<h3>Where the cases come from, best first</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Source</th><th>Quality</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><strong>Real user queries from logs</strong></td><td>Best</td><td>The actual distribution, including the ugly ones. Requires you to have logged them</td></tr>
+<tr><td><strong>Production failures</strong></td><td>Best</td><td>Every bug becomes a permanent regression test. This is how the set should grow</td></tr>
+<tr><td><strong>Domain experts writing questions</strong></td><td>Good</td><td>Covers what matters; expensive; skews toward the interesting</td></tr>
+<tr><td><strong>LLM-generated from your documents</strong></td><td>Acceptable to bootstrap</td><td>Biased toward what is easy to answer; verify a sample by hand</td></tr>
+</tbody></table></div>
+
+<p>The trap with the last row is subtle: a model asked to generate questions from a document produces questions that document
+answers cleanly. Your eval set then systematically omits the queries that actually fail — ambiguous ones, multi-hop ones, ones
+whose answer is spread across documents, and ones with no answer at all. Measured against it, your system looks excellent.</p>
+
+<h3>What a case needs</h3>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>from dataclasses import dataclass, field
+
+@dataclass
+class Case:
+    question:        str
+    expected:        str | None            # None when there is no right answer
+    must_contain:    list[str] = field(default_factory=list)   # cheap exact checks
+    must_not_contain: list[str] = field(default_factory=list)
+    gold_doc_ids:    list[str] = field(default_factory=list)   # for RETRIEVAL eval
+    category:        str = &quot;general&quot;       # slice results by this
+    should_refuse:   bool = False          # the negative cases
+
+GOLDEN = [
+    Case(&quot;What is the refund window for Acme Pro?&quot;,
+         expected=&quot;30 days from delivery&quot;,
+         must_contain=[&quot;30 days&quot;],
+         gold_doc_ids=[&quot;policy-returns#acme-pro&quot;],
+         category=&quot;policy&quot;),
+
+    # Multi-hop: the answer needs two documents. These are where systems fail.
+    Case(&quot;Is the Acme Pro refund window longer than Acme Lite&#x27;s?&quot;,
+         expected=&quot;Yes -- 30 days versus 14&quot;,
+         gold_doc_ids=[&quot;policy-returns#acme-pro&quot;, &quot;policy-returns#acme-lite&quot;],
+         category=&quot;multi-hop&quot;),
+
+    # NEGATIVE case: the corpus does not contain this. The system must decline.
+    Case(&quot;What is the refund window for Acme Enterprise?&quot;,
+         expected=None, should_refuse=True,
+         must_not_contain=[&quot;30 days&quot;, &quot;14 days&quot;],
+         category=&quot;unanswerable&quot;),
+]</code></pre></div>
+
+<p>The <code>should_refuse</code> cases are the ones teams forget, and they are the most informative. A system scoring 95% on
+answerable questions while confidently inventing answers to the other 5% is not a 95% system. <strong>Roughly 10–20% of a golden
+set should be unanswerable</strong>, and the refusal rate on that slice is one of the most useful numbers you can track.</p>
+
+<p>On size: 50 cases is enough to catch gross regressions, 200 is a reasonable working target, and beyond about 500 you are
+usually better off spending the effort on coverage of distinct <em>categories</em> than on more cases of the same kind. Slicing by
+category is what makes the number actionable — "overall 84%" tells you nothing, "multi-hop 61%, everything else 92%" tells you
+what to fix.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Mention that <strong>every production bug becomes a permanent case.</strong> It is how the set stays aligned with reality
+instead of ossifying, it is free, and it is exactly what an engineer who has operated one of these systems does. Pair it with the
+negative-case point and you have said two things most candidates do not.</p></div></section>
+
+<section id="metrics"><h2 id="metrics">Metrics: deterministic, then semantic</h2>
+<p>Reach for the cheapest metric that can detect the failure you care about. The ladder, in order — and the discipline is to
+exhaust each rung before climbing:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Rung</th><th>Metric</th><th>Cost</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><strong>Exact / schema validity</strong></td><td>Free</td><td>Structured output, classification, extraction. Parses or does not</td></tr>
+<tr><td>2</td><td><strong>Substring / regex / numeric</strong></td><td>Free</td><td>The answer must contain a figure, date or id</td></tr>
+<tr><td>3</td><td><strong>Retrieval metrics</strong></td><td>Free</td><td>Recall@k, MRR, nDCG — they need no model at all</td></tr>
+<tr><td>4</td><td><strong>Embedding similarity</strong></td><td>Cheap</td><td>Rough semantic closeness; noisy, use as a signal not a gate</td></tr>
+<tr><td>5</td><td><strong>LLM-as-judge</strong></td><td>Expensive</td><td>Open-ended quality, faithfulness, tone — nothing cheaper works</td></tr>
+<tr><td>6</td><td><strong>Human review</strong></td><td>Very expensive</td><td>Calibrating the judge; high-stakes release decisions</td></tr>
+</tbody></table></div>
+
+<p>People jump to rung 5 because it is the interesting one, and they end up with an eval suite that is slow, costs money per run,
+and is itself non-deterministic. A good suite is mostly rungs 1–3 with judges used sparingly where they earn it.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import numpy as np
+
+def recall_at_k(retrieved_ids, gold_ids, k=10):
+    &quot;&quot;&quot;Did we get the supporting documents into the top k? The single most
+    important RAG number: it is the ceiling on everything downstream.&quot;&quot;&quot;
+    if not gold_ids:
+        return None
+    return len(set(retrieved_ids[:k]) &amp; set(gold_ids)) / len(set(gold_ids))
+
+def mrr(retrieved_ids, gold_ids):
+    &quot;&quot;&quot;Reciprocal rank of the FIRST relevant hit. Sensitive to ordering,
+    which recall is not -- use both.&quot;&quot;&quot;
+    for i, doc in enumerate(retrieved_ids, start=1):
+        if doc in gold_ids:
+            return 1.0 / i
+    return 0.0
+
+def ndcg_at_k(retrieved_ids, relevance: dict, k=10):
+    &quot;&quot;&quot;Handles GRADED relevance -- some documents are more relevant than
+    others -- and discounts by position.&quot;&quot;&quot;
+    gains = [relevance.get(d, 0) for d in retrieved_ids[:k]]
+    dcg  = sum(g / np.log2(i + 2) for i, g in enumerate(gains))
+    best = sorted(relevance.values(), reverse=True)[:k]
+    idcg = sum(g / np.log2(i + 2) for i, g in enumerate(best))
+    return dcg / idcg if idcg else 0.0</code></pre></div>
+
+<p>Recall@k is the number to quote in an interview if you quote only one, because it bounds everything else: if the supporting
+document is not in the context, no model and no prompt can produce a grounded answer. It also needs no LLM to compute, so it is
+free to run on every commit.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Say the ladder out loud and emphasise the discipline: <strong>"I'd use deterministic checks wherever the task permits one, and
+reserve a judge for the genuinely open-ended parts, because a judge is slow, costs money per run and is itself
+non-deterministic."</strong> That is the opposite of the instinct and it reads as someone who has maintained a suite rather than
+written one.</p></div></section>
+
+<section id="llm-judge"><h2 id="llm-judge">LLM-as-judge: when it works, how it lies</h2>
+<p>For open-ended output there is often no deterministic check — "is this summary faithful to the source?" has no regex. So you
+use another model as the grader. It works, it is standard, and it lies in specific, known ways that you should be able to name.</p>
+
+<h3>How it lies</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Bias</th><th>What happens</th><th>Mitigation</th></tr></thead>
+<tbody>
+<tr><td><strong>Position</strong></td><td>In A/B comparison it favours whichever answer came first</td><td>Run both orders and average, or discard disagreements</td></tr>
+<tr><td><strong>Verbosity</strong></td><td>Longer answers score higher, independent of quality</td><td>Score against explicit criteria, not overall "quality"; control for length</td></tr>
+<tr><td><strong>Self-preference</strong></td><td>A model rates its own family's output higher</td><td>Judge with a different family than the generator</td></tr>
+<tr><td><strong>Scale compression</strong></td><td>Everything gets a 7 or 8 out of 10</td><td>Use a binary or 3-point rubric, not 1–10</td></tr>
+<tr><td><strong>Shared blind spots</strong></td><td>It confidently misses errors the generator also misses</td><td>Calibrate against human labels; never fully trust the number</td></tr>
+</tbody></table></div>
+
+<h3>Writing a judge that works</h3>
+<p>The single biggest improvement is to <strong>ask a narrow, factual question rather than a quality rating.</strong> "Rate this
+answer 1–10" produces noise. "Is every claim in this answer supported by the context? Answer yes or no, then list any unsupported
+claim" produces something you can act on and verify.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>FAITHFULNESS = &quot;&quot;&quot;You are checking whether an answer is grounded in its source.
+
+CONTEXT:
+{context}
+
+ANSWER:
+{answer}
+
+List every factual claim in the ANSWER. For each, say whether the CONTEXT
+supports it. Then give a verdict.
+
+A claim is SUPPORTED only if the context states it or directly entails it.
+Plausible, true-sounding, or generally-known is NOT supported.
+
+Respond as JSON:
+{{&quot;claims&quot;: [{{&quot;claim&quot;: &quot;...&quot;, &quot;supported&quot;: true/false}}],
+  &quot;verdict&quot;: &quot;grounded&quot; | &quot;partially_grounded&quot; | &quot;unsupported&quot;}}&quot;&quot;&quot;
+
+# Why this works better than a 1-10 rating:
+#   - narrow and factual, so there is a right answer
+#   - claim-by-claim, so the output is actionable, not just a score
+#   - the definition of &quot;supported&quot; is stated, closing the obvious loophole
+#   - structured output, so it parses and can be aggregated
+#   - temperature=0, always -- you cannot measure through sampling noise
+
+
+def validate_judge(judge, human_labelled_cases):
+    &quot;&quot;&quot;Never ship a judge you have not checked against humans.
+
+    Label 50 cases by hand, run the judge, and report agreement. Below
+    ~80% the judge is measuring something other than what you think, and
+    tuning your system against it will make the system worse.
+    &quot;&quot;&quot;
+    agree = sum(judge(c) == c.human_label for c in human_labelled_cases)
+    return agree / len(human_labelled_cases)</code></pre></div>
+
+<div class="callout callout-warn"><span class="callout-title">Validate the judge before you trust it</span>
+<p>An unvalidated judge is a measurement instrument with unknown error. Hand-label fifty cases, measure agreement, and quote that
+agreement number whenever you quote the judge's scores. If a team optimises against a judge that disagrees with humans a third of
+the time, they will reliably make the product worse while watching the metric improve — and that is a genuinely common
+outcome.</p></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Naming two or three specific judge biases — position, verbosity, self-preference — and then saying "so I'd validate it against
+human labels on about fifty cases and report the agreement" is one of the strongest few sentences available in this round. It
+shows you treat your own measurement as something requiring evidence, which is the distinction between measuring and
+performing measurement.</p></div></section>
+
+<section id="rag-evals"><h2 id="rag-evals">Evaluating retrieval separately from generation</h2>
+<p>The central discipline: <strong>evaluate retrieval and generation separately.</strong> An end-to-end score tells you the system
+is 72% correct and nothing about what to fix. Separated, you learn that retrieval recall is 68% and that generation given correct
+context is 96% — which says unambiguously that the work is in retrieval and that tuning the prompt would be a waste of a
+week.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Stage</th><th>Question</th><th>Metric</th><th>Needs an LLM?</th></tr></thead>
+<tbody>
+<tr><td><strong>Retrieval</strong></td><td>Did the supporting documents reach the context?</td><td>Recall@k, MRR, nDCG</td><td>No</td></tr>
+<tr><td><strong>Generation</strong></td><td>Given correct context, is the answer right and grounded?</td><td>Faithfulness, correctness</td><td>Usually</td></tr>
+<tr><td><strong>End to end</strong></td><td>Is the user's answer right?</td><td>Correctness, refusal rate</td><td>Usually</td></tr>
+</tbody></table></div>
+
+<p>The generation row has a trick in it worth knowing: evaluate generation with <strong>oracle context</strong> — hand the model
+the known-correct documents rather than whatever retrieval produced. That isolates the generator completely, so its score cannot
+be dragged down by a retrieval problem. The gap between oracle-context accuracy and end-to-end accuracy is exactly your retrieval
+loss.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>def evaluate(cases):
+    r = {&quot;recall&quot;: [], &quot;mrr&quot;: [], &quot;oracle_ok&quot;: [], &quot;e2e_ok&quot;: [],
+         &quot;faithful&quot;: [], &quot;refused_when_should&quot;: []}
+
+    for c in cases:
+        hits = retrieve(c.question)
+        ids  = [h.id for h in hits]
+
+        if c.gold_doc_ids:                                  # RETRIEVAL
+            r[&quot;recall&quot;].append(recall_at_k(ids, c.gold_doc_ids, k=10))
+            r[&quot;mrr&quot;].append(mrr(ids, c.gold_doc_ids))
+
+            # GENERATION in isolation: hand it the right context
+            oracle = generate(c.question, context=fetch(c.gold_doc_ids))
+            r[&quot;oracle_ok&quot;].append(correct(oracle, c.expected))
+
+        answer = generate(c.question, context=hits)         # END TO END
+        if c.should_refuse:
+            r[&quot;refused_when_should&quot;].append(is_refusal(answer))
+        else:
+            r[&quot;e2e_ok&quot;].append(correct(answer, c.expected))
+            r[&quot;faithful&quot;].append(judge_faithfulness(answer, hits) == &quot;grounded&quot;)
+
+    return {k: sum(v) / len(v) for k, v in r.items() if v}
+
+# A result that tells you what to do:
+#   recall 0.68 | oracle_ok 0.96 | e2e_ok 0.71
+#
+# Generation is nearly perfect when given the right context. Every point of
+# end-to-end loss is retrieval. Do not touch the prompt -- fix chunking,
+# add hybrid search, raise k.</code></pre></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Quote a decomposition like the one in that comment. "If recall is 68% and oracle accuracy is 96%, I know the problem is
+retrieval and I will not waste a week on prompts" is a complete, concrete answer to "how would you improve this system?" and it
+demonstrates the diagnostic habit the round is actually testing. It also sets up the retrieval fixes — hybrid search, chunking,
+reranking — as justified rather than arbitrary.</p></div></section>
+
+<section id="ci"><h2 id="ci">Evals in CI, and regression gates</h2>
+<p>An eval suite that is run by hand when someone remembers is a document, not a gate. The value comes from it running
+automatically on every change that could affect quality — prompts, retrieval parameters, model versions, chunking, tool
+definitions.</p>
+
+<h3>What to gate on</h3>
+<p>Not absolute scores, which fluctuate. <strong>Regressions against the committed baseline</strong>, with a tolerance that
+accounts for the suite's own noise:</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import json, sys
+
+TOLERANCE = {          # how much a metric may drop before CI fails
+    &quot;recall&quot;:    0.02,
+    &quot;e2e_ok&quot;:    0.03,
+    &quot;faithful&quot;:  0.02,
+    &quot;refused_when_should&quot;: 0.05,
+}
+
+def gate(current, baseline):
+    failures = []
+    for metric, allowed in TOLERANCE.items():
+        drop = baseline[metric] - current[metric]
+        if drop &gt; allowed:
+            failures.append(
+                f&quot;{metric}: {baseline[metric]:.3f} -&gt; {current[metric]:.3f} &quot;
+                f&quot;(-{drop:.3f}, allowed {allowed})&quot;)
+    return failures
+
+results  = evaluate(GOLDEN)
+baseline = json.load(open(&quot;evals/baseline.json&quot;))
+
+if failures := gate(results, baseline):
+    print(&quot;EVAL REGRESSION\n&quot; + &quot;\n&quot;.join(failures)); sys.exit(1)
+
+print(&quot;ok &quot; + &quot;  &quot;.join(f&quot;{k}={v:.3f}&quot; for k, v in results.items()))
+# Baseline is a COMMITTED file, updated deliberately in a PR when an
+# improvement is accepted. That makes every quality change visible in
+# review history -- which is most of the point.</code></pre></div>
+
+<p>Two practical notes. Run the deterministic rungs (schema validity, substring checks, retrieval metrics) on <strong>every
+commit</strong> — they are free and fast. Run the judge-based ones on pull requests and nightly, because they cost money and take
+minutes. And set <code>temperature=0</code> everywhere in the suite: you cannot detect a 3% regression through sampling
+noise.</p>
+
+<h3>The part that is not CI</h3>
+<p>Offline evals measure what you thought to ask. Production has a different distribution, and the loop that closes the gap runs
+the other way: log real queries and outputs, sample them for review, and <strong>feed every failure back into the golden set as a
+permanent case</strong>. A suite that only grows when someone writes new test questions drifts away from reality; one fed by
+production failures tracks it.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Finish an eval answer with the loop, not the suite: <strong>"deterministic checks on every commit, judges on PRs, a gate on
+regression against a committed baseline, and every production failure becomes a new case."</strong> That describes a system that
+improves over time rather than a test run, and it is the answer of someone who has maintained one.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Write the tolerance table for a system you have built. Deciding how much regression is acceptable forces you to decide what the system is actually for.</li>
+<li>Take your last three production bugs and write them as cases. If you cannot, you are not logging enough to build evals from.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://ai.pydantic.dev/evals/" target="_blank" rel="noopener">Pydantic Evals</a> — cases, evaluators and datasets as code; the model this page follows</li><li><a href="https://docs.ragas.io/" target="_blank" rel="noopener">Ragas</a> — RAG-specific metrics — faithfulness, context precision and recall — worth reading for the definitions</li><li><a href="https://arxiv.org/abs/2306.05685" target="_blank" rel="noopener">Judging LLM-as-a-Judge (Zheng et al.)</a> — the paper that measured position, verbosity and self-preference bias</li><li><a href="https://hamel.dev/blog/posts/evals/" target="_blank" rel="noopener">Hamel Husain: your AI product needs evals</a> — the most practical writing on building a golden set that is worth having</li><li><a href="https://docs.claude.com/en/docs/test-and-evaluate/eval-tool" target="_blank" rel="noopener">Anthropic: creating empirical evaluations</a> — grading methods and when each applies</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button · Code is Python throughout.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

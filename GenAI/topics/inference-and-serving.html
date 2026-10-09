@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inference &amp; Serving — GenAI</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="inference-and-serving">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Internals › Topic 9 of 9</div>
+  <h1>Inference &amp; Serving</h1>
+  <p class="lede">Why generation is limited by memory bandwidth and not arithmetic, and everything that follows from it: quantization and k-quants, GGUF, the KV cache, prompt caching, continuous batching, Mixture of Experts, and how to pick a serving stack.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#the-constraint">The constraint: bandwidth, not compute</a></li><li><a href="#quantization">Quantization: INT8, INT4, k-quants</a></li><li><a href="#gguf">GGUF and llama.cpp</a></li><li><a href="#kv-cache">The KV cache</a></li><li><a href="#prompt-caching">Prompt caching and prefix reuse</a></li><li><a href="#batching">Batching and continuous batching</a></li><li><a href="#moe">Mixture of Experts</a></li><li><a href="#serving">Choosing a serving stack</a></li></ol>
+  </div>
+
+<section id="the-constraint"><h2 id="the-constraint">The constraint: bandwidth, not compute</h2>
+<p>Almost everything about LLM serving follows from one fact, and it is the fact most candidates do not know:</p>
+
+<p><strong>Generating a token requires reading every weight in the model out of memory, and doing almost no arithmetic with
+each one.</strong> Generation is therefore <em>memory-bandwidth-bound</em>, not compute-bound. The GPU's arithmetic units sit
+idle waiting for weights to arrive.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code># Why decoding is bandwidth-bound -- the arithmetic intensity argument.
+params        = 7e9
+bytes_per_w   = 2                     # fp16
+model_bytes   = params * bytes_per_w  # 14 GB read PER TOKEN
+
+a100_bandwidth = 2.0e12               # 2 TB/s
+a100_flops     = 3.12e14              # 312 TFLOP/s (fp16 tensor cores)
+
+# One token: ~2 FLOPs per parameter (a multiply and an add).
+flops_per_token = 2 * params                 # 1.4e10
+
+time_memory  = model_bytes / a100_bandwidth  # 7.0 ms  &lt;- the real cost
+time_compute = flops_per_token / a100_flops  # 0.045 ms
+
+print(f&quot;memory : {time_memory*1000:.2f} ms&quot;)
+print(f&quot;compute: {time_compute*1000:.3f} ms&quot;)
+print(f&quot;=&gt; {time_memory/time_compute:.0f}x bound by MEMORY&quot;)
+print(f&quot;theoretical ceiling: {1/time_memory:.0f} tokens/s single stream&quot;)
+# ~156x bound by memory. The compute units are idle ~99% of the time.</code></pre></div>
+
+<h3>Prefill versus decode</h3>
+<p>The other half of the picture, and the distinction that makes serving metrics make sense:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Prefill (prompt)</th><th>Decode (generation)</th></tr></thead>
+<tbody>
+<tr><td>Operation</td><td>Matrix × matrix over all prompt tokens at once</td><td>Matrix × vector, one token at a time</td></tr>
+<tr><td>Bound by</td><td><strong>Compute</strong></td><td><strong>Memory bandwidth</strong></td></tr>
+<tr><td>Parallel?</td><td>Yes — the whole prompt in one pass</td><td>No — inherently serial</td></tr>
+<tr><td>Metric</td><td>Time to first token (TTFT)</td><td>Inter-token latency, tokens/second</td></tr>
+<tr><td>Scales with</td><td>Prompt length</td><td>Output length</td></tr>
+</tbody></table></div>
+
+<p>Once you have this distinction, the rest of the page follows. <strong>Quantization</strong> helps because it reduces bytes
+read. <strong>Batching</strong> helps enormously because the weights are read once and amortised across the batch — which is why
+throughput can rise 10× with barely any increase in per-token latency. The <strong>KV cache</strong> exists because without it
+decode would redo prefill every step. And <strong>MoE</strong> works because reading only the active experts is less memory
+traffic.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Lead any serving question with this: <strong>"generation is memory-bandwidth-bound, not compute-bound — you read the whole
+model per token and do about two FLOPs per weight, so the arithmetic units are idle."</strong> Then derive a number: 14 GB at
+2 TB/s is 7 ms, so about 140 tokens per second as a single-stream ceiling for a 7B at fp16. Deriving a ballpark figure from
+first principles is one of the strongest things you can do in this round, and it makes every subsequent answer — quantization,
+batching, MoE — follow naturally.</p></div></section>
+
+<section id="quantization"><h2 id="quantization">Quantization: INT8, INT4, k-quants</h2>
+<p>Store weights at lower precision. It is usually introduced as a way to make models fit, and the more interesting half is that
+<strong>it also makes generation faster</strong> — because generation is bandwidth-bound and fewer bytes means less to read.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Precision</th><th>Bytes/param</th><th>7B size</th><th>Quality</th></tr></thead>
+<tbody>
+<tr><td>fp32</td><td>4</td><td>28 GB</td><td>Reference; nobody serves this</td></tr>
+<tr><td>fp16 / bf16</td><td>2</td><td>14 GB</td><td>The practical baseline</td></tr>
+<tr><td>INT8</td><td>1</td><td>7 GB</td><td>Near-lossless</td></tr>
+<tr><td><strong>INT4 / Q4_K_M</strong></td><td>~0.5</td><td><strong>~4 GB</strong></td><td>Small but measurable loss; the usual sweet spot</td></tr>
+<tr><td>Q2</td><td>~0.25</td><td>~2 GB</td><td>Noticeably degraded</td></tr>
+</tbody></table></div>
+
+<h3>How it works, and why blocks matter</h3>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import numpy as np
+
+def quantize_block(w, bits=4):
+    &quot;&quot;&quot;Affine quantization of ONE block, with its own scale and zero point.&quot;&quot;&quot;
+    qmax = 2 ** bits - 1
+    lo, hi = w.min(), w.max()
+    scale = (hi - lo) / qmax
+    zero  = lo
+    q = np.clip(np.round((w - zero) / scale), 0, qmax).astype(np.uint8)
+    return q, scale, zero
+
+def dequantize(q, scale, zero):
+    return q.astype(np.float32) * scale + zero
+
+# WHY PER-BLOCK rather than per-tensor: one outlier ruins everything.
+w = np.random.randn(256).astype(np.float32)
+w[0] = 40.0                                   # a single large weight
+
+q, s, z = quantize_block(w)                   # whole tensor, one scale
+err_tensor = np.abs(dequantize(q, s, z) - w).mean()
+
+# Same data, blocks of 32 -- the outlier only damages ITS block.
+errs = []
+for i in range(0, 256, 32):
+    qb, sb, zb = quantize_block(w[i:i+32])
+    errs.append(np.abs(dequantize(qb, sb, zb) - w[i:i+32]).mean())
+
+print(f&quot;per-tensor: {err_tensor:.4f}&quot;)
+print(f&quot;per-block : {np.mean(errs):.4f}&quot;)     # ~an order of magnitude better</code></pre></div>
+
+<p>That outlier experiment is the heart of it. A single large weight stretches the scale so that every other weight in the
+tensor is crushed into a few levels. Quantizing in <strong>blocks of 32 or 64 with a scale each</strong> confines the damage —
+and it is why real formats always store scales alongside the weights, and why the scales themselves become worth compressing
+(see QLoRA's double quantization).</p>
+
+<h3>k-quants</h3>
+<p>The <code>Q4_K_M</code> naming in llama.cpp refers to <strong>k-quants</strong>, which add two refinements worth knowing:
+super-blocks (blocks are grouped, and the block scales are themselves quantized against a super-block scale), and
+<strong>mixed precision by importance</strong> — the <code>_M</code> suffix means attention and some FFN tensors are kept at
+higher precision than the rest, because they are more sensitive. So the effective bits-per-weight is not a round number.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Method</th><th>Needs calibration data?</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><strong>RTN</strong> (round to nearest)</td><td>No</td><td>Simplest; what the code above does</td></tr>
+<tr><td><strong>GPTQ</strong></td><td>Yes</td><td>Quantizes layer by layer, compensating error using second-order information</td></tr>
+<tr><td><strong>AWQ</strong></td><td>Yes</td><td>Protects the ~1% of weights that matter most, identified by activation magnitude</td></tr>
+<tr><td><strong>k-quants</strong></td><td>Optional (imatrix)</td><td>The llama.cpp family; super-blocks plus mixed precision</td></tr>
+</tbody></table></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Two points, in this order. <strong>"Quantization is not only a size win — generation is bandwidth-bound, so halving the bytes
+roughly halves the time to read the weights."</strong> And <strong>"it is always done per block, because a single outlier weight
+would otherwise destroy the resolution for the whole tensor."</strong> The second shows you understand the mechanism rather than
+the menu of options.</p></div></section>
+
+<section id="gguf"><h2 id="gguf">GGUF and llama.cpp</h2>
+<p><strong>GGUF</strong> is a single-file format holding quantized weights plus everything needed to run them — architecture,
+hyperparameters, the tokenizer, the chat template, and the quantization metadata. It is the reason running a model locally is
+one command rather than an afternoon of matching config files to checkpoints.</p>
+
+<p>It succeeded GGML (the earlier format from the same project) and fixed its main weakness: GGML had no extensible metadata, so
+every architecture change broke compatibility. GGUF stores typed key-value metadata, so new fields do not break old files.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>GGUF contains</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>Quantized tensors + per-block scales</td><td>The weights, ready to use</td></tr>
+<tr><td>Architecture and hyperparameters</td><td>The loader configures itself; no separate config</td></tr>
+<tr><td>The tokenizer, embedded</td><td>No separate vocab file to mismatch</td></tr>
+<tr><td>The chat template</td><td>Prompts get formatted the way the model was trained — a common source of silent quality loss</td></tr>
+<tr><td>Typed metadata</td><td>Forward compatible</td></tr>
+</tbody></table></div>
+
+<p>The chat-template row is worth dwelling on. Every instruction-tuned model was trained with a specific format of special
+tokens around turns. Get it wrong and the model still answers — just noticeably worse, with no error anywhere. Shipping the
+template inside the weights file removes a whole class of silent failures.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code># llama.cpp -- the reference GGUF runtime. Runs on CPU, CUDA, Metal, ROCm.
+#
+#   llama-cli -m model.Q4_K_M.gguf -p &quot;Explain the KV cache.&quot;
+#   llama-server -m model.Q4_K_M.gguf --n-gpu-layers 35 --ctx-size 8192
+#
+# n_gpu_layers is the knob that matters on a machine where the model does
+# not fit in VRAM: offload the first N transformer layers to the GPU and
+# run the rest on CPU. Because decoding is bandwidth-bound and CPU RAM
+# bandwidth is ~10x lower than VRAM, the fraction offloaded dominates
+# throughput -- going from 20 to 35 of 32 layers can double tokens/sec.
+
+from llama_cpp import Llama
+
+llm = Llama(model_path=&quot;model.Q4_K_M.gguf&quot;,
+            n_ctx=8192,
+            n_gpu_layers=-1)       # -1 = offload everything that fits
+
+out = llm.create_chat_completion(
+    messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Explain the KV cache in two sentences.&quot;}],
+    temperature=0,
+)
+print(out[&quot;choices&quot;][0][&quot;message&quot;][&quot;content&quot;])</code></pre></div>
+
+<p>llama.cpp also exposes an <strong>OpenAI-compatible HTTP server</strong>, which is why local models drop into existing code
+with a base-URL change. That compatibility — rather than any property of the format — is most of why the local ecosystem
+consolidated on it. Ollama wraps the same engine with model management on top.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>If local deployment comes up: GGUF is a single self-describing file containing quantized weights, tokenizer and chat
+template, run by llama.cpp across CPU, CUDA and Metal, with an OpenAI-compatible server so client code does not change. Mention
+<code>n_gpu_layers</code> and why it dominates throughput — it connects straight back to the bandwidth argument and shows the
+reasoning is joined up.</p></div></section>
+
+<section id="kv-cache"><h2 id="kv-cache">The KV cache</h2>
+<p>Attention at position <em>t</em> needs the keys and values of every previous token. Those do not change as generation
+proceeds — token 5's key is the same whether you are generating token 6 or token 600. <strong>So cache them.</strong></p>
+
+<p>Without a cache, generating token <em>n</em> reprocesses all <em>n−1</em> previous tokens: generating a 1,000-token response
+would be a thousand prefills, and total work would be O(n²) in the output length. With a cache, each step processes exactly one
+new token and reads the cache. It is the difference between unusable and real-time, and it is not an optimisation you can
+skip.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>def generate_cached(model, prompt_ids, max_new=100):
+    # PREFILL: process the whole prompt once, populate the cache.
+    out = model(prompt_ids, use_cache=True)
+    cache = out.past_key_values                   # K,V for every prompt token
+    nxt = out.logits[:, -1].argmax(-1, keepdim=True)
+    generated = [nxt]
+
+    # DECODE: feed ONE token per step. The cache supplies the rest.
+    for _ in range(max_new - 1):
+        out = model(nxt, past_key_values=cache, use_cache=True)
+        cache = out.past_key_values               # grows by one position
+        nxt = out.logits[:, -1].argmax(-1, keepdim=True)
+        generated.append(nxt)
+        if nxt.item() == EOS:
+            break
+    return torch.cat(generated, dim=1)
+
+# The win: each step is O(1) in the prefix instead of O(n).
+# The cost: MEMORY, and it is larger than people expect.</code></pre></div>
+
+<h3>What it costs</h3>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>def kv_cache_bytes(layers, kv_heads, head_dim, seq_len, batch, dtype_bytes=2):
+    #        2 = one K and one V
+    return 2 * layers * kv_heads * head_dim * seq_len * batch * dtype_bytes
+
+# Llama-3-8B: 32 layers, 32 heads, head_dim 128 -- WITHOUT grouped-query
+print(kv_cache_bytes(32, 32, 128, 8192, 1) / 1e9, &quot;GB&quot;)     # 4.3 GB for ONE
+print(kv_cache_bytes(32, 32, 128, 8192, 32) / 1e9, &quot;GB&quot;)    # 137 GB for 32!
+
+# WITH grouped-query attention (8 KV heads instead of 32):
+print(kv_cache_bytes(32, 8, 128, 8192, 32) / 1e9, &quot;GB&quot;)     # 34 GB -- 4x less</code></pre></div>
+
+<p>Those numbers explain a lot. At long context and realistic batch sizes <strong>the KV cache can exceed the model weights</strong>,
+and because it grows with every token it is also the thing that decides your maximum batch size — which, since throughput comes
+from batching, means the KV cache ultimately caps your throughput.</p>
+
+<p>Hence the mitigations, all of which are worth naming:</p>
+
+<ul>
+<li><strong>Grouped-query attention (GQA)</strong> — several query heads share one K/V head. Llama 3 uses 8 KV heads for 32 query
+heads, cutting the cache 4× for a small quality cost. This is now standard, and it is why
+<a href="transformer-internals.html#multi-head">multi-head attention</a> is no longer symmetric in modern models.</li>
+<li><strong>Multi-query attention (MQA)</strong> — the extreme: one K/V head for all queries.</li>
+<li><strong>PagedAttention</strong> — vLLM's contribution: store the cache in fixed-size pages like virtual memory instead of one
+contiguous block per sequence. Removes the fragmentation and over-allocation that came from reserving max-length buffers, and
+raised achievable batch sizes several-fold.</li>
+<li><strong>KV cache quantization</strong> — store it at 8 or 4 bits.</li>
+</ul>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"What is the KV cache and what does it cost?" is a standard internals question. Give both halves: it makes each decode step
+O(1) rather than O(n) in the prefix, and it costs memory that <strong>grows linearly with sequence length and batch size and can
+exceed the weights themselves</strong>. Then connect it: since batching is where throughput comes from and the cache limits batch
+size, the KV cache is often what actually caps a serving system. Finish with GQA and PagedAttention as the two responses.</p></div></section>
+
+<section id="prompt-caching"><h2 id="prompt-caching">Prompt caching and prefix reuse</h2>
+<p>Distinct from the KV cache, and routinely confused with it. The KV cache lives <em>within</em> one generation. <strong>Prompt
+caching reuses the prefill work <em>across</em> requests.</strong></p>
+
+<p>The observation: in most applications a large prefix is identical on every request — the system prompt, the tool schemas,
+few-shot examples, a document being discussed. Prefill is compute-bound and scales with prompt length, so recomputing an
+identical 10,000-token prefix for every request is pure waste. Cache the computed KV for that prefix and start from it.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>KV cache</th><th>Prompt caching</th></tr></thead>
+<tbody>
+<tr><td>Scope</td><td>Within one generation</td><td>Across requests</td></tr>
+<tr><td>Caches</td><td>K/V for tokens generated so far</td><td>K/V for a shared prefix</td></tr>
+<tr><td>Saves</td><td>Quadratic recomputation during decode</td><td>Prefill time and input-token cost</td></tr>
+<tr><td>Lifetime</td><td>One request</td><td>Minutes to hours</td></tr>
+<tr><td>Typical saving</td><td>Makes generation feasible at all</td><td>Up to ~90% off cached input tokens; much faster TTFT</td></tr>
+</tbody></table></div>
+
+<h3>The one rule: prefixes must match exactly</h3>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code># GOOD -- the cacheable prefix is byte-identical on every request, and
+# everything variable comes after it.
+messages = [
+    {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: SYSTEM_PROMPT},     # static
+    {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: FEW_SHOT_EXAMPLES}, # static
+    {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: POLICY_DOCUMENT},   # static, large
+    {&quot;role&quot;: &quot;user&quot;,   &quot;content&quot;: user_question},     # varies -- LAST
+]
+
+# BAD -- one timestamp at the top invalidates the entire cache, every time.
+messages = [
+    {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: f&quot;Current time: {datetime.now()}\n{SYSTEM_PROMPT}&quot;},
+    ...
+]
+# Caching is PREFIX-based: the first differing token ends the reusable
+# region. Anything dynamic belongs at the END of the prompt, always.</code></pre></div>
+
+<p>That mistake — a timestamp, a request id, or a per-user greeting at the top of the system prompt — is extremely common and
+silently costs the entire benefit. The rule is one sentence: <strong>static first, dynamic last.</strong></p>
+
+<p>For agents the effect compounds. An agent loop re-sends the growing conversation on every step, so by step ten the prefix is
+large and almost entirely unchanged. Prompt caching turns that from the dominant cost into a rounding error, which is why it
+matters more for agents than for single-shot calls.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Raise this when asked about cost. "The system prompt, tool schemas and retrieved document are identical across requests, so I
+would order the prompt static-first and let prefix caching absorb them — and I would be careful not to put anything dynamic like
+a timestamp at the top, because that invalidates the whole prefix." It is concrete, it is an easily-missed optimisation, and the
+failure mode shows you have actually used it.</p></div></section>
+
+<section id="batching"><h2 id="batching">Batching and continuous batching</h2>
+<p>Here is the consequence of the bandwidth argument that surprises people: because the weights are read once per forward pass
+regardless of how many sequences are in it, <strong>processing 32 sequences together costs barely more wall-clock time than
+processing one.</strong> Throughput rises almost linearly with batch size until you run out of memory or saturate compute.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code># One forward pass reads 14 GB of weights whether the batch is 1 or 32.
+# The per-sequence arithmetic is tiny by comparison.
+for batch in (1, 8, 32, 64):
+    weight_read_ms = 7.0                       # constant: bandwidth-bound
+    compute_ms     = 0.045 * batch             # scales with batch
+    step_ms        = max(weight_read_ms, compute_ms)
+    print(f&quot;batch {batch:3d}: {step_ms:5.2f} ms/step  &quot;
+          f&quot;{batch / step_ms * 1000:7.0f} tok/s total  &quot;
+          f&quot;{1 / step_ms * 1000:5.0f} tok/s per user&quot;)
+
+# batch   1:  7.00 ms    143 tok/s total    143 tok/s per user
+# batch  32:  7.00 ms   4571 tok/s total    143 tok/s per user
+#
+# 32x the throughput at IDENTICAL per-user latency. This is why serving
+# economics are entirely about keeping the batch full -- and why the KV
+# cache, which caps batch size, caps throughput.</code></pre></div>
+
+<h3>Static versus continuous batching</h3>
+<p>Naive (static) batching waits for a batch to fill, runs it to completion, then starts the next. It wastes enormously, because
+sequences in a batch finish at different times — a batch where one response is 500 tokens and the rest are 20 leaves most slots
+idle for most of the run.</p>
+
+<p><strong>Continuous batching</strong> (also called in-flight batching) works at the level of the decode <em>step</em>: when any
+sequence finishes, a waiting request takes its slot immediately. The batch stays full. This is vLLM's other main contribution
+alongside PagedAttention, and together they are why it is the default answer for GPU serving.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Metric</th><th>Means</th><th>Improved by</th></tr></thead>
+<tbody>
+<tr><td><strong>TTFT</strong></td><td>Time to first token</td><td>Prompt caching; prefill optimisation; smaller queues</td></tr>
+<tr><td><strong>ITL / TPOT</strong></td><td>Inter-token latency</td><td>Quantization; faster memory; smaller models</td></tr>
+<tr><td><strong>Throughput</strong></td><td>Total tokens/sec across users</td><td><strong>Batching</strong>, overwhelmingly</td></tr>
+<tr><td><strong>Goodput</strong></td><td>Throughput meeting an SLA</td><td>The one that actually matters</td></tr>
+</tbody></table></div>
+
+<p>The tension worth naming: throughput and latency pull against each other. A bigger batch means more total tokens per second
+but a longer queue wait, so TTFT suffers. Serving systems expose this as a scheduling policy, and "which do you optimise for?"
+is a reasonable design question to ask back.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"How would you reduce cost per token?" — batching, first and by a wide margin, because weights are read once per step and
+amortised across the batch. Then quantization (fewer bytes to read), then prompt caching (skip repeated prefill), then a smaller
+model. Giving them in that order, with the bandwidth reason attached to each, is a complete and well-grounded answer.</p></div></section>
+
+<section id="moe"><h2 id="moe">Mixture of Experts</h2>
+<p>A dense model uses every parameter for every token, so capacity and cost per token are welded together.
+<strong>Mixture of Experts breaks that link:</strong> replace the feed-forward block with <em>N</em> parallel FFNs plus a small
+router, and send each token to only the top <em>k</em>.</p>
+
+<p>Recall from <a href="transformer-internals.html#norm-and-ffn">the internals page</a> that the FFN holds roughly two thirds of
+a transformer's parameters. That is precisely why MoE sparsifies that layer and not attention.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import torch, torch.nn as nn, torch.nn.functional as F
+
+class MoELayer(nn.Module):
+    def __init__(self, d_model=512, d_ff=2048, n_experts=8, top_k=2):
+        super().__init__()
+        self.experts = nn.ModuleList(Expert(d_model, d_ff) for _ in range(n_experts))
+        self.router  = nn.Linear(d_model, n_experts, bias=False)   # tiny
+        self.top_k   = top_k
+
+    def forward(self, x):                       # x: (tokens, d_model)
+        logits = self.router(x)
+        topk_logits, idx = torch.topk(logits, self.top_k, dim=-1)
+        w = F.softmax(topk_logits, dim=-1)
+        # softmax AFTER topk, over the SELECTION only -- so the weights sum
+        # to 1 across the chosen experts. Softmax-then-truncate would leave
+        # them summing to less than 1 and quietly scale the output down.
+
+        out = torch.zeros_like(x)
+        for e in range(len(self.experts)):
+            # Expert-major: gather this expert&#x27;s tokens, ONE batched matmul.
+            # Token-major would be one tiny matmul per token -- hopeless.
+            tok, rank = torch.where(idx == e)
+            if tok.numel() == 0:
+                continue
+            out[tok] += w[tok, rank].unsqueeze(-1) * self.experts[e](x[tok])
+        return out
+
+
+# The arithmetic that is the whole argument (d_model=512, d_ff=2048, 8 experts, k=2):
+one_expert = 512*2048 + 2048 + 2048*512 + 512          #  2,099,712
+dense      = one_expert                                 #  2,099,712
+moe_total  = 8*one_expert + 512*8                       # 16,801,792
+moe_active = 512*8 + 2*one_expert                       #  4,203,520
+
+print(f&quot;{moe_total/dense:.2f}x parameters, {moe_active/dense:.2f}x compute, &quot;
+      f&quot;{moe_active/moe_total:.0%} active&quot;)
+# 8.00x parameters, 2.00x compute, 25% active</code></pre></div>
+
+<p>Eight times the capacity for twice the per-token compute. That is why Mixtral 8×7B is 46.7B total parameters with 12.9B
+active, and DeepSeek-V3 is 671B total with 37B active.</p>
+
+<h3>The three costs</h3>
+<ul>
+<li><strong>Memory tracks <em>total</em> parameters, not active ones.</strong> Every expert must be resident even though most are
+idle, so MoE trades memory for compute — and memory is frequently the binding constraint. This is the point people miss.</li>
+<li><strong>Load balancing.</strong> Nothing stops the router collapsing onto a few favoured experts, and it will: a marginally
+better expert gets more tokens, more gradient, improves faster, attracts more tokens. Real implementations add an
+<strong>auxiliary load-balancing loss</strong>, and often a capacity factor that caps tokens per expert.</li>
+<li><strong>Kernels.</strong> A naive expert loop issues N small kernel launches and can be <em>slower</em> than the dense
+baseline despite fewer FLOPs. Production uses fused grouped-GEMM kernels — MegaBlocks, vLLM's fused MoE.</li>
+</ul>
+
+<p>One more thing worth knowing: experts are <strong>not specialised by design</strong>. Every expert is an identical ordinary
+FFN; any specialisation emerges because the router consistently sends similar tokens to the same one. Published analyses find the
+emergent splits are often syntactic — punctuation, numerals, whitespace — rather than the tidy semantic division the name
+suggests.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Quote total and active parameters together, always: <strong>"Mixtral is 46.7B total, 12.9B active — you get the knowledge
+capacity of the large number and roughly the inference compute of the small one, but you pay VRAM for the large one."</strong>
+Then name load balancing as the thing that makes it trainable at all. Candidates who describe MoE as "making models smaller" have
+it backwards, and saying the memory point correctly is an easy way to be on the right side of that.</p></div></section>
+
+<section id="serving"><h2 id="serving">Choosing a serving stack</h2>
+<p>The choice is mostly determined by two questions: where does it run, and how many concurrent users.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Stack</th><th>Best for</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><strong>Provider API</strong></td><td>Almost everything, to start</td><td>No ops, frontier quality, pay per token. The right default until a reason appears</td></tr>
+<tr><td><strong>vLLM</strong></td><td>GPU serving at concurrency</td><td>PagedAttention + continuous batching; the throughput default</td></tr>
+<tr><td><strong>SGLang</strong></td><td>Heavy prefix reuse, structured output</td><td>RadixAttention shares KV across requests with common prefixes</td></tr>
+<tr><td><strong>TensorRT-LLM</strong></td><td>Maximum NVIDIA performance</td><td>Fastest, most work to operate</td></tr>
+<tr><td><strong>llama.cpp / Ollama</strong></td><td>Local, single user, CPU or Mac</td><td>GGUF, Metal support, trivial setup; not built for concurrency</td></tr>
+</tbody></table></div>
+
+<h3>Sizing the hardware</h3>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>def vram_needed_gb(params_b, bits, ctx, batch, layers, kv_heads, head_dim):
+    weights = params_b * 1e9 * bits / 8 / 1e9
+    kv      = 2 * layers * kv_heads * head_dim * ctx * batch * 2 / 1e9  # fp16
+    overhead = 2.0                     # activations, fragmentation, CUDA context
+    return weights, kv, weights + kv + overhead
+
+w, kv, total = vram_needed_gb(8, 4, 8192, 16, 32, 8, 128)
+print(f&quot;weights {w:.1f} GB + KV {kv:.1f} GB + 2 GB = {total:.1f} GB&quot;)
+# weights 4.0 GB + KV 8.6 GB + 2 GB = 14.6 GB
+#
+# Note the KV cache is TWICE the quantized weights here. Sizing on model
+# size alone is the classic mistake -- at realistic context and batch the
+# cache dominates, and it is what actually sets your concurrency limit.</code></pre></div>
+
+<h3>The decision, in order</h3>
+<ol>
+<li><strong>Start with a provider API.</strong> Self-hosting is justified by data residency, cost at real volume, latency without
+a network hop, or needing a pinned model version — not by preference.</li>
+<li><strong>If self-hosting on GPU for more than one user, use vLLM.</strong> Continuous batching and PagedAttention are not
+things to reimplement.</li>
+<li><strong>Quantize to 4-bit unless you have measured that you cannot.</strong> It is both a memory and a speed win.</li>
+<li><strong>Size for the KV cache, not just the weights.</strong> It is what caps batch size, and batch size is throughput.</li>
+<li><strong>Measure TTFT and inter-token latency separately.</strong> They have different causes and different fixes.</li>
+</ol>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>If asked to design serving, start by asking the two questions that determine everything — concurrency and where it must run —
+and then justify self-hosting rather than assuming it. <strong>"At ten requests a second with a privacy requirement, I'd
+self-host: vLLM on A100s, a 4-bit quantized 8B, sized for the KV cache at my target batch, and I'd watch goodput rather than raw
+throughput."</strong> Naming goodput — throughput that meets the latency SLA — is a small detail that reads as operational
+experience.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Run one model locally at Q4 and at fp16 and time both. Watching a 4-bit model generate faster, not just smaller, makes the bandwidth argument permanent.</li>
+<li>Compute the VRAM table above for a model and context you care about. Being able to say "that needs about 15 GB" without hedging is worth a lot in this round.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">vLLM: PagedAttention</a> — the paper behind the KV-cache paging that raised achievable batch sizes</li><li><a href="https://github.com/ggml-org/llama.cpp" target="_blank" rel="noopener">llama.cpp</a> — the GGUF runtime; the quantization discussions in the issues are unusually informative</li><li><a href="https://github.com/ggml-org/ggml/blob/master/docs/gguf.md" target="_blank" rel="noopener">GGUF specification</a> — what is actually in the file</li><li><a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noopener">Mixtral of Experts</a> — 46.7B total, 12.9B active, with the routing analysis</li><li><a href="https://blog.vllm.ai/2023/06/20/vllm.html" target="_blank" rel="noopener">Efficient Memory Management for LLM Serving</a> — continuous batching explained with the numbers</li><li><a href="https://huggingface.co/docs/transformers/llm_optims" target="_blank" rel="noopener">Hugging Face: LLM inference optimization</a> — a practical survey of the same techniques</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button · Code is Python throughout.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

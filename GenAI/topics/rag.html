@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAG — GenAI</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="rag">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Building › Topic 4 of 9</div>
+  <h1>RAG</h1>
+  <p class="lede">The most-asked design question in the round. Embeddings and vector search, why chunking sets your ceiling before any model choice does, hybrid search with reciprocal rank fusion, two-stage retrieval with a reranker, and the failure modes you only find by measuring retrieval separately.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#why-rag">Why retrieval, and when not to</a></li><li><a href="#embeddings">Embeddings and vector search</a></li><li><a href="#chunking">Chunking: the decision that sets your ceiling</a></li><li><a href="#hybrid">Hybrid search: BM25, vectors, and RRF</a></li><li><a href="#reranking">Reranking and the two-stage pipeline</a></li><li><a href="#context-assembly">Assembling the context, and citing it</a></li><li><a href="#failure-modes">Where RAG fails, and how you find out</a></li></ol>
+  </div>
+
+<section id="why-rag"><h2 id="why-rag">Why retrieval, and when not to</h2>
+<p>Retrieval-augmented generation is one idea: <strong>find text relevant to the question, put it in the prompt, and ask the
+model to answer from it.</strong> Everything else is engineering around that sentence.</p>
+
+<p>It exists because models have three gaps that no amount of prompting closes — a training cutoff, no knowledge of your private
+data, and no mechanism for citing a source. Retrieval fixes all three at once, which is why it is the default architecture and
+the most-asked design question in the round.</p>
+
+<h3>The two paths</h3>
+<p>Draw these separately. They have different latencies, different costs, and different failure modes, and keeping them apart
+makes the whole design easier to discuss.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Ingestion (offline)</th><th>Query (per request)</th></tr></thead>
+<tbody>
+<tr><td>Steps</td><td>Load → parse → chunk → embed → index</td><td>Embed query → retrieve → rerank → assemble → generate</td></tr>
+<tr><td>Runs</td><td>On a schedule, or on document change</td><td>Every request</td></tr>
+<tr><td>Latency budget</td><td>Hours is fine</td><td>Hundreds of milliseconds</td></tr>
+<tr><td>Cost driver</td><td>Embedding the whole corpus</td><td>Input tokens, every single time</td></tr>
+<tr><td>Expensive to change</td><td><strong>Yes</strong> — chunking or embedding model means a full re-index</td><td>No — <em>k</em>, reranking and prompts are hot knobs</td></tr>
+</tbody></table></div>
+
+<h3>When not to use it</h3>
+<p>Saying this unprompted is worth real credit, because the reflex in this field is to reach for RAG unconditionally:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Situation</th><th>Better answer</th></tr></thead>
+<tbody>
+<tr><td>The corpus is small and static — a few thousand tokens</td><td>Put it all in the prompt and cache the prefix. Retrieval adds latency, complexity and a failure mode for nothing</td></tr>
+<tr><td>Answers need aggregation — "how many tickets mention X?"</td><td>That is a query, not a retrieval. Text-to-SQL over structured data; top-<em>k</em> chunks cannot count</td></tr>
+<tr><td>You need format or tone, not facts</td><td>Fine-tuning or few-shot examples. Retrieval does not teach behaviour</td></tr>
+<tr><td>The question is a lookup with an exact key</td><td>Just look it up. A model in the path makes it slower, costlier and less reliable</td></tr>
+</tbody></table></div>
+
+<p>That second row is the sharpest one. "How many of our contracts expire this quarter?" sounds like a document question and is
+not — it needs every matching row, and retrieval returns the top <em>k</em> most similar chunks. Spotting that an apparently
+RAG-shaped question is actually an aggregation is a distinguishing answer.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Open the design by splitting the board into ingestion and query, and say why: "the ingestion decisions are expensive to change
+because they mean a re-index, so I want to get chunking and the embedding model right; the query-side knobs are cheap and I will
+tune them against evals." That single framing shows you have operated one of these rather than built one once.</p></div></section>
+
+<section id="embeddings"><h2 id="embeddings">Embeddings and vector search</h2>
+<p>An embedding model maps text to a dense vector — typically 384 to 3,072 dimensions — trained so that semantically similar text
+lands close together. Retrieval is then a nearest-neighbour search in that space.</p>
+
+<p><strong>Cosine similarity</strong> is the usual metric: the cosine of the angle between two vectors, ignoring magnitude. If the
+vectors are normalised to unit length — most embedding APIs return them that way — cosine similarity is just a dot product, which
+is why vector search is fast.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import numpy as np
+
+def cosine(a, b):
+    return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+# If vectors are already unit-normalised (most APIs do this), it is a dot
+# product -- and a whole index is one matrix multiply.
+def search(query_vec, matrix, k=10):
+    &quot;&quot;&quot;matrix: (n_chunks, dim), unit-normalised. Returns (indices, scores).&quot;&quot;&quot;
+    scores = matrix @ query_vec          # (n_chunks,)  one GEMV
+    top = np.argpartition(-scores, k)[:k]      # O(n), not a full sort
+    top = top[np.argsort(-scores[top])]        # sort only the k
+    return top, scores[top]
+
+# Brute force is O(n * dim). At 100k chunks x 768 dims that is ~77M flops --
+# about a millisecond, so you genuinely do not need an ANN index at that size.
+# Say so in an interview; reaching for a vector DB at 10k documents is a
+# complexity tell.</code></pre></div>
+
+<h3>Exact versus approximate</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Corpus size</th><th>Use</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>&lt; ~100k chunks</td><td>Brute force, or pgvector with no index</td><td>Milliseconds. Exact results. No tuning, no extra service</td></tr>
+<tr><td>100k – 10M</td><td>HNSW (pgvector, Qdrant, Weaviate)</td><td>Sub-linear and high recall; memory-hungry but simple</td></tr>
+<tr><td>&gt; 10M</td><td>IVF-PQ, DiskANN, or a managed service</td><td>Compressed vectors; recall traded for memory</td></tr>
+</tbody></table></div>
+
+<p><strong>HNSW</strong> is the one to be able to describe: a multi-layer graph where upper layers are sparse long-range links and
+lower layers dense local ones, so a search descends from a coarse layer to a fine one — a skip list in high dimensions. It is
+approximate, so there is a recall knob (<code>ef_search</code>), and it is worth saying that you would measure recall against
+brute force on a sample rather than trusting the default.</p>
+
+<h3>Choosing the model</h3>
+<p>What actually matters: the <strong>input limit</strong> (often 512 tokens — chunk above it and the tail is silently truncated),
+the <strong>dimension</strong> (storage and search cost scale with it), whether it was trained for
+<strong>asymmetric</strong> search (short query against long passage, which is what you are doing), and whether your domain is
+represented at all. Code, legal text and medical text all do badly with general-purpose models.</p>
+
+<div class="callout callout-warn"><span class="callout-title">The silent truncation trap</span>
+<p>Embed a 900-token chunk with a 512-token model and you get a vector for the first 512 tokens. No error, no warning — the rest
+of the chunk is simply not represented, and that content is unfindable. This is one of the most common real RAG bugs and it is
+invisible until you measure recall. Always assert chunk length against the model's limit at ingestion time.</p></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>If asked which vector database you would use, the strong answer starts with "how many chunks?" — and for anything under a few
+hundred thousand, "Postgres with pgvector, because the data is already relational, I get transactions and metadata filtering for
+free, and I do not add a service to operate." Reaching for a dedicated vector store at small scale reads as resume-driven design.</p></div></section>
+
+<section id="chunking"><h2 id="chunking">Chunking: the decision that sets your ceiling</h2>
+<p>Chunking is the decision that sets your ceiling, and it is made before any model is chosen. If the answer to a question is
+split across two chunks and neither contains enough to answer alone, no reranker and no frontier model will recover it.</p>
+
+<h3>The trade-off, stated plainly</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Small chunks (100–300 tokens)</th><th>Large chunks (800–2000)</th></tr></thead>
+<tbody>
+<tr><td>Embedding quality</td><td><strong>Better</strong> — one topic per vector, so the vector means something</td><td>Worse — an average of several topics, close to nothing in particular</td></tr>
+<tr><td>Precision</td><td><strong>Higher</strong> — less irrelevant text per hit</td><td>Lower — you pay tokens for surrounding noise</td></tr>
+<tr><td>Context completeness</td><td>Worse — answers get split; pronouns lose their referent</td><td><strong>Better</strong> — the answer is more likely to be whole</td></tr>
+<tr><td>Cost per query</td><td>Lower per chunk, but you need more of them</td><td>Higher per chunk</td></tr>
+</tbody></table></div>
+
+<p>Defaults worth stating: <strong>300–500 tokens with 10–20% overlap</strong> is a reasonable starting point for prose, and
+overlap exists so that a sentence straddling a boundary appears whole in at least one chunk.</p>
+
+<h3>Respect the document's own structure</h3>
+<p>Fixed-size splitting is the baseline and it is the wrong default for anything with structure. Markdown has headings; code has
+functions; contracts have clauses; transcripts have turns. Splitting on those boundaries beats splitting on a character count,
+because a chunk that is one semantic unit embeds into a vector that means one thing.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import re, tiktoken
+enc = tiktoken.get_encoding(&quot;cl100k_base&quot;)
+def ntok(s): return len(enc.encode(s))
+
+def chunk_markdown(doc: str, target=400, overlap=60, hard_limit=512):
+    &quot;&quot;&quot;Split on headings first, then pack paragraphs up to `target` tokens.
+
+    Two things this does that naive splitters do not:
+      - carries the heading trail into every chunk, so a chunk about
+        &quot;Refunds&quot; still says which product it belongs to;
+      - asserts against the EMBEDDING MODEL&#x27;s limit, so nothing is
+        silently truncated at embed time.
+    &quot;&quot;&quot;
+    sections, trail = [], []
+    for part in re.split(r&quot;^(#{1,6} .*)$&quot;, doc, flags=re.M):
+        if part.startswith(&quot;#&quot;):
+            level = len(part) - len(part.lstrip(&quot;#&quot;))
+            trail = trail[: level - 1] + [part.lstrip(&quot;# &quot;).strip()]
+        elif part.strip():
+            sections.append((list(trail), part.strip()))
+
+    chunks = []
+    for trail, body in sections:
+        prefix = &quot; &gt; &quot;.join(trail)
+        buf, size = [], 0
+        for para in re.split(r&quot;\n\s*\n&quot;, body):
+            p = ntok(para)
+            if size + p &gt; target and buf:
+                chunks.append((prefix, &quot;\n\n&quot;.join(buf)))
+                # overlap: carry the tail paragraph into the next chunk
+                buf, size = ([buf[-1]], ntok(buf[-1])) if overlap else ([], 0)
+            buf.append(para); size += p
+        if buf:
+            chunks.append((prefix, &quot;\n\n&quot;.join(buf)))
+
+    out = []
+    for prefix, text in chunks:
+        full = f&quot;{prefix}\n\n{text}&quot; if prefix else text
+        assert ntok(full) &lt;= hard_limit, f&quot;chunk exceeds embedder limit: {ntok(full)}&quot;
+        out.append(full)
+    return out</code></pre></div>
+
+<p>The heading trail in that snippet is doing the single highest-value thing in chunking, and it has a name —
+<strong>contextual retrieval</strong>. A chunk that reads "You may return items within 30 days" is ambiguous across a corpus
+covering six products. Prefix it with "Acme Pro > Returns" and it is both findable and unambiguous. Anthropic reported this kind
+of context-prefixing cutting retrieval failures substantially, and it costs nothing at query time.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Give a number and a reason, then say how you would revise it: "I'd start at 400 tokens with 60 of overlap, split on headings
+rather than character count, and prefix each chunk with its heading trail — then tune against retrieval recall on a golden set,
+because the right size depends on how answers are distributed in the corpus and I cannot know that in advance." Candidates who
+name a number with no justification and candidates who refuse to name one both score worse than this.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Take twenty questions over your corpus and check by hand whether a single chunk contains each answer. The fraction that do not is your ceiling, and it is usually lower than people expect.</li></ul></div></section>
+
+<section id="hybrid"><h2 id="hybrid">Hybrid search: BM25, vectors, and RRF</h2>
+<p>Vector search finds semantically similar text. It is bad at exactly the things keyword search is good at: product codes, error
+numbers, people's names, rare acronyms, exact quoted phrases. Searching for <code>ERR_4821</code> in a semantic index returns
+chunks about errors in general, because the embedding of a rare token carries almost no signal.</p>
+
+<p><strong>Hybrid search runs both and fuses the results.</strong> It is close to free and it is the highest-value single upgrade
+to a naive RAG system.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Good at</th><th>Bad at</th></tr></thead>
+<tbody>
+<tr><td><strong>BM25 / full-text</strong></td><td>Exact terms, codes, names, rare words, quoted phrases</td><td>Synonyms, paraphrase, "how do I cancel" vs "terminating your subscription"</td></tr>
+<tr><td><strong>Dense / vector</strong></td><td>Meaning, paraphrase, cross-lingual</td><td>Exact identifiers, rare tokens, negation</td></tr>
+</tbody></table></div>
+
+<h3>Reciprocal Rank Fusion</h3>
+<p>The problem with combining two result lists is that their scores are not comparable — BM25 is unbounded and corpus-dependent,
+cosine is in [−1, 1]. Normalising them is fiddly and fragile. <strong>RRF ignores the scores entirely and uses only the
+ranks</strong>, which is why it is the standard answer:</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>def rrf(result_lists, k=60, top_n=20):
+    &quot;&quot;&quot;Reciprocal Rank Fusion. Scores are discarded; only RANK is used.
+
+        score(d) = sum over lists of  1 / (k + rank(d))
+
+    k=60 is the value from the original paper and is a sensible default. It
+    damps the top ranks so one list cannot dominate on a single confident
+    hit -- the gap between rank 1 and 2 is 1/61 vs 1/62, not 10x.
+    &quot;&quot;&quot;
+    scores = {}
+    for results in result_lists:                 # e.g. [bm25_hits, vector_hits]
+        for rank, doc_id in enumerate(results, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+    return sorted(scores, key=scores.get, reverse=True)[:top_n]
+
+
+bm25_hits  = [&quot;d9&quot;, &quot;d3&quot;, &quot;d1&quot;]        # exact match on an error code
+vector_hits = [&quot;d1&quot;, &quot;d7&quot;, &quot;d3&quot;]       # semantic match
+print(rrf([bm25_hits, vector_hits]))
+# -&gt; [&#x27;d1&#x27;, &#x27;d3&#x27;, &#x27;d9&#x27;, &#x27;d7&#x27;]
+# d1 wins: mid-rank in BOTH lists beats rank-1 in only one. That is the
+# property you want -- agreement across different retrieval methods is a
+# stronger relevance signal than confidence within one.</code></pre></div>
+
+<p>The property to articulate: <strong>documents found by both methods rise to the top.</strong> Agreement between two retrieval
+systems that fail in different ways is a better relevance signal than a high score from either alone.</p>
+
+<p>In Postgres this is one query — <code>tsvector</code>/<code>ts_rank</code> for the keyword side, pgvector for the dense side,
+fused in SQL — which is another reason pgvector is a good default when the data is already relational.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Be ready for "why not just normalise the scores and take a weighted sum?" The answer: BM25 scores are unbounded and depend on
+corpus statistics, so any normalisation you pick is a tuned constant that drifts as the corpus grows, and the weight becomes
+another thing to maintain. RRF needs no tuning, is scale-free, and generalises to three or four retrievers without
+re-calibration. If you do want weights, RRF takes per-list weights cleanly.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Implement RRF from memory — it is six lines and it comes up often.</li>
+<li>Find five queries where your vector search fails and keyword search succeeds. They will all be identifiers, names or rare terms, and the pattern is the thing to internalise.</li></ul></div></section>
+
+<section id="reranking"><h2 id="reranking">Reranking and the two-stage pipeline</h2>
+<p>Retrieval optimises for speed over a large corpus; it therefore uses a <strong>bi-encoder</strong>, which embeds the query and
+each document <em>separately</em> and compares vectors. That separation is what makes it fast — document vectors are computed once,
+offline — and it is also its limitation: the document was embedded without any knowledge of the query.</p>
+
+<p>A <strong>cross-encoder</strong> reranker puts the query and the document through the model <em>together</em>, so attention runs
+across both and the score reflects their actual interaction. It is far more accurate and far too slow to run over a corpus — which
+gives the standard two-stage design:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Stage</th><th>Model</th><th>Over</th><th>Cost</th><th>Job</th></tr></thead>
+<tbody>
+<tr><td>1 · Retrieve</td><td>Bi-encoder + BM25</td><td>Whole corpus</td><td>~10 ms</td><td>High recall: get the answer into the top 50 somewhere</td></tr>
+<tr><td>2 · Rerank</td><td>Cross-encoder</td><td>Those 50</td><td>~100 ms</td><td>High precision: get it into the top 5, in order</td></tr>
+</tbody></table></div>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>def retrieve(query, k_recall=50, k_final=5):
+    # Stage 1 -- cheap and wide. Optimise for RECALL: the answer must be in
+    # here somewhere, order does not matter yet.
+    dense  = vector_search(embed(query), k=k_recall)
+    sparse = bm25_search(query, k=k_recall)
+    candidates = rrf([dense, sparse], top_n=k_recall)
+
+    # Stage 2 -- expensive and narrow. Optimise for PRECISION.
+    # The cross-encoder sees (query, doc) TOGETHER, so it can tell
+    # &quot;returns within 30 days&quot; from &quot;returns are not accepted after 30 days&quot;
+    # -- a distinction cosine similarity on separate embeddings misses,
+    # because the two sentences share almost all their tokens.
+    scored = cross_encoder.predict([(query, text_of(c)) for c in candidates])
+    ranked = [c for _, c in sorted(zip(scored, candidates), reverse=True)]
+    return ranked[:k_final]</code></pre></div>
+
+<p>The negation example in that comment is the clearest illustration of why reranking earns its latency. "Returns are accepted
+within 30 days" and "returns are not accepted after 30 days" have nearly identical embeddings — same vocabulary, same topic — but
+a cross-encoder reading them alongside the query can tell which one answers it.</p>
+
+<p>Reranking also lets you retrieve <em>wider</em> and send <em>narrower</em>. Fetching 50 candidates and sending the best 5 gives
+better context than fetching 5 directly, at the cost of one extra model call. That is usually a good trade, and it is the standard
+way to improve a RAG system that is "nearly right".</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>The sentence that demonstrates understanding: <strong>"a bi-encoder embeds the query and the document separately, so the
+document's vector was computed without knowing the question; a cross-encoder scores them together."</strong> Follow it with the
+cost argument — one is O(corpus) offline, the other is O(candidates) per query — and you have explained both why two stages exist
+and why they are in that order.</p></div></section>
+
+<section id="context-assembly"><h2 id="context-assembly">Assembling the context, and citing it</h2>
+<p>You have your top chunks. What you do with them before the model sees them is a surprisingly large fraction of answer quality,
+and it is the part people skip.</p>
+
+<h3>Order matters</h3>
+<p>Because of the lost-in-the-middle effect, relevance order is not the best presentation order. If you are sending ten chunks,
+put the strongest at the <em>start and the end</em> rather than ranking them 1 to 10 top to bottom.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>def assemble(chunks, question, *, budget_tokens=4000):
+    &quot;&quot;&quot;Pack chunks into the context budget, strongest at the edges.&quot;&quot;&quot;
+    kept, used = [], 0
+    for c in chunks:                       # already in relevance order
+        t = ntok(c.text)
+        if used + t &gt; budget_tokens:
+            break                          # drop the tail -- do not truncate
+        kept.append(c); used += t
+
+    # Strongest first AND last: 1, 3, 5, ... then ... 6, 4, 2
+    ends = kept[0::2] + kept[1::2][::-1]
+
+    body = &quot;\n\n&quot;.join(
+        f&quot;[{c.id}] source: {c.source} ({c.heading_trail})\n{c.text}&quot;
+        for c in ends
+    )
+    return f&quot;&lt;context&gt;\n{body}\n&lt;/context&gt;\n\n&lt;question&gt;\n{question}\n&lt;/question&gt;&quot;
+
+# Three deliberate choices:
+#   - DROP whole chunks at the budget, never truncate one mid-sentence;
+#     a half chunk is often worse than no chunk.
+#   - Every chunk carries a stable [id] so the model can cite it and you
+#     can verify the citation points at text that supports the claim.
+#   - Source and heading trail travel with the text, so the model can say
+#     WHICH product or version an answer applies to.</code></pre></div>
+
+<h3>Citations are the verification mechanism</h3>
+<p>Requiring <code>[doc-12]</code>-style citations does two things. It measurably reduces unsupported claims, because the model
+must point at something. More importantly it makes the answer <strong>checkable</strong>: you can programmatically confirm every
+cited id was actually retrieved, and you can show the user the source. An uncited RAG answer is indistinguishable from a
+hallucination until a human reads the corpus.</p>
+
+<p>Worth knowing the limit: a model can cite a real document for a claim that document does not make. Citation presence is a weak
+guarantee; citation <em>support</em> — checking that the cited chunk entails the claim — is the strong one, and that is an eval,
+covered on the <a href="evals.html">next page</a>.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Mention deduplication. Real corpora contain near-duplicates — the same policy in three documents, a page and its PDF export —
+and without a dedupe step your top 10 can be five copies of one passage, which wastes most of the context budget and starves the
+answer of the other facts it needs. A similarity threshold between selected chunks, or grouping by source document, fixes it.
+Almost nobody raises this and it is unmistakably a from-production detail.</p></div></section>
+
+<section id="failure-modes"><h2 id="failure-modes">Where RAG fails, and how you find out</h2>
+<p>When a RAG system gives a wrong answer, there are exactly two possibilities, and <strong>the first diagnostic move is to
+determine which</strong>:</p>
+
+<ol>
+<li><strong>Retrieval failure</strong> — the answer was not in the retrieved context. The model never had a chance.</li>
+<li><strong>Generation failure</strong> — the answer <em>was</em> there and the model got it wrong anyway.</li>
+</ol>
+
+<p>They have completely different fixes, and a system that cannot tell them apart cannot be improved except by guessing. This is
+why retrieval is evaluated separately from generation, and saying so is the single best answer to "your RAG system returns a wrong
+answer — debug it."</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Failure</th><th>Symptom</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td><strong>Answer split across chunks</strong></td><td>Partially right, missing a condition or an exception</td><td>Larger chunks, more overlap, or a parent-document strategy</td></tr>
+<tr><td><strong>Exact term not found</strong></td><td>Fails on codes, names, versions</td><td>Hybrid search — this is the single commonest fix</td></tr>
+<tr><td><strong>Near-duplicates flood top-k</strong></td><td>Context is five copies of one passage</td><td>Deduplicate before assembly</td></tr>
+<tr><td><strong>Silent embed truncation</strong></td><td>Content in long chunks is simply unfindable</td><td>Assert chunk length against the embedder limit at ingestion</td></tr>
+<tr><td><strong>Ambiguous chunks</strong></td><td>Right topic, wrong product or version</td><td>Heading-trail prefixes; metadata filters</td></tr>
+<tr><td><strong>Stale index</strong></td><td>Confidently cites something that changed last week</td><td>Re-index on change; show document dates in context</td></tr>
+<tr><td><strong>Needs aggregation</strong></td><td>"How many…" answered from ten chunks</td><td>Route to SQL. Top-<em>k</em> cannot count</td></tr>
+<tr><td><strong>Model ignores context</strong></td><td>Answers from parametric knowledge instead</td><td>Stronger instruction, citations required, lower temperature</td></tr>
+</tbody></table></div>
+
+<h3>The diagnostic</h3>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>def diagnose(question, gold_answer, gold_doc_ids):
+    &quot;&quot;&quot;Attribute a wrong answer to retrieval or generation. Run this first.&quot;&quot;&quot;
+    chunks = retrieve(question)
+    got = {c.id for c in chunks}
+
+    if not (got &amp; set(gold_doc_ids)):
+        return &quot;RETRIEVAL: the supporting document was never retrieved&quot;
+
+    # The answer WAS in context. Confirm the model can use it when it is
+    # handed the right context with nothing else competing.
+    oracle = generate(question, context=[c for c in chunks if c.id in gold_doc_ids])
+    if correct(oracle, gold_answer):
+        return &quot;RETRIEVAL: right doc retrieved but ranked too low / crowded out&quot;
+    return &quot;GENERATION: correct context, wrong answer&quot;</code></pre></div>
+
+<p>That three-way split — never retrieved, retrieved but out-ranked, retrieved and misused — maps onto three different fixes:
+improve recall, improve the reranker or raise <em>k</em>, and improve the prompt or the model.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"Your RAG system returns a wrong answer. Debug it." is a near-certain question and most candidates start listing fixes. Start
+instead with the attribution: <strong>"first I would check whether the supporting document was in the retrieved context at all,
+because retrieval failures and generation failures have different fixes and I do not want to tune a prompt to solve a recall
+problem."</strong> Then walk the three-way split. That is a methodology rather than a list, and it is what the question is
+testing.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>For your own pipeline, take ten wrong answers and attribute each one. The distribution will surprise you — in most systems the large majority are retrieval failures, which is why people who tune prompts first make slow progress.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://www.anthropic.com/news/contextual-retrieval" target="_blank" rel="noopener">Anthropic: Contextual Retrieval</a> — prefixing chunks with context, measured; the heading-trail idea generalised</li><li><a href="https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf" target="_blank" rel="noopener">Reciprocal Rank Fusion (Cormack et al.)</a> — the original paper, four pages, where k=60 comes from</li><li><a href="https://arxiv.org/abs/1603.09320" target="_blank" rel="noopener">HNSW (Malkov &amp; Yashunin)</a> — the index behind most vector search, clearly written</li><li><a href="https://github.com/pgvector/pgvector" target="_blank" rel="noopener">pgvector</a> — vectors in Postgres — the right default more often than people assume</li><li><a href="https://www.sbert.net/examples/applications/retrieve_rerank/README.html" target="_blank" rel="noopener">Sentence-Transformers: retrieve &amp; re-rank</a> — the two-stage pipeline with working code and the bi/cross-encoder distinction</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button · Code is Python throughout.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

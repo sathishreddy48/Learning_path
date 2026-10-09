@@ -952,11 +952,14 @@ function dotnetTopicCount() {
 }
 
 function writeRootLanding(counts) {
-  /* Every card below is only emitted if that site actually exists, so adding
-     or removing a study site needs no edit here. */
+  /* Each card is emitted only if that site exists -- but the `cards` array
+     below is hardcoded, so ADDING a study site does need an entry here, plus
+     a `.path-card.<cls>` colour in the <style> block. Only removal is
+     automatic. */
   const dotnet = siteCounts('DotNet');
   const dsa = siteCounts('DSA');
   const lld = siteCounts('LLD');
+  const genai = siteCounts('GenAI');
   const playbook = siteCounts('Playbook');
 
   const cards = [
@@ -979,6 +982,11 @@ function writeRootLanding(counts) {
       cls: ' lld', href: 'LLD/index.html', title: 'LLD',
       blurb: 'The low-level design round: how it is scored and how to run its clock, the patterns that answer almost every prompt, then five designs worked end to end with their concurrency stories and follow-ups.',
       meta: `${lld.topics} topics · ${lld.sections} sections · C# | Python tabs`,
+    },
+    genai && {
+      cls: ' genai', href: 'GenAI/index.html', title: 'GenAI',
+      blurb: 'The AI round: what it grades and how a model behaves as a component, then the systems you are asked to design \u2014 retrieval, evaluation, agents \u2014 and the internals that separate candidates: attention, LoRA, quantization and the KV cache.',
+      meta: `${genai.topics} topics \u00b7 ${genai.sections} sections \u00b7 Python`,
     },
     playbook && {
       cls: ' pb', href: 'Playbook/index.html', title: 'Interview Playbook',
@@ -1006,6 +1014,7 @@ function writeRootLanding(counts) {
   .path-card.sd { border-top-color: var(--accent); }
   .path-card.dsa { border-top-color: var(--success); }
   .path-card.lld { border-top-color: var(--warning, #b7791f); }
+  .path-card.genai { border-top-color: var(--info, #2b6cb0); }
   .path-card.pb { border-top-color: var(--danger, #c53030); }
   .path-card h2 { margin: 0 0 .4rem; font-size: 1.15rem; }
   .path-card p { margin: 0 0 .9rem; font-size: .9rem; color: var(--text-muted); }
@@ -1017,8 +1026,8 @@ function writeRootLanding(counts) {
 <main class="main">
   <h1>Learning Path</h1>
   <p class="lede">${siteWord} self-paced study sites, all offline-first and each storing its progress separately in this browser.
-  Between them they cover the four rounds a big-tech loop is made of — coding, low-level design, system design and the process
-  around them.</p>
+  Between them they cover the five rounds a big-tech loop is made of — coding, low-level design, system design, AI, and the
+  process around them.</p>
 
   <div class="path-cards">
 ${cards.map((c) => `    <a class="path-card${c.cls}" href="${c.href}">

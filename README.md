@@ -1,7 +1,7 @@
 # Learning Path
 
-Five self-paced, offline-first study sites — C# & .NET, System Design, DSA, LLD and
-the Interview Playbook. Everything is static HTML, CSS and plain JavaScript: no
+Six self-paced, offline-first study sites — C# & .NET, System Design, DSA, LLD,
+GenAI and the Interview Playbook. Everything is static HTML, CSS and plain JavaScript: no
 framework, no CDN, no runtime dependencies. The only build step regenerates the
 System Design site from its markdown notes.
 
@@ -67,8 +67,15 @@ shipping a broken site with 390+ hand-written cross-chapter links.
 Useful flags: `--no-mermaid` (skip diagram rendering for fast HTML iteration),
 `--quiet`.
 
-The other four sites are hand-authored — edit their HTML under `DotNet/`, `DSA/`,
-`LLD/` and `Playbook/` directly; there is nothing to build.
+The other five sites are hand-authored — edit their HTML under `DotNet/`, `DSA/`,
+`LLD/`, `GenAI/` and `Playbook/` directly; there is nothing to build. Each keeps its
+own `assets/js/curriculum.js` as the single source of truth for its sidebar and
+dashboard, and its own `localStorage` namespace (`dsa.v1.*`, `lld.v1.*`,
+`genai.v1.*`, …) so progress never mixes between sites.
+
+Adding a site also needs a card in `writeRootLanding()` in
+[`tools/build-system-design.mjs`](tools/build-system-design.mjs) — the array there is
+hardcoded — then a rebuild to regenerate `index.html`.
 
 See [`tools/README.md`](tools/README.md) for how the generator works and how to add
 an interactive explainer.
@@ -85,7 +92,7 @@ an interactive explainer.
 
 ```
 index.html              generated landing page
-DotNet/ DSA/ LLD/ Playbook/   hand-authored sites
+DotNet/ DSA/ LLD/ GenAI/ Playbook/   hand-authored sites
 SystemDesign/           generated from system-design-notes/
 system-design-notes/    the markdown source of truth
 tools/                  build script, animation modules, dev deps

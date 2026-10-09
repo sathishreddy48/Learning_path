@@ -15,6 +15,7 @@
   .path-card.sd { border-top-color: var(--accent); }
   .path-card.dsa { border-top-color: var(--success); }
   .path-card.lld { border-top-color: var(--warning, #b7791f); }
+  .path-card.genai { border-top-color: var(--info, #2b6cb0); }
   .path-card.pb { border-top-color: var(--danger, #c53030); }
   .path-card h2 { margin: 0 0 .4rem; font-size: 1.15rem; }
   .path-card p { margin: 0 0 .9rem; font-size: .9rem; color: var(--text-muted); }
@@ -25,9 +26,9 @@
 <div class="layout">
 <main class="main">
   <h1>Learning Path</h1>
-  <p class="lede">Five self-paced study sites, all offline-first and each storing its progress separately in this browser.
-  Between them they cover the four rounds a big-tech loop is made of — coding, low-level design, system design and the process
-  around them.</p>
+  <p class="lede">Six self-paced study sites, all offline-first and each storing its progress separately in this browser.
+  Between them they cover the five rounds a big-tech loop is made of — coding, low-level design, system design, AI, and the
+  process around them.</p>
 
   <div class="path-cards">
     <a class="path-card" href="DotNet/index.html">
@@ -49,6 +50,11 @@
       <h2>LLD →</h2>
       <p>The low-level design round: how it is scored and how to run its clock, the patterns that answer almost every prompt, then five designs worked end to end with their concurrency stories and follow-ups.</p>
       <span class="meta">7 topics · 31 sections · C# | Python tabs</span>
+    </a>
+    <a class="path-card genai" href="GenAI/index.html">
+      <h2>GenAI →</h2>
+      <p>The AI round: what it grades and how a model behaves as a component, then the systems you are asked to design — retrieval, evaluation, agents — and the internals that separate candidates: attention, LoRA, quantization and the KV cache.</p>
+      <span class="meta">9 topics · 59 sections · Python</span>
     </a>
     <a class="path-card pb" href="Playbook/index.html">
       <h2>Interview Playbook →</h2>

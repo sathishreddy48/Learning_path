@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transformer Internals — GenAI</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="transformer-internals">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Internals › Topic 7 of 9</div>
+  <h1>Transformer Internals</h1>
+  <p class="lede">Attention from the matmul up: why positional information has to be added separately, what the causal mask buys you, why multiple heads beat one wide one, where the residual stream fits, and how logits become text.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#embeddings">Token and positional embeddings</a></li><li><a href="#attention">Self-attention, step by step</a></li><li><a href="#causal-masking">Causal masking: how a decoder stays honest</a></li><li><a href="#multi-head">Multi-head attention and the residual stream</a></li><li><a href="#norm-and-ffn">LayerNorm, the FFN, and the block</a></li><li><a href="#decoding">From logits to text</a></li></ol>
+  </div>
+
+<section id="embeddings"><h2 id="embeddings">Token and positional embeddings</h2>
+<p>A transformer takes token ids and must turn them into vectors it can do arithmetic on. Two things get added together at the
+very bottom of the stack, and the second exists for a reason worth understanding.</p>
+
+<h3>Token embeddings</h3>
+<p>A lookup table of shape <code>(vocab_size, d_model)</code>. Token id 1,234 selects row 1,234. It is trained like any other
+parameter, and for a 50k vocabulary at 768 dimensions that is 38M parameters before any attention happens.</p>
+
+<h3>Positional embeddings, and why they are necessary</h3>
+<p>Here is the key fact: <strong>self-attention is permutation-equivariant.</strong> Shuffle the input tokens and the output
+rows shuffle identically — the operation itself contains no notion of order. "Dog bites man" and "man bites dog" would produce
+identical sets of representations. Position has to be injected separately, and that is the whole justification.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import torch, torch.nn as nn
+
+d_model, vocab, max_len = 768, 50_257, 1024
+
+tok_emb = nn.Embedding(vocab, d_model)     # (vocab, d_model) lookup table
+pos_emb = nn.Embedding(max_len, d_model)   # LEARNED positions (what GPT-2 does)
+
+ids = torch.randint(0, vocab, (2, 10))     # (batch=2, seq=10)
+pos = torch.arange(10)                     # 0..9
+
+x = tok_emb(ids) + pos_emb(pos)            # (2, 10, 768)   -- broadcast over batch
+# ADDED, not concatenated. The model has d_model dimensions to work with and
+# learns to use some subspaces for positional information; concatenating
+# would spend dimensions on a fixed budget instead.
+print(x.shape)</code></pre></div>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Scheme</th><th>How</th><th>Extrapolates?</th><th>Used by</th></tr></thead>
+<tbody>
+<tr><td><strong>Learned absolute</strong></td><td>A trained vector per position</td><td>No — undefined past <code>max_len</code></td><td>GPT-2, BERT</td></tr>
+<tr><td><strong>Sinusoidal</strong></td><td>Fixed sin/cos of varying frequency</td><td>In principle; poorly in practice</td><td>The original transformer</td></tr>
+<tr><td><strong>RoPE</strong></td><td><em>Rotates</em> Q and K by an angle proportional to position</td><td>Yes, and extendable by frequency scaling</td><td>Llama, Mistral, Qwen, most current models</td></tr>
+<tr><td><strong>ALiBi</strong></td><td>Adds a distance penalty to attention scores</td><td>Yes</td><td>BLOOM, some long-context models</td></tr>
+</tbody></table></div>
+
+<p><strong>RoPE</strong> is the one to be able to explain, because it is what current models use and because the mechanism is
+elegant. Instead of adding a position vector to the embedding, it rotates the query and key vectors in 2-D subspaces by an angle
+proportional to position. The dot product between a rotated query at position <em>m</em> and a rotated key at position <em>n</em>
+then depends only on <em>m − n</em> — so <strong>absolute rotations produce relative position information in the attention
+score</strong>, which is exactly what you want. It is also why context windows can be extended after training by scaling the
+rotation frequencies rather than retraining.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"Why do transformers need positional encoding?" has one correct answer: <strong>attention is permutation-equivariant, so
+without it the model cannot distinguish word order at all.</strong> Say that, give the dog-bites-man example, and then mention
+RoPE and its relative-position property if they want more. Answering "so the model knows where words are" without the
+permutation argument is the vaguer version everyone gives.</p></div></section>
+
+<section id="attention"><h2 id="attention">Self-attention, step by step</h2>
+<p>Attention is a learned, content-based lookup. Each token produces a <strong>query</strong> (what am I looking for), a
+<strong>key</strong> (what do I offer), and a <strong>value</strong> (what I pass on if selected). Every token scores every other
+by query·key, softmaxes the scores into weights, and takes the weighted sum of values.</p>
+
+<p>The whole thing is one formula, and you should be able to write it and explain each piece:</p>
+
+<p><code>Attention(Q, K, V) = softmax(QKᵀ / √d_k) V</code></p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import torch, torch.nn.functional as F, math
+
+B_, T, C = 2, 8, 64          # batch, sequence length, channels (d_model)
+x = torch.randn(B_, T, C)
+
+W_q, W_k, W_v = (torch.nn.Linear(C, C, bias=False) for _ in range(3))
+q, k, v = W_q(x), W_k(x), W_v(x)                 # each (B, T, C)
+
+# 1. SCORES -- every query against every key.
+scores = q @ k.transpose(-2, -1)                 # (B, T, T)
+#            ^ (B,T,C) @ (B,C,T) -&gt; (B,T,T). This T x T is where the
+#              O(T^2) cost of attention comes from.
+
+# 2. SCALE by sqrt(d_k).
+scores = scores / math.sqrt(C)
+# WHY: q.k is a sum of C products. If components are ~N(0,1), the dot
+# product has variance ~C, so scores grow with dimension. Feed large
+# values to softmax and it saturates -- one weight ~1, the rest ~0, and
+# the gradient vanishes. Dividing by sqrt(C) restores unit variance.
+
+# 3. SOFTMAX over the KEY axis: each query&#x27;s weights sum to 1.
+w = F.softmax(scores, dim=-1)                    # (B, T, T)
+
+# 4. WEIGHTED SUM of values.
+out = w @ v                                      # (B,T,T) @ (B,T,C) -&gt; (B,T,C)
+print(out.shape)                                 # torch.Size([2, 8, 64])</code></pre></div>
+
+<p>Three things in that snippet are asked about directly.</p>
+
+<p><strong>The √d_k scaling.</strong> The dot product of two <em>d</em>-dimensional vectors with unit-variance components has
+variance <em>d</em>. Without scaling, scores grow with model width, softmax saturates into a near-one-hot distribution, and
+gradients vanish. This is the most commonly asked "why" in the formula and the answer is one sentence about variance.</p>
+
+<p><strong>Softmax over the last dimension.</strong> Each <em>query</em>'s attention over all keys sums to 1. Softmaxing over the
+wrong axis is a real and silent bug — the shapes still work.</p>
+
+<p><strong>The T×T matrix.</strong> That is the quadratic cost. Doubling the sequence length quadruples attention's compute and
+memory, which is why long context is hard and why FlashAttention — which never materialises the full matrix, computing it in
+tiles in fast on-chip memory — mattered so much.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>When asked to walk through attention, <strong>narrate the shapes</strong>: "x is (B, T, C); three projections give Q, K, V each
+(B, T, C); Q times K-transpose is (B, T, T), which is every token scoring every token and the source of the quadratic cost;
+scale by root d_k so softmax does not saturate; softmax over the key axis; multiply by V to get back to (B, T, C)." Shapes make
+it checkable and prove you have implemented it rather than read about it.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Write the forty lines above from memory, including the scaling. If the <code>transpose(-2, -1)</code> or the softmax axis gives you pause, write it again tomorrow.</li></ul></div></section>
+
+<section id="causal-masking"><h2 id="causal-masking">Causal masking: how a decoder stays honest</h2>
+<p>A decoder predicts the next token. If position 3 could attend to position 7, the model would see the answer during training
+and learn nothing useful — it would be told the thing it is supposed to predict. The causal mask prevents that by making every
+position attend only to itself and what came before.</p>
+
+<p>The implementation is the detail worth getting exactly right: set the <em>scores</em> at future positions to
+<strong>−∞ before the softmax</strong>, so the softmax assigns them exactly zero weight.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import torch, torch.nn.functional as F, math
+
+T = 5
+scores = torch.randn(T, T)
+
+# Lower-triangular ones = positions we may attend to.
+mask = torch.tril(torch.ones(T, T, dtype=torch.bool))
+# [[1,0,0,0,0],
+#  [1,1,0,0,0],
+#  [1,1,1,0,0],      row i can see columns 0..i
+#  [1,1,1,1,0],
+#  [1,1,1,1,1]]
+
+scores = scores.masked_fill(~mask, float(&quot;-inf&quot;))   # BEFORE softmax
+w = F.softmax(scores, dim=-1)
+print(w[0])     # tensor([1., 0., 0., 0., 0.])   token 0 sees only itself
+print(w[2])     # tensor([.4, .3, .3, 0., 0.])   token 2 sees 0,1,2
+
+# WHY -inf and not 0:
+#   exp(-inf) = 0 exactly, so masked positions get ZERO weight and the
+#   remaining weights renormalise to sum to 1.
+#   Setting the SCORES to 0 would mean exp(0) = 1 -- a LARGE weight.
+#   Zeroing after the softmax leaves the rest summing to less than 1.
+#   Both are real bugs; -inf before the softmax is the only correct place.</code></pre></div>
+
+<div class="callout callout-warn"><span class="callout-title">The subtle bug: building the mask from values</span>
+<p>A common implementation builds the mask with <code>torch.triu(scores) == 0</code> or similar — deriving the mask from the
+score values rather than from positions. It usually works, which is what makes it dangerous: any score that happens to be
+<strong>exactly 0.0</strong> is then treated as masked, or a masked entry whose value is not 0 leaks through. The mask must come
+from the <em>indices</em>, never from the data. This is a genuinely good thing to mention, because it shows you have debugged an
+implementation rather than copied one.</p></div>
+
+<h3>Why this makes training efficient</h3>
+<p>The mask is what lets a decoder train on all positions at once. A single forward pass over a 1,024-token sequence produces
+1,024 next-token predictions — each conditioned only on its own prefix — and all of them contribute to the loss. Without the
+mask you would need a separate pass per position. <strong>That parallelism across the sequence is the transformer's central
+advantage over an RNN</strong>, and it is why the architecture scaled.</p>
+
+<p>This also explains a detail of inference: at generation time only the last position's logits are read, because the earlier
+ones are predicting tokens you already have. Training uses all of them; generation uses one.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Two questions come up together. "Why mask?" — so a position cannot see the token it is predicting. "Why −∞?" — because
+<code>exp(−∞) = 0</code> exactly, so masked positions get zero weight and the rest renormalise; zeroing the scores instead gives
+<code>exp(0) = 1</code>, which is a large weight, and zeroing after the softmax breaks the normalisation. Then add the training
+efficiency point, which is the one that explains why the architecture won.</p></div></section>
+
+<section id="multi-head"><h2 id="multi-head">Multi-head attention and the residual stream</h2>
+<p>One attention operation produces one set of weights — one notion of what is relevant. Language needs several at once: which
+noun this pronoun refers to, which verb governs this subject, which bracket this one closes. <strong>Multi-head attention runs
+several attention operations in parallel over different learned subspaces and concatenates the results.</strong></p>
+
+<p>The crucial detail is that heads do not make the model wider. The dimension is <em>split</em>: with
+<code>d_model = 768</code> and 12 heads, each head works in 64 dimensions, and the parameter count is identical to single-head
+attention at full width. You get multiple relationship types for free, paying only in the fact that each head has less room.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import torch, torch.nn as nn, torch.nn.functional as F, math
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model=768, n_heads=12):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.h, self.dk = n_heads, d_model // n_heads     # 12 heads x 64 dims
+        self.qkv  = nn.Linear(d_model, 3 * d_model, bias=False)  # fused: 1 matmul
+        self.proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x, mask=None):
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(C, dim=2)
+
+        # (B,T,C) -&gt; (B, heads, T, dk). The head dim moves next to batch so
+        # the matmuls below treat each head as an independent problem.
+        split = lambda t: t.view(B, T, self.h, self.dk).transpose(1, 2)
+        q, k, v = map(split, (q, k, v))
+
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.dk)   # (B,h,T,T)
+        if mask is not None:
+            att = att.masked_fill(~mask[:, :, :T, :T], float(&quot;-inf&quot;))
+        out = F.softmax(att, dim=-1) @ v                        # (B,h,T,dk)
+
+        # Concatenate heads back to (B,T,C), then MIX them. Without this
+        # projection the heads never interact -- it is not optional.
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(out)</code></pre></div>
+
+<p>Two implementation points that get asked about. The <strong>fused QKV projection</strong> is one matmul producing all three,
+split afterwards — three separate linear layers are mathematically identical but measurably slower. And the <strong>output
+projection is load-bearing</strong>: without it, heads are concatenated and never combined, so information in head 3 can never
+influence head 7.</p>
+
+<h3>The residual stream</h3>
+<p>Each block does not replace its input; it <em>adds</em> to it:</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code># Pre-norm block -- what every modern transformer uses.
+def block(x):
+    x = x + attention(layernorm_1(x))     # add, do not replace
+    x = x + mlp(layernorm_2(x))
+    return x
+
+# The &quot;residual stream&quot; view: x is a running sum that every layer reads
+# from and writes into. Two consequences:
+#
+#  1. Gradients flow through the + unchanged, so a 96-layer network trains
+#     at all. This is the ResNet insight applied to transformers.
+#
+#  2. PRE-norm (normalise the input to the sublayer) vs POST-norm
+#     (normalise after adding). Post-norm was the original and needs a
+#     learning-rate warmup to train deep stacks stably; pre-norm keeps a
+#     clean identity path from input to output and is why deep models
+#     train without careful babysitting.</code></pre></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"Why multiple heads?" — different heads learn different relationships, and crucially <strong>it is free</strong>, because
+d_model is split across heads rather than duplicated. If they push further, mention that heads are known to specialise in
+interpretable ways (induction heads, previous-token heads) and that modern models reduce the K and V heads
+(grouped-query attention) specifically to shrink the KV cache, which connects this page to
+<a href="inference-and-serving.html#kv-cache">inference</a>.</p></div></section>
+
+<section id="norm-and-ffn"><h2 id="norm-and-ffn">LayerNorm, the FFN, and the block</h2>
+<p>Attention mixes information <em>between</em> tokens. The feed-forward network processes each token <em>independently</em>. A
+transformer block is one of each, with normalisation and residual connections around them — and that alternation is the whole
+architecture.</p>
+
+<h3>LayerNorm, and why not BatchNorm</h3>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code># LayerNorm normalises ACROSS FEATURES, per token, independently.
+def layer_norm(x, gamma, beta, eps=1e-5):
+    mu  = x.mean(dim=-1, keepdim=True)          # over d_model
+    var = x.var(dim=-1, keepdim=True, unbiased=False)
+    return gamma * (x - mu) / (var + eps).sqrt() + beta
+
+# BatchNorm normalises across the BATCH, per feature -- and that is why it
+# is wrong here:
+#   - sequences in a batch have different lengths, so batch statistics are
+#     polluted by padding;
+#   - statistics would depend on which other sequences share the batch,
+#     which breaks inference with batch size 1;
+#   - it needs running statistics maintained between train and eval.
+# LayerNorm depends only on the token itself. Same result at any batch size.</code></pre></div>
+
+<p><strong>RMSNorm</strong> is the modern variant and worth knowing: it drops the mean-centring and the bias, normalising only by
+the root-mean-square. It works essentially as well, costs less, and is what Llama and most current models use.</p>
+
+<h3>The feed-forward network</h3>
+<p>Two linear layers with a non-linearity, applied identically to every position. The hidden layer is conventionally
+<strong>4× d_model</strong>:</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>class FFN(nn.Module):
+    def __init__(self, d_model=768, mult=4):
+        super().__init__()
+        self.fc   = nn.Linear(d_model, mult * d_model)   # 768 -&gt; 3072
+        self.act  = nn.GELU()
+        self.proj = nn.Linear(mult * d_model, d_model)   # 3072 -&gt; 768
+
+    def forward(self, x):
+        return self.proj(self.act(self.fc(x)))
+
+# Parameter count: 2 * 4 * d_model^2 = 8 * d_model^2 per block, against
+# 4 * d_model^2 for attention&#x27;s four projections.
+#
+# So roughly TWO THIRDS of a transformer&#x27;s parameters are in the FFNs,
+# not in attention. That is the fact behind Mixture of Experts: if most
+# of the weights are here, this is the layer worth making sparse.</code></pre></div>
+
+<p>That last comment is a good thing to know. Attention gets all the attention, but the FFN holds about twice as many parameters
+per block, and it is where most factual knowledge is thought to be stored. It is also why MoE replaces the FFN specifically —
+see <a href="inference-and-serving.html#moe">Mixture of Experts</a>.</p>
+
+<h3>The block, and the stack</h3>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>class Block(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.ln1, self.attn = nn.LayerNorm(d_model), MultiHeadSelfAttention(d_model, n_heads)
+        self.ln2, self.ffn  = nn.LayerNorm(d_model), FFN(d_model)
+
+    def forward(self, x, mask=None):
+        x = x + self.attn(self.ln1(x), mask)    # mix BETWEEN tokens
+        x = x + self.ffn(self.ln2(x))           # process EACH token
+        return x
+
+# GPT-2 small: 12 of these, d_model=768, 12 heads -&gt; 124M parameters.
+# That is the entire architecture. Everything else is scale, positional
+# scheme, normalisation variant, and attention optimisations.</code></pre></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Two crisp facts to have ready. <strong>"LayerNorm rather than BatchNorm because statistics must not depend on the other
+sequences in the batch — variable lengths and batch size 1 at inference both break BatchNorm."</strong> And <strong>"the FFN
+holds about two thirds of the parameters, which is why MoE sparsifies that layer and not attention."</strong> Both are short, both
+are specific, and neither is in the standard summary everyone has read.</p></div></section>
+
+<section id="decoding"><h2 id="decoding">From logits to text</h2>
+<p>The final layer projects the last hidden state to one logit per vocabulary token — for GPT-2, 768 dimensions to 50,257. Then
+a selection rule picks one. The model is finished at the logits; everything after is your choice.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import torch, torch.nn.functional as F
+
+@torch.no_grad()
+def generate(model, idx, max_new=50, temperature=1.0, top_k=None, top_p=None,
+             block_size=1024):
+    for _ in range(max_new):
+        # Crop to the context window -- positions beyond it are undefined.
+        cond = idx[:, -block_size:]
+
+        logits = model(cond)              # (B, T, vocab)
+        logits = logits[:, -1, :]         # ONLY the last position matters:
+                                          # earlier ones predict tokens we have.
+
+        if temperature == 0:              # greedy
+            nxt = logits.argmax(dim=-1, keepdim=True)
+        else:
+            logits = logits / temperature                 # BEFORE softmax
+            if top_k:
+                kth = torch.topk(logits, top_k, dim=-1).values[:, -1:]
+                logits = logits.masked_fill(logits &lt; kth, float(&quot;-inf&quot;))
+            if top_p:
+                logits = nucleus(logits, top_p)
+            nxt = torch.multinomial(F.softmax(logits, dim=-1), 1)
+
+        idx = torch.cat([idx, nxt], dim=1)    # append and feed back
+        if nxt.item() == EOS:
+            break
+    return idx</code></pre></div>
+
+<p>Two things in that loop are worth noticing. <strong>Only the last position's logits are used.</strong> The forward pass
+computes logits for every position, but all but the last are predicting tokens already in hand. And <strong>the output is fed
+back as input</strong> — autoregression — which is why generation is inherently serial and why the
+<a href="inference-and-serving.html#kv-cache">KV cache</a> exists: without it, every new token reprocesses the entire prefix.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Strategy</th><th>Picks</th><th>Trade</th></tr></thead>
+<tbody>
+<tr><td><strong>Greedy</strong></td><td>The argmax, always</td><td>Reproducible; degenerates into repetition on long text</td></tr>
+<tr><td><strong>Temperature</strong></td><td>Samples from a sharpened or flattened distribution</td><td>The main diversity knob</td></tr>
+<tr><td><strong>Top-k</strong></td><td>Samples from the k best</td><td>Fixed cut regardless of model confidence</td></tr>
+<tr><td><strong>Top-p</strong></td><td>Samples from the smallest set summing to p</td><td>Adapts to confidence — usually the better default</td></tr>
+<tr><td><strong>Beam search</strong></td><td>Keeps b sequences by total likelihood</td><td>Good for translation; produces bland, repetitive open text</td></tr>
+</tbody></table></div>
+
+<p>Beam search is worth a sentence because its failure is instructive. It maximises sequence likelihood, and the most likely
+long sequence in a language model is boring and repetitive — high-quality human text is <em>not</em> maximally probable. That
+observation is what motivated nucleus sampling.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Three things here are quick credit. Only the last position's logits are used at generation time. Temperature divides the
+logits <em>before</em> the softmax, so applying it after is a no-op. And beam search is wrong for open-ended generation because
+the most probable continuation is not the best one. Each is a one-liner and each separates people who have implemented
+generation from people who have called an API.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Implement the loop above against a small local model and generate from the same prompt at temperature 0, 0.7 and 1.5. Watching degeneration at 0 and incoherence at 1.5 makes the parameter permanent knowledge.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need</a> — the original; worth reading once for the formula and the scaling argument</li><li><a href="https://www.youtube.com/watch?v=kCc8FmEb1nY" target="_blank" rel="noopener">Karpathy: Let&#x27;s build GPT from scratch</a> — two hours, from bigram to a working transformer; the single best resource here</li><li><a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">The Illustrated Transformer</a> — the diagrams most people picture when they think about attention</li><li><a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">RoFormer: rotary position embedding</a> — RoPE, and why absolute rotations give relative positions</li><li><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention</a> — how to avoid materialising the T x T matrix, and why that is an IO problem</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button · Code is Python throughout.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Training &amp; Fine-Tuning — GenAI</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="training-and-fine-tuning">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Internals › Topic 8 of 9</div>
+  <h1>Training &amp; Fine-Tuning</h1>
+  <p class="lede">Pre-train, instruction-tune, align — what each stage changes and what it costs. Then the question you will actually be asked: when to fine-tune rather than prompt or retrieve, and how LoRA and QLoRA make it affordable.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#three-stages">The three stages</a></li><li><a href="#pretraining">Pre-training: data, objective, loop</a></li><li><a href="#when-to-finetune">When to fine-tune, and when not to</a></li><li><a href="#lora">LoRA: why a low-rank update is enough</a></li><li><a href="#qlora">QLoRA: NF4 and one GPU</a></li><li><a href="#preference">Preference tuning: RLHF and DPO</a></li><li><a href="#evaluating">Knowing whether it worked</a></li></ol>
+  </div>
+
+<section id="three-stages"><h2 id="three-stages">The three stages</h2>
+<p>A chat model is built in three stages, and they do different jobs. Candidates who can name all three and say what each
+changes are immediately distinguishable from those who treat "training" as one undifferentiated thing.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Pre-training</th><th>Instruction tuning (SFT)</th><th>Preference tuning</th></tr></thead>
+<tbody>
+<tr><td><strong>Data</strong></td><td>Trillions of tokens of raw text</td><td>Thousands–millions of (instruction, response) pairs</td><td>Comparisons: response A preferred to B</td></tr>
+<tr><td><strong>Objective</strong></td><td>Predict the next token</td><td>Predict the next token — on the response only</td><td>Raise the preferred response's likelihood relative to the rejected one</td></tr>
+<tr><td><strong>Teaches</strong></td><td>Language, facts, reasoning — nearly all capability</td><td>To follow instructions rather than continue text</td><td>Tone, helpfulness, refusal, what "good" looks like</td></tr>
+<tr><td><strong>Cost</strong></td><td>Millions of dollars, thousands of GPUs</td><td>Hundreds to thousands of dollars</td><td>Similar to SFT, plus collecting preferences</td></tr>
+<tr><td><strong>Who does it</strong></td><td>A handful of labs</td><td>Anyone</td><td>Mostly labs; increasingly accessible via DPO</td></tr>
+</tbody></table></div>
+
+<p>The framing worth stating: <strong>pre-training creates the capability; the later stages shape how it is expressed.</strong>
+Instruction tuning does not make a model smarter — it makes a text-continuation engine behave like something you can ask
+questions. The knowledge was already there.</p>
+
+<p>You can see this directly in a base model. Prompt GPT-2 with "What is the capital of France?" and it may continue with more
+questions, because it is completing a document that looks like a quiz. The facts are present; the instruction-following
+behaviour is not. That example is a clean way to make the distinction concrete in an interview.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"What is the difference between a base model and a chat model?" is a common opener. The answer: a base model only continues
+text; instruction tuning teaches it to treat input as a request, and preference tuning shapes tone, helpfulness and refusal.
+Add that <strong>capability comes almost entirely from pre-training</strong> — the later stages are about expression — because
+that is the point that explains why fine-tuning cannot make a small model smart.</p></div></section>
+
+<section id="pretraining"><h2 id="pretraining">Pre-training: data, objective, loop</h2>
+<p>You will not do this, and you should still be able to describe it, because the questions about data, objective and scale are
+standard.</p>
+
+<h3>The objective</h3>
+<p>Next-token prediction, with cross-entropy loss, over everything. The targets are the inputs shifted by one:</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import torch, torch.nn.functional as F
+
+# A batch of token ids: (batch, block_size + 1)
+chunk = get_batch()
+x, y = chunk[:, :-1], chunk[:, 1:]       # inputs, and the SAME tokens shifted
+                                          # left by one -- the labels are free
+
+logits = model(x)                         # (B, T, vocab)
+loss = F.cross_entropy(
+    logits.reshape(-1, logits.size(-1)),  # (B*T, vocab)
+    y.reshape(-1),                        # (B*T,)
+)
+
+# Thanks to the causal mask, EVERY position contributes a prediction
+# conditioned only on its own prefix -- B*T training signals from one
+# forward pass. That is why this is self-supervised: no labels, just text.
+#
+# Sanity check: an untrained model should have loss ~ ln(vocab_size).
+# For a 50257-token vocab that is ~10.8. If initial loss is far off,
+# initialisation or the loss shape is wrong.</code></pre></div>
+
+<p>That <code>ln(vocab_size)</code> check is worth remembering — a uniform distribution over the vocabulary gives exactly that
+cross-entropy, and it is the fastest way to catch a broken training setup.</p>
+
+<h3>Data</h3>
+<p>The quality story matters more than the quantity story now. The pipeline is deduplication (near-duplicates waste compute and
+encourage memorisation), quality filtering (classifier-based, often "does this look like a reference text?"), decontamination
+against benchmark sets, and mixing — code improves reasoning even for non-code tasks, which is one of the more interesting
+empirical findings in the field.</p>
+
+<h3>Scaling</h3>
+<p>Two papers to be able to contrast. The Kaplan scaling laws (2020) suggested making models bigger was the dominant lever.
+<strong>Chinchilla (2022) showed that models were systematically under-trained</strong> — for a fixed compute budget, the optimal
+ratio is roughly <strong>20 tokens per parameter</strong>, far more data and a smaller model than people were using. That finding
+redirected the field toward smaller, longer-trained models, which is why a modern 7B outperforms a 2020-era 175B on many tasks.
+Current practice trains well past Chinchilla-optimal because inference cost, not training cost, is what you pay forever.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"Why is a 7B model today better than GPT-3 at 175B?" is a great question to have an answer for: more and better data
+(Chinchilla-optimal and beyond), heavy deduplication and quality filtering, better architecture details (RoPE, RMSNorm, SwiGLU),
+and instruction plus preference tuning on top. <strong>Parameter count is not capability</strong> — the training recipe is, and
+being able to say that with the Chinchilla ratio attached is a strong signal.</p></div></section>
+
+<section id="when-to-finetune"><h2 id="when-to-finetune">When to fine-tune, and when not to</h2>
+<p>This is the question you are most likely to actually be asked, and <strong>the correct answer is usually "I would not".</strong>
+Getting to that answer by reasoning rather than reflex is the whole exercise.</p>
+
+<h3>The ladder — exhaust each rung first</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Rung</th><th>Approach</th><th>Cost</th><th>Iteration</th><th>Fixes</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><strong>Better prompt</strong></td><td>Free</td><td>Seconds</td><td>Most problems, genuinely</td></tr>
+<tr><td>2</td><td><strong>Few-shot examples</strong></td><td>Tokens per request</td><td>Minutes</td><td>Format and edge cases</td></tr>
+<tr><td>3</td><td><strong>Retrieval</strong></td><td>Infrastructure</td><td>Hours</td><td><strong>Missing knowledge</strong></td></tr>
+<tr><td>4</td><td><strong>Fine-tuning</strong></td><td>GPU time + data + a model to host</td><td>Days</td><td>Consistent behaviour, format, tone, latency</td></tr>
+</tbody></table></div>
+
+<h3>What fine-tuning is and is not for</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Good at</th><th>Bad at</th></tr></thead>
+<tbody>
+<tr><td>A consistent output format you cannot reliably prompt for</td><td><strong>Teaching facts</strong> — unreliable, and they go stale</td></tr>
+<tr><td>A domain's tone, idiom or style</td><td>Knowledge that changes — you would retrain on every update</td></tr>
+<tr><td>A narrow, repetitive task done at volume</td><td>Making a small model broadly capable</td></tr>
+<tr><td>Distilling a big model's behaviour into a cheaper one</td><td>Anything you have fewer than ~1,000 good examples for</td></tr>
+<tr><td>Dropping latency and cost by replacing a long prompt</td><td>Problems you have not first tried to prompt your way out of</td></tr>
+</tbody></table></div>
+
+<p>The crisp version: <strong>fine-tuning teaches behaviour; retrieval supplies knowledge.</strong> "The model does not know
+about our products" is a retrieval problem and answering it with fine-tuning is the single most common wrong answer in this
+round. Facts installed by fine-tuning are entangled with everything else, cannot be cited, cannot be updated without retraining,
+and are not reliably recalled.</p>
+
+<h3>The honest costs</h3>
+<p>Say these, because they are what makes the decision real: you now host a model, or pay a provider to; every base-model upgrade
+means redoing the work; you need an eval suite to know whether it helped, so you cannot skip the evals anyway; and
+<strong>catastrophic forgetting</strong> is real — a model tuned hard on one task gets worse at others, which is a particular
+risk when the task data is narrow.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>When asked "would you fine-tune for this?", walk the ladder out loud and land on a reason. <strong>"If the problem is that it
+does not know our data, that is retrieval. If the problem is that it will not reliably produce our output format even with
+few-shot examples, that is fine-tuning — and I would want at least a thousand good examples and an eval suite before starting,
+because otherwise I cannot tell whether it worked."</strong> Confidently declining is the stronger answer, and the specificity
+is what makes it credible.</p></div></section>
+
+<section id="lora"><h2 id="lora">LoRA: why a low-rank update is enough</h2>
+<p>Full fine-tuning updates every weight, which means storing optimizer state for every weight. With Adam that is roughly
+<strong>16 bytes per parameter</strong> — weights, gradients, and two moment estimates in fp32 — so a 7B model needs well over
+100 GB before activations. That is several A100s for a model that fits on one card at inference.</p>
+
+<p><strong>LoRA freezes the base model and trains a small low-rank update instead.</strong></p>
+
+<h3>The idea</h3>
+<p>The observation is that the <em>change</em> a fine-tune makes to a weight matrix has low intrinsic rank — you are adapting
+behaviour, not relearning language. So instead of learning ΔW directly (d×k parameters), learn two thin matrices whose product
+has the same shape:</p>
+
+<p><code>W' = W + BA</code>, where <code>B</code> is d×r, <code>A</code> is r×k, and <code>r ≪ min(d, k)</code>.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import torch, torch.nn as nn
+
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, r=8, alpha=16, dropout=0.05):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad = False                  # FROZEN
+
+        d_out, d_in = base.weight.shape
+        self.A = nn.Parameter(torch.empty(r, d_in))
+        self.B = nn.Parameter(torch.zeros(d_out, r))
+        nn.init.kaiming_uniform_(self.A, a=5 ** 0.5)
+        # B starts at ZERO, so BA = 0 and the adapted model is EXACTLY the
+        # base model at step 0. Training starts from a known-good point
+        # instead of perturbing a trained network randomly.
+
+        self.scale   = alpha / r
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.base(x) + self.dropout(x) @ self.A.T @ self.B.T * self.scale
+
+
+# The arithmetic that makes it worth it:
+d_out = d_in = 4096
+full = d_out * d_in                          # 16,777,216
+lora = 8 * d_in + d_out * 8                  #     65,536   (r=8)
+print(f&quot;{full/lora:.0f}x fewer trainable parameters&quot;)   # 256x</code></pre></div>
+
+<p>Three details that get asked about:</p>
+
+<ul>
+<li><strong>B is initialised to zero.</strong> So the product BA is zero and the model starts out exactly equal to the base.
+Initialising both randomly would perturb a trained network before learning anything.</li>
+<li><strong>alpha/r is the scaling factor.</strong> It decouples the learning rate from the rank, so changing r does not require
+re-tuning everything. A common convention is alpha = 2r.</li>
+<li><strong>Which matrices to adapt.</strong> The original paper used the attention Q and V projections; current practice often
+targets all linear layers including the FFN, which costs more parameters and generally works better.</li>
+</ul>
+
+<h3>Why it is operationally good</h3>
+<p>The adapter is tens of megabytes rather than tens of gigabytes. That means you can keep many task-specific adapters over one
+base model and swap them per request, which is a genuinely different deployment story from hosting many fine-tuned models. And
+because <code>W + BA</code> is just a matrix, the adapter can be <strong>merged into the base weights</strong> after training for
+zero added inference latency — at the cost of losing the ability to swap it.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"Why does LoRA work?" — because the weight <em>update</em> needed to adapt behaviour has low intrinsic rank; you are not
+relearning language, you are nudging a model that already has the capability. Then give the operational consequence, which is the
+part that matters in practice: <strong>a 30 MB adapter per task over one shared base model, swappable per request, mergeable for
+zero inference overhead.</strong> Mentioning the zero-init of B shows you have read the implementation and not just the
+abstract.</p></div></section>
+
+<section id="qlora"><h2 id="qlora">QLoRA: NF4 and one GPU</h2>
+<p>LoRA removes the optimizer state. The <em>frozen base model</em> still has to sit in memory, and at fp16 a 7B model is 14 GB
+before activations — so a 24 GB consumer card is tight and a 70B is impossible. <strong>QLoRA quantizes the frozen base to 4
+bits and trains the LoRA adapters in 16-bit on top.</strong></p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Approach</th><th>7B memory</th><th>Fits on</th></tr></thead>
+<tbody>
+<tr><td>Full fine-tune (Adam, fp32 states)</td><td>~112 GB</td><td>Several A100s</td></tr>
+<tr><td>LoRA, fp16 base</td><td>~16 GB</td><td>One A100 / 24 GB card, just</td></tr>
+<tr><td><strong>QLoRA, NF4 base</strong></td><td><strong>~6 GB</strong></td><td>A consumer GPU</td></tr>
+</tbody></table></div>
+
+<p>Three ideas make it work, and naming all three is the answer to "what is QLoRA?":</p>
+
+<p><strong>1 · NF4 — 4-bit NormalFloat.</strong> A data type whose 16 levels are placed at the quantiles of a normal
+distribution rather than spaced uniformly. Neural-network weights are approximately normally distributed, so
+information-theoretically optimal spacing for that distribution loses less than uniform INT4 does. This is the part people
+miss — NF4 is not "INT4 with a different name", it is a different placement of the levels.</p>
+
+<p><strong>2 · Double quantization.</strong> Quantization needs a scale factor per block. Those scales are themselves fp32 and
+add up, so QLoRA quantizes the scales too — saving roughly another 0.4 bits per parameter.</p>
+
+<p><strong>3 · Paged optimizers.</strong> Optimizer state is paged to CPU memory on a spike, so a long sequence does not kill
+the run with an out-of-memory error.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+import torch
+
+bnb = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type=&quot;nf4&quot;,            # NOT &quot;fp4&quot; -- quantile-spaced levels
+    bnb_4bit_use_double_quant=True,       # quantize the scales too
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    # ^ Weights are STORED in 4-bit and DEQUANTIZED to bf16 for each matmul.
+    #   The arithmetic is never done in 4 bits. This is the detail people
+    #   get wrong: QLoRA saves MEMORY, it does not do 4-bit math.
+)
+
+model = AutoModelForCausalLM.from_pretrained(&quot;meta-llama/Llama-3.1-8B&quot;,
+                                             quantization_config=bnb,
+                                             device_map=&quot;auto&quot;)
+model = prepare_model_for_kbit_training(model)
+
+model = get_peft_model(model, LoraConfig(
+    r=16, lora_alpha=32, lora_dropout=0.05, bias=&quot;none&quot;,
+    task_type=&quot;CAUSAL_LM&quot;,
+    target_modules=[&quot;q_proj&quot;, &quot;k_proj&quot;, &quot;v_proj&quot;, &quot;o_proj&quot;,
+                    &quot;gate_proj&quot;, &quot;up_proj&quot;, &quot;down_proj&quot;],   # attention + FFN
+))
+model.print_trainable_parameters()
+# trainable: 41,943,040 || all: 8,072,204,288 || trainable%: 0.52</code></pre></div>
+
+<div class="callout callout-warn"><span class="callout-title">The thing to get right</span>
+<p><strong>The base model is stored in 4 bits and dequantized to bf16 for every matmul.</strong> No arithmetic happens at 4-bit
+precision. This is why QLoRA is slower per step than plain LoRA despite using less memory — you are paying dequantization on
+every forward pass — and saying so distinguishes understanding the mechanism from having read the headline.</p></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"What does QLoRA quantize?" — the frozen base model, to NF4; the adapters stay in 16-bit because they are what you are
+training. Add the three components (NF4, double quantization, paged optimizers), the memory number (a 7B fine-tune in about 6 GB),
+and the trade (slower per step, because of dequantization). That is a complete answer in thirty seconds.</p></div></section>
+
+<section id="preference"><h2 id="preference">Preference tuning: RLHF and DPO</h2>
+<p>Instruction tuning teaches the model to answer. It does not teach it which of two reasonable answers is <em>better</em> —
+more helpful, better formatted, appropriately cautious. That requires comparisons, because "better" is far easier for a human to
+judge than to demonstrate.</p>
+
+<h3>RLHF</h3>
+<p>Three steps: collect preferences (humans rank model outputs), train a <strong>reward model</strong> to predict those
+preferences, then optimise the language model against that reward with reinforcement learning — PPO — with a KL penalty keeping
+it from drifting too far from the SFT model.</p>
+
+<p>It works and it is complicated: three models in play (policy, reward, reference), RL training that is notoriously
+unstable, and <strong>reward hacking</strong>, where the policy finds outputs that score highly under the reward model without
+being better. Verbosity is the classic example — reward models reliably prefer longer answers, so unconstrained RLHF produces
+models that pad.</p>
+
+<h3>DPO</h3>
+<p>Direct Preference Optimization is the one to understand, because it is what most open fine-tuning now uses. The insight is
+that the RLHF objective has a closed-form optimal policy, and you can rearrange it so that <strong>the language model is
+implicitly its own reward model</strong>. No separate reward model, no RL loop — just a classification-style loss on preference
+pairs.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import torch.nn.functional as F
+
+def dpo_loss(policy_chosen_logps, policy_rejected_logps,
+             ref_chosen_logps,    ref_rejected_logps, beta=0.1):
+    &quot;&quot;&quot;One supervised-looking loss over (prompt, chosen, rejected) triples.&quot;&quot;&quot;
+
+    # How much MORE the policy prefers `chosen` than the reference does...
+    chosen_rel   = policy_chosen_logps   - ref_chosen_logps
+    # ...minus the same quantity for `rejected`.
+    rejected_rel = policy_rejected_logps - ref_rejected_logps
+
+    # Push the gap up. beta controls how far the policy may drift from the
+    # reference -- it plays the role of the KL penalty in PPO.
+    return -F.logsigmoid(beta * (chosen_rel - rejected_rel)).mean()
+
+# The frozen reference model is why this is stable: the loss is defined
+# RELATIVE to the SFT starting point, so the policy cannot wander into
+# degenerate text that happens to score well.</code></pre></div>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>RLHF / PPO</th><th>DPO</th></tr></thead>
+<tbody>
+<tr><td>Models in play</td><td>Policy, reward, reference, value</td><td>Policy and a frozen reference</td></tr>
+<tr><td>Training</td><td>RL loop, sampling during training</td><td>A supervised-style loss over pairs</td></tr>
+<tr><td>Stability</td><td>Finicky; needs careful tuning</td><td>Much more stable</td></tr>
+<tr><td>Compute</td><td>High</td><td>Roughly SFT-level</td></tr>
+<tr><td>Ceiling</td><td>Higher, with enough care</td><td>Slightly lower, far easier</td></tr>
+</tbody></table></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>The one-line distinction: <strong>"RLHF trains a separate reward model and optimises against it with RL; DPO shows that the
+optimal policy has a closed form, so you can train directly on preference pairs with the model acting as its own implicit reward
+model — no RL loop."</strong> Then mention reward hacking and the verbosity bias, because knowing the failure mode of a technique
+is better evidence of understanding than knowing the technique.</p></div></section>
+
+<section id="evaluating"><h2 id="evaluating">Knowing whether it worked</h2>
+<p>Fine-tuning without evaluation is guessing with a GPU bill. You need a baseline before you start, and the comparison has to be
+on data the model never saw.</p>
+
+<h3>What to measure</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Measure</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><strong>Task metric on a held-out set</strong></td><td>The point of the exercise. Define it before training</td></tr>
+<tr><td><strong>The prompted baseline</strong></td><td>If a good prompt on the base model matches your tune, you have wasted the work</td></tr>
+<tr><td><strong>General capability</strong></td><td>Catastrophic forgetting — did it get worse at everything else?</td></tr>
+<tr><td><strong>Format compliance</strong></td><td>Often the actual goal: does it now produce valid output every time?</td></tr>
+<tr><td><strong>Latency and cost</strong></td><td>Sometimes the real win — a tuned 3B replacing a prompted frontier model</td></tr>
+</tbody></table></div>
+
+<p>The second row is the comparison people skip and it is the one that decides whether the project was worth doing. The honest
+baseline is <em>a seriously-tried prompt on the base model</em>, not the first thing you wrote.</p>
+
+<p>The third row is the one that bites later. A model tuned hard on a narrow task degrades elsewhere, and if your eval set only
+covers the target task you will not see it until something else breaks in production. Keep a small general suite and run it every
+time.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>def report(base_model, tuned_model, task_set, general_set):
+    rows = {
+        &quot;task / base + prompt&quot;: evaluate(base_model,  task_set, prompt=BEST_PROMPT),
+        &quot;task / tuned&quot;:         evaluate(tuned_model, task_set),
+        &quot;general / base&quot;:       evaluate(base_model,  general_set),
+        &quot;general / tuned&quot;:      evaluate(tuned_model, general_set),   # forgetting
+        &quot;format / base&quot;:        format_ok(base_model,  task_set),
+        &quot;format / tuned&quot;:       format_ok(tuned_model, task_set),
+    }
+    for k, v in rows.items():
+        print(f&quot;{k:24s} {v:.3f}&quot;)
+
+# A result that says &quot;ship it&quot;:
+#   task / base + prompt    0.71
+#   task / tuned            0.89      &lt;- clear gain over a SERIOUS baseline
+#   general / base          0.80
+#   general / tuned         0.78      &lt;- small, acceptable forgetting
+#   format / base           0.84
+#   format / tuned          1.00      &lt;- often the real prize</code></pre></div>
+
+<h3>Overfitting, which happens fast</h3>
+<p>Fine-tuning datasets are small and LoRA converges quickly. One to three epochs is usually right; beyond that the model starts
+reproducing training examples rather than generalising. Watch validation loss and stop when it turns, and be suspicious of a
+training loss that goes very low — on a few thousand examples that means memorisation.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>If a fine-tuning question comes up, close on measurement: <strong>"I'd define the metric and build the held-out set before
+training, compare against a seriously-tried prompt on the base model rather than against nothing, and keep a general suite to
+catch forgetting."</strong> The prompted-baseline point in particular signals that you would be willing to conclude the project
+was unnecessary — which is exactly the judgement the round is probing for.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Do one LoRA run on a 1–3B model with a few thousand examples, just to see the knobs move. The point is not the model; it is being able to speak concretely about rank, epochs, loss curves and how fast it overfits.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">LoRA: low-rank adaptation</a> — the original; short, and the intrinsic-rank argument is the part to read</li><li><a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">QLoRA</a> — NF4, double quantization and paged optimizers, with the memory numbers</li><li><a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noopener">Direct Preference Optimization</a> — the derivation that removes the reward model</li><li><a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener">Training Compute-Optimal LLMs (Chinchilla)</a> — the ~20 tokens per parameter result that redirected the field</li><li><a href="https://huggingface.co/docs/peft" target="_blank" rel="noopener">Hugging Face PEFT</a> — the library, and a good practical guide to adapter configuration</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button · Code is Python throughout.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

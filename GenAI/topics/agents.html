@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents — GenAI</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="agents">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Building › Topic 6 of 9</div>
+  <h1>Agents</h1>
+  <p class="lede">Anatomy — model, tools, memory, guard-rails — then the design decisions that matter: why models are stateless and what that costs, when an agent should be a state machine instead, what multi-agent buys and what it costs, MCP as a protocol, and where the human goes.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#anatomy">Anatomy of an agent</a></li><li><a href="#memory">Memory and context engineering</a></li><li><a href="#guardrails">Guard-rails and validation</a></li><li><a href="#state-machines">When an agent should be a state machine</a></li><li><a href="#multi-agent">Multi-agent: delegation, hand-off, and when not to</a></li><li><a href="#mcp">MCP: tools as a protocol</a></li><li><a href="#hitl">Human-in-the-loop and approvals</a></li></ol>
+  </div>
+
+<section id="anatomy"><h2 id="anatomy">Anatomy of an agent</h2>
+<p>An agent is <strong>a model in a loop with tools, able to act and observe the result.</strong> Four components, and it is worth
+naming them separately because each is a distinct design decision with its own failure mode.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Component</th><th>What it is</th><th>Decision</th><th>Fails as</th></tr></thead>
+<tbody>
+<tr><td><strong>Model</strong></td><td>The thing that decides what to do next</td><td>Which model, what temperature, reasoning or not</td><td>Picks the wrong tool; loops</td></tr>
+<tr><td><strong>Tools</strong></td><td>What it can perceive and do</td><td>Which capabilities, and which need approval</td><td>Misused tools; unbounded authority</td></tr>
+<tr><td><strong>Memory</strong></td><td>What it knows about this and past interactions</td><td>How much history, summarised or truncated, persisted where</td><td>Context overflow; forgotten constraints</td></tr>
+<tr><td><strong>Guard-rails</strong></td><td>What it is not allowed to do or say</td><td>Input checks, output validation, approval gates</td><td>The failure you only find in production</td></tr>
+</tbody></table></div>
+
+<p>The useful mental model is the one from <a href="genai-round.html">module 1's human analogy</a>: perception is the input and
+the tool results, cognition is the model plus whatever state you re-supply, action is the tools. The loop closes it —
+perceive, decide, act, observe, repeat.</p>
+
+<h3>Start simpler than an agent</h3>
+<p>This is the point most worth making in an interview, and Anthropic's own guidance leads with it. There is a ladder, and you
+should climb it only as far as the problem requires:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Pattern</th><th>What it is</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><strong>Single call</strong></td><td>One prompt, one response</td><td>The task is one step. Most tasks</td></tr>
+<tr><td><strong>Chain</strong></td><td>Fixed sequence of calls, output to input</td><td>Steps are known in advance and never vary</td></tr>
+<tr><td><strong>Router</strong></td><td>Classify, then dispatch to a specialised handler</td><td>Distinct input types needing different treatment</td></tr>
+<tr><td><strong>Workflow</strong></td><td>Code controls the path; the model fills in steps</td><td>The path is knowable; you want it auditable</td></tr>
+<tr><td><strong>Agent</strong></td><td>The model decides the path, in a loop</td><td>The steps genuinely cannot be known in advance</td></tr>
+</tbody></table></div>
+
+<p>An agent is the most capable and the least predictable option. You give up the ability to know what will happen, to test
+exhaustively, and to bound cost precisely. Take that trade only when the problem actually has an open-ended shape — and say so,
+because "I'd use a workflow here, not an agent, because the steps are known" is a judgement answer that stands out against a
+field that reaches for agents by default.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>When handed an agent prompt, spend your first thirty seconds on whether it needs one. If the steps are fixed, say you would
+build a workflow and keep the model inside individual steps, because it is cheaper, testable and debuggable. If the steps genuinely
+vary with what is found along the way, say that, and then design the agent. Either way you have shown you know the trade exists.</p></div></section>
+
+<section id="memory"><h2 id="memory">Memory and context engineering</h2>
+<p><strong>Models are stateless.</strong> Nothing persists between calls. Everything an agent appears to remember is text you
+re-send on every single request — which makes memory a cost and capacity problem before it is a feature.</p>
+
+<p>The consequence people miss: conversation cost grows <em>quadratically</em> with turns. Turn 20 re-sends the whole of turns
+1–19, so total tokens across a conversation is O(n²) even though each turn feels linear.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code># Why unbounded history is not an option.
+avg_turn = 300            # tokens per message pair
+total = sum(avg_turn * i for i in range(1, 51))
+print(f&quot;50 turns, naive: {total:,} tokens billed&quot;)   # 382,500
+print(f&quot;vs if each turn were independent: {avg_turn * 50:,}&quot;)  # 15,000
+# 25x the cost, and turn ~40 hits a 32k window anyway.</code></pre></div>
+
+<h3>The four strategies</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Strategy</th><th>How</th><th>Loses</th><th>Good for</th></tr></thead>
+<tbody>
+<tr><td><strong>Full history</strong></td><td>Send everything</td><td>Nothing — until it breaks</td><td>Short conversations only</td></tr>
+<tr><td><strong>Sliding window</strong></td><td>Keep the last N turns</td><td>Anything said early, silently</td><td>Support chat where recency dominates</td></tr>
+<tr><td><strong>Summarisation</strong></td><td>Compress old turns into a running summary</td><td>Detail, irrecoverably</td><td>Long conversations that need continuity</td></tr>
+<tr><td><strong>Retrieval over history</strong></td><td>Index past turns; fetch the relevant ones</td><td>Flow and ordering</td><td>Very long-running assistants</td></tr>
+</tbody></table></div>
+
+<p>Production systems combine them: a verbatim window of recent turns, a running summary of what came before, and pinned facts
+that must never be dropped.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>class Memory:
+    &quot;&quot;&quot;Window + summary + pinned facts -- the combination that actually works.&quot;&quot;&quot;
+
+    def __init__(self, window_turns=10, pin_budget=500):
+        self.turns, self.summary, self.pinned = [], &quot;&quot;, []
+        self.window, self.pin_budget = window_turns, pin_budget
+
+    def add(self, role, content):
+        self.turns.append({&quot;role&quot;: role, &quot;content&quot;: content})
+        if len(self.turns) &gt; self.window * 2:
+            old, self.turns = self.turns[:-self.window * 2], self.turns[-self.window * 2:]
+            self.summary = summarise(self.summary, old)
+
+    def pin(self, fact):
+        &quot;&quot;&quot;Constraints that must survive compaction: &#x27;user is in the EU&#x27;,
+        &#x27;budget is 5000&#x27;, &#x27;do not contact them by phone&#x27;. These are exactly
+        what summarisation drops, and dropping them causes the worst bugs.&quot;&quot;&quot;
+        self.pinned.append(fact)
+
+    def messages(self, system):
+        head = system
+        if self.pinned:
+            head += &quot;\n\nEstablished facts:\n&quot; + &quot;\n&quot;.join(f&quot;- {f}&quot; for f in self.pinned)
+        if self.summary:
+            head += f&quot;\n\nEarlier in this conversation:\n{self.summary}&quot;
+        return [{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: head}, *self.turns]</code></pre></div>
+
+<p>The pinned-facts idea is the one worth raising. Summarisation reliably drops exactly the constraints that matter — a budget, a
+deadline, a stated preference, a prior refusal — because they are short and unglamorous next to the narrative. An agent that
+forgets the user already said no is a memorable failure.</p>
+
+<h3>Context engineering</h3>
+<p>The broader discipline: deciding what goes into the window, in what order, within a fixed budget. System prompt, pinned facts,
+summary, recent turns, retrieved documents, tool schemas — all competing. The design question is not "how do I fit more in" but
+<strong>"what gets dropped first, and does the user find out?"</strong> Have an answer; most candidates do not.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"Models are stateless, so memory is something I re-send on every request, and that cost grows quadratically with conversation
+length" is a precise, slightly surprising sentence that immediately signals you have built one of these. Follow with the window
+plus summary plus pinned facts structure and the eviction question, and that is a complete answer in forty seconds.</p></div></section>
+
+<section id="guardrails"><h2 id="guardrails">Guard-rails and validation</h2>
+<p>Guard-rails are the checks around the model — before input reaches it, and before output reaches anything else. They are
+ordinary code, and the key design point is that <strong>they live outside the model, where no amount of text can disable
+them.</strong></p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Where</th><th>Checks</th><th>On failure</th></tr></thead>
+<tbody>
+<tr><td><strong>Input</strong></td><td>Length, rate limit, obvious abuse, PII you must not store</td><td>Reject before spending a token</td></tr>
+<tr><td><strong>Tool call</strong></td><td>Is this tool allowed for this user? Are the arguments in range?</td><td>Deny, and tell the model why</td></tr>
+<tr><td><strong>Output</strong></td><td>Schema validity, citation support, leaked secrets, policy</td><td>Retry, degrade, or escalate</td></tr>
+<tr><td><strong>Action</strong></td><td>Is this irreversible? Does it need a human?</td><td>Pause for approval</td></tr>
+</tbody></table></div>
+
+<p>The most valuable of these is the cheapest: <strong>validate output against a schema and retry with the error.</strong> Showing
+the model its own validation failure is remarkably effective, because the failure is usually a format slip rather than a
+misunderstanding.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>from pydantic import ValidationError
+
+def generate_validated(prompt, schema, *, max_retries=2):
+    messages = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: prompt}]
+
+    for attempt in range(max_retries + 1):
+        raw = call_model(messages, temperature=0)
+        try:
+            return schema.model_validate_json(raw)
+        except ValidationError as e:
+            if attempt == max_retries:
+                raise OutputInvalid(raw) from e     # degrade LOUDLY, never silently
+            # Feed the error back: the model can almost always fix its own
+            # schema violation when shown precisely what was wrong.
+            messages += [
+                {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: raw},
+                {&quot;role&quot;: &quot;user&quot;,
+                 &quot;content&quot;: f&quot;That did not validate:\n{e}\nReturn only valid JSON.&quot;},
+            ]</code></pre></div>
+
+<p>Note the bound. Unlimited retries turn a bad day into an expensive bad day; two attempts then a loud failure is a defensible
+policy. And the failure must be loud — an agent that silently returns a degraded answer when validation fails is worse than one
+that errors, because nobody finds out.</p>
+
+<h3>Validating against the source</h3>
+<p>For RAG, the highest-value output guard-rail is checking that cited ids were actually retrieved. It is a set membership test,
+it costs nothing, and it catches a specific and common failure — the model inventing a plausible-looking citation.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Distinguish <strong>guard-rails</strong> (checks in code) from <strong>prompt instructions</strong> (requests to the model).
+An instruction is a preference the model usually honours; a guard-rail is a constraint it cannot violate because it is enforced
+outside the model. "Do not reveal the system prompt" in a prompt is a request. A regex over the output is a guard-rail. Most
+candidates conflate them, and the distinction is exactly what makes a design safe rather than hopeful.</p></div></section>
+
+<section id="state-machines"><h2 id="state-machines">When an agent should be a state machine</h2>
+<p>An open-ended agent loop is the right answer when the path genuinely cannot be known in advance. Often it can, and then a
+state machine is better in every way that matters: you can enumerate the states, test the transitions, resume after a crash,
+and tell a user where their request is.</p>
+
+<p>The signals that a prompt is really a state machine: the domain has named stages, some transitions are illegal, something
+must be durable across a restart, or a human has to approve a step in the middle.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>from enum import Enum, auto
+
+class S(Enum):
+    RECEIVED = auto(); CLASSIFIED = auto(); INFO_NEEDED = auto()
+    RESOLVED = auto(); AWAITING_APPROVAL = auto(); ESCALATED = auto(); CLOSED = auto()
+
+# The model decides WITHIN a state. Code decides WHICH state is next, and
+# which transitions exist at all. That is the whole idea.
+ALLOWED = {
+    S.RECEIVED:          {S.CLASSIFIED},
+    S.CLASSIFIED:        {S.INFO_NEEDED, S.RESOLVED, S.AWAITING_APPROVAL, S.ESCALATED},
+    S.INFO_NEEDED:       {S.CLASSIFIED, S.ESCALATED},
+    S.AWAITING_APPROVAL: {S.RESOLVED, S.ESCALATED},      # cannot self-approve
+    S.RESOLVED:          {S.CLOSED},
+    S.ESCALATED:         {S.CLOSED},
+    S.CLOSED:            set(),
+}
+
+def transition(ticket, to):
+    if to not in ALLOWED[ticket.state]:
+        raise IllegalTransition(f&quot;{ticket.state} -&gt; {to}&quot;)
+    ticket.state = to
+    ticket.save()        # durable: survives a crash, and is auditable</code></pre></div>
+
+<p>The property worth naming: <strong>the model chooses within a state; code owns the transitions.</strong> An agent cannot
+reason its way from <code>AWAITING_APPROVAL</code> to <code>RESOLVED</code>, because that edge does not exist in the table. No
+prompt can create it. That is a far stronger guarantee than instructing the model not to self-approve.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Open loop</th><th>State machine</th></tr></thead>
+<tbody>
+<tr><td>Path</td><td>Model decides</td><td>Code constrains</td></tr>
+<tr><td>Testing</td><td>Sample and hope</td><td>Enumerate transitions</td></tr>
+<tr><td>Durability</td><td>In-memory conversation</td><td>Persisted state; resumable</td></tr>
+<tr><td>Observability</td><td>Read the trace</td><td>Query the state column</td></tr>
+<tr><td>Human steps</td><td>Awkward</td><td>Natural — a state that waits</td></tr>
+<tr><td>Flexibility</td><td>Handles the unanticipated</td><td>Only what you modelled</td></tr>
+</tbody></table></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>In any agent prompt involving a process with stages — tickets, orders, onboarding, approvals — propose the state machine and
+say why: <strong>"illegal transitions become impossible rather than discouraged, the state is durable so a crash does not lose
+the request, and an approval step is just a state that waits."</strong> It is the more senior answer, and it is the one that
+makes the human-in-the-loop requirement fall out naturally instead of being bolted on.</p></div></section>
+
+<section id="multi-agent"><h2 id="multi-agent">Multi-agent: delegation, hand-off, and when not to</h2>
+<p>Multi-agent systems are the most over-applied pattern in this field. They solve real problems; they also multiply cost,
+latency and failure modes, and the honest default is a single agent with good tools.</p>
+
+<h3>The two patterns</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Delegation (sub-agent)</th><th>Hand-off</th></tr></thead>
+<tbody>
+<tr><td>Control</td><td>Caller keeps it; sub-agent returns a result</td><td>Transferred; the new agent owns the conversation</td></tr>
+<tr><td>Looks like</td><td>A function call that happens to be an agent</td><td>A transfer to a different department</td></tr>
+<tr><td>Context</td><td>Sub-agent gets only what it needs</td><td>Usually the whole conversation</td></tr>
+<tr><td>Use for</td><td>A bounded subtask: research this, summarise that</td><td>A genuinely different specialisation and toolset</td></tr>
+</tbody></table></div>
+
+<p>Delegation is the more useful of the two, and the reason is <strong>context isolation</strong>. A sub-agent that reads twenty
+documents and returns three sentences has kept nineteen documents' worth of tokens out of the parent's window. That is a real
+architectural benefit and the strongest argument for the pattern.</p>
+
+<h3>What it costs</h3>
+<ul>
+<li><strong>Every hand-off loses information.</strong> The receiving agent gets a summary or a transcript, never the full
+reasoning. Errors compound across hops.</li>
+<li><strong>Cost multiplies.</strong> Each agent has its own system prompt, tool schemas and history. Three agents is far more
+than three times one agent's tokens.</li>
+<li><strong>Debugging gets much harder.</strong> A wrong answer could originate in any agent or in any hand-off between them.</li>
+<li><strong>Latency is additive</strong>, and usually serial.</li>
+</ul>
+
+<p>When it genuinely helps: when subtasks are <strong>parallel</strong> and independent — research five suppliers at once, where
+the wall-clock win is real; when context isolation is the point; when specialisations need genuinely different tools and system
+prompts; and when a separation is a <em>security</em> boundary, which is the strongest case of all.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code># The strongest reason for two agents: a privilege boundary.
+#
+# READER sees untrusted content and holds NO dangerous tools. Whatever a
+# malicious document tells it to do, it cannot do.
+reader = Agent(tools=[fetch_page, search], output_type=ExtractedFacts)
+
+# ACTOR holds the dangerous tools and never sees raw untrusted text --
+# only the validated, structured output of the reader.
+actor  = Agent(tools=[send_email, create_ticket], requires_approval=[&quot;send_email&quot;])
+
+facts  = reader.run(f&quot;Extract the customer&#x27;s request from: {untrusted_email}&quot;)
+result = actor.run(f&quot;Handle this request: {facts.model_dump_json()}&quot;)
+
+# A prompt injection in the email can corrupt `facts`. It cannot reach
+# send_email, because the agent holding that tool never reads the email.
+# That is an architectural guarantee, not a prompting one.</code></pre></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Resist multi-agent as a first answer. Say: <strong>"I'd start with one agent and good tools; I would split it only for
+parallelism, context isolation, or a privilege boundary."</strong> Then, if the prompt involves untrusted input and dangerous
+tools, propose the split above as a <em>security</em> measure. That ordering — default to simple, split for a named reason —
+is the judgement being graded, and the privilege-boundary case is the one that makes multi-agent clearly correct rather than
+fashionable.</p></div></section>
+
+<section id="mcp"><h2 id="mcp">MCP: tools as a protocol</h2>
+<p>Function calling is how one application describes its tools to a model. <strong>MCP — the Model Context Protocol — is a
+standard for exposing tools and data so that <em>any</em> client can use them.</strong> The distinction is worth being precise
+about, because candidates routinely conflate the two.</p>
+
+<p>The problem it solves is combinatorial. Without a protocol, every application that wants to talk to every data source needs
+its own integration: M clients × N sources. With one, each source implements a server once and each client speaks the protocol
+once — M + N. It is the same argument as LSP made for editors and language tooling, and saying that is a good shorthand.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>MCP exposes</th><th>What it is</th><th>Analogy</th></tr></thead>
+<tbody>
+<tr><td><strong>Tools</strong></td><td>Functions the model can invoke</td><td>POST — has effects</td></tr>
+<tr><td><strong>Resources</strong></td><td>Data the client can read</td><td>GET — no effects</td></tr>
+<tr><td><strong>Prompts</strong></td><td>Reusable templates the server offers</td><td>A saved query</td></tr>
+</tbody></table></div>
+
+<p>Transports are <strong>stdio</strong> — the server is a subprocess, which is how local integrations work and means no network
+exposure — and <strong>HTTP with Server-Sent Events</strong> for remote servers, which is where authentication becomes a real
+concern.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP(&quot;orders&quot;)
+
+@mcp.tool()
+def get_order(order_id: int) -&gt; dict:
+    &quot;&quot;&quot;Look up an order by id. Returns status, total_cents and placed_at.&quot;&quot;&quot;
+    return db.fetch_order(order_id)
+
+@mcp.resource(&quot;orders://recent&quot;)
+def recent() -&gt; str:
+    &quot;&quot;&quot;The 50 most recent orders, as JSON.&quot;&quot;&quot;     # read-only: a RESOURCE, not a tool
+    return json.dumps(db.recent(50))
+
+if __name__ == &quot;__main__&quot;:
+    mcp.run()        # stdio by default -- a subprocess, no port, no network</code></pre></div>
+
+<h3>The part that matters in an interview</h3>
+<p>MCP moves the trust boundary. An MCP server is <strong>third-party code with access to your data, invoked by a model</strong>.
+Three consequences worth naming: the server defines its own tool descriptions, so a malicious or compromised server can describe
+a tool misleadingly to induce the model to call it; a remote server needs real authentication and per-user authorisation, not a
+shared token; and tool results are untrusted input to your agent, exactly like retrieved documents.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Give the one-line distinction first — "function calling is the wire format between an app and a model; MCP is a protocol so
+tools can be written once and used by any client" — and then the M×N to M+N argument. If the conversation goes further, the
+security framing is where the credit is: the tool <em>descriptions</em> come from the server and go into your prompt, so
+installing an MCP server is closer to installing a dependency than to configuring an API.</p></div></section>
+
+<section id="hitl"><h2 id="hitl">Human-in-the-loop and approvals</h2>
+<p>Every agent that can do something irreversible needs a point where a human says yes. The design question is where that point
+is, what it shows, and what happens while it waits.</p>
+
+<h3>Where the gate goes</h3>
+<p>Between the tool call and its execution — in <em>your</em> code, at step 3 of the
+<a href="tools-and-function-calling.html#wire-format">wire-format loop</a>. Not in the prompt. A gate the model can be talked out
+of is not a gate, and that is precisely the distinction prompt injection exploits.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>NEEDS_APPROVAL = {&quot;send_email&quot;, &quot;issue_refund&quot;, &quot;delete_record&quot;, &quot;deploy&quot;}
+
+def execute(call, ctx):
+    if call.name not in NEEDS_APPROVAL:
+        return dispatch(call)
+
+    # Persist and SUSPEND. A human approval is minutes to days -- this
+    # cannot be an in-memory await.
+    req = ApprovalRequest.create(
+        run_id=ctx.run_id,
+        tool=call.name,
+        arguments=call.arguments,          # the EXACT payload, shown verbatim
+        preview=render_preview(call),      # &quot;To: a@b.com / Subject: ... / Body: ...&quot;
+        requested_by=ctx.user_id,
+        expires_at=now() + timedelta(hours=24),
+    )
+    raise Suspended(req.id)
+
+# On approval, the run RESUMES from the persisted state: the tool executes
+# and its result is appended as if it had returned immediately. The model
+# never knows it waited.</code></pre></div>
+
+<p>Three properties that make this work and that are worth stating:</p>
+
+<ul>
+<li><strong>Show the exact payload.</strong> "The agent wants to send an email" is unreviewable. Recipient, subject and body is
+a decision someone can actually make. An approval a human cannot evaluate is a rubber stamp, and a rubber stamp is worse than no
+gate because it creates the appearance of oversight.</li>
+<li><strong>Suspend durably.</strong> Approval takes minutes to days. The run state must survive a restart, so it is a persisted
+record, not a blocked coroutine — which is another reason the <a href="#state-machines">state-machine</a> shape fits.</li>
+<li><strong>Expire pending requests.</strong> An approval sitting for a week should lapse rather than fire when someone finally
+clicks it.</li>
+</ul>
+
+<h3>Calibrating it</h3>
+<p>Too many approvals and people click through without reading, which is worse than none. Reserve the gate for the genuinely
+irreversible, and use the other levers for the rest: scope limits (refunds under £50 auto-approve), rate limits, dry-run modes,
+and after-the-fact review of a sample. The aim is that every approval a human sees is one worth their attention.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Two sentences that land together. <strong>"The gate is in code, between the model's request and execution, so no prompt can
+open it."</strong> And <strong>"it shows the exact payload, because an approval the human cannot evaluate is a rubber
+stamp."</strong> Add that the run suspends durably because approval is slow, and you have covered the mechanism, the security
+property and the operational reality — which is more than most candidates manage on this topic.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>List the tools of an agent you have built and mark which are irreversible. Then check: is the gate in code, or in the prompt?</li>
+<li>Write the approval preview for your most dangerous tool. If you cannot render it in three lines a human can judge, the tool is too coarse.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Anthropic: Building effective agents</a> — the workflow-versus-agent ladder; the best argument for starting simpler</li><li><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">Model Context Protocol</a> — the specification, the transports, and the reference servers</li><li><a href="https://cdn.openai.com/business-guides-and-resources/a-practical-guide-to-building-agents.pdf" target="_blank" rel="noopener">OpenAI: a practical guide to building agents</a> — strong on guard-rails and hand-off patterns</li><li><a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noopener">ReAct: synergizing reasoning and acting</a> — the paper behind the reason-act-observe loop</li><li><a href="https://ai.pydantic.dev/agents/" target="_blank" rel="noopener">PydanticAI: agents, tools and dependencies</a> — a typed take on the same ideas, with validation built in</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button · Code is Python throughout.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

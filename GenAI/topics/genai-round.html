@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The GenAI Round — GenAI</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="genai-round">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Foundations › Topic 1 of 9</div>
+  <h1>The GenAI Round</h1>
+  <p class="lede">A round that barely existed three years ago and is now on most loops. The four shapes it takes, what is graded in each, the vocabulary you are expected to own, and the failure modes — chief among them answering a system question with a framework name.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#what-is-graded">What the round is, and what it grades</a></li><li><a href="#round-types">The four shapes the round takes</a></li><li><a href="#the-clock">Running a 60-minute AI design round</a></li><li><a href="#vocabulary">The vocabulary you are expected to own</a></li><li><a href="#failure-modes">The failure modes, and what to do instead</a></li><li><a href="#prep-plan">A four-week preparation plan</a></li></ol>
+  </div>
+
+<section id="what-is-graded"><h2 id="what-is-graded">What the round is, and what it grades</h2>
+<p>Three years ago this round did not exist outside a handful of research teams. It is now on most senior loops at companies that
+ship anything with a model in it, and it is <strong>not</strong> a machine-learning round. Nobody is going to ask you to derive
+backpropagation or implement k-means. The round assumes you will be <em>building systems on top of models you did not train</em>,
+and it grades whether you can do that without producing something expensive, unverifiable, or unsafe.</p>
+
+<p>The confusion worth clearing up first: <strong>system design asks how the system survives scale and failure; the AI round asks
+how the system stays correct when a core component is non-deterministic.</strong> The hard parts are not throughput and sharding
+— although they appear — they are grounding, evaluation, cost per token, and what happens when the model is confidently wrong.</p>
+
+<p>What is being graded, in roughly descending order of weight:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Signal</th><th>Present</th><th>Absent</th></tr></thead>
+<tbody>
+<tr><td><strong>Evaluation discipline</strong></td><td>You say how you would know the system works, before you say how you would build it</td><td>"We'd test it with some examples" — and nothing more</td></tr>
+<tr><td><strong>Grounding</strong></td><td>Claims are tied to retrievable sources and the system can cite them</td><td>The model is treated as a knowledge base</td></tr>
+<tr><td><strong>Cost and latency awareness</strong></td><td>You reason in tokens, name a rough cost per request, and know what batching buys</td><td>No number offered at any point</td></tr>
+<tr><td><strong>Failure handling</strong></td><td>You name what happens when output is wrong, malformed, or unsafe, and gate the irreversible</td><td>The happy path is the whole design</td></tr>
+<tr><td><strong>Depth on one layer</strong></td><td>You can go down a level on at least one thing — attention, quantization, LoRA, the KV cache</td><td>Framework names all the way down</td></tr>
+<tr><td><strong>Judgement about when not to</strong></td><td>You say when fine-tuning is wrong, when RAG is overkill, when a regex beats a model</td><td>Every problem gets an agent</td></tr>
+</tbody></table></div>
+
+<p>The last row is the one that most distinguishes senior candidates. The field rewards enthusiasm and the interview rewards
+restraint; a candidate who says "I would not use an LLM for this part — it is a deterministic lookup and a model would make it
+slower, costlier and less reliable" is demonstrating exactly the judgement the role needs.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>The single highest-return habit in this round is to <strong>volunteer the evaluation story unprompted</strong>. Most candidates
+describe an architecture and wait; the interviewer then asks "how do you know it works?" and watches them improvise. Get there
+first: "before the architecture, here is how I would measure it — a golden set of about two hundred questions with known answers,
+retrieval recall measured separately from answer quality, and a regression gate in CI." You have now answered the follow-up, shown
+you have shipped something, and framed the rest of your design as something testable.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Write the six rows above from memory. If you cannot name what is graded, you cannot aim at it.</li>
+<li>Take a feature at your current job and write two sentences on why an LLM is <em>not</em> the right tool for part of it. That answer is worth more in this round than any framework you can name.</li></ul></div></section>
+
+<section id="round-types"><h2 id="round-types">The four shapes the round takes</h2>
+<p>"The AI round" is four quite different interviews wearing one name. Work out which one you are in during the first two
+minutes, because the wrong register is the commonest way to lose it.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Shape</th><th>Prompt sounds like</th><th>What it really grades</th><th>Where to go deep</th></tr></thead>
+<tbody>
+<tr><td><strong>AI system design</strong></td><td>"Design a system that answers questions over our internal documents"</td><td>Retrieval, grounding, evaluation, cost</td><td><a href="rag.html">RAG</a>, <a href="evals.html">Evals</a></td></tr>
+<tr><td><strong>Agent design</strong></td><td>"Design an agent that resolves support tickets end to end"</td><td>Tools, loop control, guard-rails, the human gate</td><td><a href="tools-and-function-calling.html">Tools</a>, <a href="agents.html">Agents</a></td></tr>
+<tr><td><strong>Model internals</strong></td><td>"Walk me through attention" · "Why does LoRA work?"</td><td>Whether you have been below the API</td><td><a href="transformer-internals.html">Internals</a>, <a href="training-and-fine-tuning.html">Training</a></td></tr>
+<tr><td><strong>Applied coding</strong></td><td>"Here is an API key and a corpus — build retrieval in 60 minutes"</td><td>Can you actually ship; do you handle the messy parts</td><td>All of it, plus typing speed</td></tr>
+</tbody></table></div>
+
+<p><strong>AI system design</strong> is the most common by a wide margin, and it is nearly always a retrieval question underneath
+whatever story it is wrapped in. <strong>Agent design</strong> is rising fast and is distinguished by the interviewer caring about
+what the system is allowed to <em>do</em> — the moment the prompt contains a verb like "send", "book", "refund" or "deploy", the
+round is really about approval gates.</p>
+
+<p><strong>Model internals</strong> is the one candidates under-prepare, because it feels like a research question and is not. The
+questions are a small, stable set — attention, masking, positional encoding, why fine-tune, what quantization costs, what the KV
+cache is — and they are asked because they cheaply separate people who have read about LLMs from people who have taken one apart.
+Preparing for it is a weekend, not a term.</p>
+
+<p><strong>Applied coding</strong> rewards having done it before, because an hour is not long enough to discover that PDFs parse
+badly, that your embedding model has a 512-token limit, and that cosine similarity over badly chunked text returns garbage. Build
+one pipeline end to end before you sit one of these.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Ask, in the first minute, <strong>"are you more interested in the system or in what is under the model?"</strong> It is a free
+question and it is read as orientation rather than uncertainty. Companies genuinely differ: an applied-AI team wants retrieval and
+evaluation, an inference team wants quantization and batching, and a research-adjacent team wants attention shapes. Answering the
+wrong one well still scores badly.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>For each of the four shapes, write the first three questions you would ask the interviewer. They are different sets, and knowing which set to deploy is most of the first two minutes.</li></ul></div></section>
+
+<section id="the-clock"><h2 id="the-clock">Running a 60-minute AI design round</h2>
+<p>A timetable for the design shapes. The minutes are approximate; the ordering is not, and the first block is the one candidates
+skip and regret.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Minutes</th><th>Phase</th><th>What you produce</th></tr></thead>
+<tbody>
+<tr><td>0–5</td><td><strong>Clarify</strong></td><td>Corpus size and update rate, who the users are, latency and cost budget, what "correct" means</td></tr>
+<tr><td>5–12</td><td><strong>Evaluation</strong></td><td>How you will measure success, before building anything</td></tr>
+<tr><td>12–20</td><td><strong>Data path</strong></td><td>Ingestion, chunking, embedding, index choice</td></tr>
+<tr><td>20–35</td><td><strong>Query path</strong></td><td>Retrieval, reranking, context assembly, generation, citations</td></tr>
+<tr><td>35–45</td><td><strong>Failure and safety</strong></td><td>Wrong answers, malformed output, prompt injection, the human gate</td></tr>
+<tr><td>45–55</td><td><strong>Scale and cost</strong></td><td>Tokens per request, caching, batching, what breaks at 100×</td></tr>
+<tr><td>55–60</td><td><strong>Trade-offs</strong></td><td>What you chose against, and what you would do with more time</td></tr>
+</tbody></table></div>
+
+<h3>0–5 · Clarify</h3>
+<p>Ask the questions whose answers change the architecture, and skip the ones that do not. <strong>How much data, and how often
+does it change?</strong> — ten thousand static documents and ten million documents updated hourly are different systems. <strong>Who
+asks, and can they see everything?</strong> — per-user permissions push filtering into the retrieval layer and rule out some index
+designs. <strong>What is the latency budget?</strong> — two seconds rules out a reranker over a hundred candidates plus a reasoning
+model. <strong>What does a wrong answer cost?</strong> — this is the question that decides how much of your design is verification,
+and almost nobody asks it.</p>
+
+<h3>5–12 · Evaluation first</h3>
+<p>Say how you will know it works before you say how it works. This inverts the order most candidates use and it is the strongest
+signal available to you in the first ten minutes. It also constrains the rest of the design usefully: once you have said
+"retrieval recall at 10, measured on a 200-question golden set", every later choice has something to be justified against.</p>
+
+<h3>12–35 · The two paths</h3>
+<p>Split the whiteboard. The <strong>ingestion path</strong> runs offline and its decisions are expensive to change later — chunk
+size, embedding model, index type. The <strong>query path</strong> runs per request and its decisions are cheap to change but
+dominate latency and cost. Keeping them visually separate stops the conversation looping, and it makes the re-indexing question
+("you changed embedding models — now what?") easy to answer.</p>
+
+<h3>35–60 · The part that distinguishes you</h3>
+<p>Most candidates produce a reasonable pipeline by minute 35 and then coast. The remaining twenty-five minutes are where the
+grade is decided: what happens when retrieval returns nothing relevant, what happens when the model emits unparseable JSON, what
+happens when a retrieved document contains instructions aimed at your agent, what this costs per thousand requests, and what you
+would change first if the budget halved.</p>
+
+<div class="callout callout-warn"><span class="callout-title">The three clock-killers</span>
+<ol>
+<li><strong>Explaining what an embedding is.</strong> Say "dense vector, cosine similarity, roughly 1k dimensions" and move on. If they want depth they will ask.</li>
+<li><strong>Naming frameworks.</strong> "I'd use LangChain" is not a design decision. The interviewer wants the shape of the system, not your import list.</li>
+<li><strong>Designing the prompt on the board.</strong> Nobody is grading your wording. Say what the prompt must contain and move on.</li>
+</ol></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Do only minutes 0–12 — clarify plus evaluation — in twelve real minutes, timed, three times on three different prompts. It is the highest-leverage block and the one that is never practised.</li>
+<li>Take any design you have described and add the sentence "a wrong answer here costs ___". If you cannot fill it in, you do not yet know how much verification the system needs.</li></ul></div></section>
+
+<section id="vocabulary"><h2 id="vocabulary">The vocabulary you are expected to own</h2>
+<p>A small vocabulary does most of the work in this round. Using these terms precisely is a strong signal; using them loosely is a
+strong negative one, because it suggests the knowledge is second-hand.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Term</th><th>What it precisely means</th><th>The common misuse</th></tr></thead>
+<tbody>
+<tr><td><strong>Token</strong></td><td>A sub-word unit from the model's tokenizer; the unit of billing and of context</td><td>Treating tokens as words — they are roughly 0.75 words in English and far worse in other languages and in code</td></tr>
+<tr><td><strong>Context window</strong></td><td>The maximum tokens of prompt <em>plus</em> generation the model can attend over</td><td>Thinking of it as input-only, or assuming performance is flat across it</td></tr>
+<tr><td><strong>Temperature</strong></td><td>Divides the logits before softmax; sharpens or flattens the distribution</td><td>Describing it as "creativity". It is applied <em>before</em> the softmax — after would be a no-op</td></tr>
+<tr><td><strong>Top-p / nucleus</strong></td><td>Keeps the smallest set of tokens whose probabilities sum to <em>p</em>, then renormalises</td><td>Confusing it with top-k, which keeps a fixed count regardless of how peaked the distribution is</td></tr>
+<tr><td><strong>Embedding</strong></td><td>A dense vector whose geometry encodes semantic similarity</td><td>Using it for the model's internal token embeddings and for a retrieval model's output interchangeably</td></tr>
+<tr><td><strong>RAG</strong></td><td>Retrieve relevant text at query time and put it in the prompt</td><td>Calling any use of a vector database RAG, including offline classification</td></tr>
+<tr><td><strong>Fine-tuning</strong></td><td>Updating weights on task data; teaches <em>behaviour</em> and format</td><td>Expecting it to add facts reliably — that is what retrieval is for</td></tr>
+<tr><td><strong>LoRA</strong></td><td>Freezing the base model and training a low-rank update to chosen matrices</td><td>Describing it as "fine-tuning a small model"</td></tr>
+<tr><td><strong>Quantization</strong></td><td>Storing weights at lower precision, with per-block scales</td><td>Assuming it is purely a size win — it also speeds up generation, because generation is bandwidth-bound</td></tr>
+<tr><td><strong>KV cache</strong></td><td>Cached keys and values for processed tokens, so each new token is O(1) in past context</td><td>Confusing it with prompt caching, which is a cross-request reuse of a prefix</td></tr>
+<tr><td><strong>Hallucination</strong></td><td>Fluent output that is not grounded in anything true</td><td>Treating it as a bug to be fixed rather than a property of sampling from a distribution</td></tr>
+<tr><td><strong>Agent</strong></td><td>A model in a loop with tools, able to act and observe the result</td><td>Calling a single prompted LLM call an agent</td></tr>
+<tr><td><strong>MCP</strong></td><td>A protocol for exposing tools and resources to a model over a defined transport</td><td>Confusing the protocol with function calling, which is the wire format a provider uses</td></tr>
+</tbody></table></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>Two of these are free credit if you get them right, because most candidates get them wrong. <strong>Temperature is applied to
+the logits before the softmax</strong> — if you divide the probabilities afterwards and renormalise, you get back exactly the
+distribution you started with, so it does nothing. And <strong>fine-tuning teaches behaviour, not facts</strong> — if the question
+is "the model does not know our products", the answer is retrieval, and saying so confidently while others reach for fine-tuning
+is a differentiator.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Define each term in one sentence, out loud, without notes. Any you stumble on is one you have only read about.</li>
+<li>For the three you find hardest, find the paragraph on this site that covers it and read the mechanism, not the definition.</li></ul></div></section>
+
+<section id="failure-modes"><h2 id="failure-modes">The failure modes, and what to do instead</h2>
+<p>Six ways candidates lose this round. All of them are avoidable and none of them are about knowledge gaps.</p>
+
+<h3>1 · Answering a systems question with a framework name</h3>
+<p>"I'd use LangChain with a Chroma vector store" is not a design. It names your dependencies and skips every decision the
+interviewer wanted to see you make — chunk size, index type, how you handle updates, what you measure. Describe the system in terms
+of data flow and decisions, and mention tools only when asked or when a specific one genuinely changes the design.</p>
+
+<h3>2 · No evaluation story</h3>
+<p>The most common single failure. You describe a pipeline, the interviewer asks how you would know it works, and the answer is
+vague. Have a concrete one ready — golden set, size, what you measure, where the gate lives — and deploy it before being asked.</p>
+
+<h3>3 · Reaching for fine-tuning</h3>
+<p>"The model does not know about our internal systems" is a retrieval problem, and answering it with fine-tuning signals that you
+have not shipped one. Fine-tuning teaches format, tone and task behaviour; it is an unreliable and expensive way to install facts
+that change.</p>
+
+<h3>4 · Treating the model as deterministic</h3>
+<p>Designs that assume the model returns exactly what you asked for, every time, in the right shape. Say how you validate the
+output, what you do on a validation failure, and how many retries before you give up and degrade.</p>
+
+<h3>5 · No numbers</h3>
+<p>An hour of architecture with no quantity in it. You do not need precision — you need the habit. "Roughly 4,000 tokens of context
+per request, call it a cent a query at current prices, so a hundred thousand queries a day is a thousand dollars; that is where
+caching earns its place." Order of magnitude, confidently given, beats silence.</p>
+
+<h3>6 · Ignoring that retrieved text is untrusted</h3>
+<p>If your agent reads documents, emails or web pages and also has tools, then anything it reads can try to instruct it. Prompt
+injection is the AI round's equivalent of SQL injection, and candidates who raise it unprompted stand out sharply. The answer is
+not "I'd filter it" — it is that retrieved content is <em>data</em>, that privileged actions need a gate that content cannot open,
+and that the blast radius is bounded by which tools the agent holds.</p>
+
+<div class="callout callout-warn"><span class="callout-title">The tell</span>
+<p>Interviewers in this round are listening for whether you have actually run one of these systems. The giveaway is specifics:
+what your chunk size was and why you changed it, what your retrieval recall was, what broke when you swapped embedding models, how
+long re-indexing took. Nobody who has only read about RAG says "we started at 1,000 tokens and dropped to 400 with 50 of overlap
+because recall on multi-part questions was poor". One such sentence is worth more than a flawless abstract description.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Write your own answer to "how would you know it works?" for a system you have built. Three sentences, with a number in each.</li>
+<li>Rehearse the prompt-injection answer until it takes thirty seconds. It is the most reliable way to look senior in this round.</li></ul></div></section>
+
+<section id="prep-plan"><h2 id="prep-plan">A four-week preparation plan</h2>
+<p>Four weeks, assuming you can give it an hour a day and one longer session at a weekend. The ordering matters more than the
+duration — the build in week one is what makes the rest stick.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Week</th><th>Do</th><th>Pages here</th><th>You should be able to…</th></tr></thead>
+<tbody>
+<tr><td><strong>1</strong></td><td><strong>Build one RAG pipeline end to end</strong> over a real corpus you care about — parse, chunk, embed, index, retrieve, answer, cite. Do not use a framework that hides the steps.</td><td><a href="llms-and-prompting.html">LLMs &amp; Prompting</a>, <a href="rag.html">RAG</a></td><td>Quote your own chunk size, embedding model, index type and recall — the specifics that prove you have shipped</td></tr>
+<tr><td><strong>2</strong></td><td><strong>Add evaluation and tools.</strong> Build a 100-question golden set for the corpus above, measure retrieval separately from answers, then give the thing two tools and a loop.</td><td><a href="evals.html">Evals</a>, <a href="tools-and-function-calling.html">Tools</a>, <a href="agents.html">Agents</a></td><td>Say what you measure, what your numbers were, and where the approval gate goes</td></tr>
+<tr><td><strong>3</strong></td><td><strong>Go below the API.</strong> Implement attention from scratch in NumPy or PyTorch — it is about forty lines — and run a small model locally at two quantization levels, timing both.</td><td><a href="transformer-internals.html">Internals</a>, <a href="inference-and-serving.html">Inference</a></td><td>Walk through attention with shapes, explain the causal mask, and say why Q4 is faster and not just smaller</td></tr>
+<tr><td><strong>4</strong></td><td><strong>Fine-tune something small, then rehearse.</strong> One LoRA run on a 1–3B model, just to see the knobs. Then mock the four round shapes out loud, timed.</td><td><a href="training-and-fine-tuning.html">Training</a>, re-read <a href="genai-round.html">this page</a></td><td>Choose between prompting, retrieval and fine-tuning for a stated problem — and defend saying no</td></tr>
+</tbody></table></div>
+
+<p>If you have one week rather than four, do week one and the first half of week two, and read the Internals pages without
+implementing. The build is the part that cannot be substituted: this round is unusually good at detecting whether you have done
+it, because the questions that follow a vague answer are specific.</p>
+
+<div class="callout callout-note"><span class="callout-title">What to build in week one</span>
+<p>Pick a corpus with messy real structure — your own notes, a documentation site, a few hundred PDFs — rather than a clean
+benchmark dataset. The learning is in the mess: PDFs that parse into nonsense, tables that lose their shape, documents longer than
+the embedding model's input limit, near-duplicate pages that flood your top-k. Those are also exactly the problems interviewers
+probe for, because they are what production looks like.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Write the five sentences you will use to describe the system you built: corpus, chunking, index, evaluation, and the one thing that surprised you. Those five sentences are the backbone of most answers in this round.</li>
+<li>Record yourself answering "design a question-answering system over internal documents" in ten minutes. Count how long before you mention evaluation. Aim for under three.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Anthropic: Building effective agents</a> — the best short piece on when <em>not</em> to build an agent</li><li><a href="https://cdn.openai.com/business-guides-and-resources/a-practical-guide-to-building-agents.pdf" target="_blank" rel="noopener">OpenAI: A practical guide to building agents</a> — the same ground from the other vendor, with more on guard-rails</li><li><a href="https://huyenchip.com/books/" target="_blank" rel="noopener">Chip Huyen: AI Engineering</a> — the closest thing to a textbook for this round</li><li><a href="https://eugeneyan.com/writing/llm-patterns/" target="_blank" rel="noopener">Eugene Yan: patterns for building LLM systems</a> — evaluation, retrieval, caching, guard-rails — written from production</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button · Code is Python throughout.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>

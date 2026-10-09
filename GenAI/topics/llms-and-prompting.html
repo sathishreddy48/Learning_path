@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLMs &amp; Prompting — GenAI</title>
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body data-root="../" data-topic="llms-and-prompting">
+<div class="layout">
+<main class="main">
+
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Foundations › Topic 2 of 9</div>
+  <h1>LLMs &amp; Prompting</h1>
+  <p class="lede">The model as a component you are engineering around: tokens as the unit of cost and capacity, what the context window really holds, what temperature and top-p actually do to the distribution, and how to make an answer checkable instead of merely plausible.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ol><li><a href="#tokens">Tokens: the unit of everything</a></li><li><a href="#context-window">The context window, and what fills it</a></li><li><a href="#sampling">Sampling: temperature, top-k, top-p</a></li><li><a href="#prompting">Prompting that survives production</a></li><li><a href="#structured-output">Structured output: making answers checkable</a></li><li><a href="#hallucination">Hallucination, and what actually reduces it</a></li></ol>
+  </div>
+
+<section id="tokens"><h2 id="tokens">Tokens: the unit of everything</h2>
+<p>A language model does not see characters or words. It sees <strong>tokens</strong> — sub-word units produced by a tokenizer
+that was itself trained, usually with byte-pair encoding, to carve frequent sequences into single units and rare ones into
+several. Everything downstream is counted in tokens: what you pay, what fits in context, how fast you generate.</p>
+
+<p>The ratios worth carrying in your head:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Content</th><th>Roughly</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>English prose</td><td>1 token ≈ 0.75 words, or ~4 characters</td><td>Common words are single tokens</td></tr>
+<tr><td>Code</td><td>1 token ≈ 2–3 characters</td><td>Punctuation, indentation and identifiers fragment badly</td></tr>
+<tr><td>Non-Latin scripts</td><td>often 1 token per character, sometimes worse</td><td>Tokenizers are trained on web text dominated by English</td></tr>
+<tr><td>JSON</td><td>~1.5× the equivalent prose</td><td>Braces, quotes and keys are all tokens</td></tr>
+</tbody></table></div>
+
+<p>That last-but-one row has a real consequence people miss: the same question costs several times more in Hindi or Japanese than
+in English, and fits far less history into the same context window. If you are building for a non-English market, measure it
+rather than assuming the English ratio.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code># Never estimate tokens by word count — count them.
+import tiktoken
+
+enc = tiktoken.get_encoding(&quot;cl100k_base&quot;)
+
+samples = {
+    &quot;english&quot;: &quot;The quick brown fox jumps over the lazy dog.&quot;,
+    &quot;code&quot;:    &quot;def f(x): return [i**2 for i in range(x) if i % 3 == 0]&quot;,
+    &quot;json&quot;:    &#x27;{&quot;user_id&quot;: 12345, &quot;status&quot;: &quot;active&quot;, &quot;roles&quot;: [&quot;admin&quot;]}&#x27;,
+}
+
+for name, text in samples.items():
+    n = len(enc.encode(text))
+    print(f&quot;{name:8s} {len(text):4d} chars  {len(text.split()):3d} words  -&gt;  {n:3d} tokens&quot;
+          f&quot;   ({len(text)/n:.1f} chars/token)&quot;)</code></pre></div>
+
+<p>Tokenization also explains a family of behaviours that look like reasoning failures and are not. A model miscounts the letters
+in a word because it never saw the letters — it saw two or three opaque tokens. Arithmetic on long numbers is unreliable partly
+because digits group into tokens inconsistently. These are tokenizer artefacts, and naming them as such is a good signal.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>When you estimate cost in a design round, do it in tokens and say the conversion out loud: "about 3,000 tokens of retrieved
+context plus a 500-token answer, so roughly 3,500 tokens a request." That one sentence shows you think in the unit the system is
+actually billed and bounded in. Candidates who estimate in "requests" without ever converting to tokens cannot answer the
+follow-up about what happens when documents get longer.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Run the snippet above on a page of your own documentation and on the same page translated. The ratio difference is the thing to internalise.</li>
+<li>Take a prompt you use and count its tokens. Most people are surprised by how much of the budget the system prompt takes.</li></ul></div></section>
+
+<section id="context-window"><h2 id="context-window">The context window, and what fills it</h2>
+<p>The context window is the maximum number of tokens the model can attend over in one forward pass — <strong>prompt and
+generation together</strong>. It is a hard limit, not a soft one: exceed it and the request fails or is silently truncated,
+depending on the client.</p>
+
+<p>Two things about it are routinely misunderstood.</p>
+
+<p><strong>First, it is shared.</strong> A 128k window does not mean 128k of input; it means input plus output. If you need a
+4,000-token answer you have 124,000 for everything else, and "everything else" is a longer list than people expect:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Consumer</th><th>Typical</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>System prompt</td><td>200–2,000</td><td>Fixed per request; a good prompt-caching target</td></tr>
+<tr><td>Tool schemas</td><td>100–200 per tool</td><td>Ten tools is a meaningful slice of the budget</td></tr>
+<tr><td>Conversation history</td><td>grows without bound</td><td>The one that actually breaks things</td></tr>
+<tr><td>Retrieved context</td><td>1,000–8,000</td><td>Your <em>k</em> × chunk size; the knob you control</td></tr>
+<tr><td>The question</td><td>10–200</td><td>Negligible</td></tr>
+<tr><td>Reserved for output</td><td>500–4,000</td><td>Must be subtracted up front</td></tr>
+</tbody></table></div>
+
+<p><strong>Second, performance is not flat across it.</strong> Models reliably attend better to the beginning and the end of their
+context than to the middle — the "lost in the middle" effect. A fact buried at 60% depth in a long context is measurably less
+likely to be used than the same fact at the start or the end. This has a direct design consequence: <strong>put the most
+important retrieved material first or last, not in the middle</strong>, and do not assume a bigger window removes the need for
+good retrieval. It changes what is possible, not what is reliable.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code># Budget the window explicitly rather than discovering the limit in production.
+WINDOW        = 128_000
+RESERVE_OUT   =   4_000      # the answer must fit too
+SYSTEM        =     800
+TOOLS         =   1_200      # ~8 tool schemas
+
+available_for_context = WINDOW - RESERVE_OUT - SYSTEM - TOOLS
+print(f&quot;available for history + retrieval: {available_for_context:,} tokens&quot;)
+
+# Of that, decide the split deliberately. History grows; retrieval is a knob.
+HISTORY_CAP   = 8_000        # beyond this, summarise older turns
+chunk_tokens  = 400
+k             = 12
+retrieval     = chunk_tokens * k
+
+print(f&quot;retrieval: {k} x {chunk_tokens} = {retrieval:,}&quot;)
+print(f&quot;history cap: {HISTORY_CAP:,}&quot;)
+print(f&quot;headroom: {available_for_context - HISTORY_CAP - retrieval:,}&quot;)
+# Headroom is not slack to be filled. Long contexts cost money and attention
+# quality, and &#x27;lost in the middle&#x27; means stuffing the window can make
+# answers worse, not better.</code></pre></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"Why not just put everything in the context now that windows are huge?" is a common probe, and there are three good answers to
+give together: <strong>cost</strong>, because you pay per input token on every request; <strong>latency</strong>, because prefill
+time scales with context length; and <strong>quality</strong>, because of the lost-in-the-middle effect and because irrelevant
+context measurably distracts the model. Large windows reduce the <em>engineering</em> pressure on retrieval; they do not remove the
+reason for it.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Write the budget table above for a system you have built, with real numbers. Most people find history is the uncontrolled term.</li>
+<li>Decide, for that system, what you drop first when the budget is exceeded — oldest turns, lowest-scoring chunks, or the tool schemas. Having an answer is the point.</li></ul></div></section>
+
+<section id="sampling"><h2 id="sampling">Sampling: temperature, top-k, top-p</h2>
+<p>The model's forward pass ends with a vector of <strong>logits</strong> — one real number per vocabulary token. Decoding is the
+process of turning that vector into one chosen token, and it is pure post-processing: the model is unchanged, only the selection
+rule differs.</p>
+
+<h3>Temperature</h3>
+<p>Temperature divides the logits <em>before</em> the softmax:</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>import numpy as np
+
+def softmax(x):
+    e = np.exp(x - x.max())
+    return e / e.sum()
+
+logits = np.array([3.0, 2.0, 1.0, 0.5])
+
+for T in (0.1, 0.7, 1.0, 2.0):
+    p = softmax(logits / T)           # &lt;-- divide the LOGITS, then softmax
+    print(f&quot;T={T:&lt;4} {np.round(p, 3)}  max={p.max():.3f}&quot;)
+
+# T=0.1  [0.999 0.    0.    0.   ]  max=1.000   near-deterministic
+# T=1.0  [0.574 0.211 0.078 0.047]  max=0.574   the model&#x27;s own distribution
+# T=2.0  [0.396 0.24  0.146 0.113]  max=0.396   flattened toward uniform</code></pre></div>
+
+<p>The detail that is worth free credit in an interview: <strong>the division must happen before the softmax.</strong> If you
+apply softmax first and then divide the probabilities by <em>T</em> and renormalise, you get back exactly the distribution you
+started with — the division cancels in the normalisation. It is a no-op, and it is a real bug people ship.</p>
+
+<h3>Top-k and top-p</h3>
+<p>Both truncate the distribution before sampling; they differ in how they choose where to cut.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>Rule</th><th>Behaviour on a peaked distribution</th><th>Behaviour on a flat one</th></tr></thead>
+<tbody>
+<tr><td><strong>top-k</strong></td><td>Keep the <em>k</em> highest-probability tokens</td><td>Keeps k−1 tokens that were never plausible</td><td>Cuts off plausible alternatives arbitrarily</td></tr>
+<tr><td><strong>top-p</strong></td><td>Keep the smallest set summing to <em>p</em></td><td>Keeps very few — correctly</td><td>Keeps many — correctly</td></tr>
+</tbody></table></div>
+
+<p>That is why top-p (nucleus sampling) is generally preferred: the cut adapts to how confident the model is at that position. When
+the next token is obvious, it keeps one or two; when the text could genuinely go several ways, it keeps the several.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>def top_p_filter(probs, p=0.9):
+    &quot;&quot;&quot;Keep the smallest prefix of the sorted distribution summing to &gt;= p.&quot;&quot;&quot;
+    order = np.argsort(probs)[::-1]           # descending
+    sorted_p = probs[order]
+    cum = np.cumsum(sorted_p)
+
+    # Keep everything up to and INCLUDING the token that crosses p.
+    # Off-by-one here is the classic bug: cutting at `cum &lt;= p` can keep
+    # nothing at all when the top token already exceeds p.
+    keep = cum &lt;= p
+    keep[0] = True                            # always keep the argmax
+
+    out = np.zeros_like(probs)
+    out[order[keep]] = sorted_p[keep]
+    return out / out.sum()                    # renormalise
+
+probs = softmax(np.array([4.0, 2.0, 1.5, 1.0, 0.2]))
+print(np.round(probs, 3))                     # [0.76  0.103 0.062 0.038 0.017]
+print(np.round(top_p_filter(probs, 0.9), 3))  # [0.881 0.119 0.    0.    0.   ]</code></pre></div>
+
+<h3>What to actually set</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Task</th><th>Setting</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Structured extraction, classification, tool calls</td><td><code>temperature=0</code></td><td>You want the same input to give the same output; there is one right answer</td></tr>
+<tr><td>Summarisation, RAG answers</td><td><code>temperature</code> 0–0.3</td><td>Grounded tasks; variation adds nothing and costs reproducibility</td></tr>
+<tr><td>Drafting, brainstorming, creative text</td><td><code>temperature</code> 0.7–1.0, <code>top_p</code> 0.9</td><td>Variety is the product</td></tr>
+<tr><td>Evals and debugging</td><td><code>temperature=0</code>, always</td><td>You cannot measure a change through sampling noise</td></tr>
+</tbody></table></div>
+
+<div class="callout callout-warn"><span class="callout-title">Temperature 0 is not determinism</span>
+<p>It is greedy decoding, which is as close as the sampler gets — but the same prompt can still produce different output across
+runs. Floating-point reduction order varies with batch composition on GPU, so the argmax can flip when two logits are close;
+mixture-of-experts routing can depend on which other sequences are in the batch; and providers change model versions underneath a
+stable alias. Say "temperature 0 removes sampling noise but is not a determinism guarantee" and you have answered the question
+better than the person who says "yes, deterministic".</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Run the temperature snippet and watch the distribution move. Then write the one-sentence explanation of why dividing after the softmax does nothing.</li>
+<li>Implement top-p yourself, including the <code>keep[0] = True</code> guard. Getting the off-by-one wrong is the standard bug and it silently produces an all-false mask.</li></ul></div></section>
+
+<section id="prompting"><h2 id="prompting">Prompting that survives production</h2>
+<p>Prompt engineering is the least durable skill in this field and still worth a few hundred words, because the parts that survive
+model upgrades are design decisions rather than incantations.</p>
+
+<h3>What reliably helps</h3>
+<ul>
+<li><strong>Say the task, the format, and the constraints explicitly.</strong> Most prompt failures are underspecification, not
+model weakness.</li>
+<li><strong>Give examples when the task has a shape the words do not capture.</strong> Two or three well-chosen few-shot examples
+outperform a paragraph of description for formatting and edge-case handling. They cost context on every request, so they are a
+trade.</li>
+<li><strong>Let the model reason before it answers</strong> on multi-step problems. Whether you do it with an explicit instruction
+or by using a reasoning model, the mechanism is the same — the intermediate tokens are computation, and forcing an immediate
+answer skips it.</li>
+<li><strong>Put the instruction after long context, or repeat it.</strong> Lost-in-the-middle applies to your instructions too.</li>
+<li><strong>Separate data from instructions structurally</strong> — delimiters, XML-ish tags, or distinct message roles — so the
+model can tell what it is meant to obey from what it is meant to process.</li>
+</ul>
+
+<h3>What does not survive</h3>
+<p>Politeness, threats, offers of payment, "you are a world-class expert", and most of what circulates as prompt tricks. Some of
+it worked on specific older models; none of it is a design decision you would defend in a review.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code># The structure that matters: role separation, explicit format, and a clear
+# boundary between instructions and untrusted data.
+SYSTEM = &quot;&quot;&quot;You answer questions using ONLY the provided context.
+If the context does not contain the answer, say &quot;Not in the provided documents.&quot;
+Cite the source id for every claim, like [doc-12].
+Answer in at most four sentences.&quot;&quot;&quot;
+
+USER = &quot;&quot;&quot;&lt;context&gt;
+{context}
+&lt;/context&gt;
+
+&lt;question&gt;
+{question}
+&lt;/question&gt;&quot;&quot;&quot;
+
+# Three things are doing real work here:
+#  1. &quot;ONLY the provided context&quot; + an explicit escape hatch. Without the
+#     escape hatch the model invents an answer rather than admitting a gap.
+#  2. Citations, which make the answer checkable — the whole point.
+#  3. Delimited context, so retrieved text reads as DATA. It is still not a
+#     security boundary: see the prompt-injection note below.</code></pre></div>
+
+<div class="callout callout-warn"><span class="callout-title">Delimiters are not a security boundary</span>
+<p>Wrapping retrieved text in tags helps the model tell data from instructions, and it stops honest mistakes. It does <strong>not
+</strong> stop a determined prompt injection, because the tags are just more tokens and a document can contain its own closing tag.
+If the agent holds tools that do anything irreversible, the defence is architectural — the privileged action needs an approval the
+content cannot grant — not textual. Saying this distinction out loud is one of the clearest seniority signals in the round.</p></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>If asked "how would you improve this prompt?", resist the urge to rewrite the wording. The high-value answers are structural:
+add an explicit escape hatch so the model can decline, require citations so the answer is checkable, constrain the output to a
+schema so a failure is loud, and move the instruction after the context. Each of those is a correctness mechanism; adjective
+choice is not.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Take a prompt you use and add an explicit "say you do not know" path. Measure how often it fires — on most RAG systems it should fire several percent of the time, and if it never fires your model is covering gaps.</li></ul></div></section>
+
+<section id="structured-output"><h2 id="structured-output">Structured output: making answers checkable</h2>
+<p>Free text has to be read by a human to be checked. A typed object either parses or raises. That difference is why structured
+output is a <strong>correctness mechanism</strong> and not a convenience, and framing it that way is what the round is looking
+for.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code>from typing import Literal
+from pydantic import BaseModel, Field
+
+class Invoice(BaseModel):
+    &quot;&quot;&quot;A supplier invoice extracted from a scanned document.&quot;&quot;&quot;
+    invoice_number: str
+    supplier:       str
+    total_cents:    int = Field(ge=0, description=&quot;Total in minor units, never a float&quot;)
+    currency:       Literal[&quot;GBP&quot;, &quot;USD&quot;, &quot;EUR&quot;]
+    confidence:     float = Field(ge=0, le=1)
+
+# Two things to notice, both of which get asked about:
+#
+# 1. The class docstring and every Field(description=...) are sent to the
+#    model as part of the JSON schema. They are prompt, not comments — which
+#    means a vague docstring is a vague instruction.
+#
+# 2. Field(ge=0) is enforced AFTER generation, locally. Constrained decoding
+#    can guarantee the SHAPE is valid JSON matching the schema; it cannot
+#    guarantee the VALUES are right. Validation is still load-bearing.
+
+print(Invoice.model_json_schema()[&quot;description&quot;])
+# -&gt; &quot;A supplier invoice extracted from a scanned document.&quot;</code></pre></div>
+
+<h3>How providers actually enforce it</h3>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Mechanism</th><th>How</th><th>Guarantees</th></tr></thead>
+<tbody>
+<tr><td><strong>Prompted JSON</strong></td><td>Ask nicely, parse, retry on failure</td><td>Nothing. Works most of the time with capable models, fails often with small ones</td></tr>
+<tr><td><strong>Tool / function calling</strong></td><td>Schema sent as a tool definition; model emits a call</td><td>Usually well-formed; provider-dependent</td></tr>
+<tr><td><strong>Constrained decoding</strong></td><td>Mask logits so only tokens that keep the output schema-valid can be sampled</td><td>Shape is guaranteed. Values are not</td></tr>
+</tbody></table></div>
+
+<p>Constrained decoding is the one worth being able to explain, because the mechanism is neat and shows you understand decoding:
+at each step the sampler is given a mask that zeroes the probability of any token which would make the partial output unparseable
+against the schema. The model cannot emit invalid JSON because invalid tokens are unreachable. What it <em>can</em> still do is
+emit a syntactically perfect object containing a hallucinated invoice number.</p>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>The sentence that lands: <strong>"a schema makes failure loud rather than silent."</strong> Without one, a model that
+misunderstands returns prose your parser mangles into plausible-looking garbage that flows downstream. With one, it raises at the
+boundary and you can retry, fall back, or route to a human. Then add the honest limit — the schema constrains structure, not
+truth — because volunteering the limit of your own mechanism is exactly the judgement being graded.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Take a schema you use and read its generated JSON schema. If the descriptions are vague, your prompt is vague — they are the same thing.</li>
+<li>Deliberately make a small local model fail validation, and decide what your retry policy is. Two retries then degrade is a defensible answer; unlimited retries is not.</li></ul></div></section>
+
+<section id="hallucination"><h2 id="hallucination">Hallucination, and what actually reduces it</h2>
+<p>A hallucination is fluent output that is not grounded in anything true. The framing that gets credit is that it is <strong>not a
+bug</strong> — it is a direct consequence of what the model does. Generation samples from a distribution over plausible
+continuations, and plausibility and truth are different properties. A model asked about something absent from its training data
+has no mechanism for silence; the distribution still has a mode, and sampling finds it.</p>
+
+<p>So the goal is reduction and detection, never elimination. What actually works, in rough order of effect:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Technique</th><th>Why it helps</th><th>Limit</th></tr></thead>
+<tbody>
+<tr><td><strong>Retrieval grounding</strong></td><td>Puts the true answer in context, so the plausible continuation is also the correct one</td><td>Only as good as retrieval; a wrong document produces a confident wrong answer</td></tr>
+<tr><td><strong>Citations</strong></td><td>Makes claims checkable, and measurably reduces unsupported ones</td><td>Models can cite a real source for a claim it does not make</td></tr>
+<tr><td><strong>An explicit escape hatch</strong></td><td>Gives the model a licensed alternative to inventing</td><td>Needs to be in the prompt and reinforced; models default to answering</td></tr>
+<tr><td><strong>Structured output</strong></td><td>Narrows the space; a schema with no free-text field cannot ramble</td><td>Constrains shape, not truth</td></tr>
+<tr><td><strong>Low temperature</strong></td><td>Reduces sampling into the tail</td><td>A confidently wrong mode stays wrong at T=0</td></tr>
+<tr><td><strong>Verification pass</strong></td><td>Check each claim against the source with a second call or a deterministic check</td><td>Doubles cost and latency; the checker shares the generator's blind spots</td></tr>
+</tbody></table></div>
+
+<h3>Why the model cannot just tell you</h3>
+<p>Asked how confident it is, a model produces a plausible-sounding number — it is generating text about confidence, not reporting
+a calibrated probability. Token logprobs are better but measure fluency more than correctness: a confident hallucination has high
+logprobs by construction. The signals that actually correlate with correctness are external — whether the claim appears in a
+retrieved source, and whether several independent samples agree.</p>
+
+<div class="code-tabs"><div class="code-tabs-bar" role="tablist"><button role="tab" aria-selected="true" data-lang="python">Python</button></div><pre data-lang="python"><code># Self-consistency: sample n times and measure agreement. Disagreement across
+# samples is a far better unsupported-claim signal than anything the model
+# says about its own confidence.
+from collections import Counter
+
+def consistency(ask, prompt, n=5):
+    answers = [ask(prompt, temperature=0.8) for _ in range(n)]
+    top, count = Counter(answers).most_common(1)[0]
+    return top, count / n          # agreement in [1/n, 1.0]
+
+# answer, agreement = consistency(ask, &quot;In what year was X founded?&quot;)
+# if agreement &lt; 0.6:  route to a human / say &quot;uncertain&quot;
+#
+# Costs n times as much, so reserve it for high-stakes claims. The useful
+# property: it needs no ground truth, so it works in production where you
+# have no labels.</code></pre></div>
+
+<div class="callout callout-interview"><span class="callout-title">Interview angle</span>
+<p>"How do you stop it hallucinating?" is near-universal, and the strong answer has three parts. First reframe: you reduce and
+detect, you do not eliminate, because it follows from sampling. Then name the ladder — grounding, citations, an escape hatch,
+schemas — in order of effect. Then close on measurement: "and I would measure it, by scoring what fraction of claims are supported
+by the retrieved context on a golden set, so I can tell whether a change helped." Candidates who promise elimination are marked
+down; candidates who end on measurement are marked up.</p></div>
+
+<div class="callout callout-practice"><span class="callout-title">Practice</span>
+<ul><li>Ask a model ten questions you know the answers to and ten about things that do not exist. Count how often it declines on the second set. That number is why the escape hatch matters.</li>
+<li>Rehearse the three-part answer above in under sixty seconds.</li></ul></div></section>
+
+  <div class="further">
+    <h2 id="further-reading">Further reading</h2>
+    <ul><li><a href="https://www.youtube.com/watch?v=zduSFxRajkE" target="_blank" rel="noopener">Karpathy: Let&#x27;s build the GPT tokenizer</a> — two hours on why tokenization causes so many odd behaviours</li><li><a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener">Lost in the Middle (Liu et al.)</a> — the paper behind the position effect in long contexts</li><li><a href="https://arxiv.org/abs/1904.09751" target="_blank" rel="noopener">The Curious Case of Neural Text Degeneration</a> — where nucleus sampling comes from, and why greedy decoding degenerates</li><li><a href="https://arxiv.org/abs/2207.05221" target="_blank" rel="noopener">Language Models (Mostly) Know What They Know</a> — the careful treatment of calibration and self-reported confidence</li><li><a href="https://platform.openai.com/docs/guides/structured-outputs" target="_blank" rel="noopener">OpenAI: structured outputs</a> — constrained decoding as a product feature, with the guarantees stated</li></ul>
+  </div>
+
+  <p class="footer-note">Personal study site · Visited state is stored locally in your browser · Every code block has a Copy button · Code is Python throughout.</p>
+
+</main>
+</div>
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/visited.js"></script>
+<script src="../assets/js/nav.js"></script>
+<script src="../assets/js/code-tabs.js"></script>
+</body>
+</html>
