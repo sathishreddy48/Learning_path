@@ -5,7 +5,7 @@ We'll design a **payment system** in this chapter, which underpins all of modern
 
 A **payment system** is used to settle financial transactions, transferring monetary value.
 
-**The one-sentence version:** at **~11 transactions per second** this is the lowest-throughput system in the book and comfortably the hardest, because money movement has two properties nothing else here has — **it cannot be lost, and it cannot be undone.** Combine that with the fact that the authoritative record lives in systems you do not control (the PSP, the card networks, the banks) and is only confirmed to you hours later, and the shape of the problem appears.
+**The one-sentence version:** at **~11 transactions per second** this is the lowest-throughput system in these notes and comfortably the hardest, because money movement has two properties nothing else here has — **it cannot be lost, and it cannot be undone.** Combine that with the fact that the authoritative record lives in systems you do not control (the PSP, the card networks, the banks) and is only confirmed to you hours later, and the shape of the problem appears.
 
 **Two mechanisms do almost all of the work, and everything else is plumbing:**
 
@@ -225,7 +225,7 @@ Three consequences follow, and they shape the whole system:
 
 **A refund is therefore a new transaction, not an undo.** This is the practical form of "money movement cannot be rolled back": the original charge happened, is recorded, and stays recorded; the refund is a second, opposite movement. Anyone reasoning about this system as though failed operations can be rolled back has the wrong model.
 
-**The ledger is the source of truth and the wallet is a derived view.** The ledger says what happened; the wallet says what the balance *currently is*, which is a sum over the ledger. That means the wallet can always be rebuilt by replaying the ledger — and if the wallet and the ledger disagree, the ledger wins. This is now the third instance of the same pattern in the book:
+**The ledger is the source of truth and the wallet is a derived view.** The ledger says what happened; the wallet says what the balance *currently is*, which is a sum over the ledger. That means the wallet can always be rebuilt by replaying the ledger — and if the wallet and the ledger disagree, the ledger wins. This is now the third instance of the same pattern in these notes:
 
 | Chapter | Source of truth | Derived view |
 |---|---|---|
@@ -519,7 +519,7 @@ This is the hold-and-expiry pattern from [Chapter 22](../22.%20Hotel%20Reservati
 | Strong consistency at 11 TPS | Relational database, reads from the primary, or a Raft-based distributed SQL store |
 
 ## Self-check
-1. This is the lowest-throughput system in the book. Why is it also among the hardest?
+1. This is the lowest-throughput system in these notes. Why is it also among the hardest?
 2. Which two mechanisms carry the correctness of this design, and which one is counter-intuitive?
 3. Why is reconciliation the correctness mechanism rather than a cleanup process?
 4. Why is `amount` a string in the API and never a `double` anywhere?

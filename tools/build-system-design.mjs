@@ -45,7 +45,7 @@ const NO_MERMAID = ARGS.has('--no-mermaid');
 const QUIET = ARGS.has('--quiet');
 
 const SITE_TITLE = 'System Design';
-const SITE_SUBTITLE = 'Alex Xu Vol 1 & 2 · 28 chapters + fundamentals';
+const SITE_SUBTITLE = '28 chapters + distributed fundamentals';
 
 /* Relative path from SystemDesign/chapters/*.html back to the notes folder,
    used for images. Spaces are percent-encoded so file:// is happy. */
@@ -678,21 +678,21 @@ const GROUP_DEFS = [
   {
     id: 'fundamentals',
     label: 'Distributed Fundamentals',
-    blurb: 'The theory the designs assume: what a consistency guarantee actually promises, how replicas agree, why ordering needs clocks you cannot trust, and what a storage engine trades away. Not in the book — these are the follow-up questions the designs attract.',
+    blurb: 'The theory the designs assume: what a consistency guarantee actually promises, how replicas agree, why ordering needs clocks you cannot trust, and what a storage engine trades away. Not covered by the design chapters — these are the follow-up questions the designs attract.',
   },
   {
     id: 'building-blocks',
     label: 'Building Blocks',
-    blurb: 'Four mechanisms that reappear inside almost every system later in the book. Technique chapters rather than design chapters.',
+    blurb: 'Four mechanisms that reappear inside almost every system in the chapters that follow. Technique chapters rather than design chapters.',
   },
   {
     id: 'volume-1',
-    label: 'Volume 1 Systems',
+    label: 'Core Systems',
     blurb: 'The classic end-to-end designs: shorteners, crawlers, feeds, chat, video and file sync.',
   },
   {
     id: 'volume-2',
-    label: 'Volume 2 Systems',
+    label: 'Advanced Systems',
     blurb: 'The harder half — geospatial search, streaming aggregation, money, storage and exchanges, where correctness under failure is the whole problem.',
   },
 ];
@@ -833,7 +833,7 @@ function writeDashboard(curriculum, counts) {
 <main class="main">
 
   <h1>${escapeHtml(SITE_TITLE)}</h1>
-  <p class="lede">A self-paced study site built from the <strong>System Design Interview — An Insider's Guide (Vol 1 &amp; 2)</strong>
+  <p class="lede">A self-paced study site built from the <strong>system design</strong>
   notes in this repository, plus a <strong>Distributed Fundamentals</strong> group covering the theory the designs assume —
   consistency models, replication and consensus, time and ordering, and storage engines. ${counts.chapters} chapters plus
   ${counts.extras} standalone pages, ${counts.sections} sections, ${counts.images} diagrams and ${counts.mermaidInlined} rendered
@@ -970,7 +970,7 @@ function writeRootLanding(counts) {
     },
     {
       cls: ' sd', href: 'SystemDesign/index.html', title: 'System Design',
-      blurb: "Alex Xu's Insider's Guide, Volumes 1 and 2 — the scaling story, the recurring building blocks, and 28 end-to-end designs from URL shorteners to stock exchanges, plus the distributed-systems theory they assume.",
+      blurb: "The scaling story, the recurring building blocks, and 28 end-to-end designs from URL shorteners to stock exchanges, plus the distributed-systems theory they assume.",
       meta: `${counts.chapters} chapters · ${counts.sections} sections · ${counts.animations} interactive explainers`,
     },
     dsa && {

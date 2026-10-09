@@ -10,7 +10,7 @@
 <div class="layout">
 <main class="main">
 
-  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 1 Systems › Chapter 8 of 28</div>
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Core Systems › Chapter 8 of 28</div>
   <h1>Chapter 8: Design a URL Shortener</h1>
   <div class="toc">
     <h4>On this page</h4>
@@ -371,7 +371,7 @@ Convert ID <code>2009215674938</code> to Base 62:</p>
 </tbody>
 </table>
 </div>
-<p>Commercial shorteners mint a new key every time, because distinguishing <em>who shared what</em> is the entire value of the product. The book's dedupe step is the simpler design, not the better one.</p>
+<p>Commercial shorteners mint a new key every time, because distinguishing <em>who shared what</em> is the entire value of the product. The dedupe step here is the simpler design, not the better one.</p>
 <p><strong>The race nobody mentions.</strong> Two concurrent requests for the same long URL both miss the check in step 1 and both insert — producing two short URLs for one destination. If dedupe actually matters, it has to be enforced by a <strong>unique index on <code>longURLHash</code></strong>, not by a read-then-write. The same applies to the short key itself: the unique index on <code>shortURL</code> is the real guarantee, and the Bloom filter is only an optimisation that keeps you from hitting it.</p>
 <hr>
 <h3 id="url-redirecting-flow">URL Redirecting Flow</h3>

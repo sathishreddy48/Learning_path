@@ -123,7 +123,7 @@
   var W = 660, H = 360, CX = 185, CY = 180, R = 125;
 
   function polar(pos, radius) {
-    /* position 0 at the top, increasing clockwise — matches the book's figures */
+    /* position 0 at the top, increasing clockwise — matches the reference figures */
     var a = (pos / RING) * Math.PI * 2 - Math.PI / 2;
     return { x: CX + Math.cos(a) * radius, y: CY + Math.sin(a) * radius };
   }

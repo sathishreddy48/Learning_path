@@ -66,7 +66,7 @@ QPS for fetching the top 10 leaderboard - assuming users open that once a day on
 | Players in a tournament | 25 M MAU | 25 million entries |
 | Memory | 25 M × ~130 bytes of sorted-set entry | **~3.25 GB — one Redis instance** |
 
-Five hundred writes per second and fifty reads per second is, by this book's standards, nothing. There is no throughput problem, no storage problem, and no sharding problem at the stated scale — the chapter is explicit that one Redis instance suffices.
+Five hundred writes per second and fifty reads per second is, by the standards of these notes, nothing. There is no throughput problem, no storage problem, and no sharding problem at the stated scale — the chapter is explicit that one Redis instance suffices.
 
 **So the difficulty is entirely about the shape of the query, not its volume.** That is unusual and worth naming: most chapters are hard because of scale, and this one is hard because `rank` is an awkward operation no matter how little data you have. A candidate who spends the interview sharding has mis-identified the problem.
 

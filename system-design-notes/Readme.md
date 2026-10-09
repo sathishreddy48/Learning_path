@@ -1,21 +1,18 @@
 
-# [System Design Interview - An Insider's Guide (Vol 1 and 2)](https://bytebytego.com/courses/system-design-interview)
-These notes are based on the System Design Interview books - [Vol 1 and Vol 2 2nd Ed](https://www.goodreads.com/book/show/54109255-system-design-interview-an-insider-s-guide) 
-
-Check the notes here: https://pagefy.io/system-design/system-design-interview-by-alex-xu
+# System Design Notes
 
 **Note:** All 28 chapters are written up; wording and diagrams are still being refined. 
 
 
 ## How these notes are organized
 
-Every chapter has been expanded beyond a plain summary of the book, using a few consistent conventions:
+Every chapter is written as more than a plain summary, using a few consistent conventions:
 
 - **"What broke" / "What it now costs you"** — each design step is framed by the problem that forced it and the new problem it introduces, so a chapter reads as a causal story rather than a list of components.
 - **Trade-off tables** — side-by-side comparisons instead of prose, for choices like vertical vs horizontal scaling or SQL vs NoSQL.
 - **`Gotchas & failure modes`** — the things that bite in production: replication lag, cache stampede, hot shards, split-brain.
 - **`> **Interview angle:**`** callouts — what an interviewer is usually probing for in that section.
-- **Mermaid diagrams** alongside the book's images. These render on GitHub; where they don't render, the surrounding tables and prose carry the same information.
+- **Mermaid diagrams** alongside the reference images. These render on GitHub; where they don't render, the surrounding tables and prose carry the same information.
 - **Self-check questions**, a glossary, and a one-table "problem → technique" summary at the end of each chapter.
 - **Cross-links between chapters**, because the same few ideas recur: fan-out on write vs on read, an immutable log plus a derived view, idempotency instead of exactly-once delivery, and hot keys that partitioning cannot fix.
 
@@ -29,7 +26,7 @@ Every chapter has been expanded beyond a plain summary of the book, using a few 
 
 ## Distributed Fundamentals
 
-Not from the book. These four pages cover the theory the designs above assume but rarely state — the material the
+These four pages cover the theory the designs above assume but rarely state — the material the
 "what happens when a region goes down?" follow-up actually lands in.
 
 - [Consistency Models, CAP and PACELC](Fundamentals-Consistency.md) — what each guarantee promises, CAP stated correctly, and the half of the trade-off CAP leaves out.

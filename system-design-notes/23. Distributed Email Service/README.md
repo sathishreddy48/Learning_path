@@ -6,7 +6,7 @@ We'll design a **distributed email service**, similar to **Gmail** in this chapt
 
 In 2020, **Gmail** had 1.8bil active users, while **Outlook** had 400mil users worldwide.
 
-**The one-sentence version:** email is the only system in this book that is **federated** — you do not control the protocol, the other participants, or whether your output is even accepted. Everything else here you can redesign; SMTP you must speak as it was specified in 1982, to thousands of independently operated servers run by people you will never meet.
+**The one-sentence version:** email is the only system in these notes that is **federated** — you do not control the protocol, the other participants, or whether your output is even accepted. Everything else here you can redesign; SMTP you must speak as it was specified in 1982, to thousands of independently operated servers run by people you will never meet.
 
 That produces an unusual split in difficulty:
 
@@ -220,7 +220,7 @@ In an interview setting, it's infeasible to design a new distributed database so
 In order to partition the data, we can use the `user_id` as a partition key, so that one user's data is stored on a single shard.
 This prohibits us from sharing an email with multiple users, but this is not a requirement for this interview.
 
-**This is the third time in the book that the quality of a shard key comes down to one question: does it contain every transaction?**
+**This is the third time in these notes that the quality of a shard key comes down to one question: does it contain every transaction?**
 
 | Chapter | Shard key | Does a single operation stay inside one shard? |
 |---|---|---|
@@ -289,7 +289,7 @@ Finally, we'll trade availability for consistency for our distributed database, 
 
 Hence, in the event of a failover or network partition, sync/update actions will be briefly unavailable to impacted users.
 
-**This is one of the few chapters that chooses CP over AP, and it is worth understanding why**, since most of this book reaches for availability. The deciding factor is that email state changes are *user-visible and user-initiated*: an email you read reappearing as unread, a message you deleted returning, or a draft losing its last edit are all experienced as the product being broken rather than as momentary staleness. And unlike a like count ([Chapter 11](../11.%20News%20Feed%20System/)), there is no version of the data that is acceptably approximate.
+**This is one of the few chapters that chooses CP over AP, and it is worth understanding why**, since most of these notes reach for availability. The deciding factor is that email state changes are *user-visible and user-initiated*: an email you read reappearing as unread, a message you deleted returning, or a draft losing its last edit are all experienced as the product being broken rather than as momentary staleness. And unlike a like count ([Chapter 11](../11.%20News%20Feed%20System/)), there is no version of the data that is acceptably approximate.
 
 The mitigating factor is that the blast radius is tiny. Because everything is partitioned by user, a partition or failover affects only the users on that shard, and only for the duration — rather than degrading the whole service. Strong consistency is affordable here precisely because the data is so cleanly partitioned.
 
@@ -469,7 +469,7 @@ sequenceDiagram
 | Surviving a data centre loss | Multi-DC replication with leader-follower failover |
 
 ## Self-check
-1. What makes this system structurally different from every other chapter in the book?
+1. What makes this system structurally different from every other chapter in these notes?
 2. In what sense is SMTP a message queue, and which two of its behaviours correspond to retry and dead-lettering?
 3. Which line item dominates storage, and what is the single largest optimisation available against it?
 4. Why is the push-versus-pull fan-out question from Chapter 11 not available here?

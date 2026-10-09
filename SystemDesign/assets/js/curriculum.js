@@ -13,7 +13,7 @@
 window.CURRICULUM = {
   "meta": {
     "title": "System Design",
-    "subtitle": "Alex Xu Vol 1 & 2 · 28 chapters + fundamentals"
+    "subtitle": "28 chapters + distributed fundamentals"
   },
   "groups": [
     {
@@ -60,8 +60,8 @@ window.CURRICULUM = {
               "label": "8. Time-ordered IDs cut both ways"
             },
             {
-              "hash": "#9-picking-a-push-channel--the-book-decides-this-four-times",
-              "label": "9. Picking a push channel — the book decides this four times"
+              "hash": "#9-picking-a-push-channel--these-notes-decide-this-four-times",
+              "label": "9. Picking a push channel — these notes decide this four times"
             },
             {
               "hash": "#10-stateful-tiers-are-the-exception-and-they-cost",
@@ -222,7 +222,7 @@ window.CURRICULUM = {
     {
       "id": "fundamentals",
       "label": "Distributed Fundamentals",
-      "blurb": "The theory the designs assume: what a consistency guarantee actually promises, how replicas agree, why ordering needs clocks you cannot trust, and what a storage engine trades away. Not in the book — these are the follow-up questions the designs attract.",
+      "blurb": "The theory the designs assume: what a consistency guarantee actually promises, how replicas agree, why ordering needs clocks you cannot trust, and what a storage engine trades away. Not covered by the design chapters — these are the follow-up questions the designs attract.",
       "topics": [
         {
           "id": "fundamentals-consistency",
@@ -361,7 +361,7 @@ window.CURRICULUM = {
     {
       "id": "building-blocks",
       "label": "Building Blocks",
-      "blurb": "Four mechanisms that reappear inside almost every system later in the book. Technique chapters rather than design chapters.",
+      "blurb": "Four mechanisms that reappear inside almost every system in the chapters that follow. Technique chapters rather than design chapters.",
       "topics": [
         {
           "id": "04-rate-limiter",
@@ -555,7 +555,7 @@ window.CURRICULUM = {
     },
     {
       "id": "volume-1",
-      "label": "Volume 1 Systems",
+      "label": "Core Systems",
       "blurb": "The classic end-to-end designs: shorteners, crawlers, feeds, chat, video and file sync.",
       "topics": [
         {
@@ -738,7 +738,7 @@ window.CURRICULUM = {
           "id": "12-chat-system",
           "label": "Design a Chat System",
           "href": "chapters/12-chat-system.html",
-          "blurb": "every other system in this book can be made stateless and scaled by adding servers; a chat system cannot, because the server must hold a live connection for each online user. That single…",
+          "blurb": "every other system in these notes can be made stateless and scaled by adding servers; a chat system cannot, because the server must hold a live connection for each online user. That single…",
           "sections": [
             {
               "hash": "#introduction",
@@ -914,7 +914,7 @@ window.CURRICULUM = {
     },
     {
       "id": "volume-2",
-      "label": "Volume 2 Systems",
+      "label": "Advanced Systems",
       "blurb": "The harder half — geospatial search, streaming aggregation, money, storage and exchanges, where correctness under failure is the whole problem.",
       "topics": [
         {
@@ -1161,7 +1161,7 @@ window.CURRICULUM = {
           "id": "21-ad-click-event-aggregation",
           "label": "Ad Click Event Aggregation",
           "href": "chapters/21-ad-click-event-aggregation.html",
-          "blurb": "the output of this system is money — it is what advertisers are billed from — and that single fact reorders every priority in the book. Elsewhere you trade correctness for latency and cost…",
+          "blurb": "the output of this system is money — it is what advertisers are billed from — and that single fact reorders every priority used elsewhere in these notes. Elsewhere you trade correctness for…",
           "sections": [
             {
               "hash": "#introduction",
@@ -1249,7 +1249,7 @@ window.CURRICULUM = {
           "id": "23-distributed-email-service",
           "label": "Distributed Email Service",
           "href": "chapters/23-distributed-email-service.html",
-          "blurb": "email is the only system in this book that is federated — you do not control the protocol, the other participants, or whether your output is even accepted. Everything else here you can…",
+          "blurb": "email is the only system in these notes that is federated — you do not control the protocol, the other participants, or whether your output is even accepted. Everything else here you can…",
           "sections": [
             {
               "hash": "#introduction",
@@ -1381,7 +1381,7 @@ window.CURRICULUM = {
           "id": "26-payment-system",
           "label": "Payment System",
           "href": "chapters/26-payment-system.html",
-          "blurb": "at ~11 transactions per second this is the lowest-throughput system in the book and comfortably the hardest, because money movement has two properties nothing else here has — it cannot be…",
+          "blurb": "at ~11 transactions per second this is the lowest-throughput system in these notes and comfortably the hardest, because money movement has two properties nothing else here has — it cannot…",
           "sections": [
             {
               "hash": "#introduction",
@@ -1469,7 +1469,7 @@ window.CURRICULUM = {
           "id": "28-stock-exchange",
           "label": "Stock Exchange",
           "href": "chapters/28-stock-exchange.html",
-          "blurb": "latency is the requirement that reshapes everything else. At a target of tens of microseconds, every architectural convenience the rest of this book relies on — microservices, network calls…",
+          "blurb": "latency is the requirement that reshapes everything else. At a target of tens of microseconds, every architectural convenience the rest of these notes rely on — microservices, network calls…",
           "sections": [
             {
               "hash": "#introduction",

@@ -5,7 +5,7 @@ Every design in these notes makes a consistency choice, usually in one word — 
 
 **The one-sentence version:** a consistency model is a contract about *what a read is allowed to return*, strong models let you reason about the system as if it were a single machine, weak models give that up in exchange for staying available and fast, and almost every real system sits somewhere in the middle on purpose.
 
-This is theory the designs assume rather than state. It sits underneath [Chapter 6](../06.%20Key-Value%20Store/) especially, and it is where the "what if a region goes down?" follow-up to any Volume 2 chapter ends up.
+This is theory the designs assume rather than state. It sits underneath [Chapter 6](../06.%20Key-Value%20Store/) especially, and it is where the "what if a region goes down?" follow-up to any of the later design chapters ends up.
 
 ## The hierarchy, strongest to weakest
 

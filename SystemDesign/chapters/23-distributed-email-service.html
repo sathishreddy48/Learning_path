@@ -10,7 +10,7 @@
 <div class="layout">
 <main class="main">
 
-  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 23 of 28</div>
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Advanced Systems › Chapter 23 of 28</div>
   <h1>Chapter 23: Distributed Email Service</h1>
   <div class="toc">
     <h4>On this page</h4>
@@ -21,7 +21,7 @@
 <h2 id="introduction">Introduction</h2>
 <p>We'll design a <strong>distributed email service</strong>, similar to <strong>Gmail</strong> in this chapter.</p>
 <p>In 2020, <strong>Gmail</strong> had 1.8bil active users, while <strong>Outlook</strong> had 400mil users worldwide.</p>
-<p><strong>The one-sentence version:</strong> email is the only system in this book that is <strong>federated</strong> — you do not control the protocol, the other participants, or whether your output is even accepted. Everything else here you can redesign; SMTP you must speak as it was specified in 1982, to thousands of independently operated servers run by people you will never meet.</p>
+<p><strong>The one-sentence version:</strong> email is the only system in these notes that is <strong>federated</strong> — you do not control the protocol, the other participants, or whether your output is even accepted. Everything else here you can redesign; SMTP you must speak as it was specified in 1982, to thousands of independently operated servers run by people you will never meet.</p>
 <p>That produces an unusual split in difficulty:</p>
 <ul>
 <li><strong>The storage design is comparatively easy.</strong> Every operation — fetch, mark as read, search — concerns exactly one user, so <code>user_id</code> partitions the data perfectly and there are no cross-shard transactions. Compare the trouble sharing causes in <a href="15-google-drive.html#gotchas--failure-modes">Chapter 15</a>.</li>
@@ -238,7 +238,7 @@ In an interview setting, it's infeasible to design a new distributed database so
 </ul>
 <p>In order to partition the data, we can use the <code>user_id</code> as a partition key, so that one user's data is stored on a single shard.
 This prohibits us from sharing an email with multiple users, but this is not a requirement for this interview.</p>
-<p><strong>This is the third time in the book that the quality of a shard key comes down to one question: does it contain every transaction?</strong></p>
+<p><strong>This is the third time in these notes that the quality of a shard key comes down to one question: does it contain every transaction?</strong></p>
 <div class="table-wrap">
 <table>
 <thead>
@@ -311,7 +311,7 @@ One workaround is to fetch all emails in a folder and filter in-memory, but that
 </code></pre></div>
 <p>Finally, we'll trade availability for consistency for our distributed database, since it is a hard requirement for this problem.</p>
 <p>Hence, in the event of a failover or network partition, sync/update actions will be briefly unavailable to impacted users.</p>
-<p><strong>This is one of the few chapters that chooses CP over AP, and it is worth understanding why</strong>, since most of this book reaches for availability. The deciding factor is that email state changes are <em>user-visible and user-initiated</em>: an email you read reappearing as unread, a message you deleted returning, or a draft losing its last edit are all experienced as the product being broken rather than as momentary staleness. And unlike a like count (<a href="11-news-feed-system.html">Chapter 11</a>), there is no version of the data that is acceptably approximate.</p>
+<p><strong>This is one of the few chapters that chooses CP over AP, and it is worth understanding why</strong>, since most of these notes reach for availability. The deciding factor is that email state changes are <em>user-visible and user-initiated</em>: an email you read reappearing as unread, a message you deleted returning, or a draft losing its last edit are all experienced as the product being broken rather than as momentary staleness. And unlike a like count (<a href="11-news-feed-system.html">Chapter 11</a>), there is no version of the data that is acceptably approximate.</p>
 <p>The mitigating factor is that the blast radius is tiny. Because everything is partitioned by user, a partition or failover affects only the users on that shard, and only for the duration — rather than degrading the whole service. Strong consistency is affordable here precisely because the data is so cleanly partitioned.</p>
 <h3 id="email-deliverability"><strong>Email deliverability</strong></h3>
 <p>It is easy to setup a server to send emails, but getting the email to a receiver's inbox is hard, due to spam-protection algorithms.</p>
@@ -575,7 +575,7 @@ This technique is used in Cassandra, BigTable and RocksDB.</p>
 <section id="self-check" data-kind="self-check">
 <h2 id="self-check">Self-check</h2>
 <ol>
-<li>What makes this system structurally different from every other chapter in the book?</li>
+<li>What makes this system structurally different from every other chapter in these notes?</li>
 <li>In what sense is SMTP a message queue, and which two of its behaviours correspond to retry and dead-lettering?</li>
 <li>Which line item dominates storage, and what is the single largest optimisation available against it?</li>
 <li>Why is the push-versus-pull fan-out question from Chapter 11 not available here?</li>

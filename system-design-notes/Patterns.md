@@ -192,7 +192,7 @@ Chapters 11 and 12 draw the line between the two columns. Snowflake IDs are suff
 
 ---
 
-## 9. Picking a push channel — the book decides this four times
+## 9. Picking a push channel — these notes decide this four times
 
 Four chapters choose how a server reaches a client, and they choose differently, because the traffic profiles differ. The comparison is worth holding as one table.
 

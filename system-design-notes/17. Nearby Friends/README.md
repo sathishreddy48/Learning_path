@@ -329,7 +329,7 @@ We also explored how to scale restful api servers, websocket servers, data layer
 - **Straight-line distance is not travel distance.** 5 miles across a bay is not 5 miles of walking. The requirement explicitly accepts this; be aware it is an assumption, not a fact.
 - **The 30-second interval is a battery decision.** GPS is one of the most power-hungry things a phone does, and a background app draining the battery gets uninstalled or killed by the OS. Shortening the interval to improve freshness trades directly against that, and against the whole fan-out budget.
 - **900 GB/day of history is written for an unspecified future use.** It is the largest cost in the design and has no serving-path reader. Keep it off the live path, give it a retention policy, and be ready to justify it.
-- **This is the most sensitive data in the book.** A continuous location history of a billion-user app's users is a surveillance dataset. Real versions need opt-in, granular sharing, coarsening, retention limits and the ability to go invisible — and in most jurisdictions that is law, not preference.
+- **This is the most sensitive data in these notes.** A continuous location history of a billion-user app's users is a surveillance dataset. Real versions need opt-in, granular sharing, coarsening, retention limits and the ability to go invisible — and in most jurisdictions that is law, not preference.
 - **Erlang/BEAM is a real alternative with a real cost.** It collapses the websocket tier and the pub/sub tier into one runtime built for millions of lightweight processes, which removes an entire distributed component. The staffing constraint the chapter mentions is the honest objection — this is an operational and hiring decision as much as a technical one.
 
 ---

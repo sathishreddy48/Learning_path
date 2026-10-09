@@ -21,7 +21,7 @@
 <h2 id="introduction">Introduction</h2>
 <p>Every design in these notes makes a consistency choice, usually in one word — &quot;eventually consistent&quot;, &quot;strongly consistent&quot;, &quot;we use quorums&quot;. This page is about what those words actually promise, because the follow-up question in an interview is almost never &quot;which do you pick?&quot; and almost always &quot;what exactly does that give the user, and what breaks without it?&quot;</p>
 <p><strong>The one-sentence version:</strong> a consistency model is a contract about <em>what a read is allowed to return</em>, strong models let you reason about the system as if it were a single machine, weak models give that up in exchange for staying available and fast, and almost every real system sits somewhere in the middle on purpose.</p>
-<p>This is theory the designs assume rather than state. It sits underneath <a href="06-key-value-store.html">Chapter 6</a> especially, and it is where the &quot;what if a region goes down?&quot; follow-up to any Volume 2 chapter ends up.</p>
+<p>This is theory the designs assume rather than state. It sits underneath <a href="06-key-value-store.html">Chapter 6</a> especially, and it is where the &quot;what if a region goes down?&quot; follow-up to any of the later design chapters ends up.</p>
 </section>
 <section id="the-hierarchy-strongest-to-weakest">
 <h2 id="the-hierarchy-strongest-to-weakest">The hierarchy, strongest to weakest</h2>

@@ -10,7 +10,7 @@ A **chat system** supports real-time messaging between users. This chapter focus
 
 The system targets **50 million daily active users (DAU)** and stores chat history permanently.
 
-**The one-sentence version:** every other system in this book can be made stateless and scaled by adding servers; a chat system cannot, because the server must **hold a live connection** for each online user. That single fact generates almost every hard problem here — finding which server holds the recipient, surviving a server's death with millions of sockets on it, and tracking who is online at all.
+**The one-sentence version:** every other system in these notes can be made stateless and scaled by adding servers; a chat system cannot, because the server must **hold a live connection** for each online user. That single fact generates almost every hard problem here — finding which server holds the recipient, surviving a server's death with millions of sockets on it, and tracking who is online at all.
 
 The second theme is that **messaging is not the expensive part.** Presence updates and typing indicators generate an order of magnitude more traffic than the messages themselves, and that is the result most people do not expect.
 
@@ -93,7 +93,7 @@ The storage row deserves a note too: "permanent chat history" means the datastor
 
 WebSocket wins here because chat is the one case that genuinely needs the *bi-directional* column: the client both sends and receives continuously, over one connection, with low per-message overhead. SSE would serve receiving perfectly well but needs a second channel for sending; long polling pays a connection setup per message delivered.
 
-Note the row that is a cost, not a benefit: **"Reconnect handling — you implement it."** HTTP's statelessness is what makes everything else in this book easy to scale, and adopting WebSocket is a deliberate decision to give that up for the chat tier specifically. The book's design sends messages over HTTP; in practice most systems send over the same socket, since it is already open and already authenticated.
+Note the row that is a cost, not a benefit: **"Reconnect handling — you implement it."** HTTP's statelessness is what makes everything else in these notes easy to scale, and adopting WebSocket is a deliberate decision to give that up for the chat tier specifically. The design above sends messages over HTTP; in practice most systems send over the same socket, since it is already open and already authenticated.
 
 ---
 
@@ -259,7 +259,7 @@ has an inbox (message sync queue) which contains messages from different senders
 
 | Group size | Fan-out on write | What real systems do |
 |---|---|---|
-| 2–100 (this design) | ≤ 100 writes per message | Push — the book's design |
+| 2–100 (this design) | ≤ 100 writes per message | Push — the design above |
 | Thousands | Thousands of writes per message, most to idle members | Push only to active members |
 | 100,000+ (Discord-style servers) | **Infeasible** | Pull: store once per channel, readers fetch the channel |
 
@@ -361,7 +361,7 @@ Three consequences worth stating:
 
 **End-to-end encryption is not an add-on; it removes capabilities.** Once the server holds only ciphertext it cannot: search message history, generate a useful push-notification preview, scan for abuse, or let a new device read old messages without a key-transfer protocol. Group membership changes become key-rotation events. These are product decisions disguised as a checkbox, and noticing that is the valuable observation.
 
-**Media follows the same rule as everywhere else in this book:** upload to object storage, put the URL in the message, and never move bytes through the chat tier. A 20 MB video travelling over a WebSocket occupies a connection that is supposed to be serving thousands of small frames.
+**Media follows the same rule as everywhere else in these notes:** upload to object storage, put the URL in the message, and never move bytes through the chat tier. A 20 MB video travelling over a WebSocket occupies a connection that is supposed to be serving thousands of small frames.
 
 ---
 

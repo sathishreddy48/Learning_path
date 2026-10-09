@@ -201,7 +201,7 @@ flowchart TD
 | Per-link expiry or revocation | Impossible — one link, two owners | Independent |
 | Write path | Extra index lookup | Straight insert |
 
-Commercial shorteners mint a new key every time, because distinguishing *who shared what* is the entire value of the product. The book's dedupe step is the simpler design, not the better one.
+Commercial shorteners mint a new key every time, because distinguishing *who shared what* is the entire value of the product. The dedupe step here is the simpler design, not the better one.
 
 **The race nobody mentions.** Two concurrent requests for the same long URL both miss the check in step 1 and both insert — producing two short URLs for one destination. If dedupe actually matters, it has to be enforced by a **unique index on `longURLHash`**, not by a read-then-write. The same applies to the short key itself: the unique index on `shortURL` is the real guarantee, and the Bloom filter is only an optimisation that keeps you from hitting it.
 

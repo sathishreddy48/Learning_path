@@ -10,7 +10,7 @@
 <div class="layout">
 <main class="main">
 
-  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 25 of 28</div>
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Advanced Systems › Chapter 25 of 28</div>
   <h1>Chapter 25: Real-time Gaming Leaderboard</h1>
   <div class="toc">
     <h4>On this page</h4>
@@ -102,7 +102,7 @@ However, since distribution is typically uneven, we can estimate that the peak o
 </tbody>
 </table>
 </div>
-<p>Five hundred writes per second and fifty reads per second is, by this book's standards, nothing. There is no throughput problem, no storage problem, and no sharding problem at the stated scale — the chapter is explicit that one Redis instance suffices.</p>
+<p>Five hundred writes per second and fifty reads per second is, by the standards of these notes, nothing. There is no throughput problem, no storage problem, and no sharding problem at the stated scale — the chapter is explicit that one Redis instance suffices.</p>
 <p><strong>So the difficulty is entirely about the shape of the query, not its volume.</strong> That is unusual and worth naming: most chapters are hard because of scale, and this one is hard because <code>rank</code> is an awkward operation no matter how little data you have. A candidate who spends the interview sharding has mis-identified the problem.</p>
 <p>The scaling discussion only becomes real at the hypothetical 10× growth the chapter introduces later — 500 M DAU, 65 GB, 250 K QPS — and it is worth treating that as a separate, clearly-labelled extension rather than the baseline design.</p>
 <div class="callout callout-interview">

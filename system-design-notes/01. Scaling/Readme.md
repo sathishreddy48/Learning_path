@@ -212,7 +212,7 @@ The load balancer continuously probes each server and removes unhealthy ones fro
    - Since the ratio of reads to writes is higher in most applications; thus, the number of slave
 databases in a system is usually larger than the number of master databases.
 
-> Terminology note: modern tooling and documentation use **primary/replica** (or leader/follower) for the same roles. The book's master/slave wording is kept here to match it, but primary/replica is what you will see in practice.
+> Terminology note: modern tooling and documentation use **primary/replica** (or leader/follower) for the same roles. The older master/slave wording is kept here to match it, but primary/replica is what you will see in practice.
 
 ### Benefits
 1. Improved performance through parallel read operations.

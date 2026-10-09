@@ -10,7 +10,7 @@
 <div class="layout">
 <main class="main">
 
-  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 26 of 28</div>
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Advanced Systems › Chapter 26 of 28</div>
   <h1>Chapter 26: Payment System</h1>
   <div class="toc">
     <h4>On this page</h4>
@@ -21,7 +21,7 @@
 <h2 id="introduction">Introduction</h2>
 <p>We'll design a <strong>payment system</strong> in this chapter, which underpins all of modern <strong>e-commerce</strong>.</p>
 <p>A <strong>payment system</strong> is used to settle financial transactions, transferring monetary value.</p>
-<p><strong>The one-sentence version:</strong> at <strong>~11 transactions per second</strong> this is the lowest-throughput system in the book and comfortably the hardest, because money movement has two properties nothing else here has — <strong>it cannot be lost, and it cannot be undone.</strong> Combine that with the fact that the authoritative record lives in systems you do not control (the PSP, the card networks, the banks) and is only confirmed to you hours later, and the shape of the problem appears.</p>
+<p><strong>The one-sentence version:</strong> at <strong>~11 transactions per second</strong> this is the lowest-throughput system in these notes and comfortably the hardest, because money movement has two properties nothing else here has — <strong>it cannot be lost, and it cannot be undone.</strong> Combine that with the fact that the authoritative record lives in systems you do not control (the PSP, the card networks, the banks) and is only confirmed to you hours later, and the shape of the problem appears.</p>
 <p><strong>Two mechanisms do almost all of the work, and everything else is plumbing:</strong></p>
 <div class="table-wrap">
 <table>
@@ -309,7 +309,7 @@
 <p>Three consequences follow, and they shape the whole system:</p>
 <p><strong>The ledger is append-only and immutable.</strong> You never edit an entry. A mistake is corrected by posting a <em>reversing</em> entry, which leaves both the error and its correction permanently visible. That is what makes the ledger auditable — history cannot be rewritten — and it is the same immutability argument as <a href="24-s3-like-object-storage.html">Chapter 24</a>.</p>
 <p><strong>A refund is therefore a new transaction, not an undo.</strong> This is the practical form of &quot;money movement cannot be rolled back&quot;: the original charge happened, is recorded, and stays recorded; the refund is a second, opposite movement. Anyone reasoning about this system as though failed operations can be rolled back has the wrong model.</p>
-<p><strong>The ledger is the source of truth and the wallet is a derived view.</strong> The ledger says what happened; the wallet says what the balance <em>currently is</em>, which is a sum over the ledger. That means the wallet can always be rebuilt by replaying the ledger — and if the wallet and the ledger disagree, the ledger wins. This is now the third instance of the same pattern in the book:</p>
+<p><strong>The ledger is the source of truth and the wallet is a derived view.</strong> The ledger says what happened; the wallet says what the balance <em>currently is</em>, which is a sum over the ledger. That means the wallet can always be rebuilt by replaying the ledger — and if the wallet and the ledger disagree, the ledger wins. This is now the third instance of the same pattern in these notes:</p>
 <div class="table-wrap">
 <table>
 <thead>
@@ -670,7 +670,7 @@ We could also use a consensus-based distributed database such as YugabyteDB or C
 <section id="self-check" data-kind="self-check">
 <h2 id="self-check">Self-check</h2>
 <ol>
-<li>This is the lowest-throughput system in the book. Why is it also among the hardest?</li>
+<li>This is the lowest-throughput system in these notes. Why is it also among the hardest?</li>
 <li>Which two mechanisms carry the correctness of this design, and which one is counter-intuitive?</li>
 <li>Why is reconciliation the correctness mechanism rather than a cleanup process?</li>
 <li>Why is <code>amount</code> a string in the API and never a <code>double</code> anywhere?</li>

@@ -10,7 +10,7 @@
 <div class="layout">
 <main class="main">
 
-  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 22 of 28</div>
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Advanced Systems › Chapter 22 of 28</div>
   <h1>Chapter 22: Hotel Reservation System</h1>
   <div class="toc">
     <h4>On this page</h4>
@@ -21,7 +21,7 @@
 <h2 id="introduction">Introduction</h2>
 <p>In this chapter, we're designing a <strong>hotel reservation system</strong>, similar to Marriott International.</p>
 <p>Applicable to other types of systems as well - Airbnb, flight reservation, movie ticket booking.</p>
-<p><strong>The one-sentence version:</strong> this is a <strong>concurrency</strong> problem wearing a CRUD costume. The dataset is tiny (73 million rows, comfortably one server), the write rate is about <strong>3 reservations per second</strong>, and every service is stateless — by the standards of this book it is trivially small. It is nonetheless one of the harder chapters, because the system has exactly one invariant that must never be violated — <em>do not sell the same room twice</em> — and correctness under concurrency is the one thing distributed systems do not hand you for free.</p>
+<p><strong>The one-sentence version:</strong> this is a <strong>concurrency</strong> problem wearing a CRUD costume. The dataset is tiny (73 million rows, comfortably one server), the write rate is about <strong>3 reservations per second</strong>, and every service is stateless — by the standards of these notes it is trivially small. It is nonetheless one of the harder chapters, because the system has exactly one invariant that must never be violated — <em>do not sell the same room twice</em> — and correctness under concurrency is the one thing distributed systems do not hand you for free.</p>
 <p><strong>And then the requirements quietly dissolve the hardest part of the problem.</strong> Overbooking by 10% is permitted, which means the invariant is not &quot;never exceed inventory&quot; but &quot;never exceed 110% of inventory&quot; — a <em>soft</em> limit, deliberately set above the real one. That is only acceptable because the business already has a procedure for the failure case: when a hotel is genuinely oversold, the guest is walked to another property at the hotel's expense. <strong>The business absorbs the inconsistency.</strong></p>
 <p>This is worth noticing as a general technique, not a quirk of hotels. Asking &quot;what does the business do when this constraint is violated?&quot; sometimes reveals that an apparently absolute technical requirement is a negotiable one — and negotiable constraints are enormously cheaper to enforce. Airline seats work the same way; a bank balance does not (<a href="27-digital-wallet.html">Chapter 27</a>).</p>
 <hr>

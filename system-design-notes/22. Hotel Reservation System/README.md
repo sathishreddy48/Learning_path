@@ -5,7 +5,7 @@ In this chapter, we're designing a **hotel reservation system**, similar to Marr
 
 Applicable to other types of systems as well - Airbnb, flight reservation, movie ticket booking.
 
-**The one-sentence version:** this is a **concurrency** problem wearing a CRUD costume. The dataset is tiny (73 million rows, comfortably one server), the write rate is about **3 reservations per second**, and every service is stateless — by the standards of this book it is trivially small. It is nonetheless one of the harder chapters, because the system has exactly one invariant that must never be violated — *do not sell the same room twice* — and correctness under concurrency is the one thing distributed systems do not hand you for free.
+**The one-sentence version:** this is a **concurrency** problem wearing a CRUD costume. The dataset is tiny (73 million rows, comfortably one server), the write rate is about **3 reservations per second**, and every service is stateless — by the standards of these notes it is trivially small. It is nonetheless one of the harder chapters, because the system has exactly one invariant that must never be violated — *do not sell the same room twice* — and correctness under concurrency is the one thing distributed systems do not hand you for free.
 
 **And then the requirements quietly dissolve the hardest part of the problem.** Overbooking by 10% is permitted, which means the invariant is not "never exceed inventory" but "never exceed 110% of inventory" — a *soft* limit, deliberately set above the real one. That is only acceptable because the business already has a procedure for the failure case: when a hotel is genuinely oversold, the guest is walked to another property at the hotel's expense. **The business absorbs the inconsistency.**
 

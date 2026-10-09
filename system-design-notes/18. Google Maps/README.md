@@ -520,7 +520,7 @@ We have several options, which enable us to proactively push data to clients fro
  * WebSocket is generally a better option than long-polling as it has less compute footprint on servers
  * We can also use server-sent events (SSE) but lean towards web sockets as they support bi-directional communication which can come in handy for eg a last-mile delivery feature
 
-This is the third time this book works through the same protocol comparison, and the three answers differ because the traffic profiles differ — worth holding together:
+This is the third time these notes work through the same protocol comparison, and the three answers differ because the traffic profiles differ — worth holding together:
 
 | Chapter | Traffic shape | Choice |
 |---|---|---|
@@ -549,7 +549,7 @@ The distinguishing feature here is that the connection is **session-scoped**: it
 - **A stale or mismatched position produces confidently wrong instructions.** "Turn right now" delivered 50 metres late is worse than no instruction. Accuracy is the first non-functional requirement for this reason.
 - **Battery and radio, not CPU, are the mobile constraints.** Waking the radio for each GPS reading costs more than the fix; hence batched uploads, and hence the 200 K QPS figure.
 - **Offline maps are a separate product.** Downloading a region means shipping vector tiles *and* routing tiles and running the search on the device — a different engine with different data, not a cache of the online one.
-- **Location history is a surveillance dataset.** Continuous position traces for a billion users are the most sensitive data in this book. Aggregation for traffic should not require retaining identifiable individual traces, and retention limits and opt-out are part of the design rather than a compliance step afterwards.
+- **Location history is a surveillance dataset.** Continuous position traces for a billion users are the most sensitive data in these notes. Aggregation for traffic should not require retaining identifiable individual traces, and retention limits and opt-out are part of the design rather than a compliance step afterwards.
 - **A billion DAU does not mean a billion connections.** Only actively navigating users hold a socket. Conflating the two over-sizes the stateful tier by orders of magnitude.
 
 ---

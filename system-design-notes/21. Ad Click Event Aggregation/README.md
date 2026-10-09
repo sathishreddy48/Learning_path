@@ -16,7 +16,7 @@ Data accuracy is also very important as it impacts how much money advertisers pa
 
 Based on ad click event aggregations, advertisers can make decisions such as adjust target audience and keywords.
 
-**The one-sentence version:** the output of this system is **money** — it is what advertisers are billed from — and that single fact reorders every priority in the book. Elsewhere you trade correctness for latency and cost without much hesitation; here a 0.1% error on a billion events a day is a material financial discrepancy and a legal problem.
+**The one-sentence version:** the output of this system is **money** — it is what advertisers are billed from — and that single fact reorders every priority used elsewhere in these notes. Elsewhere you trade correctness for latency and cost without much hesitation; here a 0.1% error on a billion events a day is a material financial discrepancy and a legal problem.
 
 Everything unusual about this design follows from that:
 
@@ -695,7 +695,7 @@ It would be easier to understand and design it if you have prior knowledge of re
 | Knowing the system is healthy | End-to-end latency, consumer lag, and a daily reconciliation comparison |
 
 ## Self-check
-1. What makes this system different from every other aggregation pipeline in the book, and which requirement does that promote above the rest?
+1. What makes this system different from every other aggregation pipeline in these notes, and which requirement does that promote above the rest?
 2. The aggregated output is far smaller than the raw input. Give three reasons the raw events are still kept.
 3. Why does the query API take an opaque `filter` identifier rather than arbitrary filter predicates?
 4. Give the trade-off between event time and processing time, and say which is chosen and why.

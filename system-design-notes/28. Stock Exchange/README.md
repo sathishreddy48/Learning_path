@@ -5,7 +5,7 @@ We'll design an **electronic stock exchange** in this chapter.
 
 Its basic function is to efficiently match buyers and sellers.
 
-**The one-sentence version:** **latency is the requirement that reshapes everything else.** At a target of tens of microseconds, every architectural convenience the rest of this book relies on — microservices, network calls between them, message brokers, logging, locks, garbage collection, even disk — costs more than the entire latency budget. So this design runs the book's advice backwards: **one machine, one thread, shared memory, no disk, no locks, no allocations.**
+**The one-sentence version:** **latency is the requirement that reshapes everything else.** At a target of tens of microseconds, every architectural convenience the rest of these notes rely on — microservices, network calls between them, message brokers, logging, locks, garbage collection, even disk — costs more than the entire latency budget. So this design runs the usual advice backwards: **one machine, one thread, shared memory, no disk, no locks, no allocations.**
 
 That makes this chapter the collection's deliberate counter-example. Every other system here scales *out*, because its constraint is volume. This one scales *in*, because its constraint is the speed of a single decision — and the useful lesson is that "distribute it" is an answer to a particular kind of problem, not a universal principle.
 
@@ -55,9 +55,9 @@ Other non-functional requirements:
  * Peak QPS = 5*QPS = 215000
  * Trading volume is significantly higher when the market opens
 
-### The number that rules out almost every design in this book
+### The number that rules out almost every design in these notes
 
-43,000 orders/sec sustained and ~215,000 at peak is a middling throughput by this book's standards. **The latency target is what makes it hard.** At 215,000 orders/sec, orders arrive about every **4.6 microseconds** — so a single-threaded matching engine has roughly that long to handle one, and the end-to-end target is "tens of microseconds".
+43,000 orders/sec sustained and ~215,000 at peak is a middling throughput by the standards of these notes. **The latency target is what makes it hard.** At 215,000 orders/sec, orders arrive about every **4.6 microseconds** — so a single-threaded matching engine has roughly that long to handle one, and the end-to-end target is "tens of microseconds".
 
 Now put that budget next to what operations actually cost:
 
@@ -758,7 +758,7 @@ flowchart LR
 | Protecting the trading path from the internet | Isolate public services; cache; allowlists; rate limiting |
 
 ## Self-check
-1. Why is this chapter the book's counter-example? What does it do that every other chapter does not?
+1. Why is this chapter the counter-example to the rest of these notes? What does it do that every other chapter does not?
 2. At 215,000 orders/sec, how long is the mean inter-arrival time? How does one data-centre network round trip compare with the whole latency budget?
 3. Name the four things the latency target forces out of the critical path, and what replaces each.
 4. What does `mmap` on `/dev/shm` give you, and what does it emphatically not give you?

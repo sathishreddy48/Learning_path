@@ -10,7 +10,7 @@
 <div class="layout">
 <main class="main">
 
-  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 17 of 28</div>
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Advanced Systems › Chapter 17 of 28</div>
   <h1>Chapter 17: Nearby Friends</h1>
   <div class="toc">
     <h4>On this page</h4>
@@ -383,7 +383,7 @@
 <li><strong>Straight-line distance is not travel distance.</strong> 5 miles across a bay is not 5 miles of walking. The requirement explicitly accepts this; be aware it is an assumption, not a fact.</li>
 <li><strong>The 30-second interval is a battery decision.</strong> GPS is one of the most power-hungry things a phone does, and a background app draining the battery gets uninstalled or killed by the OS. Shortening the interval to improve freshness trades directly against that, and against the whole fan-out budget.</li>
 <li><strong>900 GB/day of history is written for an unspecified future use.</strong> It is the largest cost in the design and has no serving-path reader. Keep it off the live path, give it a retention policy, and be ready to justify it.</li>
-<li><strong>This is the most sensitive data in the book.</strong> A continuous location history of a billion-user app's users is a surveillance dataset. Real versions need opt-in, granular sharing, coarsening, retention limits and the ability to go invisible — and in most jurisdictions that is law, not preference.</li>
+<li><strong>This is the most sensitive data in these notes.</strong> A continuous location history of a billion-user app's users is a surveillance dataset. Real versions need opt-in, granular sharing, coarsening, retention limits and the ability to go invisible — and in most jurisdictions that is law, not preference.</li>
 <li><strong>Erlang/BEAM is a real alternative with a real cost.</strong> It collapses the websocket tier and the pub/sub tier into one runtime built for millions of lightweight processes, which removes an entire distributed component. The staffing constraint the chapter mentions is the honest objection — this is an operational and hiring decision as much as a technical one.</li>
 </ul>
 <hr>

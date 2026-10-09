@@ -10,7 +10,7 @@
 <div class="layout">
 <main class="main">
 
-  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Volume 2 Systems › Chapter 18 of 28</div>
+  <div class="breadcrumb"><a href="../index.html">Dashboard</a> › Advanced Systems › Chapter 18 of 28</div>
   <h1>Chapter 18: Google Maps</h1>
   <div class="toc">
     <h4>On this page</h4>
@@ -513,7 +513,7 @@ user_n: r_2, r_10, r21, ..., r_l
 <li>WebSocket is generally a better option than long-polling as it has less compute footprint on servers</li>
 <li>We can also use server-sent events (SSE) but lean towards web sockets as they support bi-directional communication which can come in handy for eg a last-mile delivery feature</li>
 </ul>
-<p>This is the third time this book works through the same protocol comparison, and the three answers differ because the traffic profiles differ — worth holding together:</p>
+<p>This is the third time these notes work through the same protocol comparison, and the three answers differ because the traffic profiles differ — worth holding together:</p>
 <div class="table-wrap">
 <table>
 <thead>
@@ -563,7 +563,7 @@ user_n: r_2, r_10, r21, ..., r_l
 <li><strong>A stale or mismatched position produces confidently wrong instructions.</strong> &quot;Turn right now&quot; delivered 50 metres late is worse than no instruction. Accuracy is the first non-functional requirement for this reason.</li>
 <li><strong>Battery and radio, not CPU, are the mobile constraints.</strong> Waking the radio for each GPS reading costs more than the fix; hence batched uploads, and hence the 200 K QPS figure.</li>
 <li><strong>Offline maps are a separate product.</strong> Downloading a region means shipping vector tiles <em>and</em> routing tiles and running the search on the device — a different engine with different data, not a cache of the online one.</li>
-<li><strong>Location history is a surveillance dataset.</strong> Continuous position traces for a billion users are the most sensitive data in this book. Aggregation for traffic should not require retaining identifiable individual traces, and retention limits and opt-out are part of the design rather than a compliance step afterwards.</li>
+<li><strong>Location history is a surveillance dataset.</strong> Continuous position traces for a billion users are the most sensitive data in these notes. Aggregation for traffic should not require retaining identifiable individual traces, and retention limits and opt-out are part of the design rather than a compliance step afterwards.</li>
 <li><strong>A billion DAU does not mean a billion connections.</strong> Only actively navigating users hold a socket. Conflating the two over-sizes the stateful tier by orders of magnitude.</li>
 </ul>
 <hr>
